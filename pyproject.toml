@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meshive"
+description = "Python SDK and CLI for the Meshive GPU Cloud"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "SeungHyeon", email = "bsh12341@gmail.com" },
+    { name = "Dokebi", email = "dokebivc@gmail.com" },
+]
+dynamic = ["version"]
+keywords = ["meshive", "gpu", "cloud", "ai", "ml", "sdk", "cli"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Distributed Computing",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "pytest-mock>=3.12",
+    "build",
+    "twine",
+]
+
+[project.urls]
+Homepage = "https://console.meshive.ai"
+Repository = "https://github.com/meshive/meshive-python"
+
+[project.scripts]
+meshive = "meshive.cli.main:main"
+
+[tool.setuptools.packages.find]
+include = ["meshive*"]
+exclude = ["tests*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "meshive._version.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "live: tests that hit the real Meshive API (require MESHIVE_API_KEY)",
+    "integration: integration tests requiring API credentials and fixtures",
+]
+addopts = "-m 'not live and not integration' --tb=short -ra"

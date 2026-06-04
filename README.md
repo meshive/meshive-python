@@ -48,11 +48,19 @@ meshive pods <workspace>       # list pods in a workspace
 meshive pods --all             # list pods across every workspace (adds a WORKSPACE column)
 meshive pod <workspace> <pod>  # show a single pod
 
+meshive machines               # list your machines (as a host)
+meshive machine <id>           # show a single machine
+
 # filter pods (client-side; the API itself returns the full list)
 meshive pods <workspace-id> --status running
 meshive pods <workspace-id> --status running,error   # comma-separated or repeatable
 meshive pods <workspace-id> --rental spot
 meshive pods <workspace-id> --name llama              # match the display name (alias)
+
+# filter machines (client-side)
+meshive machines --status online                      # comma-separated or repeatable
+meshive machines --type gpu                           # gpu | cpu | storage
+meshive machines --name node-a                        # match the display name
 
 # any command accepts --json for raw output, plus --api-key / --base-url overrides
 meshive pods <workspace-id> --json
@@ -83,6 +91,13 @@ with Meshive() as client:               # reads MESHIVE_API_KEY / MESHIVE_BASE_U
     pods = client.list_pods("my-workspace")
     pod = client.get_pod(pods[0].pod_name, "my-workspace")
     print(pod.status, pod.raw)           # .raw holds the full payload (machine, template, ...)
+
+    # host view: the machines you contribute to the network
+    machines = client.list_machines()
+    for m in machines:
+        print(m.machine_id, m.status, m.gpu_count, m.gpu_model)
+    machine = client.get_machine(machines[0].machine_id)
+    print(machine.earning_hourly, machine.raw)   # .raw holds specs, state, podUses, ...
 ```
 
 Credentials can also be passed explicitly: `Meshive(api_key="meshive_...", base_url="https://api.dev.meshive.ai")`.

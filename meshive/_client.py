@@ -22,7 +22,7 @@ from .exceptions import (
     PermissionDeniedError,
     RateLimitError,
 )
-from .models import Pod, WhoAmI, Workspace
+from .models import Machine, Pod, WhoAmI, Workspace
 
 
 def _extract_error(payload: Any) -> tuple[str | None, str]:
@@ -147,6 +147,14 @@ class Meshive(_BaseClient):
         """파드 단건 (GET /pods/{pod_name}?workspace=)."""
         return Pod.from_dict(self._get(f"/pods/{pod_name}", params={"workspace": workspace}))
 
+    def list_machines(self) -> list[Machine]:
+        """host 로 등록한 머신 목록 (GET /machines). workspace 불필요 (host 가 직접 소유)."""
+        return [Machine.from_dict(d) for d in self._get("/machines")]
+
+    def get_machine(self, machine_id: str) -> Machine:
+        """머신 단건 (GET /machines/{machine_id})."""
+        return Machine.from_dict(self._get(f"/machines/{machine_id}"))
+
     def close(self) -> None:
         self._client.close()
 
@@ -200,6 +208,14 @@ class AsyncMeshive(_BaseClient):
         """파드 단건 (GET /pods/{pod_name}?workspace=)."""
         data = await self._get(f"/pods/{pod_name}", params={"workspace": workspace})
         return Pod.from_dict(data)
+
+    async def list_machines(self) -> list[Machine]:
+        """host 로 등록한 머신 목록 (GET /machines). workspace 불필요 (host 가 직접 소유)."""
+        return [Machine.from_dict(d) for d in await self._get("/machines")]
+
+    async def get_machine(self, machine_id: str) -> Machine:
+        """머신 단건 (GET /machines/{machine_id})."""
+        return Machine.from_dict(await self._get(f"/machines/{machine_id}"))
 
     async def close(self) -> None:
         await self._client.aclose()

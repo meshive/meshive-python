@@ -28,15 +28,23 @@ _STATUS_COLOR = {
     "running": "green",
     "active": "green",
     "ready": "green",
+    "online": "green",          # machine state.name
     "stopped": "gray",
     "terminated": "gray",
     "revoked": "gray",
+    "offline": "gray",          # machine state.name
     "paused": "yellow",
     "waiting": "yellow",
+    "maintenance": "yellow",    # machine state.name
     "provisioning": "cyan",
     "pending": "cyan",
+    "start_up": "cyan",         # machine setup stage
+    "re_verifying": "cyan",     # machine setup stage
     "error": "red",
     "failed": "red",
+    "node_not_ready": "red",    # machine state.name
+    "agent_not_ready": "red",   # machine state.name
+    "delete_machine": "red",    # machine state.name
 }
 
 _STATUS_ICON = "●"  # ●
@@ -83,6 +91,13 @@ def money(value: str | None) -> str:
 
 def yes_no(value: bool) -> str:
     return "yes" if value else "no"
+
+
+def percent(rate: float | None) -> str:
+    """비율(0.0~1.0) → '99.9%'. None/비유한값은 '-'."""
+    if rate is None or not math.isfinite(rate):
+        return "-"
+    return f"{rate * 100:.1f}%"
 
 
 def relative_time(dt: datetime | None, *, now: datetime | None = None) -> str:

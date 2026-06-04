@@ -11,7 +11,7 @@ from .. import _config, _credentials
 from .._version import __version__
 from .._client import Meshive
 from ..exceptions import MeshiveError
-from ..models import Pod, WhoAmI, Workspace
+from ..models import Machine, Pod, WhoAmI, Workspace
 
 # K8sResourceLifecycleStatus (백엔드 enum). --status 검증용 — 서버가 필터를 안 받으므로
 # 클라이언트에서 오타를 잡아 "조용히 빈 결과" 대신 유효값을 알려준다.
@@ -32,6 +32,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  meshive workspaces             List workspaces\n"
             "  meshive pods <workspace>       List pods in a workspace\n"
             "  meshive pod <workspace> <pod>  Show a single pod\n"
+            "  meshive machines               List your machines (as a host)\n"
+            "  meshive machine <id>           Show a single machine\n"
             "\n"
             "Auth: `meshive login`, or set MESHIVE_API_KEY / pass --api-key. For dev, set MESHIVE_BASE_URL.\n"
             "Docs: https://github.com/meshive/meshive-python"
@@ -86,6 +88,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_pod = sub.add_parser("pod", parents=[common], help="Show a single pod.")
     p_pod.add_argument("workspace", help="Workspace ID (namespace name).")
     p_pod.add_argument("pod_name", help="Pod ID (pod name). See ID column of `meshive pods`.")
+
+    p_machines = sub.add_parser("machines", parents=[common], aliases=["m"],
+                                help="List your machines (as a host).")
+    p_machines.add_argument(
+        "--type", choices=["gpu", "cpu", "storage"], default=None, dest="machine_type",
+        help="Filter by machine type.",
+    )
+    # 머신 status(state.name) enum 은 합성/확장적이라 클라이언트에서 검증하지 않는다 —
+    # 서버가 주는 값과 대소문자 무시 비교만 한다.
+    p_machines.add_argument(
+        "--status", action="append", metavar="STATUS",
+        help="Filter by status (repeatable or comma-separated), e.g. online,offline.",
+    )
+    p_machines.add_argument(
+        "--name", default=None, metavar="SUBSTR",
+        help="Filter by display name substring. Note: a label, not a unique key.",
+    )
+
+    p_machine = sub.add_parser("machine", parents=[common], help="Show a single machine.")
+    p_machine.add_argument("machine_id", help="Machine ID. See ID column of `meshive machines`.")
 
     return parser
 
@@ -199,6 +221,60 @@ def _print_pod(pod: Pod, color: bool) -> None:
         print(fmt.paint("⚠ under maintenance", "yellow", color))
 
 
+def _gpu_cell(machine: Machine) -> str:
+    """'8x NVIDIA H100' 형태. GPU 없는(cpu/storage) 머신은 '-'."""
+    if not machine.gpu_count:
+        return "-"
+    return f"{machine.gpu_count}x {machine.gpu_model}" if machine.gpu_model else str(machine.gpu_count)
+
+
+def _filter_machines(
+    machines: list[Machine], statuses: set[str], machine_type: str | None, name: str | None
+) -> list[Machine]:
+    if statuses:
+        machines = [m for m in machines if m.status.lower() in statuses]
+    if machine_type:
+        machines = [m for m in machines if m.machine_type.lower() == machine_type]
+    if name:
+        needle = name.lower()
+        machines = [m for m in machines if needle in (m.name or "").lower()]
+    return machines
+
+
+def _print_machines(machines: list[Machine], color: bool) -> None:
+    if not machines:
+        print("No machines.")
+        return
+    # NAME = name(유저 라벨), ID = machine_id(조회 키).
+    rows = []
+    colors = []
+    for m in machines:
+        rows.append([
+            m.name or "-", m.machine_id, m.machine_type or "-",
+            fmt.status_cell(m.status), _gpu_cell(m),
+            fmt.money(m.earning_hourly), fmt.percent(m.uptime_rate),
+        ])
+        colors.append([None, None, None, fmt.status_color(m.status), None, None, None])
+    fmt.render_table(
+        ["NAME", "ID", "TYPE", "STATUS", "GPU", "EARN/HR", "UPTIME"],
+        rows,
+        aligns=["l", "l", "l", "l", "l", "r", "r"],
+        colors=colors,
+        enabled=color,
+    )
+
+
+def _print_machine(machine: Machine, color: bool) -> None:
+    print(f"name:      {machine.name or '-'}")            # 유저 라벨
+    print(f"id:        {machine.machine_id}")             # 조회 키
+    print(f"type:      {machine.machine_type or '-'}")
+    print(f"status:    {fmt.paint(fmt.status_cell(machine.status), fmt.status_color(machine.status), color)}")
+    print(f"gpu:       {_gpu_cell(machine)}")
+    print(f"earn/hr:   {fmt.money(machine.earning_hourly)}")
+    print(f"uptime:    {fmt.percent(machine.uptime_rate)}")
+    print(f"tier:      {machine.host_tier or '-'}")
+
+
 def _cmd_login(args: argparse.Namespace) -> int:
     api_key = args.api_key or getpass.getpass("Meshive API key: ").strip()
     if not api_key:
@@ -268,6 +344,15 @@ def _run_command(args: argparse.Namespace) -> int:
         elif args.command == "pod":
             pod = client.get_pod(args.pod_name, args.workspace)
             print(json.dumps(pod.raw, indent=2, ensure_ascii=False)) if args.as_json else _print_pod(pod, color)
+        elif args.command in ("machines", "m"):
+            statuses = _parse_status_filter(args.status)
+            machines = _filter_machines(client.list_machines(), statuses, args.machine_type, args.name)
+            print(json.dumps([m.raw for m in machines], indent=2, ensure_ascii=False)) if args.as_json \
+                else _print_machines(machines, color)
+        elif args.command == "machine":
+            machine = client.get_machine(args.machine_id)
+            print(json.dumps(machine.raw, indent=2, ensure_ascii=False)) if args.as_json \
+                else _print_machine(machine, color)
         else:  # pragma: no cover - unreachable (handled by caller)
             return 1
     except MeshiveError as err:

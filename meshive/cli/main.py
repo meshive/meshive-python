@@ -121,6 +121,12 @@ def _filter_pods(pods: list[Pod], statuses: set[str], rental: str | None, name: 
     return pods
 
 
+def _pod_price(pod: Pod) -> str:
+    """웹 pod 페이지와 동일: running 일 때만 가격, 아니면 '-'.
+    (꺼진/대기 중인 pod 는 과금되지 않으므로 가격을 노출하지 않는다.)"""
+    return fmt.money(pod.price_per_hour) if pod.status.lower() == "running" else "-"
+
+
 def _print_whoami(me: WhoAmI, color: bool) -> None:
     print(f"email:    {me.email}")
     print(f"username: {me.username or '-'}")
@@ -169,7 +175,7 @@ def _print_pods(pods: list[Pod], color: bool, show_workspace: bool = False) -> N
             row.append(pod.namespace_name)
             color_row.append(None)
         row += [fmt.status_cell(pod.status), pod.rental_type,
-                fmt.money(pod.price_per_hour), fmt.relative_time(pod.created_at)]
+                _pod_price(pod), fmt.relative_time(pod.created_at)]
         color_row += [fmt.status_color(pod.status), None, None, "dim"]
         rows.append(row)
         colors.append(color_row)
@@ -186,7 +192,7 @@ def _print_pod(pod: Pod, color: bool) -> None:
     print(f"workspace: {pod.namespace_name}")
     print(f"status:    {fmt.paint(fmt.status_cell(pod.status), fmt.status_color(pod.status), color)}")
     print(f"rental:    {pod.rental_type}")
-    print(f"price/hr:  {fmt.money(pod.price_per_hour)}")
+    print(f"price/hr:  {_pod_price(pod)}")
     print(f"created:   {created}")
     # maintenance 는 진행 중일 때만 노출 (boolean 나열 대신 의미 있을 때만).
     if pod.is_maintenance:

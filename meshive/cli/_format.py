@@ -7,6 +7,7 @@ ANSI 코드가 칸 맞춤을 망가뜨리지 않는다.
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -64,8 +65,20 @@ def status_cell(status: str) -> str:
 
 
 def money(value: str | None) -> str:
-    """price_per_hour 문자열 → '$2.10/h'. 서버가 통화 메타를 안 주므로 USD 가정."""
-    return f"${value if value not in (None, '') else '0'}/h"
+    """price 문자열 → '$2.10' (USD, 소수점 2자리, 천단위 콤마). 빈/잘못된 값은 '-'.
+
+    서버 price_per_hour 는 Numeric(20,8) 이라 '2.10000000' 처럼 와서 그대로 쓰면
+    불필요한 자릿수가 보인다. 웹 formatUsd 와 동일 규칙으로 2자리 반올림한다.
+    """
+    if value in (None, ""):
+        return "-"
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if not math.isfinite(amount):
+        return "-"
+    return f"${amount:,.2f}"
 
 
 def yes_no(value: bool) -> str:

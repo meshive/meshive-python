@@ -9,7 +9,7 @@ from .exceptions import (
     PermissionDeniedError,
     RateLimitError,
 )
-from .models import Pod, WhoAmI, Workspace, WorkspaceResources
+from .models import Machine, Pod, WhoAmI, Workspace, WorkspaceResources
 
 version = __version__
 
@@ -24,6 +24,7 @@ __all__ = [
     "Workspace",
     "WorkspaceResources",
     "Pod",
+    "Machine",
     # exceptions
     "MeshiveError",
     "ConfigurationError",

@@ -20,6 +20,14 @@ def _parse_dt(value: str | None) -> datetime | None:
         return None
 
 
+def _as_float(value: object) -> float:
+    """숫자/숫자문자열 → float. 변환 불가 시 0.0 (서버가 Numeric 을 문자열로 줘도 안전)."""
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+
+
 @dataclass
 class WhoAmI:
     """GET /v1/sdk/me 응답 — 현재 API Key 의 소유자."""
@@ -117,5 +125,45 @@ class Pod:
             price_per_hour=str(d.get("pricePerHour", "0")),
             is_maintenance=bool(d.get("isMaintenance", False)),
             created_at=_parse_dt(d.get("createdAt")),
+            raw=d,
+        )
+
+
+@dataclass
+class Machine:
+    """GET /v1/sdk/machines[/{machine_id}] 항목 — host 가 등록한 머신.
+
+    웹 콘솔의 MachineDataInterface 와 같은 스키마(camelCase)지만, SDK read 표면은
+    민감 필드(ssh/ipmi credentials, grafana, bootReport 등)를 제외한 trim DTO 를
+    받는다. 자주 쓰는 스칼라만 타입화하고 — status/gpu/earning 처럼 중첩에 있던
+    표시용 필드는 끌어올린다 — 나머지(specs/state 전체/podUses 등)는 `.raw` 로 접근.
+    """
+
+    machine_id: str       # id (조회 키)
+    name: str             # 유저 라벨
+    machine_type: str     # "gpu" | "cpu" | "storage"
+    status: str           # state.name (ONLINE/OFFLINE/MAINTENANCE/...). stageState 는 .raw.
+    gpu_model: str         # specs.gpu (cpu/storage 머신은 빈 문자열)
+    gpu_count: int         # specs.gpuNumber
+    earning_hourly: float  # earning.hourly
+    uptime_rate: float     # uptimeRate (0.0~1.0)
+    host_tier: str         # hostTier
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Machine":
+        state = d.get("state") or {}
+        specs = d.get("specs") or {}
+        earning = d.get("earning") or {}
+        return cls(
+            machine_id=d.get("id", ""),
+            name=d.get("name", ""),
+            machine_type=d.get("machineType", ""),
+            status=state.get("name", ""),
+            gpu_model=specs.get("gpu", "") or "",
+            gpu_count=int(specs.get("gpuNumber", 0) or 0),
+            earning_hourly=_as_float(earning.get("hourly", 0)),
+            uptime_rate=_as_float(d.get("uptimeRate", 0)),
+            host_tier=d.get("hostTier", "") or "",
             raw=d,
         )

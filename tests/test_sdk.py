@@ -41,6 +41,17 @@ POD = {
     "createdAt": "2026-03-01T12:00:00Z",
     "machine": {"nodeName": "node-a"},  # nested → preserved in .raw only
 }
+MACHINE = {
+    "id": "mac-1",
+    "name": "node-a",
+    "machineType": "gpu",
+    "state": {"name": "ONLINE", "stageState": "COMPLETED"},  # status pulled from state.name
+    "specs": {"gpu": "NVIDIA H100", "gpuNumber": 8},          # gpu fields pulled from specs
+    "earning": {"hourly": 2.5, "daily": 60.0},
+    "uptimeRate": 0.999,
+    "hostTier": "gold",
+    "sshCredentials": {"password": "secret"},  # nested → preserved in .raw only
+}
 
 
 def sync_client(handler, **kwargs):
@@ -153,6 +164,55 @@ def test_get_pod_parses():
     assert pod.rental_type == "on_demand"
 
 
+def test_list_machines_parses():
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json=[MACHINE])  # bare list, no workspace query
+
+    machines = sync_client(handler).list_machines()
+    assert seen["url"] == "https://api.test/v1/sdk/machines"
+    assert len(machines) == 1
+    m = machines[0]
+    assert m.machine_id == "mac-1"
+    assert m.name == "node-a"
+    assert m.machine_type == "gpu"
+    assert m.status == "ONLINE"          # pulled from state.name
+    assert m.gpu_model == "NVIDIA H100"  # pulled from specs.gpu
+    assert m.gpu_count == 8
+    assert m.earning_hourly == 2.5
+    assert m.uptime_rate == 0.999
+    assert m.host_tier == "gold"
+    # nested / sensitive fields preserved only in raw
+    assert m.raw["sshCredentials"]["password"] == "secret"
+    assert m.raw["state"]["stageState"] == "COMPLETED"
+
+
+def test_get_machine_parses():
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json=MACHINE)
+
+    machine = sync_client(handler).get_machine("mac-1")
+    assert seen["url"] == "https://api.test/v1/sdk/machines/mac-1"
+    assert machine.machine_id == "mac-1"
+    assert machine.status == "ONLINE"
+
+
+def test_machine_tolerates_missing_nested():
+    """trim/부분 응답에도 안 깨진다 (state/specs/earning 없음 → 안전한 기본값)."""
+    machine = sync_client(
+        lambda r: httpx.Response(200, json={"id": "mac-2", "name": "bare"})
+    ).get_machine("mac-2")
+    assert machine.machine_id == "mac-2"
+    assert machine.status == ""
+    assert machine.gpu_count == 0
+    assert machine.earning_hourly == 0.0
+
+
 # --- error mapping ----------------------------------------------------------
 
 @pytest.mark.parametrize(
@@ -223,3 +283,14 @@ def test_async_get_pod_query():
     pod = asyncio.run(run())
     assert pod.pod_name == "pod-1"
     assert seen["params"] == {"workspace": "team-ns"}
+
+
+def test_async_list_machines_parses():
+    async def run():
+        async with async_client(lambda r: httpx.Response(200, json=[MACHINE])) as client:
+            return await client.list_machines()
+
+    machines = asyncio.run(run())
+    assert len(machines) == 1
+    assert machines[0].machine_id == "mac-1"
+    assert machines[0].gpu_count == 8

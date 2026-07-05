@@ -4,7 +4,9 @@
 pip install meshive
 ```
 
-ㅇ## Authentication
+Full SDK & CLI documentation: [docs.meshive.ai/sdk-cli](https://docs.meshive.ai/sdk-cli/)
+
+## Authentication
 
 The SDK and CLI authenticate with a **Meshive API Key** (READ scope). Issue one from
 the [console](https://console.meshive.ai).

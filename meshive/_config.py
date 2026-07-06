@@ -7,8 +7,10 @@ base_url / api_key 는 모두 "명시 인자 > 환경변수 > 기본값" 순으�
     export MESHIVE_API_KEY=meshive_xxxxxxxx
 """
 import os
+from urllib.parse import urlparse
 
 from . import _credentials
+from .exceptions import ConfigurationError
 
 # prod(real) 엔드포인트. dev 는 MESHIVE_BASE_URL 로 오버라이드.
 DEFAULT_BASE_URL = "https://api.meshive.ai"
@@ -24,13 +26,23 @@ API_KEY_PREFIX = "meshive_"
 
 
 def resolve_base_url(explicit: str | None = None) -> str:
-    """base URL 해석 (명시 > env > credentials 파일 > 기본 prod). 후행 슬래시 제거."""
+    """base URL 해석 (명시 > env > credentials 파일 > 기본 prod). 후행 슬래시 제거.
+
+    env/credentials 파일은 신뢰 경계 밖에서 조작될 수 있으므로 스킴을 검증한다 —
+    http(s) 외 스킴이나 host 없는 값이면 Bearer 키를 실어 보내기 전에 거부.
+    """
     url = (
         explicit
         or os.getenv(ENV_BASE_URL)
         or _credentials.load().get("base_url")
         or DEFAULT_BASE_URL
     )
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ConfigurationError(
+            f"Invalid base URL {url!r}: must be an absolute http(s) URL "
+            f"(e.g. {DEFAULT_BASE_URL})."
+        )
     return url.rstrip("/")
 
 

@@ -8,7 +8,9 @@ transport(httpx.Client vs httpx.AsyncClient)만 다르다.
 """
 from __future__ import annotations
 
+import math
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -25,14 +27,33 @@ from .exceptions import (
 from .models import Machine, Pod, WhoAmI, Workspace
 
 
+def _path_segment(value: str, name: str) -> str:
+    """URL 경로 세그먼트 인코딩. `/`·`?`·`#` 등이 섞인 값이 경로 구조를 바꾸거나
+    (`../me` → 다른 엔드포인트) 쿼리를 주입하지 못하게 percent-encode 한다."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return quote(value, safe="")
+
+
+# 예외 message 상한 — 프록시/게이트웨이가 거대한 HTML 등을 돌려줘도 예외 메시지와
+# 로그가 폭주하지 않게 자른다. 원본 전체는 MeshiveAPIError.raw 로 접근 가능.
+_MAX_ERROR_MESSAGE_LEN = 2000
+
+
+def _truncate(text: str) -> str:
+    if len(text) <= _MAX_ERROR_MESSAGE_LEN:
+        return text
+    return text[:_MAX_ERROR_MESSAGE_LEN] + "… (truncated)"
+
+
 def _extract_error(payload: Any) -> tuple[str | None, str]:
     """서버 detail({"title","message"})에서 (title, message) 추출. 형식이 다르면 best-effort."""
     if isinstance(payload, dict):
         detail = payload.get("detail", payload)
         if isinstance(detail, dict):
-            return detail.get("title"), detail.get("message", str(detail))
-        return None, str(detail)
-    return None, str(payload) if payload else "Unknown error"
+            return detail.get("title"), _truncate(str(detail.get("message", detail)))
+        return None, _truncate(str(detail))
+    return None, _truncate(str(payload)) if payload else "Unknown error"
 
 
 def _retry_after(headers: httpx.Headers) -> float | None:
@@ -40,9 +61,11 @@ def _retry_after(headers: httpx.Headers) -> float | None:
     if raw is None:
         return None
     try:
-        return float(raw)
+        value = float(raw)
     except (TypeError, ValueError):
         return None
+    # "inf"/"nan"/음수도 float() 을 통과한다 — 이 값으로 sleep 하는 호출자를 보호.
+    return value if math.isfinite(value) and value >= 0 else None
 
 
 def _raise_for_status(status_code: int, payload: Any, headers: httpx.Headers) -> None:
@@ -145,7 +168,8 @@ class Meshive(_BaseClient):
 
     def get_pod(self, pod_name: str, workspace: str) -> Pod:
         """파드 단건 (GET /pods/{pod_name}?workspace=)."""
-        return Pod.from_dict(self._get(f"/pods/{pod_name}", params={"workspace": workspace}))
+        segment = _path_segment(pod_name, "pod_name")
+        return Pod.from_dict(self._get(f"/pods/{segment}", params={"workspace": workspace}))
 
     def list_machines(self) -> list[Machine]:
         """host 로 등록한 머신 목록 (GET /machines). workspace 불필요 (host 가 직접 소유)."""
@@ -153,7 +177,7 @@ class Meshive(_BaseClient):
 
     def get_machine(self, machine_id: str) -> Machine:
         """머신 단건 (GET /machines/{machine_id})."""
-        return Machine.from_dict(self._get(f"/machines/{machine_id}"))
+        return Machine.from_dict(self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}"))
 
     def close(self) -> None:
         self._client.close()
@@ -206,7 +230,8 @@ class AsyncMeshive(_BaseClient):
 
     async def get_pod(self, pod_name: str, workspace: str) -> Pod:
         """파드 단건 (GET /pods/{pod_name}?workspace=)."""
-        data = await self._get(f"/pods/{pod_name}", params={"workspace": workspace})
+        segment = _path_segment(pod_name, "pod_name")
+        data = await self._get(f"/pods/{segment}", params={"workspace": workspace})
         return Pod.from_dict(data)
 
     async def list_machines(self) -> list[Machine]:
@@ -215,7 +240,7 @@ class AsyncMeshive(_BaseClient):
 
     async def get_machine(self, machine_id: str) -> Machine:
         """머신 단건 (GET /machines/{machine_id})."""
-        return Machine.from_dict(await self._get(f"/machines/{machine_id}"))
+        return Machine.from_dict(await self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}"))
 
     async def close(self) -> None:
         await self._client.aclose()

@@ -48,7 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     # 모든 서브커맨드가 공유하는 전역 옵션.
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--api-key", default=None, help="Meshive API key (overrides MESHIVE_API_KEY).")
+    common.add_argument(
+        "--api-key", default=None,
+        help="Meshive API key (overrides MESHIVE_API_KEY). "
+             "Note: visible in shell history and `ps`; prefer `meshive login` or the env var.",
+    )
     common.add_argument("--base-url", default=None, help="API base URL (overrides MESHIVE_BASE_URL).")
     common.add_argument("--json", action="store_true", dest="as_json", help="Output raw JSON.")
 
@@ -128,7 +132,7 @@ def _gather_all_pods(client: Meshive) -> list[Pod]:
         try:
             pods.extend(client.list_pods(ws.namespace_name))
         except MeshiveError as err:
-            print(f"Warning: skipped workspace {ws.namespace_name}: {err}", file=sys.stderr)
+            print(fmt.clean(f"Warning: skipped workspace {ws.namespace_name}: {err}"), file=sys.stderr)
     return pods
 
 
@@ -150,9 +154,10 @@ def _pod_price(pod: Pod) -> str:
 
 
 def _print_whoami(me: WhoAmI, color: bool) -> None:
-    print(f"email:    {me.email}")
-    print(f"username: {me.username or '-'}")
-    print(f"role:     {me.user_role}")
+    # 서버 유래 문자열은 fmt.clean 으로 제어문자 제거 후 출력 (터미널 이스케이프 인젝션 방어).
+    print(f"email:    {fmt.clean(me.email)}")
+    print(f"username: {fmt.clean(me.username or '-')}")
+    print(f"role:     {fmt.clean(me.user_role)}")
 
 
 def _print_workspaces(workspaces: list[Workspace], color: bool) -> None:
@@ -209,11 +214,11 @@ def _print_pod(pod: Pod, color: bool) -> None:
     created = "-"
     if pod.created_at:
         created = f"{fmt.relative_time(pod.created_at)} ({pod.created_at.isoformat()})"
-    print(f"name:      {pod.user_alias or '-'}")           # 유저 라벨
-    print(f"id:        {pod.pod_name}")                     # 조회 키
-    print(f"workspace: {pod.namespace_name}")
-    print(f"status:    {fmt.paint(fmt.status_cell(pod.status), fmt.status_color(pod.status), color)}")
-    print(f"rental:    {pod.rental_type}")
+    print(f"name:      {fmt.clean(pod.user_alias or '-')}")  # 유저 라벨
+    print(f"id:        {fmt.clean(pod.pod_name)}")           # 조회 키
+    print(f"workspace: {fmt.clean(pod.namespace_name)}")
+    print(f"status:    {fmt.paint(fmt.clean(fmt.status_cell(pod.status)), fmt.status_color(pod.status), color)}")
+    print(f"rental:    {fmt.clean(pod.rental_type)}")
     print(f"price/hr:  {_pod_price(pod)}")
     print(f"created:   {created}")
     # maintenance 는 진행 중일 때만 노출 (boolean 나열 대신 의미 있을 때만).
@@ -265,11 +270,11 @@ def _print_machines(machines: list[Machine], color: bool) -> None:
 
 
 def _print_machine(machine: Machine, color: bool) -> None:
-    print(f"name:      {machine.name or '-'}")            # 유저 라벨
-    print(f"id:        {machine.machine_id}")             # 조회 키
-    print(f"type:      {machine.machine_type or '-'}")
-    print(f"status:    {fmt.paint(fmt.status_cell(machine.status), fmt.status_color(machine.status), color)}")
-    print(f"gpu:       {_gpu_cell(machine)}")
+    print(f"name:      {fmt.clean(machine.name or '-')}")  # 유저 라벨
+    print(f"id:        {fmt.clean(machine.machine_id)}")   # 조회 키
+    print(f"type:      {fmt.clean(machine.machine_type or '-')}")
+    print(f"status:    {fmt.paint(fmt.clean(fmt.status_cell(machine.status)), fmt.status_color(machine.status), color)}")
+    print(f"gpu:       {fmt.clean(_gpu_cell(machine))}")
     print(f"earn/hr:   {fmt.money(machine.earning_hourly)}")
     print(f"uptime:    {fmt.percent(machine.uptime_rate)}")
     print(f"tier:      {machine.host_tier or '-'}")
@@ -287,7 +292,7 @@ def _cmd_login(args: argparse.Namespace) -> int:
     try:
         me = client.me()  # 저장 전에 키를 검증.
     except (MeshiveError, httpx.HTTPError) as err:
-        print(f"Error: could not verify API key against {base_url}: {err}", file=sys.stderr)
+        print(fmt.clean(f"Error: could not verify API key against {base_url}: {err}"), file=sys.stderr)
         return 1
     finally:
         client.close()
@@ -295,7 +300,7 @@ def _cmd_login(args: argparse.Namespace) -> int:
     # prod 기본값이면 base_url 은 저장 안 함(암묵적으로 기본 사용). dev 등 비표준일 때만 기억.
     stored_base = base_url if base_url != _config.DEFAULT_BASE_URL else None
     path = _credentials.save(api_key, stored_base)
-    print(f"Logged in as {me.email} ({base_url}).")
+    print(fmt.clean(f"Logged in as {me.email} ({base_url})."))
     print(f"Credentials saved to {path}.")
     return 0
 
@@ -356,7 +361,8 @@ def _run_command(args: argparse.Namespace) -> int:
         else:  # pragma: no cover - unreachable (handled by caller)
             return 1
     except MeshiveError as err:
-        print(f"Error: {err}", file=sys.stderr)
+        # 서버 detail.message 가 포함되므로 제어문자 정제 후 출력.
+        print(fmt.clean(f"Error: {err}"), file=sys.stderr)
         return 1
     finally:
         client.close()

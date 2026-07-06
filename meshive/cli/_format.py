@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from typing import TextIO
@@ -48,6 +49,23 @@ _STATUS_COLOR = {
 }
 
 _STATUS_ICON = "●"  # ●
+
+# C0/C1 제어문자 (탭·개행 포함) + 유니코드 bidi/서식 제어문자.
+# 서버가 주는 문자열(alias/name 등)에 이스케이프 시퀀스가 섞이면 터미널 조작이,
+# RTL override(U+202E) 등이 섞이면 출력 순서 뒤집기 스푸핑(Trojan Source 류)이
+# 가능하므로 출력 전에 제거한다.
+_CONTROL_CHARS = re.compile(
+    "[\x00-\x1f\x7f-\x9f"
+    "\u200e\u200f"        # LRM/RLM
+    "\u202a-\u202e"       # LRE/RLE/PDF/LRO/RLO
+    "\u2066-\u2069"       # LRI/RLI/FSI/PDI
+    "]"
+)
+
+
+def clean(text: str) -> str:
+    """서버 유래 문자열에서 제어문자 제거 (터미널 이스케이프 인젝션 방어)."""
+    return _CONTROL_CHARS.sub("", text)
 
 
 def color_enabled(stream: TextIO | None = None) -> bool:
@@ -137,6 +155,8 @@ def render_table(
     """공백 정렬 테이블. aligns: 칸별 'l'/'r'. colors: 칸별 색(None=무색)."""
     out = out if out is not None else sys.stdout
     aligns = aligns or ["l"] * len(headers)
+    # 모든 셀은 서버 유래 값일 수 있으므로 제어문자를 걷어낸다 (폭 계산도 정제 후 기준).
+    rows = [[clean(cell) for cell in row] for row in rows]
     widths = [len(h) for h in headers]
     for row in rows:
         for i, cell in enumerate(row):

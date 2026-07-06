@@ -42,10 +42,23 @@ def save(api_key: str, base_url: str | None = None) -> Path:
     data: dict[str, str] = {"api_key": api_key}
     if base_url:
         data["base_url"] = base_url
-    # O_CREAT 시점부터 0600 으로 — 평문 키가 잠깐이라도 넓은 권한으로 노출되지 않게.
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
+    # 임시 파일에 쓰고 os.replace 로 원자 교체 — 쓰기 도중 크래시로 파일이 깨지지 않고,
+    # 최종 경로에 심링크가 심어져 있어도 키가 다른 곳으로 새지 않는다(rename 은 링크 자체를 대체).
+    # O_CREAT 시점부터 0600 — 평문 키가 잠깐이라도 넓은 권한으로 노출되지 않게.
+    # O_NOFOLLOW — 임시 경로에 미리 심어둔 심링크도 추적하지 않는다.
+    tmp = path.with_name(path.name + ".tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     os.chmod(path, 0o600)
     return path
 

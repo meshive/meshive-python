@@ -53,6 +53,10 @@ meshive pod <workspace> <pod>  # show a single pod
 meshive machines               # list your machines (as a host)
 meshive machine <id>           # show a single machine
 
+# wait for a pod to reach a status (polls every 5s, gives up early if it errors out)
+meshive pod <workspace> <pod> --wait running
+meshive pod <workspace> <pod> --wait running --wait-timeout 120
+
 # filter pods (client-side; the API itself returns the full list)
 meshive pods <workspace-id> --status running
 meshive pods <workspace-id> --status running,error   # comma-separated or repeatable
@@ -64,9 +68,15 @@ meshive machines --status online                      # comma-separated or repea
 meshive machines --type gpu                           # gpu | cpu | storage
 meshive machines --name node-a                        # match the display name
 
-# any command accepts --json for raw output, plus --api-key / --base-url overrides
-meshive pods <workspace-id> --json
+# output format: table (default) | json (raw payload) | name (IDs only, one per line)
+meshive pods <workspace-id> -o json          # --json is a shorthand for this
+meshive pods <workspace-id> -o name          # pipe-friendly: one ID per line
+
+# every command also takes --api-key / --base-url / --timeout overrides
+meshive machines --timeout 60
 ```
+
+Exit codes: `0` success, `1` API or network error, `2` usage error, `130` interrupted.
 
 ### IDs vs names
 
@@ -94,6 +104,9 @@ with Meshive() as client:               # reads MESHIVE_API_KEY / MESHIVE_BASE_U
     pod = client.get_pod(pods[0].pod_name, "my-workspace")
     print(pod.status, pod.raw)           # .raw holds the full payload (machine, template, ...)
 
+    # block until a pod is up (polls every `interval` seconds)
+    pod = client.wait_for_pod(pod.pod_name, "my-workspace", until="running", timeout=600)
+
     # host view: the machines you contribute to the network
     machines = client.list_machines()
     for m in machines:
@@ -103,6 +116,15 @@ with Meshive() as client:               # reads MESHIVE_API_KEY / MESHIVE_BASE_U
 ```
 
 Credentials can also be passed explicitly: `Meshive(api_key="meshive_...", base_url="https://api.dev.meshive.ai")`.
+
+### Retries
+
+Rate limits (429), gateway errors (5xx), and dropped connections are retried automatically —
+twice by default, with exponential backoff, honouring the server's `Retry-After` header. Other
+4xx responses are never retried. Turn it off with `Meshive(max_retries=0)`.
+
+If `Retry-After` asks for more than 60 seconds, the SDK raises `RateLimitError` instead of
+blocking that long — sleeping through it is your call, via `.retry_after`.
 
 ### Async
 
@@ -122,6 +144,12 @@ All errors subclass `meshive.MeshiveError`:
 - `AuthenticationError` (401), `PermissionDeniedError` (403), `NotFoundError` (404),
   `RateLimitError` (429, exposes `.retry_after`), and `MeshiveAPIError` for other HTTP errors
   (carry `.status_code`, `.title`, `.message`, `.raw`)
+- `WaitTimeoutError` — `wait_for_pod` ran out of time (it is also a built-in `TimeoutError`).
+  A pod that reaches `error`/`terminated` while waiting raises `MeshiveError` immediately
+  rather than burning the full timeout.
+
+Transport failures (DNS, refused connections) surface as `httpx` exceptions once retries are
+exhausted. The package ships a `py.typed` marker, so mypy/pyright read its annotations.
 
 ## License
 

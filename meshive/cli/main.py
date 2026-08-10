@@ -35,6 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  meshive machines               List your machines (as a host)\n"
             "  meshive machine <id>           Show a single machine\n"
             "\n"
+            "Scripting: `-o name` prints just the IDs, one per line (pipe into xargs).\n"
             "Auth: `meshive login`, or set MESHIVE_API_KEY / pass --api-key. For dev, set MESHIVE_BASE_URL.\n"
             "Docs: https://github.com/meshive/meshive-python"
         ),
@@ -54,7 +55,16 @@ def build_parser() -> argparse.ArgumentParser:
              "Note: visible in shell history and `ps`; prefer `meshive login` or the env var.",
     )
     common.add_argument("--base-url", default=None, help="API base URL (overrides MESHIVE_BASE_URL).")
-    common.add_argument("--json", action="store_true", dest="as_json", help="Output raw JSON.")
+    common.add_argument(
+        "-o", "--output", choices=["table", "json", "name"], default=None,
+        help="Output format: table (default), json (raw payload), name (IDs only, one per line).",
+    )
+    # --json 은 -o json 의 별칭 (0.0.5 이전부터 쓰던 플래그 — 하위 호환 유지).
+    common.add_argument("--json", action="store_true", dest="as_json", help="Shorthand for -o json.")
+    common.add_argument(
+        "--timeout", type=float, default=30.0, metavar="SECONDS",
+        help="HTTP timeout in seconds (default: 30).",
+    )
 
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
@@ -92,6 +102,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_pod = sub.add_parser("pod", parents=[common], help="Show a single pod.")
     p_pod.add_argument("workspace", help="Workspace ID (namespace name).")
     p_pod.add_argument("pod_name", help="Pod ID (pod name). See ID column of `meshive pods`.")
+    p_pod.add_argument(
+        "--wait", default=None, metavar="STATUS",
+        help="Poll until the pod reaches STATUS, then show it. "
+             f"One of: {', '.join(POD_STATUSES)}. Gives up early if the pod errors out.",
+    )
+    p_pod.add_argument(
+        "--wait-timeout", type=float, default=600.0, metavar="SECONDS",
+        help="Give up waiting after this long (default: 600).",
+    )
 
     p_machines = sub.add_parser("machines", parents=[common], aliases=["m"],
                                 help="List your machines (as a host).")
@@ -280,6 +299,17 @@ def _print_machine(machine: Machine, color: bool) -> None:
     print(f"tier:      {machine.host_tier or '-'}")
 
 
+def _emit(output: str, raw: object, ids: list[str], show) -> None:
+    """선택된 포맷으로 출력. json=원본 payload, name=ID 만, table=사람용 렌더러(show)."""
+    if output == "json":
+        print(json.dumps(raw, indent=2, ensure_ascii=False))
+    elif output == "name":
+        for value in ids:
+            print(fmt.clean(value))
+    else:
+        show()
+
+
 def _cmd_login(args: argparse.Namespace) -> int:
     api_key = args.api_key or getpass.getpass("Meshive API key: ").strip()
     if not api_key:
@@ -288,7 +318,7 @@ def _cmd_login(args: argparse.Namespace) -> int:
     # base_url 은 credentials 파일을 *읽지 않고* 결정 — 기존 저장값이 새 로그인에 새지 않도록.
     base_url = (args.base_url or os.getenv(_config.ENV_BASE_URL) or _config.DEFAULT_BASE_URL).rstrip("/")
 
-    client = Meshive(api_key=api_key, base_url=base_url)
+    client = Meshive(api_key=api_key, base_url=base_url, timeout=args.timeout)
     try:
         me = client.me()  # 저장 전에 키를 검증.
     except (MeshiveError, httpx.HTTPError) as err:
@@ -314,21 +344,26 @@ def _cmd_logout(args: argparse.Namespace) -> int:
 
 
 def _run_command(args: argparse.Namespace) -> int:
+    if args.timeout <= 0:
+        print("Error: --timeout must be greater than 0.", file=sys.stderr)
+        return 2
+
     if args.command == "login":
         return _cmd_login(args)
     if args.command == "logout":
         return _cmd_logout(args)
 
-    color = fmt.color_enabled() and not args.as_json
-    client = Meshive(api_key=args.api_key, base_url=args.base_url)
+    output = args.output or ("json" if args.as_json else "table")
+    color = fmt.color_enabled() and output == "table"
+    client = Meshive(api_key=args.api_key, base_url=args.base_url, timeout=args.timeout)
     try:
         if args.command in ("me", "whoami"):
             me = client.me()
-            print(json.dumps(me.raw, indent=2, ensure_ascii=False)) if args.as_json else _print_whoami(me, color)
+            _emit(output, me.raw, [me.email], lambda: _print_whoami(me, color))
         elif args.command in ("workspaces", "ws"):
             workspaces = client.list_workspaces()
-            print(json.dumps([w.raw for w in workspaces], indent=2, ensure_ascii=False)) if args.as_json \
-                else _print_workspaces(workspaces, color)
+            _emit(output, [w.raw for w in workspaces], [w.namespace_name for w in workspaces],
+                  lambda: _print_workspaces(workspaces, color))
         elif args.command == "pods":
             if args.all_workspaces and args.workspace:
                 print("Error: pass a workspace or --all, not both.", file=sys.stderr)
@@ -344,20 +379,27 @@ def _run_command(args: argparse.Namespace) -> int:
                 return 2
             raw_pods = _gather_all_pods(client) if args.all_workspaces else client.list_pods(args.workspace)
             pods = _filter_pods(raw_pods, statuses, args.rental, args.name)
-            print(json.dumps([p.raw for p in pods], indent=2, ensure_ascii=False)) if args.as_json \
-                else _print_pods(pods, color, show_workspace=args.all_workspaces)
+            _emit(output, [p.raw for p in pods], [p.pod_name for p in pods],
+                  lambda: _print_pods(pods, color, show_workspace=args.all_workspaces))
         elif args.command == "pod":
-            pod = client.get_pod(args.pod_name, args.workspace)
-            print(json.dumps(pod.raw, indent=2, ensure_ascii=False)) if args.as_json else _print_pod(pod, color)
+            if args.wait and args.wait.lower() not in POD_STATUSES:
+                print(f"Error: unknown status: {args.wait}. "
+                      f"Valid: {', '.join(POD_STATUSES)}.", file=sys.stderr)
+                return 2
+            pod = (
+                client.wait_for_pod(args.pod_name, args.workspace,
+                                    until=args.wait, timeout=args.wait_timeout)
+                if args.wait else client.get_pod(args.pod_name, args.workspace)
+            )
+            _emit(output, pod.raw, [pod.pod_name], lambda: _print_pod(pod, color))
         elif args.command in ("machines", "m"):
             statuses = _parse_status_filter(args.status)
             machines = _filter_machines(client.list_machines(), statuses, args.machine_type, args.name)
-            print(json.dumps([m.raw for m in machines], indent=2, ensure_ascii=False)) if args.as_json \
-                else _print_machines(machines, color)
+            _emit(output, [m.raw for m in machines], [m.machine_id for m in machines],
+                  lambda: _print_machines(machines, color))
         elif args.command == "machine":
             machine = client.get_machine(args.machine_id)
-            print(json.dumps(machine.raw, indent=2, ensure_ascii=False)) if args.as_json \
-                else _print_machine(machine, color)
+            _emit(output, machine.raw, [machine.machine_id], lambda: _print_machine(machine, color))
         else:  # pragma: no cover - unreachable (handled by caller)
             return 1
     except MeshiveError as err:
@@ -377,7 +419,21 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 0
 
-    return _run_command(args)
+    try:
+        return _run_command(args)
+    except MeshiveError as err:
+        # 클라이언트 생성 단계(잘못된 base URL 등)는 _run_command 안쪽 try 밖에서 터진다.
+        print(fmt.clean(f"Error: {err}"), file=sys.stderr)
+        return 1
+    except httpx.HTTPError as err:
+        # 서버까지 못 갔거나 연결이 끊긴 경우 (MeshiveError 가 아니라 트레이스백이 그대로 새던 자리).
+        target = getattr(getattr(err, "request", None), "url", None)
+        where = f" {target}" if target else ""
+        print(fmt.clean(f"Error: could not reach the Meshive API{where}: {err}"), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        return 130  # 관례: 128 + SIGINT
 
 
 if __name__ == "__main__":

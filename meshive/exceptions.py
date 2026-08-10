@@ -14,6 +14,14 @@ class ConfigurationError(MeshiveError):
     """API Key 누락 등 클라이언트 설정 문제 (요청을 보내기 전)."""
 
 
+class WaitTimeoutError(MeshiveError, TimeoutError):
+    """wait_for_pod 가 제한 시간 안에 목표 상태에 도달하지 못했을 때.
+
+    내장 TimeoutError 도 겸하므로 `except MeshiveError` / `except TimeoutError`
+    어느 쪽으로 잡아도 걸린다.
+    """
+
+
 class MeshiveAPIError(MeshiveError):
     """서버가 4xx/5xx 를 반환했을 때.
 

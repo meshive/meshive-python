@@ -9,11 +9,14 @@ from meshive import (
     AuthenticationError,
     ConfigurationError,
     Meshive,
+    MeshiveAPIError,
+    MeshiveError,
     NotFoundError,
     PermissionDeniedError,
     RateLimitError,
+    WaitTimeoutError,
 )
-from meshive import _config
+from meshive import _client, _config
 
 
 # --- fixtures / helpers -----------------------------------------------------
@@ -67,6 +70,19 @@ def async_client(handler, **kwargs):
 
 
 # --- config -----------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def slept(monkeypatch):
+    """재시도/폴링 대기를 실제로 자지 않고 기록만 한다 (테스트는 횟수·간격만 검증)."""
+    recorded: list[float] = []
+
+    async def _async_sleep(seconds):
+        recorded.append(seconds)
+
+    monkeypatch.setattr(_client.time, "sleep", recorded.append)
+    monkeypatch.setattr(_client.asyncio, "sleep", _async_sleep)
+    return recorded
+
 
 @pytest.fixture(autouse=True)
 def isolate_config_dir(monkeypatch, tmp_path):
@@ -294,3 +310,178 @@ def test_async_list_machines_parses():
     assert len(machines) == 1
     assert machines[0].machine_id == "mac-1"
     assert machines[0].gpu_count == 8
+
+
+# --- retry ------------------------------------------------------------------
+
+def _counting_handler(responses):
+    """호출될 때마다 responses 를 순서대로 반환하는 handler + 호출 횟수 카운터."""
+    calls = {"n": 0}
+
+    def handler(request):
+        index = min(calls["n"], len(responses) - 1)
+        calls["n"] += 1
+        item = responses[index]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    return handler, calls
+
+
+def test_retries_429_then_succeeds(slept):
+    handler, calls = _counting_handler([
+        httpx.Response(429, json={"detail": {"message": "slow down"}}, headers={"Retry-After": "2"}),
+        httpx.Response(200, json=WHOAMI),
+    ])
+    me = sync_client(handler).me()
+    assert me.email == "a@b.com"
+    assert calls["n"] == 2
+    assert slept == [2.0]  # Retry-After 를 그대로 존중
+
+
+def test_retry_uses_backoff_without_retry_after(slept):
+    handler, calls = _counting_handler([
+        httpx.Response(503, json={"detail": {"message": "unavailable"}}),
+        httpx.Response(503, json={"detail": {"message": "unavailable"}}),
+        httpx.Response(200, json=WHOAMI),
+    ])
+    sync_client(handler).me()
+    assert calls["n"] == 3
+    assert slept == [0.5, 1.0]  # 지수 백오프
+
+
+def test_retries_are_capped_then_raise(slept):
+    handler, calls = _counting_handler([httpx.Response(429, json={"detail": {"message": "nope"}})])
+    with pytest.raises(RateLimitError):
+        sync_client(handler).me()
+    assert calls["n"] == 3  # 최초 1회 + max_retries(2)
+
+
+def test_long_retry_after_is_not_waited_out(slept):
+    handler, calls = _counting_handler([
+        httpx.Response(429, json={"detail": {"message": "nope"}}, headers={"Retry-After": "3600"}),
+    ])
+    with pytest.raises(RateLimitError) as info:
+        sync_client(handler).me()
+    assert calls["n"] == 1  # 한 시간 기다리느니 바로 올린다
+    assert info.value.retry_after == 3600.0
+    assert slept == []
+
+
+def test_client_errors_are_not_retried():
+    handler, calls = _counting_handler([httpx.Response(404, json={"detail": {"message": "gone"}})])
+    with pytest.raises(NotFoundError):
+        sync_client(handler).get_pod("pod-1", "team-ns")
+    assert calls["n"] == 1
+
+
+def test_retries_can_be_disabled():
+    handler, calls = _counting_handler([httpx.Response(500, json={"detail": {"message": "boom"}})])
+    with pytest.raises(MeshiveAPIError):
+        sync_client(handler, max_retries=0).me()
+    assert calls["n"] == 1
+
+
+def test_connect_errors_are_retried(slept):
+    handler, calls = _counting_handler([
+        httpx.ConnectError("refused"),
+        httpx.Response(200, json=WHOAMI),
+    ])
+    assert sync_client(handler).me().email == "a@b.com"
+    assert calls["n"] == 2
+
+
+def test_connect_errors_propagate_after_retries():
+    handler, calls = _counting_handler([httpx.ConnectError("refused")])
+    with pytest.raises(httpx.ConnectError):
+        sync_client(handler).me()
+    assert calls["n"] == 3
+
+
+def test_async_retries(slept):
+    handler, calls = _counting_handler([
+        httpx.Response(502, json={"detail": {"message": "bad gateway"}}),
+        httpx.Response(200, json=WHOAMI),
+    ])
+
+    async def run():
+        async with async_client(handler) as client:
+            return await client.me()
+
+    assert asyncio.run(run()).email == "a@b.com"
+    assert calls["n"] == 2
+    assert slept == [0.5]
+
+
+# --- wait_for_pod -----------------------------------------------------------
+
+def _pod_with(status):
+    return httpx.Response(200, json={**POD, "status": status})
+
+
+def test_wait_for_pod_polls_until_target(slept):
+    handler, calls = _counting_handler([
+        _pod_with("pending"), _pod_with("creating"), _pod_with("running"),
+    ])
+    pod = sync_client(handler).wait_for_pod("pod-1", "team-ns", interval=5.0)
+    assert pod.status == "running"
+    assert calls["n"] == 3
+    assert slept == [5.0, 5.0]
+
+
+def test_wait_for_pod_returns_immediately_when_already_there():
+    handler, calls = _counting_handler([_pod_with("running")])
+    assert sync_client(handler).wait_for_pod("pod-1", "team-ns").status == "running"
+    assert calls["n"] == 1
+
+
+def test_wait_for_pod_accepts_multiple_targets():
+    handler, calls = _counting_handler([_pod_with("stopped")])
+    pod = sync_client(handler).wait_for_pod("pod-1", "team-ns", until=("running", "stopped"))
+    assert pod.status == "stopped"
+    assert calls["n"] == 1
+
+
+def test_wait_for_pod_gives_up_on_terminal_status():
+    handler, calls = _counting_handler([_pod_with("error")])
+    with pytest.raises(MeshiveError, match="terminal status"):
+        sync_client(handler).wait_for_pod("pod-1", "team-ns")
+    assert calls["n"] == 1  # timeout 을 채우지 않는다
+
+
+def test_wait_for_pod_can_target_a_terminal_status():
+    """error 를 기다리라고 했으면 error 는 실패가 아니라 목표다."""
+    handler, calls = _counting_handler([_pod_with("error")])
+    assert sync_client(handler).wait_for_pod("pod-1", "team-ns", until="error").status == "error"
+    assert calls["n"] == 1
+
+
+def test_wait_for_pod_times_out():
+    handler, calls = _counting_handler([_pod_with("pending")])
+    with pytest.raises(WaitTimeoutError, match="pending"):
+        sync_client(handler).wait_for_pod("pod-1", "team-ns", timeout=0.0)
+    assert calls["n"] == 1
+
+
+def test_wait_timeout_is_also_a_builtin_timeout_error():
+    handler, _ = _counting_handler([_pod_with("pending")])
+    with pytest.raises(TimeoutError):
+        sync_client(handler).wait_for_pod("pod-1", "team-ns", timeout=0.0)
+
+
+def test_wait_for_pod_rejects_empty_target():
+    with pytest.raises(ValueError):
+        sync_client(lambda r: _pod_with("running")).wait_for_pod("pod-1", "team-ns", until=[])
+
+
+def test_async_wait_for_pod(slept):
+    handler, calls = _counting_handler([_pod_with("pending"), _pod_with("running")])
+
+    async def run():
+        async with async_client(handler) as client:
+            return await client.wait_for_pod("pod-1", "team-ns", interval=3.0)
+
+    assert asyncio.run(run()).status == "running"
+    assert calls["n"] == 2
+    assert slept == [3.0]

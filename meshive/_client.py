@@ -8,7 +8,10 @@ transport(httpx.Client vs httpx.AsyncClient)만 다르다.
 """
 from __future__ import annotations
 
+import asyncio
 import math
+import time
+from collections.abc import Iterable
 from typing import Any
 from urllib.parse import quote
 
@@ -20,9 +23,11 @@ from .exceptions import (
     AuthenticationError,
     ConfigurationError,
     MeshiveAPIError,
+    MeshiveError,
     NotFoundError,
     PermissionDeniedError,
     RateLimitError,
+    WaitTimeoutError,
 )
 from .models import Machine, Pod, WhoAmI, Workspace
 
@@ -85,6 +90,18 @@ def _raise_for_status(status_code: int, payload: Any, headers: httpx.Headers) ->
     raise MeshiveAPIError(status_code, message, **common)
 
 
+# --- 재시도 -----------------------------------------------------------------
+# 일시적 실패(rate limit / 게이트웨이 오류 / 커넥션 끊김)만 재시도한다. 다른 4xx 는
+# 재시도해도 결과가 같으므로 즉시 raise. read 표면은 전부 GET(멱등)이라 안전하다 —
+# 쓰기 엔드포인트가 생기면 이 가정을 다시 따져야 한다.
+_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+_RETRY_EXCEPTIONS = (httpx.ConnectError, httpx.TimeoutException)
+_RETRY_BACKOFF = 0.5  # 0.5s → 1s → 2s ...
+# Retry-After 가 이보다 길면 기다리지 않고 RateLimitError 를 그대로 올린다 —
+# 스크립트가 영문도 모르고 몇 분씩 멈춰 있는 편이 에러보다 나쁘다.
+_MAX_RETRY_AFTER = 60.0
+
+
 class _BaseClient:
     def __init__(
         self,
@@ -92,10 +109,12 @@ class _BaseClient:
         *,
         base_url: str | None = None,
         timeout: float = 30.0,
+        max_retries: int = 2,
     ) -> None:
         self._api_key = _config.resolve_api_key(api_key)
         self._base_url = _config.resolve_base_url(base_url)
         self._timeout = timeout
+        self._max_retries = max_retries
 
     @property
     def base_url(self) -> str:
@@ -125,6 +144,58 @@ class _BaseClient:
         _raise_for_status(response.status_code, payload, response.headers)
         return payload
 
+    def _retry_delay(self, attempt: int, response: httpx.Response | None = None) -> float | None:
+        """재시도 대기 시간(초). 재시도하지 않을 상황이면 None.
+
+        response=None 은 네트워크 예외를 뜻한다 (응답 자체가 없음).
+        """
+        if attempt >= self._max_retries:
+            return None
+        if response is None:
+            return _RETRY_BACKOFF * 2 ** attempt
+        if response.status_code not in _RETRY_STATUSES:
+            return None
+        after = _retry_after(response.headers)
+        if after is None:
+            return _RETRY_BACKOFF * 2 ** attempt
+        return after if after <= _MAX_RETRY_AFTER else None
+
+
+# --- wait_for_pod 공통 판정 ---------------------------------------------------
+# 여기 도달하면 목표 상태로 갈 가능성이 없다 — timeout 을 채우지 않고 바로 실패시킨다.
+# (목표 상태로 지정된 값은 아래 _wait_targets 에서 제외한다.)
+_POD_TERMINAL_STATUSES = frozenset({"error", "terminated"})
+
+
+def _wait_targets(until: str | Iterable[str]) -> tuple[set[str], set[str]]:
+    """until → (목표 상태 set, 즉시 실패로 볼 상태 set). 비교는 소문자 기준."""
+    values = [until] if isinstance(until, str) else list(until)
+    targets = {s.lower() for s in values if s and s.strip()}
+    if not targets:
+        raise ValueError("until must name at least one status")
+    return targets, _POD_TERMINAL_STATUSES - targets
+
+
+def _wait_reached(pod: Pod, targets: set[str], terminal: set[str], label: str) -> bool:
+    status = pod.status.lower()
+    if status in targets:
+        return True
+    if status in terminal:
+        raise MeshiveError(
+            f"Pod {label} reached terminal status {pod.status!r} "
+            f"while waiting for {'/'.join(sorted(targets))}."
+        )
+    return False
+
+
+def _wait_expired(deadline: float, label: str, targets: set[str], last: str) -> None:
+    if time.monotonic() < deadline:
+        return
+    raise WaitTimeoutError(
+        f"Timed out waiting for pod {label} to reach {'/'.join(sorted(targets))} "
+        f"(last status: {last or '-'})."
+    )
+
 
 class Meshive(_BaseClient):
     """동기 Meshive SDK 클라이언트.
@@ -145,13 +216,28 @@ class Meshive(_BaseClient):
         *,
         base_url: str | None = None,
         timeout: float = 30.0,
+        max_retries: int = 2,
     ) -> None:
-        super().__init__(api_key, base_url=base_url, timeout=timeout)
+        super().__init__(api_key, base_url=base_url, timeout=timeout, max_retries=max_retries)
         self._client = httpx.Client(timeout=timeout)
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        response = self._client.get(self._url(path), params=params, headers=self._build_headers())
-        return self._process(response)
+        url = self._url(path)
+        headers = self._build_headers()
+        attempt = 0
+        while True:
+            try:
+                response = self._client.get(url, params=params, headers=headers)
+            except _RETRY_EXCEPTIONS:
+                delay = self._retry_delay(attempt)
+                if delay is None:
+                    raise
+            else:
+                delay = self._retry_delay(attempt, response)
+                if delay is None:
+                    return self._process(response)
+            time.sleep(delay)
+            attempt += 1
 
     def me(self) -> WhoAmI:
         """현재 API Key 소유자 정보 (GET /me)."""
@@ -179,6 +265,33 @@ class Meshive(_BaseClient):
         """머신 단건 (GET /machines/{machine_id})."""
         return Machine.from_dict(self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}"))
 
+    def wait_for_pod(
+        self,
+        pod_name: str,
+        workspace: str,
+        *,
+        until: str | Iterable[str] = "running",
+        timeout: float = 600.0,
+        interval: float = 5.0,
+    ) -> Pod:
+        """파드가 `until` 상태가 될 때까지 폴링하고 그 시점의 Pod 를 반환.
+
+            pod = client.wait_for_pod("pod-1", "my-workspace", until="running")
+
+        error/terminated 에 도달하면 timeout 을 채우지 않고 MeshiveError 를 올린다.
+        시간 초과는 WaitTimeoutError (MeshiveError 이자 내장 TimeoutError).
+        """
+        targets, terminal = _wait_targets(until)
+        deadline = time.monotonic() + timeout
+        last = ""
+        while True:
+            pod = self.get_pod(pod_name, workspace)
+            if _wait_reached(pod, targets, terminal, pod_name):
+                return pod
+            last = pod.status
+            _wait_expired(deadline, pod_name, targets, last)
+            time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+
     def close(self) -> None:
         self._client.close()
 
@@ -205,15 +318,28 @@ class AsyncMeshive(_BaseClient):
         *,
         base_url: str | None = None,
         timeout: float = 30.0,
+        max_retries: int = 2,
     ) -> None:
-        super().__init__(api_key, base_url=base_url, timeout=timeout)
+        super().__init__(api_key, base_url=base_url, timeout=timeout, max_retries=max_retries)
         self._client = httpx.AsyncClient(timeout=timeout)
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        response = await self._client.get(
-            self._url(path), params=params, headers=self._build_headers()
-        )
-        return self._process(response)
+        url = self._url(path)
+        headers = self._build_headers()
+        attempt = 0
+        while True:
+            try:
+                response = await self._client.get(url, params=params, headers=headers)
+            except _RETRY_EXCEPTIONS:
+                delay = self._retry_delay(attempt)
+                if delay is None:
+                    raise
+            else:
+                delay = self._retry_delay(attempt, response)
+                if delay is None:
+                    return self._process(response)
+            await asyncio.sleep(delay)
+            attempt += 1
 
     async def me(self) -> WhoAmI:
         """현재 API Key 소유자 정보 (GET /me)."""
@@ -241,6 +367,27 @@ class AsyncMeshive(_BaseClient):
     async def get_machine(self, machine_id: str) -> Machine:
         """머신 단건 (GET /machines/{machine_id})."""
         return Machine.from_dict(await self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}"))
+
+    async def wait_for_pod(
+        self,
+        pod_name: str,
+        workspace: str,
+        *,
+        until: str | Iterable[str] = "running",
+        timeout: float = 600.0,
+        interval: float = 5.0,
+    ) -> Pod:
+        """파드가 `until` 상태가 될 때까지 폴링 (동기판 wait_for_pod 와 동일 규칙)."""
+        targets, terminal = _wait_targets(until)
+        deadline = time.monotonic() + timeout
+        last = ""
+        while True:
+            pod = await self.get_pod(pod_name, workspace)
+            if _wait_reached(pod, targets, terminal, pod_name):
+                return pod
+            last = pod.status
+            _wait_expired(deadline, pod_name, targets, last)
+            await asyncio.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
 
     async def close(self) -> None:
         await self._client.aclose()

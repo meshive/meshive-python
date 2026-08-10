@@ -1,12 +1,13 @@
 import importlib
 import json
 
+import httpx
 import pytest
 
 # `meshive.cli.__init__` does `from .main import main`, which shadows the
 # `main` submodule attribute — import the module explicitly via importlib.
 cli = importlib.import_module("meshive.cli.main")
-from meshive.exceptions import AuthenticationError
+from meshive.exceptions import AuthenticationError, WaitTimeoutError
 from meshive.models import Machine, Pod, WhoAmI, Workspace, WorkspaceResources
 
 
@@ -43,6 +44,11 @@ class FakeClient:
     def get_pod(self, pod_name, workspace):
         return Pod(pod_name, workspace, "alias", "running", "on_demand", "0.9", False,
                    raw={"podName": pod_name})
+
+    def wait_for_pod(self, pod_name, workspace, *, until, timeout):
+        FakeClient.last_wait = {"pod_name": pod_name, "workspace": workspace,
+                                "until": until, "timeout": timeout}
+        return self.get_pod(pod_name, workspace)
 
     def list_machines(self):
         return [
@@ -257,7 +263,18 @@ def test_machine_json_output(capsys):
 
 def test_passes_credentials_to_client():
     cli.main(["me", "--api-key", "meshive_x", "--base-url", "https://api.dev"])
-    assert FakeClient.last_kwargs == {"api_key": "meshive_x", "base_url": "https://api.dev"}
+    assert FakeClient.last_kwargs == {"api_key": "meshive_x", "base_url": "https://api.dev",
+                                      "timeout": 30.0}
+
+
+def test_timeout_flag_passed_to_client():
+    cli.main(["me", "--timeout", "5"])
+    assert FakeClient.last_kwargs["timeout"] == 5.0
+
+
+def test_non_positive_timeout_rejected(capsys):
+    assert cli.main(["me", "--timeout", "0"]) == 2
+    assert "--timeout" in capsys.readouterr().err
 
 
 def test_api_error_returns_nonzero(monkeypatch, capsys):
@@ -267,3 +284,79 @@ def test_api_error_returns_nonzero(monkeypatch, capsys):
     monkeypatch.setattr(FakeClient, "me", raise_auth)
     assert cli.main(["me"]) == 1
     assert "Error:" in capsys.readouterr().err
+
+
+# --- output formats ---------------------------------------------------------
+
+def test_output_name_lists_ids_only(capsys):
+    assert cli.main(["pods", "team-ns", "-o", "name"]) == 0
+    out = capsys.readouterr().out
+    assert out.splitlines() == ["pod-run", "pod-stop", "pod-err"]  # IDs only, no header/alias
+
+
+def test_output_name_respects_filters(capsys):
+    assert cli.main(["machines", "-o", "name", "--type", "gpu"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["mac-gpu"]
+
+
+def test_output_name_single_resource(capsys):
+    assert cli.main(["machine", "mac-gpu", "-o", "name"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["mac-gpu"]
+
+
+def test_output_json_matches_legacy_json_flag(capsys):
+    assert cli.main(["workspaces", "-o", "json"]) == 0
+    from_o = capsys.readouterr().out
+    assert cli.main(["workspaces", "--json"]) == 0
+    assert capsys.readouterr().out == from_o
+
+
+# --- pod --wait -------------------------------------------------------------
+
+def test_pod_wait_calls_wait_for_pod(capsys):
+    FakeClient.last_wait = None
+    assert cli.main(["pod", "team-ns", "pod-1", "--wait", "running", "--wait-timeout", "12"]) == 0
+    assert FakeClient.last_wait == {"pod_name": "pod-1", "workspace": "team-ns",
+                                    "until": "running", "timeout": 12.0}
+    assert "pod-1" in capsys.readouterr().out
+
+
+def test_pod_without_wait_does_not_poll():
+    FakeClient.last_wait = None
+    assert cli.main(["pod", "team-ns", "pod-1"]) == 0
+    assert FakeClient.last_wait is None
+
+
+def test_pod_wait_unknown_status_errors(capsys):
+    assert cli.main(["pod", "team-ns", "pod-1", "--wait", "runnning"]) == 2
+    assert "unknown status" in capsys.readouterr().err
+
+
+def test_pod_wait_timeout_returns_nonzero(monkeypatch, capsys):
+    def raise_timeout(self, pod_name, workspace, *, until, timeout):
+        raise WaitTimeoutError("Timed out waiting for pod pod-1 to reach running.")
+
+    monkeypatch.setattr(FakeClient, "wait_for_pod", raise_timeout)
+    assert cli.main(["pod", "team-ns", "pod-1", "--wait", "running"]) == 1
+    assert "Timed out" in capsys.readouterr().err
+
+
+# --- transport / interrupt failures -----------------------------------------
+
+def test_network_error_is_reported_not_raised(monkeypatch, capsys):
+    def raise_connect(self):
+        raise httpx.ConnectError("Connection refused",
+                                 request=httpx.Request("GET", "https://api.test/v1/sdk/me"))
+
+    monkeypatch.setattr(FakeClient, "me", raise_connect)
+    assert cli.main(["me"]) == 1
+    err = capsys.readouterr().err
+    assert "could not reach" in err and "https://api.test/v1/sdk/me" in err
+
+
+def test_keyboard_interrupt_exits_130(monkeypatch):
+    def raise_interrupt(self):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(FakeClient, "me", raise_interrupt)
+    assert cli.main(["me"]) == 130

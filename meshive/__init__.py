@@ -8,6 +8,7 @@ from .exceptions import (
     NotFoundError,
     PermissionDeniedError,
     RateLimitError,
+    WaitTimeoutError,
 )
 from .models import Machine, Pod, WhoAmI, Workspace, WorkspaceResources
 
@@ -33,4 +34,5 @@ __all__ = [
     "PermissionDeniedError",
     "NotFoundError",
     "RateLimitError",
+    "WaitTimeoutError",
 ]

@@ -53,6 +53,10 @@ meshive = "meshive.cli.main:main"
 include = ["meshive*"]
 exclude = ["tests*"]
 
+# PEP 561 — 이 마커가 있어야 mypy/pyright 가 패키지의 타입힌트를 실제로 읽는다.
+[tool.setuptools.package-data]
+meshive = ["py.typed"]
+
 [tool.setuptools.dynamic]
 version = { attr = "meshive._version.__version__" }
 

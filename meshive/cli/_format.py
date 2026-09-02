@@ -11,7 +11,7 @@ import math
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import TextIO
 
 _RESET = "\033[0m"
@@ -41,6 +41,21 @@ _STATUS_COLOR = {
     "pending": "cyan",
     "start_up": "cyan",         # machine setup stage
     "re_verifying": "cyan",     # machine setup stage
+    "succeeded": "green",       # task terminal (성공)
+    "queued": "cyan",           # task 대기/준비 단계
+    "scheduling": "cyan",
+    "pulling": "cyan",
+    "fetching": "cyan",
+    "scaling": "yellow",        # serving group status
+    "draining": "yellow",
+    "expired": "gray",
+    "uploading": "cyan",        # asset version
+    "frozen": "yellow",         # asset (admin freeze)
+    "source_missing": "red",    # asset (유저 S3 원본 유실)
+    "deleted": "gray",
+    "purged": "gray",
+    "merged": "gray",
+    "timed_out": "red",         # task terminal (실패 취급)
     "error": "red",
     "failed": "red",
     "node_not_ready": "red",    # machine state.name
@@ -90,7 +105,7 @@ def status_cell(status: str) -> str:
     return f"{_STATUS_ICON} {status}" if status else f"{_STATUS_ICON} -"
 
 
-def money(value: str | None) -> str:
+def money(value: str | float | None) -> str:
     """price 문자열 → '$2.10' (USD, 소수점 2자리, 천단위 콤마). 빈/잘못된 값은 '-'.
 
     서버 price_per_hour 는 Numeric(20,8) 이라 '2.10000000' 처럼 와서 그대로 쓰면
@@ -104,7 +119,9 @@ def money(value: str | None) -> str:
         return "-"
     if not math.isfinite(amount):
         return "-"
-    return f"${amount:,.2f}"
+    # 환불/회수 원장행은 음수 — '$-12.50' 이 아니라 '-$12.50'.
+    sign = "-" if amount < 0 else ""
+    return f"{sign}${abs(amount):,.2f}"
 
 
 def yes_no(value: bool) -> str:
@@ -116,6 +133,76 @@ def percent(rate: float | None) -> str:
     if rate is None or not math.isfinite(rate):
         return "-"
     return f"{rate * 100:.1f}%"
+
+
+def usage(rate: float | None) -> str:
+    """사용률(0.0~1.0) → '35.0%'. 측정 불가(None)는 'n/a' — 0% 와 구분한다."""
+    if rate is None or not math.isfinite(rate):
+        return "n/a"
+    return f"{rate * 100:.1f}%"
+
+
+def gib(mib: float | None) -> str:
+    """MiB 값 → 'N GB' (웹 콘솔과 동일하게 /1024). 1 GB 미만은 'N MB' 로 — 시스템 파드의
+    수십 MB 가 '0.0 GB' 로 뭉개지지 않게. None/비유한값은 '-'."""
+    if mib is None:
+        return "-"
+    try:
+        raw = float(mib)
+    except (TypeError, ValueError):
+        return "-"
+    if not math.isfinite(raw):
+        return "-"
+    value = raw / 1024
+    if 0 < raw < 1024:
+        return f"{raw:.0f} MB"
+    if value >= 10 or value == int(value):
+        return f"{value:,.0f} GB"
+    return f"{value:.1f} GB"
+
+
+def mbps(bytes_per_second: float | None) -> str:
+    """바이트/초 → 'N Mbps' (웹 콘솔과 동일: x8 / 1024 / 1024). None/비유한값은 '-'."""
+    if bytes_per_second is None:
+        return "-"
+    try:
+        value = float(bytes_per_second) * 8 / 1024 / 1024
+    except (TypeError, ValueError):
+        return "-"
+    return f"{value:.1f} Mbps" if math.isfinite(value) else "-"
+
+
+def bytes_human(value: float | int | None) -> str:
+    """바이트 → '1.5 KB' / '12.3 MB' / '2.00 GB' (웹 콘솔 formatBytes 와 동일 규칙, 1024 기준)."""
+    if value is None:
+        return "-"
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if not math.isfinite(amount) or amount < 0:
+        return "-"
+    if amount < 1024:
+        return f"{int(amount)} B"
+    for unit, size, digits in (("TB", 1024 ** 4, 2), ("GB", 1024 ** 3, 2), ("MB", 1024 ** 2, 1), ("KB", 1024, 1)):
+        if amount >= size:
+            return f"{amount / size:.{digits}f} {unit}"
+    return f"{int(amount)} B"  # pragma: no cover - unreachable
+
+
+def temperature(celsius: float | None) -> str:
+    if celsius is None:
+        return "-"
+    try:
+        value = float(celsius)
+    except (TypeError, ValueError):
+        return "-"
+    return f"{value:.0f}°C" if math.isfinite(value) else "-"
+
+
+def date_str(value: date | None) -> str:
+    """date → 'YYYY-MM-DD'. None → '-'."""
+    return value.isoformat() if value else "-"
 
 
 def relative_time(dt: datetime | None, *, now: datetime | None = None) -> str:

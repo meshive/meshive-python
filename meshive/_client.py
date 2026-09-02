@@ -4,7 +4,9 @@
 transport(httpx.Client vs httpx.AsyncClient)만 다르다.
 
 인증: Meshive API Key (READ scope). `Authorization: Bearer meshive_...`.
-대상 표면: routers/sdk/app.py 의 read allowlist 4개.
+대상 표면: routers/sdk/app.py 의 read allowlist — 계정(me/api-keys/credit/earnings),
+워크스페이스(목록/상세/멤버), 파드(목록/단건/메트릭), 스토리지, 머신(목록/단건/메트릭),
+GPU 가용량, 템플릿, 서버리스(servings/tasks), 자산(Asset Hub). 전부 GET 이라 재시도가 안전하다.
 """
 from __future__ import annotations
 
@@ -12,6 +14,7 @@ import asyncio
 import math
 import time
 from collections.abc import Iterable
+from datetime import date, datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -29,7 +32,28 @@ from .exceptions import (
     RateLimitError,
     WaitTimeoutError,
 )
-from .models import Machine, Pod, WhoAmI, Workspace
+from .models import (
+    ApiKey,
+    Asset,
+    AssetPage,
+    AssetStorage,
+    Credit,
+    CreditHistoryEntry,
+    Earnings,
+    GpuAvailability,
+    Machine,
+    MachineMetrics,
+    Member,
+    Pod,
+    PodMetrics,
+    Serving,
+    Storage,
+    Task,
+    Template,
+    WhoAmI,
+    Workspace,
+    WorkspaceDetail,
+)
 
 
 def _path_segment(value: str, name: str) -> str:
@@ -38,6 +62,101 @@ def _path_segment(value: str, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
     return quote(value, safe="")
+
+
+def _int_segment(value: int | str, name: str) -> str:
+    """정수 ID(template/serving) 경로 세그먼트. bool 은 int 의 서브클래스라 따로 거른다."""
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(f"{name} must be an integer")
+    try:
+        number = int(value)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer") from None
+    if number < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return str(number)
+
+
+# --- 쿼리 파라미터 구성 (sync/async 클라이언트가 공유) ----------------------------
+# 서버 표면은 camelCase 쿼리(startDate/rentalType/appType)를 받는다. 값 검증은 서버 왕복
+# 전에 여기서 끝내 "조용히 빈 결과" 대신 ValueError 로 알린다.
+
+_RENTAL_TYPES = ("demand", "spot")
+
+
+def _iso_date(value: date | datetime | str, name: str) -> str:
+    """date/datetime/'YYYY-MM-DD' → 'YYYY-MM-DD'. datetime 은 date 의 서브클래스라 먼저 본다."""
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, str) and value.strip():
+        try:
+            return date.fromisoformat(value.strip()).isoformat()
+        except ValueError:
+            raise ValueError(f"{name} must be a date, datetime, or 'YYYY-MM-DD' string") from None
+    raise ValueError(f"{name} must be a date, datetime, or 'YYYY-MM-DD' string")
+
+
+def _date_range_params(start_date: date | datetime | str | None,
+                       end_date: date | datetime | str | None) -> dict[str, str]:
+    """startDate/endDate 쿼리. 둘 다 None 이면 빈 dict (서버 기본: 최근 90일)."""
+    params: dict[str, str] = {}
+    if start_date is not None:
+        params["startDate"] = _iso_date(start_date, "start_date")
+    if end_date is not None:
+        params["endDate"] = _iso_date(end_date, "end_date")
+    return params
+
+
+def _gpus_params(rental_type: str, min_vram: int | None) -> dict[str, Any]:
+    rental = (rental_type or "").strip().lower()
+    if rental not in _RENTAL_TYPES:
+        raise ValueError(f"rental_type must be one of {', '.join(_RENTAL_TYPES)}")
+    params: dict[str, Any] = {"rentalType": rental}
+    if min_vram is not None:
+        if isinstance(min_vram, bool) or not isinstance(min_vram, int) or min_vram < 0:
+            raise ValueError("min_vram must be a non-negative integer (GB)")
+        params["vram"] = min_vram
+    return params
+
+
+def _templates_params(workspace: str | None, app_type: str | None) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    if workspace:
+        params["workspace"] = workspace
+    if app_type:
+        params["appType"] = app_type.strip().lower()
+    return params
+
+
+def _assets_params(workspace: str, asset_type: str | None, status: str | None,
+                   page: int, page_size: int) -> dict[str, Any]:
+    if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+        raise ValueError("page must be a positive integer")
+    if isinstance(page_size, bool) or not isinstance(page_size, int) or not 1 <= page_size <= 100:
+        raise ValueError("page_size must be an integer between 1 and 100")
+    params: dict[str, Any] = {"workspace": workspace, "page": page, "pageSize": page_size}
+    if asset_type:
+        params["assetType"] = asset_type.strip().lower()
+    if status:
+        params["status"] = status.strip().lower()
+    return params
+
+
+def _tasks_params(workspace: str, status: str | Iterable[str] | None,
+                  limit: int, offset: int) -> dict[str, Any]:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+        raise ValueError("limit must be an integer between 1 and 200")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("offset must be a non-negative integer")
+    params: dict[str, Any] = {"workspace": workspace, "limit": limit, "offset": offset}
+    if status:
+        values = [status] if isinstance(status, str) else list(status)
+        joined = ",".join(s.strip().lower() for s in values if s and s.strip())
+        if joined:
+            params["status"] = joined
+    return params
 
 
 # 예외 message 상한 — 프록시/게이트웨이가 거대한 HTML 등을 돌려줘도 예외 메시지와
@@ -292,6 +411,109 @@ class Meshive(_BaseClient):
             _wait_expired(deadline, pod_name, targets, last)
             time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
 
+    # --- 0.0.7 확장 read 표면 ------------------------------------------------
+
+    def get_workspace(self, workspace: str) -> WorkspaceDetail:
+        """워크스페이스 상세 — 비용/리소스 요약 (GET /workspaces/{namespace})."""
+        return WorkspaceDetail.from_dict(
+            self._get(f"/workspaces/{_path_segment(workspace, 'workspace')}"))
+
+    def list_members(self, workspace: str) -> list[Member]:
+        """워크스페이스 멤버 목록 (GET /members?workspace=)."""
+        data = self._get("/members", params={"workspace": workspace})
+        return [Member.from_dict(d) for d in data.get("members", [])]
+
+    def list_storages(self, workspace: str) -> list[Storage]:
+        """워크스페이스의 스토리지(볼륨) 목록 (GET /storages?workspace=)."""
+        data = self._get("/storages", params={"workspace": workspace})
+        return [Storage.from_dict(d) for d in data.get("storages", [])]
+
+    def get_storage(self, storage_name: str, workspace: str) -> Storage:
+        """스토리지 단건 (GET /storages/{storage_name}?workspace=). 인자 순서는 get_pod 와 동일."""
+        segment = _path_segment(storage_name, "storage_name")
+        return Storage.from_dict(self._get(f"/storages/{segment}", params={"workspace": workspace}))
+
+    def get_pod_metrics(self, pod_name: str, workspace: str) -> PodMetrics:
+        """파드 리소스 사용량 (GET /pods/{pod_name}/metrics?workspace=)."""
+        segment = _path_segment(pod_name, "pod_name")
+        return PodMetrics.from_dict(
+            self._get(f"/pods/{segment}/metrics", params={"workspace": workspace}))
+
+    def get_machine_metrics(self, machine_id: str) -> MachineMetrics:
+        """host 머신 실시간 메트릭 (GET /machines/{machine_id}/metrics)."""
+        segment = _path_segment(machine_id, "machine_id")
+        return MachineMetrics.from_dict(self._get(f"/machines/{segment}/metrics"))
+
+    def list_gpus(self, *, rental_type: str = "demand",
+                  min_vram: int | None = None) -> list[GpuAvailability]:
+        """지금 대여 가능한 GPU 티어와 가격 (GET /gpus?rentalType=&vram=)."""
+        return [GpuAvailability.from_dict(d)
+                for d in self._get("/gpus", params=_gpus_params(rental_type, min_vram))]
+
+    def list_api_keys(self) -> list[ApiKey]:
+        """내 활성 API Key 목록 — prefix 만, 평문 없음 (GET /api-keys)."""
+        return [ApiKey.from_dict(d) for d in self._get("/api-keys")]
+
+    def get_credit(self) -> Credit:
+        """크레딧 잔액 + 자동충전 설정 (GET /credit)."""
+        return Credit.from_dict(self._get("/credit"))
+
+    def list_credit_history(self, *, start_date: date | datetime | str | None = None,
+                            end_date: date | datetime | str | None = None) -> list[CreditHistoryEntry]:
+        """크레딧 충전/환불 내역 (GET /credit/history). 기본 최근 90일."""
+        data = self._get("/credit/history", params=_date_range_params(start_date, end_date))
+        return [CreditHistoryEntry.from_dict(d) for d in data]
+
+    def get_earnings(self, *, start_date: date | datetime | str | None = None,
+                     end_date: date | datetime | str | None = None) -> Earnings:
+        """host 수익 요약 + 일별 내역 (GET /earnings). 기본 최근 90일."""
+        return Earnings.from_dict(self._get("/earnings", params=_date_range_params(start_date, end_date)))
+
+    def list_templates(self, workspace: str | None = None, *,
+                       app_type: str | None = None) -> list[Template]:
+        """official 템플릿 (+ workspace 지정 시 그 워크스페이스의 custom 템플릿) (GET /templates)."""
+        data = self._get("/templates", params=_templates_params(workspace, app_type))
+        return [Template.from_dict(d) for d in data]
+
+    def get_template(self, template_id: int | str, workspace: str | None = None) -> Template:
+        """템플릿 단건 (GET /templates/{template_id}). custom 템플릿은 workspace 를 함께 넘긴다."""
+        params = {"workspace": workspace} if workspace else None
+        segment = _int_segment(template_id, "template_id")
+        return Template.from_dict(self._get(f"/templates/{segment}", params=params))
+
+    def list_servings(self, workspace: str) -> list[Serving]:
+        """워크스페이스의 serverless serving 배포 목록 (GET /servings?workspace=)."""
+        return [Serving.from_dict(d) for d in self._get("/servings", params={"workspace": workspace})]
+
+    def get_serving(self, serving_id: int | str) -> Serving:
+        """serving 배포 단건 (GET /servings/{serving_id})."""
+        return Serving.from_dict(self._get(f"/servings/{_int_segment(serving_id, 'serving_id')}"))
+
+    def list_tasks(self, workspace: str, *, status: str | Iterable[str] | None = None,
+                   limit: int = 50, offset: int = 0) -> list[Task]:
+        """워크스페이스의 serverless task 목록, 최신순 (GET /tasks?workspace=&status=&limit=&offset=)."""
+        data = self._get("/tasks", params=_tasks_params(workspace, status, limit, offset))
+        return [Task.from_dict(d) for d in data]
+
+    def get_task(self, task_id: str) -> Task:
+        """task 단건 — 스크립트/설정/비용 분해는 `.raw` (GET /tasks/{task_id})."""
+        return Task.from_dict(self._get(f"/tasks/{_path_segment(task_id, 'task_id')}"))
+
+    def list_assets(self, workspace: str, *, asset_type: str | None = None, status: str | None = None,
+                    page: int = 1, page_size: int = 20) -> AssetPage:
+        """워크스페이스 자산 목록 한 페이지 (GET /assets?workspace=&assetType=&status=&page=&pageSize=).
+        status 미지정 시 deleted/purged/merged 는 제외된다."""
+        data = self._get("/assets", params=_assets_params(workspace, asset_type, status, page, page_size))
+        return AssetPage.from_dict(data, namespace_name=workspace)
+
+    def get_asset(self, asset_id: str) -> Asset:
+        """자산 상세 — 버전 스택과 파일 목록 포함 (GET /assets/{asset_id})."""
+        return Asset.from_dict(self._get(f"/assets/{_path_segment(asset_id, 'asset_id')}"))
+
+    def get_asset_storage(self, workspace: str) -> AssetStorage:
+        """managed 자산 저장량/월 예상 비용/크레딧 차단 상태 (GET /assets/storage-summary?workspace=)."""
+        return AssetStorage.from_dict(self._get("/assets/storage-summary", params={"workspace": workspace}))
+
     def close(self) -> None:
         self._client.close()
 
@@ -388,6 +610,113 @@ class AsyncMeshive(_BaseClient):
             last = pod.status
             _wait_expired(deadline, pod_name, targets, last)
             await asyncio.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+
+    # --- 0.0.7 확장 read 표면 (동기판과 동일 규칙) ---------------------------
+
+    async def get_workspace(self, workspace: str) -> WorkspaceDetail:
+        """워크스페이스 상세 (GET /workspaces/{namespace})."""
+        return WorkspaceDetail.from_dict(
+            await self._get(f"/workspaces/{_path_segment(workspace, 'workspace')}"))
+
+    async def list_members(self, workspace: str) -> list[Member]:
+        """워크스페이스 멤버 목록 (GET /members?workspace=)."""
+        data = await self._get("/members", params={"workspace": workspace})
+        return [Member.from_dict(d) for d in data.get("members", [])]
+
+    async def list_storages(self, workspace: str) -> list[Storage]:
+        """워크스페이스의 스토리지(볼륨) 목록 (GET /storages?workspace=)."""
+        data = await self._get("/storages", params={"workspace": workspace})
+        return [Storage.from_dict(d) for d in data.get("storages", [])]
+
+    async def get_storage(self, storage_name: str, workspace: str) -> Storage:
+        """스토리지 단건 (GET /storages/{storage_name}?workspace=)."""
+        segment = _path_segment(storage_name, "storage_name")
+        data = await self._get(f"/storages/{segment}", params={"workspace": workspace})
+        return Storage.from_dict(data)
+
+    async def get_pod_metrics(self, pod_name: str, workspace: str) -> PodMetrics:
+        """파드 리소스 사용량 (GET /pods/{pod_name}/metrics?workspace=)."""
+        segment = _path_segment(pod_name, "pod_name")
+        data = await self._get(f"/pods/{segment}/metrics", params={"workspace": workspace})
+        return PodMetrics.from_dict(data)
+
+    async def get_machine_metrics(self, machine_id: str) -> MachineMetrics:
+        """host 머신 실시간 메트릭 (GET /machines/{machine_id}/metrics)."""
+        segment = _path_segment(machine_id, "machine_id")
+        return MachineMetrics.from_dict(await self._get(f"/machines/{segment}/metrics"))
+
+    async def list_gpus(self, *, rental_type: str = "demand",
+                        min_vram: int | None = None) -> list[GpuAvailability]:
+        """지금 대여 가능한 GPU 티어와 가격 (GET /gpus?rentalType=&vram=)."""
+        data = await self._get("/gpus", params=_gpus_params(rental_type, min_vram))
+        return [GpuAvailability.from_dict(d) for d in data]
+
+    async def list_api_keys(self) -> list[ApiKey]:
+        """내 활성 API Key 목록 — prefix 만, 평문 없음 (GET /api-keys)."""
+        return [ApiKey.from_dict(d) for d in await self._get("/api-keys")]
+
+    async def get_credit(self) -> Credit:
+        """크레딧 잔액 + 자동충전 설정 (GET /credit)."""
+        return Credit.from_dict(await self._get("/credit"))
+
+    async def list_credit_history(self, *, start_date: date | datetime | str | None = None,
+                                  end_date: date | datetime | str | None = None) -> list[CreditHistoryEntry]:
+        """크레딧 충전/환불 내역 (GET /credit/history). 기본 최근 90일."""
+        data = await self._get("/credit/history", params=_date_range_params(start_date, end_date))
+        return [CreditHistoryEntry.from_dict(d) for d in data]
+
+    async def get_earnings(self, *, start_date: date | datetime | str | None = None,
+                           end_date: date | datetime | str | None = None) -> Earnings:
+        """host 수익 요약 + 일별 내역 (GET /earnings). 기본 최근 90일."""
+        data = await self._get("/earnings", params=_date_range_params(start_date, end_date))
+        return Earnings.from_dict(data)
+
+    async def list_templates(self, workspace: str | None = None, *,
+                             app_type: str | None = None) -> list[Template]:
+        """official 템플릿 (+ workspace 지정 시 custom 템플릿) (GET /templates)."""
+        data = await self._get("/templates", params=_templates_params(workspace, app_type))
+        return [Template.from_dict(d) for d in data]
+
+    async def get_template(self, template_id: int | str, workspace: str | None = None) -> Template:
+        """템플릿 단건 (GET /templates/{template_id}). custom 템플릿은 workspace 를 함께 넘긴다."""
+        params = {"workspace": workspace} if workspace else None
+        segment = _int_segment(template_id, "template_id")
+        return Template.from_dict(await self._get(f"/templates/{segment}", params=params))
+
+    async def list_servings(self, workspace: str) -> list[Serving]:
+        """워크스페이스의 serverless serving 배포 목록 (GET /servings?workspace=)."""
+        data = await self._get("/servings", params={"workspace": workspace})
+        return [Serving.from_dict(d) for d in data]
+
+    async def get_serving(self, serving_id: int | str) -> Serving:
+        """serving 배포 단건 (GET /servings/{serving_id})."""
+        segment = _int_segment(serving_id, "serving_id")
+        return Serving.from_dict(await self._get(f"/servings/{segment}"))
+
+    async def list_tasks(self, workspace: str, *, status: str | Iterable[str] | None = None,
+                         limit: int = 50, offset: int = 0) -> list[Task]:
+        """워크스페이스의 serverless task 목록, 최신순 (GET /tasks?...)."""
+        data = await self._get("/tasks", params=_tasks_params(workspace, status, limit, offset))
+        return [Task.from_dict(d) for d in data]
+
+    async def get_task(self, task_id: str) -> Task:
+        """task 단건 — 스크립트/설정/비용 분해는 `.raw` (GET /tasks/{task_id})."""
+        return Task.from_dict(await self._get(f"/tasks/{_path_segment(task_id, 'task_id')}"))
+
+    async def list_assets(self, workspace: str, *, asset_type: str | None = None,
+                          status: str | None = None, page: int = 1, page_size: int = 20) -> AssetPage:
+        """워크스페이스 자산 목록 한 페이지 (GET /assets?...). status 미지정 시 deleted/purged/merged 제외."""
+        data = await self._get("/assets", params=_assets_params(workspace, asset_type, status, page, page_size))
+        return AssetPage.from_dict(data, namespace_name=workspace)
+
+    async def get_asset(self, asset_id: str) -> Asset:
+        """자산 상세 — 버전 스택과 파일 목록 포함 (GET /assets/{asset_id})."""
+        return Asset.from_dict(await self._get(f"/assets/{_path_segment(asset_id, 'asset_id')}"))
+
+    async def get_asset_storage(self, workspace: str) -> AssetStorage:
+        """managed 자산 저장량/월 예상 비용/크레딧 차단 상태 (GET /assets/storage-summary?workspace=)."""
+        data = await self._get("/assets/storage-summary", params={"workspace": workspace})
+        return AssetStorage.from_dict(data)
 
     async def close(self) -> None:
         await self._client.aclose()

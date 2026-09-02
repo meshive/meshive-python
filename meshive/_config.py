@@ -1,9 +1,8 @@
 """Meshive SDK 설정 해석.
 
-base_url / api_key 는 모두 "명시 인자 > 환경변수 > 기본값" 순으로 해석된다.
-기본 엔드포인트는 prod(real). dev 로 붙으려면 MESHIVE_BASE_URL 을 export 한다.
+base_url / api_key 는 모두 "명시 인자 > 환경변수 > credentials 파일 > 기본값" 순으로 해석된다.
+기본 엔드포인트는 실서비스 API 이고, 다른 주소는 MESHIVE_BASE_URL 로 덮어쓴다.
 
-    export MESHIVE_BASE_URL=https://api.dev.meshive.ai
     export MESHIVE_API_KEY=meshive_xxxxxxxx
 """
 import os
@@ -12,7 +11,7 @@ from urllib.parse import urlparse
 from . import _credentials
 from .exceptions import ConfigurationError
 
-# prod(real) 엔드포인트. dev 는 MESHIVE_BASE_URL 로 오버라이드.
+# 실서비스 엔드포인트. 다른 주소는 MESHIVE_BASE_URL / --base-url 로 오버라이드.
 DEFAULT_BASE_URL = "https://api.meshive.ai"
 
 # SDK 전용 read 표면의 공통 prefix (routers/sdk/app.py 의 /sdk + v1 마운트).

@@ -55,7 +55,10 @@ jobs:
           name: dist
           path: dist/
       - name: Create GitHub Release
-        # 릴리스 노트는 태그 메시지(annotated) 또는 커밋 메시지(lightweight)를 쓴다.
-        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-from-tag
+        # 릴리스 노트는 CHANGELOG.md 의 해당 버전 섹션(영어, 사용자 관점)을 쓴다.
+        # 섹션이 없으면 실패한다 — 한국어 커밋/태그 메시지가 공개 노트로 새지 않게.
+        run: |
+          scripts/release-notes.sh "$GITHUB_REF_NAME" > notes.md
+          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md
         env:
           GH_TOKEN: ${{ github.token }}

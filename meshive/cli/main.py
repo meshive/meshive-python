@@ -811,7 +811,11 @@ def _print_assets(assets: list[Asset], page: AssetPage, color: bool) -> None:
             colors=colors,
             enabled=color,
         )
-    if page.pages > 1:
+    if page.page > page.pages:
+        print(fmt.paint(f"Page {page.page} is past the end: {page.total} asset"
+                        f"{'s' if page.total != 1 else ''} on {page.pages} page{'s' if page.pages != 1 else ''}.",
+                        "dim", color))
+    elif page.pages > 1:
         print(fmt.paint(f"Page {page.page} of {page.pages} ({page.total} assets). Use --page to see more.",
                         "dim", color))
 

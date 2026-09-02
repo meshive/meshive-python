@@ -909,3 +909,14 @@ def test_async_assets_mirror_sync():
     assert page.total == 57 and asset.latest_version.version_number == 1
     assert storage.credit_state == "grace"
     assert seen["params"] == {"workspace": "team-ns"}
+
+
+def test_format_gib_uses_mb_below_one_gigabyte():
+    from meshive.cli import _format as fmt
+
+    assert fmt.gib(0) == "0 GB"
+    assert fmt.gib(512) == "512 MB"
+    assert fmt.gib(1024) == "1 GB"
+    assert fmt.gib(1536) == "1.5 GB"
+    assert fmt.gib(131072) == "128 GB"
+    assert fmt.gib(None) == "-"

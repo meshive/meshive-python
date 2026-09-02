@@ -143,15 +143,19 @@ def usage(rate: float | None) -> str:
 
 
 def gib(mib: float | None) -> str:
-    """MiB 값 → 'N GB' (웹 콘솔과 동일하게 /1024). None/비유한값은 '-'."""
+    """MiB 값 → 'N GB' (웹 콘솔과 동일하게 /1024). 1 GB 미만은 'N MB' 로 — 시스템 파드의
+    수십 MB 가 '0.0 GB' 로 뭉개지지 않게. None/비유한값은 '-'."""
     if mib is None:
         return "-"
     try:
-        value = float(mib) / 1024
+        raw = float(mib)
     except (TypeError, ValueError):
         return "-"
-    if not math.isfinite(value):
+    if not math.isfinite(raw):
         return "-"
+    value = raw / 1024
+    if 0 < raw < 1024:
+        return f"{raw:.0f} MB"
     if value >= 10 or value == int(value):
         return f"{value:,.0f} GB"
     return f"{value:.1f} GB"

@@ -791,7 +791,7 @@ def test_assets_output_filters_and_paging(capsys):
     assert cli.main(["assets", "ns", "--type", "Dataset", "--status", "active",
                      "--page", "2", "--page-size", "50"]) == 0
     out = capsys.readouterr().out
-    assert "Page " not in out                                  # 45 < 50 → 한 페이지뿐
+    assert "Page 2 is past the end: 45 assets on 1 page." in out   # 45 < 50 → 한 페이지뿐
     assert FakeClient.last_call == ("list_assets", ("ns",),
                                     {"asset_type": "dataset", "status": "active", "page": 2, "page_size": 50})
 
@@ -806,6 +806,13 @@ def test_assets_output_filters_and_paging(capsys):
 
     assert cli.main(["assets", "ns", "-o", "name"]) == 0
     assert capsys.readouterr().out.splitlines() == ["asset_data", "asset_lora"]
+
+
+def test_assets_page_past_the_end_is_explained(capsys):
+    assert cli.main(["assets", "ns", "--page", "9", "--page-size", "20"]) == 0   # 45개 → 3페이지뿐
+    out = capsys.readouterr().out
+    assert "Page 9 is past the end: 45 assets on 3 pages." in out
+    assert "Use --page" not in out
 
 
 def test_assets_json_keeps_page_metadata_with_filtered_items(capsys):

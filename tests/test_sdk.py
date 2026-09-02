@@ -98,8 +98,8 @@ def test_resolve_base_url_default(monkeypatch):
 
 
 def test_resolve_base_url_env_and_trailing_slash(monkeypatch):
-    monkeypatch.setenv(_config.ENV_BASE_URL, "https://api.dev.meshive.ai/")
-    assert _config.resolve_base_url() == "https://api.dev.meshive.ai"
+    monkeypatch.setenv(_config.ENV_BASE_URL, "https://api.example.com/")
+    assert _config.resolve_base_url() == "https://api.example.com"
 
 
 def test_resolve_base_url_explicit_wins(monkeypatch):

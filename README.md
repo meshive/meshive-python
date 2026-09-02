@@ -28,17 +28,10 @@ export MESHIVE_API_KEY=meshive_xxxxxxxx
 # or per-command: meshive me --api-key meshive_xxxxxxxx
 ```
 
-By default requests go to the production API. To target the dev endpoint, override the
-base URL (same precedence: flag › env › login file › prod default) — no code change needed:
-
-```bash
-export MESHIVE_BASE_URL=https://api.dev.meshive.ai
-# or remember it at login time:
-meshive login --base-url https://api.dev.meshive.ai
-```
-
-> The dev endpoint needs a dev-issued key — pair `--base-url`/`MESHIVE_BASE_URL` with the
-> matching key. The config directory can be relocated via `MESHIVE_CONFIG_DIR`.
+Requests go to the production API. If you have been given a different API address, override
+it with `--base-url` or `MESHIVE_BASE_URL` (same precedence: flag › env › login file › default);
+`meshive login --base-url <url>` remembers it. The config directory can be relocated via
+`MESHIVE_CONFIG_DIR`.
 
 ## CLI
 
@@ -208,7 +201,7 @@ Dates accept `datetime.date`, `datetime.datetime`, or a `"YYYY-MM-DD"` string. E
 the exact server payload on `.raw`, so nested or newly added fields are always reachable. Credit
 history entries carry the amount, method and date only; Stripe receipt links stay in the console.
 
-Credentials can also be passed explicitly: `Meshive(api_key="meshive_...", base_url="https://api.dev.meshive.ai")`.
+Credentials can also be passed explicitly: `Meshive(api_key="meshive_...")`, and `base_url=` overrides the API address.
 
 ### Retries
 

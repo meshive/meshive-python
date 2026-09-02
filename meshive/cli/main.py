@@ -87,7 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
             "\n"
             "Run `meshive <command> --help` for filters and options.\n"
             "Scripting: `-o name` prints just the IDs, one per line (pipe into xargs).\n"
-            "Auth: `meshive login`, or set MESHIVE_API_KEY / pass --api-key. For dev, set MESHIVE_BASE_URL.\n"
+            "Auth: `meshive login`, or set MESHIVE_API_KEY / pass --api-key.\n"
             "Docs: https://github.com/meshive/meshive-python"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,

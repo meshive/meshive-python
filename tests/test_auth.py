@@ -39,9 +39,9 @@ def _patch_client(monkeypatch, handler):
 # --- credentials store -------------------------------------------------------
 
 def test_save_load_roundtrip():
-    _credentials.save("meshive_abc", "https://api.dev.meshive.ai")
+    _credentials.save("meshive_abc", "https://api.example.com")
     data = _credentials.load()
-    assert data == {"api_key": "meshive_abc", "base_url": "https://api.dev.meshive.ai"}
+    assert data == {"api_key": "meshive_abc", "base_url": "https://api.example.com"}
 
 
 def test_save_omits_base_url_when_none():
@@ -68,13 +68,13 @@ def test_clear():
 # --- resolution precedence ---------------------------------------------------
 
 def test_credentials_used_as_fallback():
-    _credentials.save("meshive_file", "https://api.dev.meshive.ai")
+    _credentials.save("meshive_file", "https://api.example.com")
     assert _config.resolve_api_key() == "meshive_file"
-    assert _config.resolve_base_url() == "https://api.dev.meshive.ai"
+    assert _config.resolve_base_url() == "https://api.example.com"
 
 
 def test_env_overrides_credentials(monkeypatch):
-    _credentials.save("meshive_file", "https://api.dev.meshive.ai")
+    _credentials.save("meshive_file", "https://api.example.com")
     monkeypatch.setenv(_config.ENV_API_KEY, "meshive_env")
     monkeypatch.setenv(_config.ENV_BASE_URL, "https://env.meshive.ai")
     assert _config.resolve_api_key() == "meshive_env"
@@ -82,7 +82,7 @@ def test_env_overrides_credentials(monkeypatch):
 
 
 def test_explicit_overrides_all(monkeypatch):
-    _credentials.save("meshive_file", "https://api.dev.meshive.ai")
+    _credentials.save("meshive_file", "https://api.example.com")
     monkeypatch.setenv(_config.ENV_API_KEY, "meshive_env")
     assert _config.resolve_api_key("meshive_explicit") == "meshive_explicit"
 
@@ -102,8 +102,8 @@ def test_login_with_flag_saves_and_verifies(monkeypatch, capsys):
 def test_login_dev_remembers_base_url(monkeypatch):
     _patch_client(monkeypatch, _ok_me)
     assert cli.main(["login", "--api-key", "meshive_xyz",
-                     "--base-url", "https://api.dev.meshive.ai"]) == 0
-    assert _credentials.load()["base_url"] == "https://api.dev.meshive.ai"
+                     "--base-url", "https://api.example.com"]) == 0
+    assert _credentials.load()["base_url"] == "https://api.example.com"
 
 
 def test_login_prompts_when_no_flag(monkeypatch, capsys):

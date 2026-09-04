@@ -4,7 +4,7 @@
 pip install meshive
 ```
 
-Full SDK & CLI documentation: [docs.meshive.ai/sdk-cli](https://docs.meshive.ai/sdk-cli/)
+Docs: [SDK & CLI reference](https://docs.meshive.ai/sdk-cli/) · [Quickstart](https://docs.meshive.ai/getting-started/quickstart-client/) · [Serverless API](https://docs.meshive.ai/api-reference/) · [GPU pricing](https://docs.meshive.ai/documentation/pricing/)
 
 ## Authentication
 

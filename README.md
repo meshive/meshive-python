@@ -8,8 +8,10 @@ Docs: [SDK & CLI reference](https://docs.meshive.ai/sdk-cli/) · [Quickstart](ht
 
 ## Authentication
 
-The SDK and CLI authenticate with a **Meshive API Key** (READ scope). Issue one from
-the [console](https://console.meshive.ai).
+The SDK and CLI authenticate with a **Meshive API Key**. Issue one from the
+[console](https://console.meshive.ai) (workspace Settings → Secret). A **Read only** key can view
+everything; a **Read & write** key is needed to create, change or delete resources, and it always
+expires (30 days by default, 90 at most).
 
 The easiest way is `meshive login` — it verifies the key and stores it (file mode `0600`)
 under `~/.meshive/credentials.json`, so later commands need no flags or env vars:
@@ -35,8 +37,9 @@ it with `--base-url` or `MESHIVE_BASE_URL` (same precedence: flag › env › lo
 
 ## CLI
 
-Everything is read-only. `meshive --help` lists the commands; `meshive <command> --help`
-shows its filters.
+`meshive --help` lists the commands; `meshive <command> --help` shows their options.
+Commands that spend credit or delete something show an estimate and ask for confirmation
+(`--yes` to skip, `--estimate` to only see the price).
 
 ```bash
 meshive --version
@@ -122,6 +125,24 @@ List output shows two columns:
 
 RAM, storage and VRAM are shown in GB (the same conversion the console uses); usage rates in
 percent, with `n/a` when a measurement is unavailable; network throughput in Mbps.
+
+### Write commands (Read & write key)
+
+```bash
+meshive pod-create <workspace> my-pod --template 457 --gpu "RTX 3060" --estimate   # price only
+meshive pod-create <workspace> my-pod --template 457 --gpu "RTX 3060" --max-price 0.10 --wait running
+meshive pod-stop <workspace> <pod>          # billing stops (storage still billed)
+meshive pod-start <workspace> <pod>         # --any-node to move to another machine
+meshive pod-delete <workspace> <pod> --yes
+meshive logs <workspace> <pod> --tail 100
+
+meshive storage-create <workspace> data --size 50 --type nfs
+meshive storage-delete <workspace> <pv>
+
+meshive task-submit <workspace> train --script train.py --image python:3.12-slim --gpu "RTX 3060"
+meshive task-logs <task>; meshive task-stop <task>
+meshive serving-deploy <workspace> <model_id> --price-cap 1.5 --max-replicas 2
+```
 
 ## SDK
 
@@ -249,3 +270,21 @@ older API those calls return `NotFoundError`; the commands that existed in 0.0.6
 ## License
 
 [Apache License 2.0](LICENSE)
+
+### Writing (0.1.0+)
+
+```python
+from meshive import Meshive, ConflictError
+
+client = Meshive()  # key with the write scope
+est = client.estimate_pod("my-pod", template_id=457, workspace="<workspace>", gpu_model="RTX 3060")
+print(est.price_per_hour, est.resources)          # "0.068423" {...}
+
+created = client.create_pod("my-pod", 457, workspace="<workspace>", gpu_model="RTX 3060",
+                            max_price_per_hour=0.10)  # refused with ConflictError if pricier
+pod = next(p for p in client.list_pods("<workspace>") if p.user_alias == "my-pod")
+client.wait_for_pod(pod.pod_name, "<workspace>", until="running")
+print(client.get_pod_logs(pod.pod_name, "<workspace>", tail=50).text)
+client.stop_pod(pod.pod_name, "<workspace>")
+client.delete_pod(pod.pod_name, "<workspace>")
+```

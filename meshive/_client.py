@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+import uuid
 from collections.abc import Iterable
 from datetime import date, datetime
 from typing import Any
@@ -22,9 +23,12 @@ import httpx
 
 from . import _config
 from ._version import __version__
+from . import _write
 from .exceptions import (
     AuthenticationError,
     ConfigurationError,
+    ConflictError,
+    InsufficientCreditError,
     MeshiveAPIError,
     MeshiveError,
     NotFoundError,
@@ -41,14 +45,22 @@ from .models import (
     CreditHistoryEntry,
     Earnings,
     GpuAvailability,
+    Logs,
     Machine,
     MachineMetrics,
     Member,
     Pod,
+    PodCreated,
+    PodEstimate,
     PodMetrics,
+    ResourceAction,
     Serving,
     Storage,
+    StorageCreated,
+    StorageEstimate,
     Task,
+    TaskEstimate,
+    TaskSubmitted,
     Template,
     WhoAmI,
     Workspace,
@@ -62,6 +74,13 @@ def _path_segment(value: str, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
     return quote(value, safe="")
+
+
+def _query_value(value: str, name: str) -> str:
+    """쿼리 파라미터용 문자열 검증. 인코딩은 httpx 가 하므로 여기서 하지 않는다(이중 인코딩 방지)."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value.strip()
 
 
 def _int_segment(value: int | str, name: str) -> str:
@@ -204,6 +223,10 @@ def _raise_for_status(status_code: int, payload: Any, headers: httpx.Headers) ->
         raise PermissionDeniedError(status_code, message, **common)
     if status_code == 404:
         raise NotFoundError(status_code, message, **common)
+    if status_code == 402:
+        raise InsufficientCreditError(status_code, message, **common)
+    if status_code == 409:
+        raise ConflictError(status_code, message, **common)
     if status_code == 429:
         raise RateLimitError(status_code, message, retry_after=_retry_after(headers), **common)
     raise MeshiveAPIError(status_code, message, **common)
@@ -211,8 +234,8 @@ def _raise_for_status(status_code: int, payload: Any, headers: httpx.Headers) ->
 
 # --- 재시도 -----------------------------------------------------------------
 # 일시적 실패(rate limit / 게이트웨이 오류 / 커넥션 끊김)만 재시도한다. 다른 4xx 는
-# 재시도해도 결과가 같으므로 즉시 raise. read 표면은 전부 GET(멱등)이라 안전하다 —
-# 쓰기 엔드포인트가 생기면 이 가정을 다시 따져야 한다.
+# 재시도해도 결과가 같으므로 즉시 raise. GET 은 멱등이고, 쓰기 요청은 Idempotency-Key 를
+# 같은 값으로 다시 보내므로(서버가 첫 응답을 재생) 이중 생성 없이 재시도할 수 있다.
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 _RETRY_EXCEPTIONS = (httpx.ConnectError, httpx.TimeoutException)
 _RETRY_BACKOFF = 0.5  # 0.5s → 1s → 2s ...
@@ -229,11 +252,15 @@ class _BaseClient:
         base_url: str | None = None,
         timeout: float = 30.0,
         max_retries: int = 2,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self._api_key = _config.resolve_api_key(api_key)
         self._base_url = _config.resolve_base_url(base_url)
         self._timeout = timeout
         self._max_retries = max_retries
+        # 추가 헤더(예: MCP 서버가 싣는 X-Meshive-Client). 인증/Accept 는 덮어쓸 수 없다.
+        self._extra_headers = {str(k): str(v) for k, v in (headers or {}).items()
+                               if k.lower() not in ("authorization", "accept")}
 
     @property
     def base_url(self) -> str:
@@ -249,9 +276,10 @@ class _BaseClient:
                 f"or set the {_config.ENV_API_KEY} environment variable."
             )
         return {
+            "User-Agent": f"meshive-python/{__version__}",
+            **self._extra_headers,
             "Authorization": f"Bearer {self._api_key}",
             "Accept": "application/json",
-            "User-Agent": f"meshive-python/{__version__}",
         }
 
     @staticmethod
@@ -336,8 +364,9 @@ class Meshive(_BaseClient):
         base_url: str | None = None,
         timeout: float = 30.0,
         max_retries: int = 2,
+        headers: dict[str, str] | None = None,
     ) -> None:
-        super().__init__(api_key, base_url=base_url, timeout=timeout, max_retries=max_retries)
+        super().__init__(api_key, base_url=base_url, timeout=timeout, max_retries=max_retries, headers=headers)
         self._client = httpx.Client(timeout=timeout)
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
@@ -347,6 +376,27 @@ class Meshive(_BaseClient):
         while True:
             try:
                 response = self._client.get(url, params=params, headers=headers)
+            except _RETRY_EXCEPTIONS:
+                delay = self._retry_delay(attempt)
+                if delay is None:
+                    raise
+            else:
+                delay = self._retry_delay(attempt, response)
+                if delay is None:
+                    return self._process(response)
+            time.sleep(delay)
+            attempt += 1
+
+    def _send(self, method: str, path: str, *, params: dict[str, Any] | None = None,
+              json: dict[str, Any] | None = None, idempotency_key: str | None = None) -> Any:
+        """쓰기 요청. Idempotency-Key 를 붙여 보내므로 재시도해도 서버가 첫 응답을 재생한다(이중 생성 없음)."""
+        url = self._url(path)
+        headers = self._build_headers()
+        headers["Idempotency-Key"] = idempotency_key or str(uuid.uuid4())
+        attempt = 0
+        while True:
+            try:
+                response = self._client.request(method, url, params=params, json=json, headers=headers)
             except _RETRY_EXCEPTIONS:
                 delay = self._retry_delay(attempt)
                 if delay is None:
@@ -514,6 +564,177 @@ class Meshive(_BaseClient):
         """managed 자산 저장량/월 예상 비용/크레딧 차단 상태 (GET /assets/storage-summary?workspace=)."""
         return AssetStorage.from_dict(self._get("/assets/storage-summary", params={"workspace": workspace}))
 
+    # --- 쓰기: 파드 (write 스코프) ---------------------------------------------------
+
+    def estimate_pod(self, name: str, template_id: int, *, workspace: str, gpu_model: str | None = None,
+                     gpu_count: int = 1, gpu_vram_gb: int | None = None, rental_type: str = "demand",
+                     vcpu: int | None = None, ram_gb: int | None = None, disk_gb: int | None = None,
+                     volumes: Any = None, env: dict[str, str] | None = None, secret_keys: Iterable[str] | None = None,
+                     ports: Any = None, command: str | None = None, internet_premium: bool = False,
+                     uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
+                     max_price_per_hour: Any = None) -> PodEstimate:
+        """파드 견적 — 아무것도 만들지 않는다(read 스코프로 충분). create_pod 와 인자가 같다."""
+        body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
+                               rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, disk_gb=disk_gb, volumes=volumes,
+                               env=env, secret_keys=secret_keys, ports=ports, command=command,
+                               internet_premium=internet_premium, uptime_premium=uptime_premium,
+                               cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour)
+        return PodEstimate.from_dict(self._send("POST", "/pods/estimate",
+                                                 params={"workspace": _query_value(workspace, "workspace")}, json=body))
+
+    def create_pod(self, name: str, template_id: int, *, workspace: str, gpu_model: str | None = None,
+                   gpu_count: int = 1, gpu_vram_gb: int | None = None, rental_type: str = "demand",
+                   vcpu: int | None = None, ram_gb: int | None = None, disk_gb: int | None = None,
+                   volumes: Any = None, env: dict[str, str] | None = None, secret_keys: Iterable[str] | None = None,
+                   ports: Any = None, command: str | None = None, internet_premium: bool = False,
+                   uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
+                   max_price_per_hour: Any = None, idempotency_key: str | None = None) -> PodCreated:
+        """파드 생성(202 수락). 시간당 요금이 발생한다 — 먼저 estimate_pod 로 가격을 확인하고,
+        max_price_per_hour 를 주면 견적이 그보다 높을 때 서버가 거절한다(ConflictError 'Price Exceeds Cap')."""
+        body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
+                               rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, disk_gb=disk_gb, volumes=volumes,
+                               env=env, secret_keys=secret_keys, ports=ports, command=command,
+                               internet_premium=internet_premium, uptime_premium=uptime_premium,
+                               cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour)
+        return PodCreated.from_dict(self._send("POST", "/pods", params={"workspace": _query_value(workspace, "workspace")},
+                                                json=body, idempotency_key=idempotency_key))
+
+    def stop_pod(self, pod_name: str, workspace: str, *, idempotency_key: str | None = None) -> ResourceAction:
+        """파드 정지(replicas=0). 파드 과금은 멈추고 스토리지 과금은 계속된다."""
+        data = self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/stop",
+                             params={"workspace": _query_value(workspace, "workspace")}, idempotency_key=idempotency_key)
+        return ResourceAction.from_dict(data, resource="pod")
+
+    def start_pod(self, pod_name: str, workspace: str, *, placement: str = "same_node",
+                  idempotency_key: str | None = None) -> ResourceAction:
+        """정지된 파드 시작. placement: same_node(원래 노드) | any_node(다른 노드로 재배치, 로컬 스토리지는 남음)."""
+        data = self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/start",
+                             params={"workspace": _query_value(workspace, "workspace"), "placement": _write.placement(placement)},
+                             idempotency_key=idempotency_key)
+        return ResourceAction.from_dict(data, resource="pod")
+
+    def restart_pod(self, pod_name: str, workspace: str, *, idempotency_key: str | None = None) -> ResourceAction:
+        data = self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/restart",
+                             params={"workspace": _query_value(workspace, "workspace")}, idempotency_key=idempotency_key)
+        return ResourceAction.from_dict(data, resource="pod")
+
+    def delete_pod(self, pod_name: str, workspace: str, *, delete_local_storages: Iterable[str] | None = None,
+                   idempotency_key: str | None = None) -> ResourceAction:
+        """파드 삭제. 로컬(hostPath) 스토리지는 delete_local_storages 에 pv_name 을 적은 것만 같이 삭제된다."""
+        data = self._send("DELETE", f"/pods/{_path_segment(pod_name, 'pod_name')}",
+                             params=_write.delete_pod_params(_query_value(workspace, "workspace"), delete_local_storages),
+                             idempotency_key=idempotency_key)
+        return ResourceAction.from_dict(data, resource="pod")
+
+    # --- 쓰기: 스토리지 ---------------------------------------------------------------
+
+    def estimate_storage(self, name: str, size_gb: int, *, workspace: str, storage_type: str = "nfs",
+                         disk_type: str = "NVMe", encrypted: bool = False, region: str | None = None,
+                         max_price_per_hour: Any = None) -> StorageEstimate:
+        body = _write.storage_body(name, size_gb, storage_type=storage_type, disk_type=disk_type, encrypted=encrypted,
+                                   region=region, max_price_per_hour=max_price_per_hour)
+        return StorageEstimate.from_dict(self._send("POST", "/storages/estimate",
+                                                     params={"workspace": _query_value(workspace, "workspace")}, json=body))
+
+    def create_storage(self, name: str, size_gb: int, *, workspace: str, storage_type: str = "nfs",
+                       disk_type: str = "NVMe", encrypted: bool = False, region: str | None = None,
+                       max_price_per_hour: Any = None, idempotency_key: str | None = None) -> StorageCreated:
+        """스토리지(PV) 생성(202). 존재하는 동안 용량 기준으로 시간당 과금된다."""
+        body = _write.storage_body(name, size_gb, storage_type=storage_type, disk_type=disk_type, encrypted=encrypted,
+                                   region=region, max_price_per_hour=max_price_per_hour)
+        return StorageCreated.from_dict(self._send("POST", "/storages", params={"workspace": _query_value(workspace, "workspace")},
+                                                    json=body, idempotency_key=idempotency_key))
+
+    def delete_storage(self, storage_name: str, workspace: str, *, idempotency_key: str | None = None) -> ResourceAction:
+        """스토리지 삭제. 사용자 파드가 마운트 중이면 ConflictError('Storage In Use', raw.detail.linkedPods)."""
+        data = self._send("DELETE", f"/storages/{_path_segment(storage_name, 'storage_name')}",
+                             params={"workspace": _query_value(workspace, "workspace")}, idempotency_key=idempotency_key)
+        return ResourceAction.from_dict(data, resource="storage")
+
+    # --- 쓰기: 서빙 -----------------------------------------------------------------
+
+    def deploy_serving(self, model_registration_id: int, *, workspace: str, price_cap_per_hour: Any,
+                       min_replicas: int = 1, max_replicas: int = 3, autoscale: bool = True,
+                       max_context_tokens: int | None = None, share_idle_capacity: bool = False,
+                       idempotency_key: str | None = None) -> ResourceAction:
+        """등록된 모델(registration id) 을 서빙으로 배포(201). 비용 상한 = price_cap_per_hour × max_replicas."""
+        body = _write.serving_deploy_body(model_registration_id, price_cap_per_hour=price_cap_per_hour,
+                                          min_replicas=min_replicas, max_replicas=max_replicas, autoscale=autoscale,
+                                          max_context_tokens=max_context_tokens, share_idle_capacity=share_idle_capacity)
+        data = self._send("POST", "/servings", params={"workspace": _query_value(workspace, "workspace")}, json=body,
+                             idempotency_key=idempotency_key)
+        return ResourceAction.from_dict(data, resource="serving")
+
+    def scale_serving(self, serving_id: int | str, *, min_replicas: int | None = None, max_replicas: int | None = None,
+                      autoscale: bool | None = None, price_cap_per_hour: Any = None,
+                      idempotency_key: str | None = None) -> ResourceAction:
+        body = _write.serving_scale_body(min_replicas=min_replicas, max_replicas=max_replicas, autoscale=autoscale,
+                                         price_cap_per_hour=price_cap_per_hour)
+        data = self._send("PATCH", f"/servings/{_int_segment(serving_id, 'serving_id')}/scale", json=body,
+                             idempotency_key=idempotency_key)
+        return ResourceAction.from_dict(data, resource="serving")
+
+    def pause_serving(self, serving_id: int | str, *, paused: bool = True,
+                      idempotency_key: str | None = None) -> ResourceAction:
+        """paused=True 로 일시정지, False 로 재개."""
+        data = self._send("PATCH", f"/servings/{_int_segment(serving_id, 'serving_id')}/pause",
+                             json={"paused": bool(paused)}, idempotency_key=idempotency_key)
+        return ResourceAction.from_dict(data, resource="serving")
+
+    def delete_serving(self, serving_id: int | str, *, idempotency_key: str | None = None) -> ResourceAction:
+        data = self._send("DELETE", f"/servings/{_int_segment(serving_id, 'serving_id')}", idempotency_key=idempotency_key)
+        return ResourceAction.from_dict(data, resource="serving")
+
+    # --- 쓰기: 태스크 ----------------------------------------------------------------
+
+    def estimate_task(self, name: str, script: str, *, workspace: str, image: str | None = None,
+                      template_id: int | None = None, requirements: str | None = None,
+                      env: dict[str, str] | None = None, secret_keys: Iterable[str] | None = None,
+                      args: Iterable[str] | None = None, gpu_model: str | None = None, gpu_count: int | None = None,
+                      gpu_vram_gb: int | None = None, cpu_preset: str | None = None, max_duration: int = 3600,
+                      webhook_url: str | None = None, input_assets: Any = None,
+                      max_price_per_hour: Any = None) -> TaskEstimate:
+        body = _write.task_body(name, script, image=image, template_id=template_id, requirements=requirements, env=env,
+                                secret_keys=secret_keys, args=args, gpu_model=gpu_model, gpu_count=gpu_count,
+                                gpu_vram_gb=gpu_vram_gb, cpu_preset=cpu_preset, max_duration=max_duration,
+                                webhook_url=webhook_url, input_assets=input_assets, max_price_per_hour=max_price_per_hour)
+        return TaskEstimate.from_dict(self._send("POST", "/tasks/estimate",
+                                                  params={"workspace": _query_value(workspace, "workspace")}, json=body))
+
+    def submit_task(self, name: str, script: str, *, workspace: str, image: str | None = None,
+                    template_id: int | None = None, requirements: str | None = None,
+                    env: dict[str, str] | None = None, secret_keys: Iterable[str] | None = None,
+                    args: Iterable[str] | None = None, gpu_model: str | None = None, gpu_count: int | None = None,
+                    gpu_vram_gb: int | None = None, cpu_preset: str | None = None, max_duration: int = 3600,
+                    webhook_url: str | None = None, input_assets: Any = None, max_price_per_hour: Any = None,
+                    idempotency_key: str | None = None) -> TaskSubmitted:
+        """단발 태스크 제출(202). 로그를 남기려면 스크립트에서 print(..., flush=True) 를 쓴다(버퍼링 주의)."""
+        body = _write.task_body(name, script, image=image, template_id=template_id, requirements=requirements, env=env,
+                                secret_keys=secret_keys, args=args, gpu_model=gpu_model, gpu_count=gpu_count,
+                                gpu_vram_gb=gpu_vram_gb, cpu_preset=cpu_preset, max_duration=max_duration,
+                                webhook_url=webhook_url, input_assets=input_assets, max_price_per_hour=max_price_per_hour)
+        return TaskSubmitted.from_dict(self._send("POST", "/tasks", params={"workspace": _query_value(workspace, "workspace")},
+                                                   json=body, idempotency_key=idempotency_key))
+
+    def stop_task(self, task_id: str, *, idempotency_key: str | None = None) -> ResourceAction:
+        data = self._send("POST", f"/tasks/{_path_segment(task_id, 'task_id')}/stop", idempotency_key=idempotency_key)
+        return ResourceAction.from_dict(data, resource="task")
+
+    # --- 로그 (read 스코프) -----------------------------------------------------------
+
+    def get_pod_logs(self, pod_name: str, workspace: str, *, tail: int = 200, container: str | None = None,
+                     wait: float | None = None) -> Logs:
+        """파드 로그 마지막 tail 줄. 버퍼가 비어 있으면 서버가 로그 워처를 깨워 최대 wait 초(기본 8) 기다린다."""
+        params = _write.logs_params(tail=tail, wait=wait, container=container)
+        params["workspace"] = _query_value(workspace, "workspace")
+        return Logs.from_dict(self._get(f"/pods/{_path_segment(pod_name, 'pod_name')}/logs", params))
+
+    def get_task_logs(self, task_id: str, *, tail: int = 200, wait: float | None = None,
+                      cursor: int | None = None) -> Logs:
+        """태스크 로그 마지막 tail 줄 (내부 태스크). 외부 provider 태스크는 cursor 로 증분 조회."""
+        params = _write.logs_params(tail=tail, wait=wait, cursor=cursor)
+        return Logs.from_dict(self._get(f"/tasks/{_path_segment(task_id, 'task_id')}/logs", params))
+
     def close(self) -> None:
         self._client.close()
 
@@ -541,8 +762,9 @@ class AsyncMeshive(_BaseClient):
         base_url: str | None = None,
         timeout: float = 30.0,
         max_retries: int = 2,
+        headers: dict[str, str] | None = None,
     ) -> None:
-        super().__init__(api_key, base_url=base_url, timeout=timeout, max_retries=max_retries)
+        super().__init__(api_key, base_url=base_url, timeout=timeout, max_retries=max_retries, headers=headers)
         self._client = httpx.AsyncClient(timeout=timeout)
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
@@ -552,6 +774,27 @@ class AsyncMeshive(_BaseClient):
         while True:
             try:
                 response = await self._client.get(url, params=params, headers=headers)
+            except _RETRY_EXCEPTIONS:
+                delay = self._retry_delay(attempt)
+                if delay is None:
+                    raise
+            else:
+                delay = self._retry_delay(attempt, response)
+                if delay is None:
+                    return self._process(response)
+            await asyncio.sleep(delay)
+            attempt += 1
+
+    async def _send(self, method: str, path: str, *, params: dict[str, Any] | None = None,
+              json: dict[str, Any] | None = None, idempotency_key: str | None = None) -> Any:
+        """쓰기 요청. Idempotency-Key 를 붙여 보내므로 재시도해도 서버가 첫 응답을 재생한다(이중 생성 없음)."""
+        url = self._url(path)
+        headers = self._build_headers()
+        headers["Idempotency-Key"] = idempotency_key or str(uuid.uuid4())
+        attempt = 0
+        while True:
+            try:
+                response = await self._client.request(method, url, params=params, json=json, headers=headers)
             except _RETRY_EXCEPTIONS:
                 delay = self._retry_delay(attempt)
                 if delay is None:
@@ -717,6 +960,177 @@ class AsyncMeshive(_BaseClient):
         """managed 자산 저장량/월 예상 비용/크레딧 차단 상태 (GET /assets/storage-summary?workspace=)."""
         data = await self._get("/assets/storage-summary", params={"workspace": workspace})
         return AssetStorage.from_dict(data)
+
+    # --- 쓰기: 파드 (write 스코프) ---------------------------------------------------
+
+    async def estimate_pod(self, name: str, template_id: int, *, workspace: str, gpu_model: str | None = None,
+                     gpu_count: int = 1, gpu_vram_gb: int | None = None, rental_type: str = "demand",
+                     vcpu: int | None = None, ram_gb: int | None = None, disk_gb: int | None = None,
+                     volumes: Any = None, env: dict[str, str] | None = None, secret_keys: Iterable[str] | None = None,
+                     ports: Any = None, command: str | None = None, internet_premium: bool = False,
+                     uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
+                     max_price_per_hour: Any = None) -> PodEstimate:
+        """파드 견적 — 아무것도 만들지 않는다(read 스코프로 충분). create_pod 와 인자가 같다."""
+        body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
+                               rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, disk_gb=disk_gb, volumes=volumes,
+                               env=env, secret_keys=secret_keys, ports=ports, command=command,
+                               internet_premium=internet_premium, uptime_premium=uptime_premium,
+                               cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour)
+        return PodEstimate.from_dict(await self._send("POST", "/pods/estimate",
+                                                 params={"workspace": _query_value(workspace, "workspace")}, json=body))
+
+    async def create_pod(self, name: str, template_id: int, *, workspace: str, gpu_model: str | None = None,
+                   gpu_count: int = 1, gpu_vram_gb: int | None = None, rental_type: str = "demand",
+                   vcpu: int | None = None, ram_gb: int | None = None, disk_gb: int | None = None,
+                   volumes: Any = None, env: dict[str, str] | None = None, secret_keys: Iterable[str] | None = None,
+                   ports: Any = None, command: str | None = None, internet_premium: bool = False,
+                   uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
+                   max_price_per_hour: Any = None, idempotency_key: str | None = None) -> PodCreated:
+        """파드 생성(202 수락). 시간당 요금이 발생한다 — 먼저 estimate_pod 로 가격을 확인하고,
+        max_price_per_hour 를 주면 견적이 그보다 높을 때 서버가 거절한다(ConflictError 'Price Exceeds Cap')."""
+        body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
+                               rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, disk_gb=disk_gb, volumes=volumes,
+                               env=env, secret_keys=secret_keys, ports=ports, command=command,
+                               internet_premium=internet_premium, uptime_premium=uptime_premium,
+                               cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour)
+        return PodCreated.from_dict(await self._send("POST", "/pods", params={"workspace": _query_value(workspace, "workspace")},
+                                                json=body, idempotency_key=idempotency_key))
+
+    async def stop_pod(self, pod_name: str, workspace: str, *, idempotency_key: str | None = None) -> ResourceAction:
+        """파드 정지(replicas=0). 파드 과금은 멈추고 스토리지 과금은 계속된다."""
+        data = await self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/stop",
+                             params={"workspace": _query_value(workspace, "workspace")}, idempotency_key=idempotency_key)
+        return ResourceAction.from_dict(data, resource="pod")
+
+    async def start_pod(self, pod_name: str, workspace: str, *, placement: str = "same_node",
+                  idempotency_key: str | None = None) -> ResourceAction:
+        """정지된 파드 시작. placement: same_node(원래 노드) | any_node(다른 노드로 재배치, 로컬 스토리지는 남음)."""
+        data = await self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/start",
+                             params={"workspace": _query_value(workspace, "workspace"), "placement": _write.placement(placement)},
+                             idempotency_key=idempotency_key)
+        return ResourceAction.from_dict(data, resource="pod")
+
+    async def restart_pod(self, pod_name: str, workspace: str, *, idempotency_key: str | None = None) -> ResourceAction:
+        data = await self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/restart",
+                             params={"workspace": _query_value(workspace, "workspace")}, idempotency_key=idempotency_key)
+        return ResourceAction.from_dict(data, resource="pod")
+
+    async def delete_pod(self, pod_name: str, workspace: str, *, delete_local_storages: Iterable[str] | None = None,
+                   idempotency_key: str | None = None) -> ResourceAction:
+        """파드 삭제. 로컬(hostPath) 스토리지는 delete_local_storages 에 pv_name 을 적은 것만 같이 삭제된다."""
+        data = await self._send("DELETE", f"/pods/{_path_segment(pod_name, 'pod_name')}",
+                             params=_write.delete_pod_params(_query_value(workspace, "workspace"), delete_local_storages),
+                             idempotency_key=idempotency_key)
+        return ResourceAction.from_dict(data, resource="pod")
+
+    # --- 쓰기: 스토리지 ---------------------------------------------------------------
+
+    async def estimate_storage(self, name: str, size_gb: int, *, workspace: str, storage_type: str = "nfs",
+                         disk_type: str = "NVMe", encrypted: bool = False, region: str | None = None,
+                         max_price_per_hour: Any = None) -> StorageEstimate:
+        body = _write.storage_body(name, size_gb, storage_type=storage_type, disk_type=disk_type, encrypted=encrypted,
+                                   region=region, max_price_per_hour=max_price_per_hour)
+        return StorageEstimate.from_dict(await self._send("POST", "/storages/estimate",
+                                                     params={"workspace": _query_value(workspace, "workspace")}, json=body))
+
+    async def create_storage(self, name: str, size_gb: int, *, workspace: str, storage_type: str = "nfs",
+                       disk_type: str = "NVMe", encrypted: bool = False, region: str | None = None,
+                       max_price_per_hour: Any = None, idempotency_key: str | None = None) -> StorageCreated:
+        """스토리지(PV) 생성(202). 존재하는 동안 용량 기준으로 시간당 과금된다."""
+        body = _write.storage_body(name, size_gb, storage_type=storage_type, disk_type=disk_type, encrypted=encrypted,
+                                   region=region, max_price_per_hour=max_price_per_hour)
+        return StorageCreated.from_dict(await self._send("POST", "/storages", params={"workspace": _query_value(workspace, "workspace")},
+                                                    json=body, idempotency_key=idempotency_key))
+
+    async def delete_storage(self, storage_name: str, workspace: str, *, idempotency_key: str | None = None) -> ResourceAction:
+        """스토리지 삭제. 사용자 파드가 마운트 중이면 ConflictError('Storage In Use', raw.detail.linkedPods)."""
+        data = await self._send("DELETE", f"/storages/{_path_segment(storage_name, 'storage_name')}",
+                             params={"workspace": _query_value(workspace, "workspace")}, idempotency_key=idempotency_key)
+        return ResourceAction.from_dict(data, resource="storage")
+
+    # --- 쓰기: 서빙 -----------------------------------------------------------------
+
+    async def deploy_serving(self, model_registration_id: int, *, workspace: str, price_cap_per_hour: Any,
+                       min_replicas: int = 1, max_replicas: int = 3, autoscale: bool = True,
+                       max_context_tokens: int | None = None, share_idle_capacity: bool = False,
+                       idempotency_key: str | None = None) -> ResourceAction:
+        """등록된 모델(registration id) 을 서빙으로 배포(201). 비용 상한 = price_cap_per_hour × max_replicas."""
+        body = _write.serving_deploy_body(model_registration_id, price_cap_per_hour=price_cap_per_hour,
+                                          min_replicas=min_replicas, max_replicas=max_replicas, autoscale=autoscale,
+                                          max_context_tokens=max_context_tokens, share_idle_capacity=share_idle_capacity)
+        data = await self._send("POST", "/servings", params={"workspace": _query_value(workspace, "workspace")}, json=body,
+                             idempotency_key=idempotency_key)
+        return ResourceAction.from_dict(data, resource="serving")
+
+    async def scale_serving(self, serving_id: int | str, *, min_replicas: int | None = None, max_replicas: int | None = None,
+                      autoscale: bool | None = None, price_cap_per_hour: Any = None,
+                      idempotency_key: str | None = None) -> ResourceAction:
+        body = _write.serving_scale_body(min_replicas=min_replicas, max_replicas=max_replicas, autoscale=autoscale,
+                                         price_cap_per_hour=price_cap_per_hour)
+        data = await self._send("PATCH", f"/servings/{_int_segment(serving_id, 'serving_id')}/scale", json=body,
+                             idempotency_key=idempotency_key)
+        return ResourceAction.from_dict(data, resource="serving")
+
+    async def pause_serving(self, serving_id: int | str, *, paused: bool = True,
+                      idempotency_key: str | None = None) -> ResourceAction:
+        """paused=True 로 일시정지, False 로 재개."""
+        data = await self._send("PATCH", f"/servings/{_int_segment(serving_id, 'serving_id')}/pause",
+                             json={"paused": bool(paused)}, idempotency_key=idempotency_key)
+        return ResourceAction.from_dict(data, resource="serving")
+
+    async def delete_serving(self, serving_id: int | str, *, idempotency_key: str | None = None) -> ResourceAction:
+        data = await self._send("DELETE", f"/servings/{_int_segment(serving_id, 'serving_id')}", idempotency_key=idempotency_key)
+        return ResourceAction.from_dict(data, resource="serving")
+
+    # --- 쓰기: 태스크 ----------------------------------------------------------------
+
+    async def estimate_task(self, name: str, script: str, *, workspace: str, image: str | None = None,
+                      template_id: int | None = None, requirements: str | None = None,
+                      env: dict[str, str] | None = None, secret_keys: Iterable[str] | None = None,
+                      args: Iterable[str] | None = None, gpu_model: str | None = None, gpu_count: int | None = None,
+                      gpu_vram_gb: int | None = None, cpu_preset: str | None = None, max_duration: int = 3600,
+                      webhook_url: str | None = None, input_assets: Any = None,
+                      max_price_per_hour: Any = None) -> TaskEstimate:
+        body = _write.task_body(name, script, image=image, template_id=template_id, requirements=requirements, env=env,
+                                secret_keys=secret_keys, args=args, gpu_model=gpu_model, gpu_count=gpu_count,
+                                gpu_vram_gb=gpu_vram_gb, cpu_preset=cpu_preset, max_duration=max_duration,
+                                webhook_url=webhook_url, input_assets=input_assets, max_price_per_hour=max_price_per_hour)
+        return TaskEstimate.from_dict(await self._send("POST", "/tasks/estimate",
+                                                  params={"workspace": _query_value(workspace, "workspace")}, json=body))
+
+    async def submit_task(self, name: str, script: str, *, workspace: str, image: str | None = None,
+                    template_id: int | None = None, requirements: str | None = None,
+                    env: dict[str, str] | None = None, secret_keys: Iterable[str] | None = None,
+                    args: Iterable[str] | None = None, gpu_model: str | None = None, gpu_count: int | None = None,
+                    gpu_vram_gb: int | None = None, cpu_preset: str | None = None, max_duration: int = 3600,
+                    webhook_url: str | None = None, input_assets: Any = None, max_price_per_hour: Any = None,
+                    idempotency_key: str | None = None) -> TaskSubmitted:
+        """단발 태스크 제출(202). 로그를 남기려면 스크립트에서 print(..., flush=True) 를 쓴다(버퍼링 주의)."""
+        body = _write.task_body(name, script, image=image, template_id=template_id, requirements=requirements, env=env,
+                                secret_keys=secret_keys, args=args, gpu_model=gpu_model, gpu_count=gpu_count,
+                                gpu_vram_gb=gpu_vram_gb, cpu_preset=cpu_preset, max_duration=max_duration,
+                                webhook_url=webhook_url, input_assets=input_assets, max_price_per_hour=max_price_per_hour)
+        return TaskSubmitted.from_dict(await self._send("POST", "/tasks", params={"workspace": _query_value(workspace, "workspace")},
+                                                   json=body, idempotency_key=idempotency_key))
+
+    async def stop_task(self, task_id: str, *, idempotency_key: str | None = None) -> ResourceAction:
+        data = await self._send("POST", f"/tasks/{_path_segment(task_id, 'task_id')}/stop", idempotency_key=idempotency_key)
+        return ResourceAction.from_dict(data, resource="task")
+
+    # --- 로그 (read 스코프) -----------------------------------------------------------
+
+    async def get_pod_logs(self, pod_name: str, workspace: str, *, tail: int = 200, container: str | None = None,
+                     wait: float | None = None) -> Logs:
+        """파드 로그 마지막 tail 줄. 버퍼가 비어 있으면 서버가 로그 워처를 깨워 최대 wait 초(기본 8) 기다린다."""
+        params = _write.logs_params(tail=tail, wait=wait, container=container)
+        params["workspace"] = _query_value(workspace, "workspace")
+        return Logs.from_dict(await self._get(f"/pods/{_path_segment(pod_name, 'pod_name')}/logs", params))
+
+    async def get_task_logs(self, task_id: str, *, tail: int = 200, wait: float | None = None,
+                      cursor: int | None = None) -> Logs:
+        """태스크 로그 마지막 tail 줄 (내부 태스크). 외부 provider 태스크는 cursor 로 증분 조회."""
+        params = _write.logs_params(tail=tail, wait=wait, cursor=cursor)
+        return Logs.from_dict(await self._get(f"/tasks/{_path_segment(task_id, 'task_id')}/logs", params))
 
     async def close(self) -> None:
         await self._client.aclose()

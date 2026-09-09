@@ -913,3 +913,174 @@ class AssetStorage:
             paid_balance_available=bool(d.get("paidBalanceAvailable", True)),
             raw=d,
         )
+
+
+# =============================================================================
+# 쓰기 표면 (0.1.0) — 견적·수락 응답·로그
+# =============================================================================
+
+@dataclass
+class PodEstimate:
+    """POST /v1/sdk/pods/estimate 응답 — 파드 시간당 견적(추정). 청구가는 착지 노드에서 확정된다."""
+
+    price_per_hour: str            # USD/h (문자열, 정규화)
+    breakdown: dict                # {"gpu": "...", "cpu_extra": "...", "ram_extra": "...", ...}
+    resources: dict                # gpu_model/vram_gb/gpu_count/vcpu/ram_gb/disk_gb/rental_type ...
+    availability: dict             # available_gpus/max_gpus_per_pod/machine_count
+    template: dict                 # id/name/image/hardware_type
+    volumes: list = field(default_factory=list)
+    note: str = ""
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PodEstimate":
+        return cls(price_per_hour=str(d.get("pricePerHourUsd", "0")), breakdown=d.get("breakdown") or {},
+                   resources=d.get("resources") or {}, availability=d.get("availability") or {},
+                   template=d.get("template") or {}, volumes=list(d.get("volumes") or []),
+                   note=d.get("note") or "", raw=d)
+
+
+@dataclass
+class PodCreated:
+    """POST /v1/sdk/pods 응답 (202). pod_name 은 K8sCS 가 확정하므로 생성 직후에는 None —
+    `list_pods()` 에서 user_alias == name 인 파드로 찾거나 `wait_for_pod_by_name()` 을 쓴다."""
+
+    name: str
+    workspace: str
+    transaction_id: int | str | None
+    estimate: PodEstimate
+    pod_name: str | None = None
+    accepted: bool = True
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PodCreated":
+        return cls(name=d.get("name", ""), workspace=d.get("workspace", ""), transaction_id=d.get("transactionId"),
+                   estimate=PodEstimate.from_dict(d.get("estimate") or {}), pod_name=d.get("podName"),
+                   accepted=bool(d.get("accepted", True)), raw=d)
+
+
+@dataclass
+class ResourceAction:
+    """정지/시작/재시작/삭제/스케일 등 수락 응답. 상태 변화는 비동기 — 조회 메서드로 폴링한다."""
+
+    resource: str                  # pod | storage | serving | task
+    id: str                        # pod_name / pv_name / serving id / task id
+    action: str
+    workspace: str | None = None
+    accepted: bool = True
+    result: object = None          # 위임된 웹 핸들러의 반환값(트랜잭션 id 등)
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict, *, resource: str | None = None) -> "ResourceAction":
+        return cls(resource=d.get("resource") or resource or "", id=str(d.get("id") or d.get("podName") or ""),
+                   action=d.get("action", ""), workspace=d.get("workspace"), accepted=bool(d.get("accepted", True)),
+                   result=d.get("result"), raw=d)
+
+
+@dataclass
+class StorageEstimate:
+    """POST /v1/sdk/storages/estimate 응답."""
+
+    price_per_hour: str
+    price_per_gb_month: str
+    size_gb: int
+    storage_type: str
+    max_size_gb: int
+    note: str = ""
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "StorageEstimate":
+        return cls(price_per_hour=str(d.get("pricePerHourUsd", "0")), price_per_gb_month=str(d.get("pricePerGbMonthUsd", "0")),
+                   size_gb=_as_int(d.get("sizeGb")), storage_type=str(d.get("storageType", "")),
+                   max_size_gb=_as_int(d.get("maxSizeGb")), note=d.get("note") or "", raw=d)
+
+
+@dataclass
+class StorageCreated:
+    """POST /v1/sdk/storages 응답 (202). pv_name 은 생성 후 `list_storages()` 에서 user_alias == name 으로 찾는다."""
+
+    name: str
+    workspace: str
+    transaction_id: int | str | None
+    estimate: StorageEstimate
+    pv_name: str | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "StorageCreated":
+        return cls(name=d.get("name", ""), workspace=d.get("workspace", ""), transaction_id=d.get("transactionId"),
+                   estimate=StorageEstimate.from_dict(d.get("estimate") or {}), pv_name=d.get("pvName"), raw=d)
+
+
+@dataclass
+class TaskEstimate:
+    """POST /v1/sdk/tasks/estimate 응답. CPU 프리셋 태스크는 가격이 착지 노드에 따라 달라 None."""
+
+    price_per_hour: str | None
+    max_cost: str | None           # price_per_hour × max_duration (상한)
+    max_duration: int
+    resources: dict
+    note: str = ""
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TaskEstimate":
+        price = d.get("pricePerHourUsd")
+        cost = d.get("maxCostUsd")
+        return cls(price_per_hour=None if price is None else str(price), max_cost=None if cost is None else str(cost),
+                   max_duration=_as_int(d.get("maxDurationS")), resources=d.get("resources") or {},
+                   note=d.get("note") or "", raw=d)
+
+
+@dataclass
+class TaskSubmitted:
+    """POST /v1/sdk/tasks 응답 (202) — 제출된 태스크 + 견적."""
+
+    task: Task
+    estimate: TaskEstimate
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TaskSubmitted":
+        return cls(task=Task.from_dict(d.get("task") or {}), estimate=TaskEstimate.from_dict(d.get("estimate") or {}),
+                   raw=d)
+
+
+@dataclass
+class LogLine:
+    line: str
+    ts: str | None = None
+
+
+@dataclass
+class Logs:
+    """GET /v1/sdk/pods/{pod}/logs · /tasks/{id}/logs 응답 — 마지막 N줄."""
+
+    pod_name: str
+    workspace: str
+    source: str                    # live | archive | external | none
+    lines: list[LogLine]
+    count: int
+    truncated: bool = False
+    note: str | None = None
+    container: str | None = None
+    task_id: str | None = None
+    finished: bool | None = None   # 태스크 로그에서만
+    next_cursor: int | None = None # 외부 provider 태스크에서만
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def text(self) -> str:
+        return "\n".join(item.line for item in self.lines)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Logs":
+        lines = [LogLine(line=str(item.get("line", "")), ts=item.get("ts")) for item in d.get("lines") or []
+                 if isinstance(item, dict)]
+        return cls(pod_name=d.get("podName", ""), workspace=d.get("workspace", ""), source=str(d.get("source", "")),
+                   lines=lines, count=_as_int(d.get("count")) or len(lines), truncated=bool(d.get("truncated", False)),
+                   note=d.get("note"), container=d.get("container"), task_id=d.get("taskId"),
+                   finished=d.get("finished"), next_cursor=d.get("nextCursor"), raw=d)

@@ -60,6 +60,16 @@ class NotFoundError(MeshiveAPIError):
     """404 — 리소스(파드/유저 등) 없음."""
 
 
+class InsufficientCreditError(MeshiveAPIError):
+    """402 — 유료 크레딧 잔액 부족 (파드/스토리지/태스크 생성·시작 시)."""
+
+
+class ConflictError(MeshiveAPIError):
+    """409 — 현재 상태와 충돌: 재고 없음(No Capacity), 이름 중복(Name Taken), 가격 캡 초과(Price Exceeds Cap),
+    스토리지 사용 중(Storage In Use), 같은 Idempotency-Key 요청 처리 중(Request In Progress) 등.
+    `title` 로 종류를 구분하고, `raw["detail"]` 에 availability/pricePerHourUsd 같은 부가 정보가 있다."""
+
+
 class RateLimitError(MeshiveAPIError):
     """429 — 유저 단위 rate limit 초과. retry_after(초) 가 있으면 노출."""
 

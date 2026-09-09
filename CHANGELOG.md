@@ -12,6 +12,34 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## v0.1.0
+
+The SDK and CLI can now **create and manage resources**, not just read them. This needs an API key issued with the
+**write** scope (console → workspace Settings → Secret → "Read & write"; such keys always expire, 30 days by default).
+Read-only keys keep working for everything that existed before.
+
+### New in the SDK (sync and async)
+
+- **Pods**: `estimate_pod()` shows the hourly price before you spend anything; `create_pod()` takes a template ID, a GPU model
+  and count (or nothing for a CPU pod), optional vCPU/RAM/disk, existing storage volumes, env vars, ports and a price cap.
+  Then `stop_pod()`, `start_pod()`, `restart_pod()`, `delete_pod()`.
+- **Storage**: `estimate_storage()`, `create_storage()`, `delete_storage()`.
+- **Serverless**: `deploy_serving()`, `scale_serving()`, `pause_serving()`, `delete_serving()`; `estimate_task()`,
+  `submit_task()`, `stop_task()`.
+- **Logs**: `get_pod_logs()` and `get_task_logs()` return the last N lines (up to 1000). If nothing is buffered yet the server
+  starts a log watcher and waits briefly. Tip: in task scripts use `print(..., flush=True)` so output is captured.
+- **Safety**: every write request carries an `Idempotency-Key`, so retries after a timeout never create a second pod.
+  Pass `max_price_per_hour=` to have the server refuse anything more expensive than you expect.
+- New exceptions: `ConflictError` (no capacity, name taken, price above cap, storage in use) and `InsufficientCreditError`.
+- `Meshive(headers={...})` adds custom headers to every request (used by the Meshive MCP server).
+
+### New in the CLI
+
+- `pod-create`, `pod-stop`, `pod-start`, `pod-restart`, `pod-delete`, `storage-create`, `storage-delete`, `serving-deploy`,
+  `serving-scale`, `serving-pause`, `serving-resume`, `serving-delete`, `task-submit`, `task-stop`, `logs`, `task-logs`.
+- Commands that spend credit or delete something show the estimate and ask for confirmation; pass `--yes` in scripts,
+  or `--estimate` to only see the price.
+
 ## v0.0.7
 
 Many more read-only views of your account are now available from Python and the terminal.

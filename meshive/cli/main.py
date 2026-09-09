@@ -8,6 +8,7 @@ from collections.abc import Callable
 import httpx
 
 from . import _format as fmt
+from . import _write as write_cli
 from .. import _config, _credentials
 from .._version import __version__
 from .._client import Meshive
@@ -84,6 +85,13 @@ def build_parser() -> argparse.ArgumentParser:
             "  meshive machines               List your machines (as a host)\n"
             "  meshive machine <id>           Show a single machine\n"
             "  meshive earnings               Show your earnings (as a host)\n"
+            "\n"
+            "Write commands (need a key with the write scope; they ask for confirmation unless --yes):\n"
+            "  meshive pod-create <ws> <name> --template ID --gpu MODEL [--estimate]\n"
+            "  meshive pod-stop|pod-start|pod-restart|pod-delete <ws> <pod>\n"
+            "  meshive storage-create <ws> <name> --size GB   meshive storage-delete <ws> <pv>\n"
+            "  meshive task-submit <ws> <name> --script FILE --image IMG --cpu-preset micro-2c8g\n"
+            "  meshive logs <ws> <pod>          meshive task-logs <task>\n"
             "\n"
             "Run `meshive <command> --help` for filters and options.\n"
             "Scripting: `-o name` prints just the IDs, one per line (pipe into xargs).\n"
@@ -311,6 +319,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_asset_storage.add_argument("workspace", help="Workspace ID (namespace name).")
 
     # --- account --------------------------------------------------------------
+    write_cli.add_parsers(sub, common)
+
     sub.add_parser("api-keys", parents=[common], aliases=["keys"],
                    help="List your API keys (prefixes only; the secret is never shown).")
     sub.add_parser("credit", parents=[common],
@@ -1179,6 +1189,7 @@ _HANDLERS: dict[str, Handler] = {
     "api-keys": _cmd_api_keys, "keys": _cmd_api_keys,
     "credit": _cmd_credit,
     "credit-history": _cmd_credit_history,
+    **write_cli.HANDLERS,
 }
 
 

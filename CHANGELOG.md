@@ -12,6 +12,12 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## v0.1.0rc1
+
+Pre-release of 0.1.0 for early testing. `pip install meshive` keeps installing the latest stable
+release; use `pip install --pre meshive` (or `pip install meshive==0.1.0rc1`) to try it. Contents are
+those of the v0.1.0 section below.
+
 ## v0.1.0
 
 The SDK and CLI can now **create and manage resources**, not just read them. This needs an API key issued with the

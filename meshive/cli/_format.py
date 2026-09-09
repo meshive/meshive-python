@@ -12,8 +12,9 @@ import os
 import re
 import sys
 from datetime import date, datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import TextIO
+
+from ..formatting import format_hourly, format_usd
 
 _RESET = "\033[0m"
 _COLORS = {
@@ -106,31 +107,9 @@ def status_cell(status: str) -> str:
     return f"{_STATUS_ICON} {status}" if status else f"{_STATUS_ICON} -"
 
 
-def _usd(value: str | float | None, digits: int) -> str:
-    """USD 금액 → '$2.10' / '$0.068'. 빈/잘못된 값은 '-'.
-
-    서버 금액은 Numeric(20,8) 이라 '2.10000000' 처럼 와서 그대로 쓰면 불필요한 자릿수가 보인다.
-    웹 콘솔(`WebFrontend/src/common/Formatter.tsx`)의 Intl.NumberFormat 과 같은 값을 내야 하므로
-    float 이 아니라 Decimal 로 반올림한다 — Intl 의 기본 반올림은 halfExpand(0에서 먼 쪽)이고,
-    파이썬 float 포맷은 이진수 오차 + half-even 이라 경계값에서 갈린다(0.015 → '$0.01' vs '$0.02').
-    """
-    if value in (None, ""):
-        return "-"
-    try:
-        amount = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
-        return "-"
-    if not amount.is_finite():
-        return "-"
-    quantized = amount.quantize(Decimal(1).scaleb(-digits), rounding=ROUND_HALF_UP)
-    # 환불/회수 원장행은 음수 — '$-12.50' 이 아니라 '-$12.50'.
-    sign = "-" if quantized < 0 else ""
-    return f"{sign}${abs(quantized):,.{digits}f}"
-
-
 def money(value: str | float | None) -> str:
     """일반 금액 → '$2.10' (2자리). 잔액·일/월 합계·누적 비용·환불 등. 웹 `formatUsd` 와 동일."""
-    return _usd(value, 2)
+    return format_usd(value)
 
 
 def money_hourly(value: str | float | None) -> str:
@@ -140,7 +119,7 @@ def money_hourly(value: str | float | None) -> str:
     스토리지·서빙·태스크·GPU·견적 내역의 $/hr 을 전부 3자리로 고정하는 이유고, CLI 도 같은 값을 낸다.
     (호스트 수익의 earn/hr·current/hr 은 콘솔이 `formatUsd` 2자리라 `money` 를 쓴다 — 콘솔 미러링.)
     """
-    return _usd(value, 3)
+    return format_hourly(value)
 
 
 def yes_no(value: bool) -> str:

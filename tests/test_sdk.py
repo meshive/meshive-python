@@ -920,3 +920,27 @@ def test_format_gib_uses_mb_below_one_gigabyte():
     assert fmt.gib(1536) == "1.5 GB"
     assert fmt.gib(131072) == "128 GB"
     assert fmt.gib(None) == "-"
+
+
+# --- 표시 헬퍼: 웹 콘솔과 같은 금액 -------------------------------------------
+# SDK 는 서버 숫자를 그대로 돌려준다("0.06770833") — 사람에게 보여줄 때 쓰라고 이 둘을 공개한다.
+# 규칙 소스는 콘솔 `Formatter.tsx`(시간당 3자리 / 그 외 2자리), 반올림은 Intl 과 같은 halfExpand.
+def test_formatting_helpers_are_public_and_match_the_console():
+    import meshive
+
+    assert meshive.format_hourly("0.06770833") == "$0.068"     # 워크스페이스 시간당 합계
+    assert meshive.format_hourly("0.00097222") == "$0.001"     # 2자리면 "$0.00" 이 된다
+    assert meshive.format_usd("12.5") == "$12.50"
+    assert meshive.format_usd("0.015") == "$0.02"              # halfExpand — 콘솔과 같은 방향
+    assert meshive.format_hourly(None) == "-" and meshive.format_usd("") == "-"
+    assert {"format_hourly", "format_usd"} <= set(meshive.__all__)
+
+
+def test_cli_money_helpers_delegate_to_the_public_formatter():
+    """CLI 와 SDK 가 같은 함수를 쓰는지 — 두 벌이면 언젠가 갈린다."""
+    import meshive
+    from meshive.cli import _format as fmt
+
+    for value in ("0.06770833", "2.1", "0.015", None, ""):
+        assert fmt.money_hourly(value) == meshive.format_hourly(value)
+        assert fmt.money(value) == meshive.format_usd(value)

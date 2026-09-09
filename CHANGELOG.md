@@ -50,6 +50,9 @@ Read-only keys keep working for everything that existed before.
   other amount to two (`$2.10`). Previously an hourly rate was rounded to two decimals, so a workspace the console
   showed as `$0.068/hr` read `$0.07/hr` in the terminal and a small storage volume read `$0.00/hr`. Use `-o json`
   for the unrounded number.
+- `meshive.format_hourly()` and `meshive.format_usd()` are public, so your own output can show the same amounts the
+  console and CLI do. The SDK still returns the server's unrounded number (`pod.price_per_hour == "0.06770833"`) —
+  format it only when you print it.
 
 ## v0.0.7
 

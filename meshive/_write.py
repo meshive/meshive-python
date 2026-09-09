@@ -105,7 +105,7 @@ def _drop_none(body: dict[str, Any]) -> dict[str, Any]:
 # --- 파드 --------------------------------------------------------------------
 
 def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: int, gpu_vram_gb: int | None,
-             rental_type: str, vcpu: int | None, ram_gb: int | None, disk_gb: int | None,
+             rental_type: str, vcpu: int | None, ram_gb: int | None,
              volumes: Any, env: Mapping[str, Any] | None, secret_keys: Iterable[str] | None, ports: Any,
              command: str | None, internet_premium: bool, uptime_premium: bool, cpu_premium: bool,
              region: str | None, max_price_per_hour: Any) -> dict[str, Any]:
@@ -123,7 +123,7 @@ def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: i
         "rentalType": _rental(rental_type),
         "vcpu": _optional_int(vcpu, "vcpu"),
         "ramGb": _optional_int(ram_gb, "ram_gb"),
-        "diskGb": _optional_int(disk_gb, "disk_gb", minimum=5),
+        # 시스템 디스크는 서버 공식으로 고정된다(견적 resources.disk_gb) — 보내지 않는다.
         "volumes": _volumes(volumes),
         "env": env_out,
         "secretKeys": secrets,
@@ -256,6 +256,7 @@ def task_body(name: str, script: str, *, image: str | None, template_id: int | N
 
 def logs_params(*, tail: int, wait: float | None, container: str | None = None,
                 cursor: int | None = None) -> dict[str, Any]:
+    """cursor 는 외부 provider 태스크 전용: None/0 = 마지막 tail 줄, 이전 응답의 next_cursor = 그 뒤 증분."""
     if isinstance(tail, bool) or not isinstance(tail, int) or not 1 <= tail <= 1000:
         raise ValueError("tail must be an integer between 1 and 1000")
     params: dict[str, Any] = {"tail": tail}

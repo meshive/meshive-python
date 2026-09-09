@@ -48,7 +48,7 @@ class Recorder:
 def test_estimate_pod_builds_request():
     rec = Recorder((200, ESTIMATE))
     est = sync_client(rec).estimate_pod("agent-pod", 457, workspace="ws 1", gpu_model="RTX 3060", gpu_count=2,
-                                        gpu_vram_gb=12, rental_type="Spot", vcpu=8, ram_gb=24, disk_gb=30,
+                                        gpu_vram_gb=12, rental_type="Spot", vcpu=8, ram_gb=24,
                                         volumes=[("pv-data", "/data"), {"storage": "pv-b", "mount_path": "/b"}],
                                         env={"A": "1", "TOKEN": "x"}, secret_keys=["TOKEN"],
                                         ports=[8888, {"port": 6006, "name": "tb", "external": False}],
@@ -60,7 +60,7 @@ def test_estimate_pod_builds_request():
     body = rec.body()
     assert body == {
         "name": "agent-pod", "templateId": 457, "gpuModel": "RTX 3060", "gpuCount": 2, "gpuVramGb": 12,
-        "rentalType": "spot", "vcpu": 8, "ramGb": 24, "diskGb": 30,
+        "rentalType": "spot", "vcpu": 8, "ramGb": 24,
         "volumes": [{"storage": "pv-data", "mountPath": "/data"}, {"storage": "pv-b", "mountPath": "/b"}],
         "env": {"A": "1", "TOKEN": "x"}, "secretKeys": ["TOKEN"],
         "ports": [{"port": 8888, "external": True}, {"port": 6006, "external": False, "name": "tb"}],
@@ -105,7 +105,7 @@ def test_pod_lifecycle_paths_and_params():
 
 
 @pytest.mark.parametrize("kwargs", [
-    dict(gpu_count=0), dict(gpu_count=9), dict(rental_type="hourly"), dict(disk_gb=1),
+    dict(gpu_count=0), dict(gpu_count=9), dict(rental_type="hourly"),
     dict(env={"A": "1"}, secret_keys=["B"]), dict(volumes=[("pv", "data")]), dict(ports=[70000]),
     dict(max_price_per_hour="free"), dict(max_price_per_hour=0),
 ])
@@ -291,3 +291,30 @@ def test_data_loss_consent_does_not_coerce_a_string_to_true():
     with pytest.raises(ValueError, match='explicit boolean'):
         sync_client(rec).start_pod('p', 'ws', placement='any_node', allow_data_loss='false')
     assert rec.requests == []
+
+
+# --- 서빙 비용 증가 판정 (CLI/MCP 확인 기준) ----------------------------------------------
+
+def test_serving_scale_raises_cost_covers_range_autoscale_and_cap():
+    """범위 확대·autoscale 켜기·상한 인상만 "비용이 늘 수 있다" — 줄이거나 무제한 상한에 값을 주는 건 아니다."""
+    from meshive.models import Serving
+    current = Serving.from_dict({"id": 42, "namespaceName": "ws", "framework": "vllm", "status": "active",
+                                 "minReplicas": 1, "maxReplicas": 3, "currentReplicas": 2, "autoScaleEnabled": False,
+                                 "priceCapPerHour": "1.5"})
+    assert current.autoscale is False and current.price_cap_per_hour == "1.5"
+    assert current.scale_raises_cost(max_replicas=4) and current.scale_raises_cost(min_replicas=2)
+    assert current.scale_raises_cost(autoscale=True) and current.scale_raises_cost(price_cap_per_hour=2)
+    assert current.scale_raises_cost(price_cap_per_hour="not a number")
+    assert not current.scale_raises_cost(max_replicas=2, min_replicas=0, autoscale=False, price_cap_per_hour="1.5")
+    assert not current.scale_raises_cost(price_cap_per_hour=0.9)
+    unlimited = Serving.from_dict({"id": 1, "namespaceName": "ws", "framework": "vllm", "status": "active",
+                                   "minReplicas": 1, "maxReplicas": 3, "currentReplicas": 1, "autoScaleEnabled": True})
+    assert unlimited.price_cap_per_hour is None and not unlimited.scale_raises_cost(price_cap_per_hour=99, autoscale=True)
+
+
+def test_storage_estimate_carries_disk_type():
+    from meshive.models import StorageEstimate
+    est = StorageEstimate.from_dict({"pricePerHourUsd": "0.0001", "pricePerGbMonthUsd": "0.07", "sizeGb": 10,
+                                     "storageType": "nfs", "diskType": "SSD", "maxSizeGb": 300})
+    assert est.disk_type == "SSD"
+    assert StorageEstimate.from_dict({"sizeGb": 1, "maxSizeGb": 1}).disk_type == "NVMe"   # 구 서버 응답

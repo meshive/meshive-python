@@ -12,6 +12,32 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## v0.1.1
+
+Fixes from the 2026-09-09 review of the write surface (server-side changes ship with the matching Meshive release).
+
+### SDK
+
+- `Serving` now carries `autoscale` and `price_cap_per_hour`, and has `scale_raises_cost(...)` — the rule the CLI and the
+  MCP server use to decide whether a `scale_serving` change needs the user's go-ahead (larger replica range, turning
+  autoscale on, raising the per-replica cap).
+- `StorageEstimate.disk_type`: storage is priced per `(storage_type, disk_type)`; the server now quotes the disk type you
+  asked for (and refuses combinations it has no price for) instead of always quoting NVMe.
+- `get_task_logs(task_id, cursor=...)`: for tasks on an external provider, `cursor=None`/`0` returns the **last** `tail`
+  lines (previously the oldest ones in the buffer); pass the previous response's `next_cursor` to read only new lines.
+- Pod logs: when nobody has been watching a pod, the server wakes the log watcher before answering instead of returning a
+  stale buffer; if it cannot (`wait=0` or the watcher is down) the response `note` says the lines may be behind.
+- **Removed** `disk_gb` from `estimate_pod()` / `create_pod()`. The system disk is sized by the server and always was —
+  the value was silently overridden after the estimate. The estimate's `resources["disk_gb"]` shows the real size.
+
+### CLI
+
+- `serving-scale` asks for confirmation (or `--yes`) when the change can raise the hourly cost; `serving-resume` asks
+  because billing resumes. Lowering the range, pausing, and cap decreases apply immediately as before.
+- `pod-create --wait` exits with code 1 when the pod does not appear within `--wait-timeout`; the accepted transaction
+  id is still printed. Previously it exited 0 as if the wait had succeeded.
+- `pod-create --disk` is gone (see above). `storage-create` output shows the disk type that was priced.
+
 ## v0.1.0rc1
 
 Pre-release of 0.1.0 for early testing. `pip install meshive` keeps installing the latest stable

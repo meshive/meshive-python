@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -671,12 +672,32 @@ class Serving:
     endpoint_url: str | None
     price_per_hour: str        # 과금 중 replica 단가 합 (USD), 없으면 "0"
     billing_active: bool
+    autoscale: bool = False                 # auto_scale_enabled
+    price_cap_per_hour: str | None = None   # replica 당 시간당 상한 (USD), None = 무제한
     raw: dict = field(default_factory=dict, repr=False)
+
+    def scale_raises_cost(self, *, min_replicas: int | None = None, max_replicas: int | None = None,
+                          autoscale: bool | None = None, price_cap_per_hour: object = None) -> bool:
+        """scale_serving 인자가 시간당 비용을 **늘릴 수 있는지** — CLI/MCP 가 확인을 요구하는 기준.
+        replica 범위 확대, autoscale 켜기(꺼져 있던 경우), replica 당 상한 인상(무제한은 이미 최대)."""
+        if min_replicas is not None and min_replicas > self.min_replicas:
+            return True
+        if max_replicas is not None and max_replicas > self.max_replicas:
+            return True
+        if autoscale and not self.autoscale:
+            return True
+        if price_cap_per_hour is not None and self.price_cap_per_hour is not None:
+            try:
+                return Decimal(str(price_cap_per_hour)) > Decimal(self.price_cap_per_hour)
+            except (InvalidOperation, ValueError):
+                return True     # 해석 불가한 값은 안전하게 "확인 필요"
+        return False
 
     @classmethod
     def from_dict(cls, d: dict) -> "Serving":
         price = d.get("pricePerHour")
         healthy = d.get("healthyReplicas")
+        cap = d.get("priceCapPerHour")
         return cls(
             serving_id=_as_int(d.get("id")),
             namespace_name=d.get("namespaceName", ""),
@@ -692,6 +713,8 @@ class Serving:
             endpoint_url=d.get("endpointUrl"),
             price_per_hour=str(price) if price is not None else "0",
             billing_active=bool(d.get("billingActive", False)),
+            autoscale=bool(d.get("autoScaleEnabled", False)),
+            price_cap_per_hour=None if cap is None else str(cap),
             raw=d,
         )
 
@@ -992,6 +1015,7 @@ class StorageEstimate:
     size_gb: int
     storage_type: str
     max_size_gb: int
+    disk_type: str = "NVMe"        # 가격이 (storage_type, disk_type) 조합으로 정해진다
     note: str = ""
     raw: dict = field(default_factory=dict, repr=False)
 
@@ -999,7 +1023,8 @@ class StorageEstimate:
     def from_dict(cls, d: dict) -> "StorageEstimate":
         return cls(price_per_hour=str(d.get("pricePerHourUsd", "0")), price_per_gb_month=str(d.get("pricePerGbMonthUsd", "0")),
                    size_gb=_as_int(d.get("sizeGb")), storage_type=str(d.get("storageType", "")),
-                   max_size_gb=_as_int(d.get("maxSizeGb")), note=d.get("note") or "", raw=d)
+                   max_size_gb=_as_int(d.get("maxSizeGb")), disk_type=str(d.get("diskType") or "NVMe"),
+                   note=d.get("note") or "", raw=d)
 
 
 @dataclass
@@ -1073,7 +1098,7 @@ class Logs:
     container: str | None = None
     task_id: str | None = None
     finished: bool | None = None   # 태스크 로그에서만
-    next_cursor: int | None = None # 외부 provider 태스크에서만
+    next_cursor: int | None = None # 외부 provider 태스크에서만 — get_task_logs(cursor=next_cursor) 로 그 뒤 증분 조회
     raw: dict = field(default_factory=dict, repr=False)
 
     @property

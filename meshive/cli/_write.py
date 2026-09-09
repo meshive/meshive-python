@@ -1,8 +1,9 @@
 """CLI 쓰기 커맨드 (0.1.0): pod-create/stop/start/restart/delete, storage-create/delete,
 serving-deploy/scale/pause/resume/delete, task-submit/stop, logs, task-logs.
 
-규칙: 돈이 들거나 되돌릴 수 없는 커맨드(create/start/deploy/submit/delete)는 먼저 견적·요약을 보여주고
-`--yes` 가 없으면 확인을 묻는다(TTY 가 아니면 exit 2). `--estimate` 는 견적만 보고 끝낸다.
+규칙: 돈이 들거나 되돌릴 수 없는 커맨드(create/start/deploy/submit/delete, 그리고 비용이 늘 수 있는
+serving-scale·serving-resume)는 먼저 견적·요약을 보여주고 `--yes` 가 없으면 확인을 묻는다(TTY 가 아니면 exit 2).
+`--estimate` 는 견적만 보고 끝낸다. `pod-create --wait` 가 시간 안에 파드를 못 찾으면 exit 1 (수락된 transaction 은 출력).
 """
 from __future__ import annotations
 
@@ -150,7 +151,7 @@ def _print_logs(logs: Logs, color: bool) -> None:
 def _pod_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     return dict(
         gpu_model=args.gpu, gpu_count=args.gpu_count, gpu_vram_gb=args.vram,
-        rental_type="spot" if args.spot else "demand", vcpu=args.vcpu, ram_gb=args.ram, disk_gb=args.disk,
+        rental_type="spot" if args.spot else "demand", vcpu=args.vcpu, ram_gb=args.ram,
         volumes=_parse_volumes(args.volume), env=_parse_env(args.env), secret_keys=args.secret or [],
         ports=_parse_ports(args.port), command=args.overwrite_command, internet_premium=args.internet_premium,
         uptime_premium=args.uptime_premium, cpu_premium=args.cpu_premium, region=args.region,
@@ -189,6 +190,11 @@ def cmd_pod_create(client: Meshive, args: argparse.Namespace, output: str, color
         ("accepted", fmt.yes_no(created.accepted)), ("name", created.name),
         ("pod", pod_name or "(assigned shortly — see `meshive pods`)"),
         ("transaction", str(created.transaction_id))]))
+    if args.wait and pod_name is None:
+        # 수락은 됐지만 파드가 시간 안에 안 나타났다 — 자동화가 `--wait running` 성공으로 오인하면 안 된다.
+        print(fmt.clean(f"Error: pod '{args.name}' did not appear within {args.wait_timeout:g}s. The create was accepted "
+                        f"(transaction {created.transaction_id}); check `meshive pods {args.workspace}`."), file=sys.stderr)
+        return 1
     return 0
 
 
@@ -230,7 +236,7 @@ def _pod_action(method: str, needs_confirm: bool, question: str):
 def _print_storage_estimate(est: StorageEstimate, color: bool) -> None:
     _kv([("estimate", fmt.paint(f"{fmt.money_hourly(est.price_per_hour)}/hr", "green", color)),
          ("per GB·month", fmt.money(est.price_per_gb_month)), ("size", f"{est.size_gb} GB"),
-         ("type", est.storage_type), ("max size", f"{est.max_size_gb} GB")])
+         ("type", f"{est.storage_type} / {est.disk_type}"), ("max size", f"{est.max_size_gb} GB")])
     print(fmt.paint(est.note, "dim", color))
 
 
@@ -281,15 +287,23 @@ def cmd_serving_scale(client: Meshive, args: argparse.Namespace, output: str, co
         autoscale = True
     elif args.no_autoscale:
         autoscale = False
+    # 비용이 늘 수 있는 변경(범위 확대·autoscale 켜기·상한 인상)만 확인 — 줄이는 변경은 바로 적용.
+    current = client.get_serving(args.serving_id)
+    if current.scale_raises_cost(min_replicas=args.min_replicas, max_replicas=args.max_replicas, autoscale=autoscale,
+                                 price_cap_per_hour=args.price_cap):
+        if not _confirm(args, f"Scale serving #{args.serving_id} ({current.min_replicas}-{current.max_replicas} replicas, "
+                              f"cap {fmt.money_hourly(current.price_cap_per_hour) if current.price_cap_per_hour else 'none'}/hr)? "
+                              "Its possible hourly cost goes up."):
+            return 2
     action = client.scale_serving(args.serving_id, min_replicas=args.min_replicas, max_replicas=args.max_replicas,
                                   autoscale=autoscale, price_cap_per_hour=args.price_cap)
     _emit(output, action.raw, [action.id], lambda: _print_action(action, color))
     return 0
 
 
-def _serving_simple(method: str, needs_confirm: bool = False, **fixed: Any):
+def _serving_simple(method: str, question: str | None = None, **fixed: Any):
     def handler(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
-        if needs_confirm and not _confirm(args, f"Delete serving #{args.serving_id}?"):
+        if question and not _confirm(args, question.format(id=args.serving_id)):
             return 2
         action = getattr(client, method)(args.serving_id, **fixed)
         _emit(output, action.raw, [action.id], lambda: _print_action(action, color))
@@ -377,7 +391,6 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--spot", action="store_true", help="Spot (preemptible) rental instead of on-demand.")
     p.add_argument("--vcpu", type=int, default=None, metavar="N", help="vCPU (default: recommended for the GPU).")
     p.add_argument("--ram", type=int, default=None, metavar="GB", help="RAM in GB (default: recommended).")
-    p.add_argument("--disk", type=int, default=None, metavar="GB", help="System disk in GB (min 5).")
     p.add_argument("--volume", action="append", metavar="PV:/mount", help="Attach an existing storage (repeatable).")
     p.add_argument("--env", action="append", metavar="KEY=VALUE", help="Environment variable (repeatable).")
     p.add_argument("--secret", action="append", metavar="KEY", help="Mark an --env key as secret (repeatable).")
@@ -441,8 +454,9 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--min-replicas", type=int, default=None); p.add_argument("--max-replicas", type=int, default=None)
     g = p.add_mutually_exclusive_group(); g.add_argument("--autoscale", action="store_true"); g.add_argument("--no-autoscale", action="store_true")
     p.add_argument("--price-cap", default=None, metavar="USD")
+    _yes(p)
     p = sub.add_parser("serving-pause", parents=[common], help="Pause a serving."); p.add_argument("serving_id", type=int)
-    p = sub.add_parser("serving-resume", parents=[common], help="Resume a paused serving."); p.add_argument("serving_id", type=int)
+    p = sub.add_parser("serving-resume", parents=[common], help="Resume a paused serving (billing resumes)."); p.add_argument("serving_id", type=int); _yes(p)
     p = sub.add_parser("serving-delete", parents=[common], help="Delete a serving."); p.add_argument("serving_id", type=int); _yes(p)
 
     # --- tasks ---
@@ -488,8 +502,8 @@ HANDLERS: dict[str, Handler] = {
     "serving-deploy": cmd_serving_deploy,
     "serving-scale": cmd_serving_scale,
     "serving-pause": _serving_simple("pause_serving", paused=True),
-    "serving-resume": _serving_simple("pause_serving", paused=False),
-    "serving-delete": _serving_simple("delete_serving", needs_confirm=True),
+    "serving-resume": _serving_simple("pause_serving", "Resume serving #{id}? Billing resumes.", paused=False),
+    "serving-delete": _serving_simple("delete_serving", "Delete serving #{id}?"),
     "task-submit": cmd_task_submit,
     "task-stop": cmd_task_stop,
     "logs": cmd_logs,

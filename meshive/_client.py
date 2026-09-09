@@ -586,14 +586,14 @@ class Meshive(_BaseClient):
 
     def estimate_pod(self, name: str, template_id: int, *, workspace: str, gpu_model: str | None = None,
                      gpu_count: int = 1, gpu_vram_gb: int | None = None, rental_type: str = "demand",
-                     vcpu: int | None = None, ram_gb: int | None = None, disk_gb: int | None = None,
+                     vcpu: int | None = None, ram_gb: int | None = None,
                      volumes: Any = None, env: dict[str, str] | None = None, secret_keys: Iterable[str] | None = None,
                      ports: Any = None, command: str | None = None, internet_premium: bool = False,
                      uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
                      max_price_per_hour: Any = None) -> PodEstimate:
         """파드 견적 — 아무것도 만들지 않는다(read 스코프로 충분). create_pod 와 인자가 같다."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
-                               rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, disk_gb=disk_gb, volumes=volumes,
+                               rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
                                internet_premium=internet_premium, uptime_premium=uptime_premium,
                                cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour)
@@ -602,7 +602,7 @@ class Meshive(_BaseClient):
 
     def create_pod(self, name: str, template_id: int, *, workspace: str, gpu_model: str | None = None,
                    gpu_count: int = 1, gpu_vram_gb: int | None = None, rental_type: str = "demand",
-                   vcpu: int | None = None, ram_gb: int | None = None, disk_gb: int | None = None,
+                   vcpu: int | None = None, ram_gb: int | None = None,
                    volumes: Any = None, env: dict[str, str] | None = None, secret_keys: Iterable[str] | None = None,
                    ports: Any = None, command: str | None = None, internet_premium: bool = False,
                    uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
@@ -611,7 +611,7 @@ class Meshive(_BaseClient):
         max_price_per_hour 는 최종 compute 시간당 요금 상한이다. 초과 배치는 비동기로 실패할 수 있다.
         스토리지(자동 PV 포함)와 자산 보관 요금은 별도이며 상한에서 제외된다."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
-                               rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, disk_gb=disk_gb, volumes=volumes,
+                               rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
                                internet_premium=internet_premium, uptime_premium=uptime_premium,
                                cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour)
@@ -754,7 +754,8 @@ class Meshive(_BaseClient):
 
     def get_task_logs(self, task_id: str, *, tail: int = 200, wait: float | None = None,
                       cursor: int | None = None) -> Logs:
-        """태스크 로그 마지막 tail 줄 (내부 태스크). 외부 provider 태스크는 cursor 로 증분 조회."""
+        """태스크 로그 마지막 tail 줄. 외부 provider 태스크는 cursor=None/0 이면 마지막 tail 줄, 응답의 next_cursor 를
+        cursor 로 넘기면 그 뒤에 새로 생긴 줄만 돌아온다(증분). 내부 태스크는 항상 마지막 tail 줄(next_cursor 없음)."""
         params = _write.logs_params(tail=tail, wait=wait, cursor=cursor)
         return Logs.from_dict(self._get(f"/tasks/{_path_segment(task_id, 'task_id')}/logs", params))
 
@@ -1006,14 +1007,14 @@ class AsyncMeshive(_BaseClient):
 
     async def estimate_pod(self, name: str, template_id: int, *, workspace: str, gpu_model: str | None = None,
                      gpu_count: int = 1, gpu_vram_gb: int | None = None, rental_type: str = "demand",
-                     vcpu: int | None = None, ram_gb: int | None = None, disk_gb: int | None = None,
+                     vcpu: int | None = None, ram_gb: int | None = None,
                      volumes: Any = None, env: dict[str, str] | None = None, secret_keys: Iterable[str] | None = None,
                      ports: Any = None, command: str | None = None, internet_premium: bool = False,
                      uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
                      max_price_per_hour: Any = None) -> PodEstimate:
         """파드 견적 — 아무것도 만들지 않는다(read 스코프로 충분). create_pod 와 인자가 같다."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
-                               rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, disk_gb=disk_gb, volumes=volumes,
+                               rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
                                internet_premium=internet_premium, uptime_premium=uptime_premium,
                                cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour)
@@ -1022,7 +1023,7 @@ class AsyncMeshive(_BaseClient):
 
     async def create_pod(self, name: str, template_id: int, *, workspace: str, gpu_model: str | None = None,
                    gpu_count: int = 1, gpu_vram_gb: int | None = None, rental_type: str = "demand",
-                   vcpu: int | None = None, ram_gb: int | None = None, disk_gb: int | None = None,
+                   vcpu: int | None = None, ram_gb: int | None = None,
                    volumes: Any = None, env: dict[str, str] | None = None, secret_keys: Iterable[str] | None = None,
                    ports: Any = None, command: str | None = None, internet_premium: bool = False,
                    uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
@@ -1031,7 +1032,7 @@ class AsyncMeshive(_BaseClient):
         max_price_per_hour 는 최종 compute 시간당 요금 상한이다. 초과 배치는 비동기로 실패할 수 있다.
         스토리지(자동 PV 포함)와 자산 보관 요금은 별도이며 상한에서 제외된다."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
-                               rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, disk_gb=disk_gb, volumes=volumes,
+                               rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
                                internet_premium=internet_premium, uptime_premium=uptime_premium,
                                cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour)
@@ -1174,7 +1175,8 @@ class AsyncMeshive(_BaseClient):
 
     async def get_task_logs(self, task_id: str, *, tail: int = 200, wait: float | None = None,
                       cursor: int | None = None) -> Logs:
-        """태스크 로그 마지막 tail 줄 (내부 태스크). 외부 provider 태스크는 cursor 로 증분 조회."""
+        """태스크 로그 마지막 tail 줄. 외부 provider 태스크는 cursor=None/0 이면 마지막 tail 줄, 응답의 next_cursor 를
+        cursor 로 넘기면 그 뒤에 새로 생긴 줄만 돌아온다(증분). 내부 태스크는 항상 마지막 tail 줄(next_cursor 없음)."""
         params = _write.logs_params(tail=tail, wait=wait, cursor=cursor)
         return Logs.from_dict(await self._get(f"/tasks/{_path_segment(task_id, 'task_id')}/logs", params))
 

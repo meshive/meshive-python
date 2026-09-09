@@ -6,7 +6,7 @@ import pytest
 
 
 cli = importlib.import_module("meshive.cli.main")  # cli.__init__ 이 main 함수를 노출해 서브모듈을 가린다
-from meshive.models import (Pod, Logs, PodCreated, PodEstimate, ResourceAction, StorageCreated, StorageEstimate,
+from meshive.models import (Pod, Logs, PodCreated, PodEstimate, ResourceAction, Serving, StorageCreated, StorageEstimate,
                             TaskEstimate, TaskSubmitted)
 
 ESTIMATE = {"pricePerHourUsd": "0.068423", "breakdown": {"gpu": "0.068423"},
@@ -30,6 +30,22 @@ class FakeClient:
 
     def get_pod(self, *a, **kw):
         return Pod.from_dict({"podName": a[0], "namespaceName": a[1], "hasUnpreservedWorkspace": True})
+
+    def list_pods(self, *a, **kw):
+        self._rec("list_pods", *a, **kw); return []          # 생성 직후 파드가 아직 없다
+
+    def get_serving(self, *a, **kw):
+        self._rec("get_serving", *a, **kw)
+        return Serving.from_dict({"id": int(a[0]), "namespaceName": "ws", "framework": "vllm", "status": "active",
+                                  "minReplicas": 1, "maxReplicas": 3, "currentReplicas": 2, "autoScaleEnabled": False,
+                                  "priceCapPerHour": "1.5"})
+
+    def scale_serving(self, *a, **kw):
+        self._rec("scale_serving", *a, **kw); return ResourceAction.from_dict({"id": str(a[0]), "action": "scale"}, resource="serving")
+
+    def pause_serving(self, *a, **kw):
+        self._rec("pause_serving", *a, **kw)
+        return ResourceAction.from_dict({"id": str(a[0]), "action": "resume" if not kw.get("paused", True) else "pause"}, resource="serving")
 
     def estimate_pod(self, *a, **kw):
         self._rec("estimate_pod", *a, **kw); return PodEstimate.from_dict(ESTIMATE)
@@ -104,7 +120,7 @@ def test_pod_create_requires_yes_when_not_tty(capsys, non_tty):
 
 def test_pod_create_with_yes_passes_all_options(capsys):
     argv = ["pod-create", "ws", "agent-pod", "--template", "457", "--gpu", "RTX 3060", "--gpu-count", "2", "--vram", "12",
-            "--spot", "--vcpu", "8", "--ram", "24", "--disk", "30", "--volume", "pv-a:/data", "--env", "A=1", "--env", "TOKEN=x",
+            "--spot", "--vcpu", "8", "--ram", "24", "--volume", "pv-a:/data", "--env", "A=1", "--env", "TOKEN=x",
             "--secret", "TOKEN", "--port", "8888:jupyter", "--port", "6006::internal", "--command", "sleep 1", "--region", "KR",
             "--uptime-premium", "--max-price", "0.5", "--yes", "-o", "name"]
     assert cli.main(argv) == 0
@@ -112,7 +128,7 @@ def test_pod_create_with_yes_passes_all_options(capsys):
     name, args, kw = _last("create_pod")
     assert args == ("agent-pod", 457) and kw["workspace"] == "ws"
     assert kw["gpu_model"] == "RTX 3060" and kw["gpu_count"] == 2 and kw["gpu_vram_gb"] == 12 and kw["rental_type"] == "spot"
-    assert kw["vcpu"] == 8 and kw["ram_gb"] == 24 and kw["disk_gb"] == 30 and kw["volumes"] == [("pv-a", "/data")]
+    assert kw["vcpu"] == 8 and kw["ram_gb"] == 24 and "disk_gb" not in kw and kw["volumes"] == [("pv-a", "/data")]
     assert kw["env"] == {"A": "1", "TOKEN": "x"} and kw["secret_keys"] == ["TOKEN"]
     assert kw["ports"] == [{"port": 8888, "external": True, "name": "jupyter"}, {"port": 6006, "external": False}]
     assert kw["command"] == "sleep 1" and kw["region"] == "KR" and kw["uptime_premium"] is True and kw["max_price_per_hour"] == "0.5"
@@ -176,3 +192,47 @@ def test_any_node_yes_does_not_imply_data_loss_consent(capsys, non_tty):
     assert cli.main(['pod-start', 'ws', 'p-0', '--any-node', '--yes']) == 2
     assert all(c[0] != 'pod_action' for instance in FakeClient.instances for c in instance.calls)
     assert 'permanently deletes' in capsys.readouterr().err
+
+
+def test_pod_create_wait_timeout_is_an_error_but_keeps_the_transaction(capsys):
+    """파드가 시간 안에 안 나타나면 exit 1 — 자동화가 `--wait running` 성공으로 오인하면 안 된다. 수락된 transaction 은 출력."""
+    assert cli.main(["pod-create", "ws", "late-pod", "--template", "457", "--yes", "--wait", "running", "--wait-timeout", "0"]) == 1
+    captured = capsys.readouterr()
+    assert "transaction" in captured.out and "99" in captured.out
+    assert "did not appear" in captured.err and "transaction 99" in captured.err
+    assert cli.main(["pod-create", "ws", "late-pod", "--template", "457", "--yes", "--wait", "running", "--wait-timeout", "0",
+                     "-o", "name"]) == 1
+    assert capsys.readouterr().out.strip() == "99"
+
+
+def test_disk_flag_is_gone(capsys):
+    """시스템 디스크는 서버 공식으로 고정된다 — 받는 척하던 --disk 는 없앤다(argparse 가 usage 오류 2 로 끝낸다)."""
+    with pytest.raises(SystemExit) as exit_:
+        cli.main(["pod-create", "ws", "p", "--template", "1", "--disk", "30", "--yes"])
+    assert exit_.value.code == 2 and "--disk" in capsys.readouterr().err
+
+
+def test_serving_scale_and_resume_confirm_only_when_cost_can_rise(capsys, non_tty):
+    # 범위 확대 → 확인 필요(비대화형 + --yes 없음 → 2, 호출 없음)
+    assert cli.main(["serving-scale", "42", "--max-replicas", "4"]) == 2
+    assert "--yes" in capsys.readouterr().err
+    assert all(c[0] != "scale_serving" for c in FakeClient.instances[-1].calls)
+    assert cli.main(["serving-scale", "42", "--max-replicas", "4", "--yes"]) == 0
+    assert _last("scale_serving")[2]["max_replicas"] == 4
+    # 상한 인상·autoscale 켜기도 확인 대상
+    assert cli.main(["serving-scale", "42", "--price-cap", "2"]) == 2
+    assert cli.main(["serving-scale", "42", "--autoscale"]) == 2
+    # 줄이는 변경은 --yes 없이 바로 적용
+    assert cli.main(["serving-scale", "42", "--max-replicas", "2", "--price-cap", "1"]) == 0
+    assert _last("scale_serving")[2] == {"min_replicas": None, "max_replicas": 2, "autoscale": None, "price_cap_per_hour": "1"}
+    # resume 은 과금 재개 → 확인, pause 는 즉시
+    assert cli.main(["serving-resume", "42"]) == 2
+    assert all(c[0] != "pause_serving" for c in FakeClient.instances[-1].calls)
+    assert cli.main(["serving-resume", "42", "-y"]) == 0 and _last("pause_serving")[2]["paused"] is False
+    assert cli.main(["serving-pause", "42"]) == 0 and _last("pause_serving")[2]["paused"] is True
+
+
+def test_storage_estimate_shows_disk_type(capsys):
+    assert cli.main(["storage-create", "ws", "vol", "--size", "10", "--disk", "SSD", "--estimate"]) == 0
+    assert "nfs / NVMe" in capsys.readouterr().out       # FakeClient 응답에 diskType 이 없어 기본 NVMe
+    assert _last("estimate_storage")[2]["disk_type"] == "SSD"

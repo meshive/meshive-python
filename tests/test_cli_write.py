@@ -131,7 +131,7 @@ def test_pod_stop_and_delete(capsys, non_tty):
 
 
 def test_storage_create_and_estimate(capsys, non_tty):
-    assert cli.main(["storage-create", "ws", "vol", "--size", "10", "--type", "hostPath", "--encrypted", "--estimate"]) == 0
+    assert cli.main(["storage-create", "ws", "vol", "--size", "10", "--type", "nfs", "--encrypted", "--estimate"]) == 0
     assert "$0.00/hr" in capsys.readouterr().out
     assert cli.main(["storage-create", "ws", "vol", "--size", "10", "--yes", "-o", "name"]) == 0
     assert capsys.readouterr().out.strip() == "5"

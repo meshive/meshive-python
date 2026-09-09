@@ -132,9 +132,13 @@ def test_storage_methods():
                           "estimate": {"pricePerHourUsd": "0.000097", "pricePerGbMonthUsd": "0.07", "sizeGb": 1,
                                        "storageType": "nfs", "maxSizeGb": 305}}))
     c = sync_client(rec)
-    created = c.create_storage("vol", 1, workspace="ws", storage_type="hostpath", disk_type="ssd", encrypted=True)
+    created = c.create_storage("vol", 1, workspace="ws", storage_type="NFS", disk_type="ssd", encrypted=True)
     assert isinstance(created, StorageCreated) and created.estimate.max_size_gb == 305 and created.transaction_id == 5
-    assert rec.body() == {"name": "vol", "sizeGb": 1, "storageType": "hostPath", "diskType": "SSD", "encrypted": True}
+    assert rec.body() == {"name": "vol", "sizeGb": 1, "storageType": "nfs", "diskType": "SSD", "encrypted": True}
+    c.create_storage("vol", 1, workspace="ws", storage_type="hostpath")
+    assert rec.body() == {"name": "vol", "sizeGb": 1, "storageType": "hostPath", "diskType": "NVMe", "encrypted": False}
+    with pytest.raises(ValueError, match="nfs"):          # 암호화는 네트워크 스토리지만 (서버도 hostPath+encrypted 를 422 로 거절)
+        c.estimate_storage("vol", 1, workspace="ws", storage_type="hostPath", encrypted=True)
     c.delete_storage("pv-1", "ws")
     assert rec.last.method == "DELETE" and rec.last.url.path == "/v1/sdk/storages/pv-1"
     with pytest.raises(ValueError):

@@ -400,7 +400,7 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--size", type=int, required=True, metavar="GB")
     p.add_argument("--type", default="nfs", choices=["nfs", "hostPath"], help="nfs (network, default) or hostPath (local).")
     p.add_argument("--disk", default="NVMe", choices=["NVMe", "SSD", "HDD"])
-    p.add_argument("--encrypted", action="store_true", help="At-rest encryption (hostPath only).")
+    p.add_argument("--encrypted", action="store_true", help="At-rest encryption (network storage, --type nfs, only).")
     p.add_argument("--region", default=None, metavar="CODE")
     p.add_argument("--max-price", default=None, metavar="USD")
     p.add_argument("--estimate", action="store_true", help="Only show the estimate; create nothing.")

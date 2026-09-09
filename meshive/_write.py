@@ -164,6 +164,9 @@ def storage_body(name: str, size_gb: int, *, storage_type: str, disk_type: str, 
     disk = next((t for t in DISK_TYPES if t.lower() == (disk_type or "").strip().lower()), None)
     if disk is None:
         raise ValueError(f"disk_type must be one of {', '.join(DISK_TYPES)}")
+    # at-rest 암호화는 네트워크(nfs) 스토리지만 — 서버(WSB write_resources)가 hostPath+encrypted 를 422 로 거절한다.
+    if encrypted and kind != "nfs":
+        raise ValueError("encrypted is only available for nfs (network) storage; hostPath volumes cannot be encrypted")
     return _drop_none({
         "name": _require_str(name, "name"), "sizeGb": size_gb, "storageType": kind, "diskType": disk,
         "encrypted": bool(encrypted), "region": region.strip() if isinstance(region, str) and region.strip() else None,

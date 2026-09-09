@@ -29,7 +29,8 @@ Read-only keys keep working for everything that existed before.
 - **Pods**: `estimate_pod()` shows the hourly price before you spend anything; `create_pod()` takes a template ID, a GPU model
   and count (or nothing for a CPU pod), optional vCPU/RAM/disk, existing storage volumes, env vars, ports and a price cap.
   Then `stop_pod()`, `start_pod()`, `restart_pod()`, `delete_pod()`.
-- **Storage**: `estimate_storage()`, `create_storage()`, `delete_storage()`.
+- **Storage**: `estimate_storage()`, `create_storage()`, `delete_storage()`. At-rest encryption (`encrypted=True`) is
+  available for `nfs` (network) volumes only; for `hostPath` the SDK raises `ValueError` before sending anything.
 - **Serverless**: `deploy_serving()`, `scale_serving()`, `pause_serving()`, `delete_serving()`; `estimate_task()`,
   `submit_task()`, `stop_task()`.
 - **Logs**: `get_pod_logs()` and `get_task_logs()` return the last N lines (up to 1000). If nothing is buffered yet the server

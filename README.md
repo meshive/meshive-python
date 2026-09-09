@@ -288,3 +288,11 @@ print(client.get_pod_logs(pod.pod_name, "<workspace>", tail=50).text)
 client.stop_pod(pod.pod_name, "<workspace>")
 client.delete_pod(pod.pod_name, "<workspace>")
 ```
+
+### Write safety contract
+
+`start_pod(..., placement="any_node")` can permanently delete unpreserved workspace files after a node move. Inspect `Pod.has_unpreserved_workspace`; use `allow_data_loss=True` only after separate consent for that pod and move. The CLI requires `--allow-data-loss` in addition to `--yes` for an unattended move that can lose data. `Pod.storage_rate_per_hour` is separate from compute pricing.
+
+`max_price_per_hour` on pods/tasks caps the final compute rate, excluding attached/automatic storage and Asset Hub retention. Over-cap pod placements fail asynchronously. CPU capped requests are refused when a quote is unavailable. Task `max_cost` may be unknown because fetch time and storage charges exceed the script-runtime estimate.
+
+Keep one `idempotency_key` for each logical write and reuse it after a timeout. Results expose `raw["idempotencyKey"]`, `raw["operationMethod"]` and `raw["operationPath"]`; terminal network/API exceptions expose `idempotency_key`, `operation_method` and `operation_path`. `get_operation(key, method="POST", path="/tasks")` checks the durable acceptance record without resubmitting work. Pending/unknown records require reconciliation. `done` records API acceptance, not completion of the asynchronous resource operation.

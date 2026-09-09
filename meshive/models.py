@@ -113,6 +113,8 @@ class Pod:
     is_maintenance: bool
     created_at: datetime | None = None
     raw: dict = field(default_factory=dict, repr=False)
+    has_unpreserved_workspace: bool | None = None
+    storage_rate_per_hour: str = "0"
 
     @classmethod
     def from_dict(cls, d: dict) -> "Pod":
@@ -124,6 +126,8 @@ class Pod:
             rental_type=d.get("rentalType", ""),
             price_per_hour=str(d.get("pricePerHour", "0")),
             is_maintenance=bool(d.get("isMaintenance", False)),
+            has_unpreserved_workspace=d.get("hasUnpreservedWorkspace"),
+            storage_rate_per_hour=str(d.get("storageRatePerHour", "0")),
             created_at=_parse_dt(d.get("createdAt")),
             raw=d,
         )
@@ -1020,7 +1024,7 @@ class TaskEstimate:
     """POST /v1/sdk/tasks/estimate 응답. CPU 프리셋 태스크는 가격이 착지 노드에 따라 달라 None."""
 
     price_per_hour: str | None
-    max_cost: str | None           # price_per_hour × max_duration (상한)
+    max_cost: str | None           # total bill ceiling, None when storage/fetch costs cannot be bounded
     max_duration: int
     resources: dict
     note: str = ""

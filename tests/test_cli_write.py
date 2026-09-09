@@ -6,7 +6,7 @@ import pytest
 
 
 cli = importlib.import_module("meshive.cli.main")  # cli.__init__ 이 main 함수를 노출해 서브모듈을 가린다
-from meshive.models import (Logs, PodCreated, PodEstimate, ResourceAction, StorageCreated, StorageEstimate,
+from meshive.models import (Pod, Logs, PodCreated, PodEstimate, ResourceAction, StorageCreated, StorageEstimate,
                             TaskEstimate, TaskSubmitted)
 
 ESTIMATE = {"pricePerHourUsd": "0.068423", "breakdown": {"gpu": "0.068423"},
@@ -27,6 +27,9 @@ class FakeClient:
 
     def _rec(self, name, *a, **kw):
         self.calls.append((name, a, kw))
+
+    def get_pod(self, *a, **kw):
+        return Pod.from_dict({"podName": a[0], "namespaceName": a[1], "hasUnpreservedWorkspace": True})
 
     def estimate_pod(self, *a, **kw):
         self._rec("estimate_pod", *a, **kw); return PodEstimate.from_dict(ESTIMATE)
@@ -127,7 +130,7 @@ def test_pod_stop_and_delete(capsys, non_tty):
     assert cli.main(["pod-delete", "ws", "p-0", "--yes", "--delete-local-storage", "pv-1"]) == 0
     name, args, kw = _last("pod_action")
     assert args == ("p-0", "ws") and kw["delete_local_storages"] == ["pv-1"]
-    assert cli.main(["pod-start", "ws", "p-0", "--any-node", "-y"]) == 0
+    assert cli.main(["pod-start", "ws", "p-0", "--any-node", "--allow-data-loss", "-y"]) == 0
     assert _last("pod_action")[2]["placement"] == "any_node"
 
 
@@ -167,3 +170,9 @@ def test_logs_output_formats(capsys):
     assert _last("get_pod_logs")[2] == {"tail": 50, "container": None, "wait": 3.0}
     assert cli.main(["logs", "ws", "p-0", "-o", "name"]) == 0
     assert capsys.readouterr().out == "tick 1\ntick 2\n"
+
+
+def test_any_node_yes_does_not_imply_data_loss_consent(capsys, non_tty):
+    assert cli.main(['pod-start', 'ws', 'p-0', '--any-node', '--yes']) == 2
+    assert all(c[0] != 'pod_action' for instance in FakeClient.instances for c in instance.calls)
+    assert 'permanently deletes' in capsys.readouterr().err

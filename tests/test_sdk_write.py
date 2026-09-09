@@ -247,3 +247,47 @@ def test_async_write_methods_mirror_sync():
     created, action, logs = asyncio.run(main())
     assert created.transaction_id == 3 and rec.last.headers["Idempotency-Key"] == "k-1"
     assert action.action == "stop" and logs.source == "none"
+
+
+def test_generated_key_is_available_after_timeout_and_can_be_reused():
+    seen = []
+    def timeout(req):
+        seen.append(req.headers['Idempotency-Key'])
+        raise httpx.ReadTimeout('offline', request=req)
+    client = sync_client(timeout, max_retries=0)
+    with pytest.raises(httpx.ReadTimeout) as err:
+        client.stop_task('task_1')
+    key = err.value.idempotency_key
+    assert key == seen[0] and err.value.operation_method == 'POST' and err.value.operation_path == '/tasks/task_1/stop'
+    with pytest.raises(httpx.ReadTimeout):
+        client.stop_task('task_1', idempotency_key=key)
+    assert seen == [key, key]
+
+
+def test_write_result_and_status_lookup_keep_operation_identity():
+    rec = Recorder((202, {'podName': 'p', 'action': 'start'}))
+    result = sync_client(rec).start_pod('p', 'ws', placement='any_node', allow_data_loss=True,
+                                      idempotency_key='move-operation-0001')
+    assert rec.last.url.params['allow_data_loss'] == 'true'
+    assert result.raw['idempotencyKey'] == 'move-operation-0001' and result.raw['operationPath'] == '/pods/p/start'
+    client = sync_client(Recorder((200, {'state': 'unknown'})))
+    assert client.get_operation('move-operation-0001', method='POST', path='/pods/p/start')['state'] == 'unknown'
+
+
+def test_async_data_loss_flag_and_error_key():
+    async def run():
+        rec = Recorder((409, {'detail': {'title': 'Data Loss Consent Required', 'message': 'consent required'}}))
+        client = async_client(rec)
+        with pytest.raises(ConflictError) as err:
+            await client.start_pod('p', 'ws', placement='any_node', idempotency_key='async-move-0001')
+        assert rec.last.url.params['allow_data_loss'] == 'false'
+        assert err.value.idempotency_key == 'async-move-0001'
+        await client.close()
+    asyncio.run(run())
+
+
+def test_data_loss_consent_does_not_coerce_a_string_to_true():
+    rec = Recorder((202, {}))
+    with pytest.raises(ValueError, match='explicit boolean'):
+        sync_client(rec).start_pod('p', 'ws', placement='any_node', allow_data_loss='false')
+    assert rec.requests == []

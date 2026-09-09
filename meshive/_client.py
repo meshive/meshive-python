@@ -397,16 +397,34 @@ class Meshive(_BaseClient):
         while True:
             try:
                 response = self._client.request(method, url, params=params, json=json, headers=headers)
-            except _RETRY_EXCEPTIONS:
+            except _RETRY_EXCEPTIONS as exc:
                 delay = self._retry_delay(attempt)
                 if delay is None:
+                    exc.idempotency_key = headers["Idempotency-Key"]
+                    exc.operation_method = method
+                    exc.operation_path = path
                     raise
             else:
                 delay = self._retry_delay(attempt, response)
                 if delay is None:
-                    return self._process(response)
+                    try:
+                        data = self._process(response)
+                    except Exception as exc:
+                        exc.idempotency_key = headers["Idempotency-Key"]
+                        exc.operation_method = method
+                        exc.operation_path = path
+                        raise
+                    if isinstance(data, dict):
+                        data = {**data, "idempotencyKey": headers["Idempotency-Key"],
+                                "operationMethod": method, "operationPath": path}
+                    return data
             time.sleep(delay)
             attempt += 1
+
+    def get_operation(self, operation_id: str, *, method: str, path: str) -> dict:
+        """Lookup an earlier write by its key and SDK-relative path; this never resubmits work."""
+        return self._get(f"/operations/{_path_segment(operation_id, 'operation_id')}",
+                         params={"method": method, "path": path})
 
     def me(self) -> WhoAmI:
         """현재 API Key 소유자 정보 (GET /me)."""
@@ -590,7 +608,8 @@ class Meshive(_BaseClient):
                    uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
                    max_price_per_hour: Any = None, idempotency_key: str | None = None) -> PodCreated:
         """파드 생성(202 수락). 시간당 요금이 발생한다 — 먼저 estimate_pod 로 가격을 확인하고,
-        max_price_per_hour 를 주면 견적이 그보다 높을 때 서버가 거절한다(ConflictError 'Price Exceeds Cap')."""
+        max_price_per_hour 는 최종 compute 시간당 요금 상한이다. 초과 배치는 비동기로 실패할 수 있다.
+        스토리지(자동 PV 포함)와 자산 보관 요금은 별도이며 상한에서 제외된다."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, disk_gb=disk_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
@@ -606,10 +625,14 @@ class Meshive(_BaseClient):
         return ResourceAction.from_dict(data, resource="pod")
 
     def start_pod(self, pod_name: str, workspace: str, *, placement: str = "same_node",
-                  idempotency_key: str | None = None) -> ResourceAction:
-        """정지된 파드 시작. placement: same_node(원래 노드) | any_node(다른 노드로 재배치, 로컬 스토리지는 남음)."""
+                  allow_data_loss: bool = False, idempotency_key: str | None = None) -> ResourceAction:
+        """정지된 파드 시작. placement: same_node(원래 노드) | any_node(노드 이동 시 보존되지 않은 작업 파일 영구 삭제).
+        allow_data_loss=True 는 이 파드/이동 요청에 대한 별도 데이터 손실 동의다."""
+        if not isinstance(allow_data_loss, bool):
+            raise ValueError("allow_data_loss must be an explicit boolean")
         data = self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/start",
-                             params={"workspace": _query_value(workspace, "workspace"), "placement": _write.placement(placement)},
+                             params={"workspace": _query_value(workspace, "workspace"), "placement": _write.placement(placement),
+                                     "allow_data_loss": bool(allow_data_loss)},
                              idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="pod")
 
@@ -795,16 +818,34 @@ class AsyncMeshive(_BaseClient):
         while True:
             try:
                 response = await self._client.request(method, url, params=params, json=json, headers=headers)
-            except _RETRY_EXCEPTIONS:
+            except _RETRY_EXCEPTIONS as exc:
                 delay = self._retry_delay(attempt)
                 if delay is None:
+                    exc.idempotency_key = headers["Idempotency-Key"]
+                    exc.operation_method = method
+                    exc.operation_path = path
                     raise
             else:
                 delay = self._retry_delay(attempt, response)
                 if delay is None:
-                    return self._process(response)
+                    try:
+                        data = self._process(response)
+                    except Exception as exc:
+                        exc.idempotency_key = headers["Idempotency-Key"]
+                        exc.operation_method = method
+                        exc.operation_path = path
+                        raise
+                    if isinstance(data, dict):
+                        data = {**data, "idempotencyKey": headers["Idempotency-Key"],
+                                "operationMethod": method, "operationPath": path}
+                    return data
             await asyncio.sleep(delay)
             attempt += 1
+
+    async def get_operation(self, operation_id: str, *, method: str, path: str) -> dict:
+        """Lookup an earlier write by its key and SDK-relative path; this never resubmits work."""
+        return await self._get(f"/operations/{_path_segment(operation_id, 'operation_id')}",
+                               params={"method": method, "path": path})
 
     async def me(self) -> WhoAmI:
         """현재 API Key 소유자 정보 (GET /me)."""
@@ -987,7 +1028,8 @@ class AsyncMeshive(_BaseClient):
                    uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
                    max_price_per_hour: Any = None, idempotency_key: str | None = None) -> PodCreated:
         """파드 생성(202 수락). 시간당 요금이 발생한다 — 먼저 estimate_pod 로 가격을 확인하고,
-        max_price_per_hour 를 주면 견적이 그보다 높을 때 서버가 거절한다(ConflictError 'Price Exceeds Cap')."""
+        max_price_per_hour 는 최종 compute 시간당 요금 상한이다. 초과 배치는 비동기로 실패할 수 있다.
+        스토리지(자동 PV 포함)와 자산 보관 요금은 별도이며 상한에서 제외된다."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, disk_gb=disk_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
@@ -1003,10 +1045,14 @@ class AsyncMeshive(_BaseClient):
         return ResourceAction.from_dict(data, resource="pod")
 
     async def start_pod(self, pod_name: str, workspace: str, *, placement: str = "same_node",
-                  idempotency_key: str | None = None) -> ResourceAction:
-        """정지된 파드 시작. placement: same_node(원래 노드) | any_node(다른 노드로 재배치, 로컬 스토리지는 남음)."""
+                  allow_data_loss: bool = False, idempotency_key: str | None = None) -> ResourceAction:
+        """정지된 파드 시작. placement: same_node(원래 노드) | any_node(노드 이동 시 보존되지 않은 작업 파일 영구 삭제).
+        allow_data_loss=True 는 이 파드/이동 요청에 대한 별도 데이터 손실 동의다."""
+        if not isinstance(allow_data_loss, bool):
+            raise ValueError("allow_data_loss must be an explicit boolean")
         data = await self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/start",
-                             params={"workspace": _query_value(workspace, "workspace"), "placement": _write.placement(placement)},
+                             params={"workspace": _query_value(workspace, "workspace"), "placement": _write.placement(placement),
+                                     "allow_data_loss": bool(allow_data_loss)},
                              idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="pod")
 

@@ -199,6 +199,22 @@ def _pod_action(method: str, needs_confirm: bool, question: str):
         extra: dict[str, Any] = {}
         if method == "start_pod":
             extra["placement"] = "any_node" if args.any_node else "same_node"
+            extra["allow_data_loss"] = bool(getattr(args, "allow_data_loss", False))
+            if args.any_node:
+                current = client.get_pod(args.pod_name, args.workspace)
+                if current.has_unpreserved_workspace is not False:
+                    warning = ("Moving this pod to another node permanently deletes unpreserved workspace files. "
+                               "Attached local hostPath storage stays on the old node.")
+                    print(warning, file=sys.stderr)
+                    if not extra["allow_data_loss"]:
+                        if not sys.stdin.isatty():
+                            print("Error: separate data-loss consent is required: --allow-data-loss (in addition to --yes).",
+                                  file=sys.stderr)
+                            return 2
+                        if not _confirm(argparse.Namespace(yes=False),
+                                        f"Permanently lose unpreserved files for {args.workspace}/{args.pod_name} if it moves?"):
+                            return 2
+                        extra["allow_data_loss"] = True
         if method == "delete_pod":
             extra["delete_local_storages"] = args.delete_local_storage or []
         action: ResourceAction = getattr(client, method)(args.pod_name, args.workspace, **extra)
@@ -372,7 +388,7 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--internet-premium", action="store_true")
     p.add_argument("--uptime-premium", action="store_true")
     p.add_argument("--cpu-premium", action="store_true")
-    p.add_argument("--max-price", default=None, metavar="USD", help="Refuse if the estimate exceeds this hourly price.")
+    p.add_argument("--max-price", default=None, metavar="USD", help="Cap the final compute USD/hour rate; storage/Asset Hub charges are separate.")
     p.add_argument("--estimate", action="store_true", help="Only show the estimate; create nothing.")
     p.add_argument("--wait", default=None, metavar="STATUS", help="After creating, wait until the pod reaches STATUS (e.g. running).")
     p.add_argument("--wait-timeout", type=float, default=600.0, metavar="SECONDS")
@@ -387,7 +403,9 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
         p.add_argument("pod_name", help="Pod ID (pod name).")
         if name == "pod-start":
             p.add_argument("--any-node", action="store_true",
-                           help="Start on any available node instead of the original one (local storage stays behind).")
+                           help="Start on any available node; unpreserved workspace files are permanently deleted on migration.")
+            p.add_argument("--allow-data-loss", action="store_true",
+                           help="Separately consent to permanent loss of unpreserved workspace files for this pod's migration.")
             _yes(p)
         if name == "pod-delete":
             p.add_argument("--delete-local-storage", action="append", metavar="PV",
@@ -402,7 +420,7 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--disk", default="NVMe", choices=["NVMe", "SSD", "HDD"])
     p.add_argument("--encrypted", action="store_true", help="At-rest encryption (network storage, --type nfs, only).")
     p.add_argument("--region", default=None, metavar="CODE")
-    p.add_argument("--max-price", default=None, metavar="USD")
+    p.add_argument("--max-price", default=None, metavar="USD", help="Cap this volume's final initial USD/hour rate.")
     p.add_argument("--estimate", action="store_true", help="Only show the estimate; create nothing.")
     _yes(p)
     p = sub.add_parser("storage-delete", parents=[common], help="Delete a storage volume.")
@@ -444,7 +462,7 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--max-duration", type=int, default=3600, metavar="SECONDS", help="Hard stop (3600..86400).")
     p.add_argument("--webhook", default=None, metavar="URL")
     p.add_argument("--input-asset", action="append", metavar="ASSET_ID[:VERSION]")
-    p.add_argument("--max-price", default=None, metavar="USD")
+    p.add_argument("--max-price", default=None, metavar="USD", help="Final compute USD/hour cap; storage and Asset Hub charges are separate.")
     p.add_argument("--estimate", action="store_true", help="Only show the estimate; submit nothing.")
     _yes(p)
     p = sub.add_parser("task-stop", parents=[common], help="Stop a running task."); p.add_argument("task_id")

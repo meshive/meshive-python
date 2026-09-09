@@ -22,7 +22,8 @@ those of the v0.1.0 section below.
 
 The SDK and CLI can now **create and manage resources**, not just read them. This needs an API key issued with the
 **write** scope (console → workspace Settings → Secret → "Read & write"; such keys always expire, 30 days by default).
-Read-only keys keep working for everything that existed before.
+Read-only keys keep working for everything that existed before. Newly issued read keys now expire too (365 days) —
+they can fetch pod and task logs, which often contain tokens your container printed. Keys issued earlier are unaffected.
 
 ### New in the SDK (sync and async)
 

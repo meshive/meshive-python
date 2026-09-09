@@ -426,7 +426,7 @@ def _filter_servings(servings: list[Serving], statuses: set[str], name: str | No
 def _pod_price(pod: Pod) -> str:
     """웹 pod 페이지와 동일: running 일 때만 가격, 아니면 '-'.
     (꺼진/대기 중인 pod 는 과금되지 않으므로 가격을 노출하지 않는다.)"""
-    return fmt.money(pod.price_per_hour) if pod.status.lower() == "running" else "-"
+    return fmt.money_hourly(pod.price_per_hour) if pod.status.lower() == "running" else "-"
 
 
 def _print_whoami(me: WhoAmI, color: bool) -> None:
@@ -443,7 +443,7 @@ def _print_workspaces(workspaces: list[Workspace], color: bool) -> None:
     # NAME = workspace_name(유저 라벨), ID = namespace_name(조회 키).
     rows = [
         [ws.workspace_name or "-", ws.namespace_name, fmt.status_cell(ws.status),
-         str(ws.resources.pod), fmt.money(ws.price_per_hour)]
+         str(ws.resources.pod), fmt.money_hourly(ws.price_per_hour)]
         for ws in workspaces
     ]
     colors = [[None, None, fmt.status_color(ws.status), None, None] for ws in workspaces]
@@ -459,7 +459,7 @@ def _print_workspaces(workspaces: list[Workspace], color: bool) -> None:
 def _print_workspace(ws: WorkspaceDetail, color: bool) -> None:
     print(f"name:      {fmt.clean(ws.workspace_name or '-')}")  # 유저 라벨
     print(f"id:        {fmt.clean(ws.namespace_name)}")         # 조회 키
-    print(f"price/hr:  {fmt.money(ws.price_per_hour)}")
+    print(f"price/hr:  {fmt.money_hourly(ws.price_per_hour)}")
     print(f"avg/day:   {fmt.money(ws.weekly_avg_daily_cost)}  (last 7 days)")
     print(f"gpus:      {ws.gpus}")
     print(f"vcpus:     {ws.vcpus}")
@@ -570,7 +570,7 @@ def _print_storages(storages: list[Storage], color: bool) -> None:
     for s in storages:
         rows.append([
             s.user_alias or "-", s.pv_name, s.storage_type or "-", fmt.status_cell(s.status),
-            fmt.gib(s.total_size), fmt.usage(s.usage_rate), fmt.money(s.price_per_hour),
+            fmt.gib(s.total_size), fmt.usage(s.usage_rate), fmt.money_hourly(s.price_per_hour),
             str(len(s.linked_pods)), fmt.relative_time(s.created_at),
         ])
         colors.append([None, None, None, fmt.status_color(s.status), None, None, None, None, "dim"])
@@ -593,7 +593,7 @@ def _print_storage(s: Storage, color: bool) -> None:
     print(f"type:      {fmt.clean(s.storage_type or '-')}")
     print(f"status:    {fmt.paint(fmt.clean(fmt.status_cell(s.status)), fmt.status_color(s.status), color)}")
     print(f"size:      {fmt.gib(s.total_size)}, {fmt.usage(s.usage_rate)} used ({fmt.gib(s.available_size)} free)")
-    print(f"price/hr:  {fmt.money(s.price_per_hour)}")
+    print(f"price/hr:  {fmt.money_hourly(s.price_per_hour)}")
     print(f"pods:      {fmt.clean(', '.join(s.linked_pods)) if s.linked_pods else '-'}")
     print(f"encrypted: {fmt.yes_no(s.encrypted)}")
     print(f"created:   {created}")
@@ -659,7 +659,7 @@ def _print_gpus(gpus: list[GpuAvailability], color: bool) -> None:
     if not gpus:
         print("No GPUs available.")
         return
-    rows = [[g.gpu_model, f"{g.vram} GB", g.rental_type or "-", fmt.money(g.price_per_hour),
+    rows = [[g.gpu_model, f"{g.vram} GB", g.rental_type or "-", fmt.money_hourly(g.price_per_hour),
              str(g.available_gpus), str(g.max_gpus_per_pod), str(g.machine_count)] for g in gpus]
     fmt.render_table(
         ["GPU", "VRAM", "RENTAL", "PRICE/HR", "AVAILABLE", "MAX/POD", "MACHINES"],
@@ -720,7 +720,7 @@ def _print_servings(servings: list[Serving], color: bool) -> None:
         healthy = "-" if s.healthy_replicas is None else str(s.healthy_replicas)
         rows.append([_serving_label(s), str(s.serving_id), _serving_status_cell(s),
                      f"{s.current_replicas} ({s.min_replicas}-{s.max_replicas})", healthy,
-                     fmt.money(s.price_per_hour) if s.billing_active else "-"])
+                     fmt.money_hourly(s.price_per_hour) if s.billing_active else "-"])
         colors.append([None, None, fmt.status_color(s.status), None, None, None])
     fmt.render_table(
         ["NAME", "ID", "STATUS", "REPLICAS", "HEALTHY", "PRICE/HR"],
@@ -741,7 +741,7 @@ def _print_serving(s: Serving, color: bool) -> None:
     print(f"status:    {fmt.paint(fmt.clean(_serving_status_cell(s)), fmt.status_color(s.status), color)}")
     print(f"replicas:  {s.current_replicas} running, {s.min_replicas}-{s.max_replicas} configured{healthy}")
     print(f"endpoint:  {fmt.clean(s.endpoint_url or '-')}")
-    print(f"price/hr:  {fmt.money(s.price_per_hour) if s.billing_active else '-'}")
+    print(f"price/hr:  {fmt.money_hourly(s.price_per_hour) if s.billing_active else '-'}")
 
 
 def _task_gpu(t: Task) -> str:
@@ -781,7 +781,7 @@ def _print_task(t: Task, color: bool) -> None:
     print(f"image:       {fmt.clean(t.image or '-')}")
     print(f"gpu:         {fmt.clean(_task_gpu(t))}")
     print(f"cpu/ram:     {t.cpu_cores} cores / {t.ram_gb} GB")
-    print(f"price/hr:    {fmt.money(t.price_per_hour)}")
+    print(f"price/hr:    {fmt.money_hourly(t.price_per_hour)}")
     print(f"cost so far: {fmt.money(t.cost_so_far)}")
     print(f"total cost:  {fmt.money(t.total_cost)}")
     print(f"created:     {when(t.created_at)}")
@@ -866,7 +866,7 @@ def _print_asset(a: Asset, color: bool) -> None:
 
 def _print_asset_storage(s: AssetStorage, color: bool) -> None:
     print(f"managed:       {fmt.bytes_human(s.managed_bytes)}")
-    print(f"price:         ${s.price_per_gb_month:.3f} per GB-month")
+    print(f"price:         {fmt.money(s.price_per_gb_month)} per GB-month")
     print(f"est. monthly:  {fmt.money(s.estimated_monthly_cost)}")
     state = s.credit_state or "-"
     tone = None

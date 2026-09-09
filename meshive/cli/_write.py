@@ -110,13 +110,13 @@ def _print_pod_estimate(est: PodEstimate, color: bool) -> None:
     res = est.resources
     hw = (f"{res.get('gpu_count')}× {res.get('gpu_model')} ({res.get('vram_gb')} GB)" if res.get("gpu_model")
           else f"CPU ({res.get('cpu_model', '-')})")
-    _kv([("estimate", fmt.paint(f"{fmt.money(est.price_per_hour)}/hr", "green", color)),
+    _kv([("estimate", fmt.paint(f"{fmt.money_hourly(est.price_per_hour)}/hr", "green", color)),
          ("hardware", hw),
          ("vcpu / ram", f"{res.get('vcpu')} vCPU / {res.get('ram_gb')} GB"),
          ("disk", f"{res.get('disk_gb')} GB"),
          ("rental", str(res.get("rental_type", "-"))),
          ("template", f"{est.template.get('name', '-')} (#{est.template.get('id', '-')})"),
-         ("breakdown", ", ".join(f"{k}={fmt.money(v)}" for k, v in est.breakdown.items()) or "-"),
+         ("breakdown", ", ".join(f"{k}={fmt.money_hourly(v)}" for k, v in est.breakdown.items()) or "-"),
          ("available", str(est.availability.get("available_gpus", est.availability.get("machine_count", "-"))))])
     if est.volumes:
         print("volumes:   " + ", ".join(f"{v.get('storage')}→{v.get('mount_path')}" for v in est.volumes))
@@ -179,7 +179,7 @@ def cmd_pod_create(client: Meshive, args: argparse.Namespace, output: str, color
         if output == "json":
             print(json.dumps(estimate.raw, indent=2, ensure_ascii=False))
         return 0
-    if not _confirm(args, f"Create pod '{args.name}' at {fmt.money(estimate.price_per_hour)}/hr?"):
+    if not _confirm(args, f"Create pod '{args.name}' at {fmt.money_hourly(estimate.price_per_hour)}/hr?"):
         return 2
     created = client.create_pod(args.name, args.template, workspace=args.workspace, **kwargs)
     pod_name = None
@@ -212,7 +212,7 @@ def _pod_action(method: str, needs_confirm: bool, question: str):
 # =============================================================================
 
 def _print_storage_estimate(est: StorageEstimate, color: bool) -> None:
-    _kv([("estimate", fmt.paint(f"{fmt.money(est.price_per_hour)}/hr", "green", color)),
+    _kv([("estimate", fmt.paint(f"{fmt.money_hourly(est.price_per_hour)}/hr", "green", color)),
          ("per GB·month", fmt.money(est.price_per_gb_month)), ("size", f"{est.size_gb} GB"),
          ("type", est.storage_type), ("max size", f"{est.max_size_gb} GB")])
     print(fmt.paint(est.note, "dim", color))
@@ -229,7 +229,7 @@ def cmd_storage_create(client: Meshive, args: argparse.Namespace, output: str, c
             print(json.dumps(estimate.raw, indent=2, ensure_ascii=False))
         return 0
     if not _confirm(args, f"Create {args.size} GB {estimate.storage_type} storage '{args.name}' "
-                          f"at {fmt.money(estimate.price_per_hour)}/hr?"):
+                          f"at {fmt.money_hourly(estimate.price_per_hour)}/hr?"):
         return 2
     created = client.create_storage(args.name, args.size, workspace=args.workspace, **kwargs)
     _emit(output, created.raw, [str(created.transaction_id)], lambda: _kv([
@@ -247,7 +247,7 @@ def cmd_storage_delete(client: Meshive, args: argparse.Namespace, output: str, c
 
 
 def cmd_serving_deploy(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
-    cap = fmt.money(args.price_cap)
+    cap = fmt.money_hourly(args.price_cap)
     if not _confirm(args, f"Deploy model registration #{args.model_id} with up to {args.max_replicas} replica(s) "
                           f"at ≤{cap}/hr each?"):
         return 2
@@ -282,7 +282,7 @@ def _serving_simple(method: str, needs_confirm: bool = False, **fixed: Any):
 
 
 def _print_task_estimate(est: TaskEstimate, color: bool) -> None:
-    price = f"{fmt.money(est.price_per_hour)}/hr" if est.price_per_hour is not None else "depends on machine"
+    price = f"{fmt.money_hourly(est.price_per_hour)}/hr" if est.price_per_hour is not None else "depends on machine"
     cost = fmt.money(est.max_cost) if est.max_cost is not None else "-"
     _kv([("estimate", fmt.paint(price, "green", color)), ("max cost", f"{cost} (for {est.max_duration}s)"),
          ("resources", json.dumps(est.resources))])

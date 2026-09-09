@@ -538,7 +538,7 @@ def test_workspace_detail_output(capsys):
     assert cli.main(["workspace", "ns"]) == 0
     out = capsys.readouterr().out
     assert "Team" in out and "ns" in out
-    assert "$2.10" in out and "$40.50" in out           # price/hr, avg/day
+    assert "$2.100" in out and "$40.50" in out          # price/hr 은 3자리, avg/day 는 2자리
     assert "128 GB" in out and "500 GB" in out           # ram/storage: MiB → GB
     assert "RESOURCE" in out and "pod" in out            # resource table
     assert "2026-08-30" in out and "$1.75" in out        # daily cost + total
@@ -617,7 +617,7 @@ def test_machine_metrics_output(capsys):
 def test_gpus_output_and_passthrough(capsys):
     assert cli.main(["gpus"]) == 0
     out = capsys.readouterr().out
-    assert "NVIDIA H100" in out and "80 GB" in out and "$2.50" in out
+    assert "NVIDIA H100" in out and "80 GB" in out and "$2.500" in out   # $/hr 은 3자리
     assert FakeClient.last_call == ("list_gpus", (), {"rental_type": "demand", "min_vram": None})
 
     assert cli.main(["gpus", "--rental", "spot", "--vram", "40", "--model", "h100"]) == 0
@@ -840,7 +840,7 @@ def test_asset_storage_output_and_name(capsys):
     assert cli.main(["asset-storage", "ns"]) == 0
     out = capsys.readouterr().out
     assert "managed:       2.00 GB" in out
-    assert "$0.015 per GB-month" in out and "$0.03" in out
+    assert "$0.02 per GB-month" in out and "$0.03" in out
     assert "grace (uploads block in" in out
     assert "none (pods and tasks cannot start)" in out
     assert cli.main(["asset-storage", "ns", "-o", "name"]) == 0

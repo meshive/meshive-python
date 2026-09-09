@@ -88,7 +88,8 @@ def _last(name):
 def test_pod_create_estimate_only(capsys):
     assert cli.main(["pod-create", "ws", "agent-pod", "--template", "457", "--gpu", "RTX 3060", "--estimate"]) == 0
     out = capsys.readouterr().out
-    assert "$0.07/hr" in out and "RTX 3060" in out
+    # 콘솔과 같은 값이어야 한다 — $/hr 은 3자리, 견적 내역도 줄마다 3자리(Receipt).
+    assert "$0.068/hr" in out and "gpu=$0.068" in out and "RTX 3060" in out
     assert not any(c[0] == "create_pod" for c in FakeClient.instances[-1].calls)
 
 
@@ -132,7 +133,9 @@ def test_pod_stop_and_delete(capsys, non_tty):
 
 def test_storage_create_and_estimate(capsys, non_tty):
     assert cli.main(["storage-create", "ws", "vol", "--size", "10", "--type", "nfs", "--encrypted", "--estimate"]) == 0
-    assert "$0.00/hr" in capsys.readouterr().out
+    # 스토리지 시간당 단가도 3자리 — 2자리면 "$0.00" 이 돼 콘솔("$0.000")과 갈린다.
+    storage_out = capsys.readouterr().out
+    assert "$0.000/hr" in storage_out and "per GB·month: $0.07" in storage_out
     assert cli.main(["storage-create", "ws", "vol", "--size", "10", "--yes", "-o", "name"]) == 0
     assert capsys.readouterr().out.strip() == "5"
     name, args, kw = _last("create_storage")

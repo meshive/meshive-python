@@ -46,6 +46,10 @@ Read-only keys keep working for everything that existed before.
   `serving-scale`, `serving-pause`, `serving-resume`, `serving-delete`, `task-submit`, `task-stop`, `logs`, `task-logs`.
 - Commands that spend credit or delete something show the estimate and ask for confirmation; pass `--yes` in scripts,
   or `--estimate` to only see the price.
+- Amounts print exactly as the Meshive web console shows them: hourly rates to three decimals (`$0.068/hr`), every
+  other amount to two (`$2.10`). Previously an hourly rate was rounded to two decimals, so a workspace the console
+  showed as `$0.068/hr` read `$0.07/hr` in the terminal and a small storage volume read `$0.00/hr`. Use `-o json`
+  for the unrounded number.
 
 ## v0.0.7
 

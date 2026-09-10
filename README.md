@@ -1,7 +1,7 @@
 ## Install
 
 ```bash
-pip install meshive
+pip install "meshive==0.1.1"
 ```
 
 Docs: [SDK & CLI reference](https://docs.meshive.ai/sdk-cli/) · [Quickstart](https://docs.meshive.ai/getting-started/quickstart-client/) · [Serverless API](https://docs.meshive.ai/api-reference/) · [GPU pricing](https://docs.meshive.ai/documentation/pricing/)
@@ -12,6 +12,7 @@ The SDK and CLI authenticate with a **Meshive API Key**. Issue one from the
 [console](https://console.meshive.ai) (workspace Settings → Secret). A **Read only** key can view
 everything; a **Read & write** key is needed to create, change or delete resources, and it always
 expires (30 days by default, 90 at most).
+New read-only keys also expire (365 days by default and at most); existing keys retain their original expiry policy.
 
 The easiest way is `meshive login` — it verifies the key and stores it (file mode `0600`)
 under `~/.meshive/credentials.json`, so later commands need no flags or env vars:
@@ -40,6 +41,15 @@ it with `--base-url` or `MESHIVE_BASE_URL` (same precedence: flag › env › lo
 `meshive --help` lists the commands; `meshive <command> --help` shows their options.
 Commands that spend credit or delete something show an estimate and ask for confirmation
 (`--yes` to skip, `--estimate` to only see the price).
+`--estimate` is available on `pod-create`, `storage-create`, and `task-submit`.
+Resuming a serving and changes that can raise its cost also require confirmation. `--yes` does
+not replace `--allow-data-loss` for an unattended pod move that can lose unpreserved files.
+
+Automatic HTTP retries reuse a key, but **rerunning a CLI command creates a new key**. CLI 0.1.1
+has no `--idempotency-key` or operation lookup command, and terminal errors do not print recovery
+metadata. A successful write's `-o json` output does carry `idempotencyKey`, `operationMethod`
+and `operationPath`, so record those if you may need to reconcile later. Inspect the resource and transaction before retrying a timed-out write; use the SDK's
+explicit `idempotency_key` and `get_operation` for automation that must survive process restarts.
 
 ```bash
 meshive --version
@@ -56,6 +66,7 @@ meshive pods <workspace>       # list pods in a workspace
 meshive pods --all             # list pods across every workspace (adds a WORKSPACE column)
 meshive pod <workspace> <pod>  # show a single pod
 meshive pod-metrics <workspace> <pod>   # live CPU/RAM/GPU/disk usage
+meshive transactions <workspace>        # in-flight pod operations (why a pod is still creating)
 
 meshive storages <workspace>   # storages (volumes) in a workspace
 meshive storage <workspace> <storage>   # show a single storage
@@ -206,6 +217,8 @@ All methods (identical on `AsyncMeshive`, awaited):
 | `list_workspaces()` / `get_workspace(workspace)` | `list[Workspace]` / `WorkspaceDetail` |
 | `list_members(workspace)` | `list[Member]` |
 | `list_pods(workspace)` / `get_pod(pod_name, workspace)` / `wait_for_pod(...)` | `list[Pod]` / `Pod` |
+| `list_transactions(workspace)` | `list[Transaction]` — the step a pod is on, with progress |
+| `get_operation(operation_id, method=, path=)` | `dict` with acceptance state and task/transaction references |
 | `get_pod_metrics(pod_name, workspace)` | `PodMetrics` |
 | `list_storages(workspace)` / `get_storage(storage_name, workspace)` | `list[Storage]` / `Storage` |
 | `list_gpus(rental_type=, min_vram=)` | `list[GpuAvailability]` |
@@ -274,25 +287,46 @@ older API those calls return `NotFoundError`; the commands that existed in 0.0.6
 ### Writing (0.1.0+)
 
 ```python
-from meshive import Meshive, ConflictError
+import time
+import uuid
+from meshive import Meshive
 
-client = Meshive()  # key with the write scope
-est = client.estimate_pod("my-pod", template_id=457, workspace="<workspace>", gpu_model="RTX 3060")
-print(est.price_per_hour, est.resources)          # "0.068423" {...}
-
-created = client.create_pod("my-pod", 457, workspace="<workspace>", gpu_model="RTX 3060",
-                            max_price_per_hour=0.10)  # refused with ConflictError if pricier
-pod = next(p for p in client.list_pods("<workspace>") if p.user_alias == "my-pod")
-client.wait_for_pod(pod.pod_name, "<workspace>", until="running")
-print(client.get_pod_logs(pod.pod_name, "<workspace>", tail=50).text)
-client.stop_pod(pod.pod_name, "<workspace>")
-client.delete_pod(pod.pod_name, "<workspace>")
+with Meshive() as client:  # key with the write scope
+    workspace = "<workspace>"
+    name = "my-pod-" + uuid.uuid4().hex[:12]
+    key = str(uuid.uuid4())  # save durably before sending in an application
+    print("create operation:", key)
+    est = client.estimate_pod(name, 457, workspace=workspace, gpu_model="RTX 3060")
+    print(est.price_per_hour, est.resources)
+    created = client.create_pod(name, 457, workspace=workspace, gpu_model="RTX 3060",
+                                max_price_per_hour=0.10, idempotency_key=key)
+    deadline = time.monotonic() + 120
+    while True:
+        pod = next((p for p in client.list_pods(workspace) if p.user_alias == name), None)
+        if pod is not None:
+            break
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Accepted transaction {created.transaction_id}; reconcile before retrying")
+        time.sleep(5)
+    client.wait_for_pod(pod.pod_name, workspace, until="running")
+    print(client.get_pod_logs(pod.pod_name, workspace, tail=50).text)
+    client.stop_pod(pod.pod_name, workspace)
+    client.wait_for_pod(pod.pod_name, workspace, until="stopped")
+    client.delete_pod(pod.pod_name, workspace)
 ```
+
+### Why a pod is still `creating`
+
+A pod that stays `creating` is usually pulling its image, not stuck. `list_transactions(workspace)`
+(CLI: `meshive transactions`) returns the operations still in flight: `step` is the current stage,
+`progress` is `0.0`-`1.0` for stages that report it and **`None` when the stage reports none** — do
+not render that as 0%. `detail` carries the failure reason when one is known. Finished work drops
+off the list, so an empty result means "nothing in flight", never "nothing failed".
 
 ### Write safety contract
 
 `start_pod(..., placement="any_node")` can permanently delete unpreserved workspace files after a node move. Inspect `Pod.has_unpreserved_workspace`; use `allow_data_loss=True` only after separate consent for that pod and move. The CLI requires `--allow-data-loss` in addition to `--yes` for an unattended move that can lose data. `Pod.storage_rate_per_hour` is separate from compute pricing.
 
-`max_price_per_hour` on pods/tasks caps the final compute rate, excluding attached/automatic storage and Asset Hub retention. Over-cap pod placements fail asynchronously. CPU capped requests are refused when a quote is unavailable. Task `max_cost` may be unknown because fetch time and storage charges exceed the script-runtime estimate.
+`max_price_per_hour` on pods/tasks caps the final compute rate, excluding attached/automatic storage and Asset Hub retention. Over-cap pod placements fail asynchronously. CPU capped requests are refused when a quote is unavailable. Task `max_cost` is unknown because fetch time and storage charges can exceed the script-runtime estimate.
 
 Keep one `idempotency_key` for each logical write and reuse it after a timeout. Results expose `raw["idempotencyKey"]`, `raw["operationMethod"]` and `raw["operationPath"]`; terminal network/API exceptions expose `idempotency_key`, `operation_method` and `operation_path`. `get_operation(key, method="POST", path="/tasks")` checks the durable acceptance record without resubmitting work. Pending/unknown records require reconciliation. `done` records API acceptance, not completion of the asynchronous resource operation.

@@ -31,6 +31,7 @@ from ..models import (
     Storage,
     Task,
     Template,
+    Transaction,
     WhoAmI,
     Workspace,
     WorkspaceDetail,
@@ -184,6 +185,11 @@ def build_parser() -> argparse.ArgumentParser:
                                    help="Show live resource usage (CPU/RAM/GPU/disk) of a pod.")
     p_pod_metrics.add_argument("workspace", help="Workspace ID (namespace name).")
     p_pod_metrics.add_argument("pod_name", help="Pod ID (pod name). See ID column of `meshive pods`.")
+
+    # --- transactions ---------------------------------------------------------
+    p_txn = sub.add_parser("transactions", parents=[common], aliases=["txn"],
+                           help="Show in-flight pod operations (why a pod is still creating).")
+    p_txn.add_argument("workspace", help="Workspace ID (namespace name).")
 
     # --- storages -------------------------------------------------------------
     p_storages = sub.add_parser("storages", parents=[common],
@@ -1010,6 +1016,34 @@ def _cmd_pod_metrics(client: Meshive, args: argparse.Namespace, output: str, col
     return 0
 
 
+def _print_transactions(transactions: list[Transaction], color: bool) -> None:
+    if not transactions:
+        # 끝난 작업은 목록에서 빠진다 — 빈 목록은 "실패 없음" 이 아니라 "진행 중 없음" 이다.
+        print("No in-flight pod operations.")
+        return
+    rows = []
+    colors = []
+    for t in transactions:
+        rows.append([
+            t.user_alias or t.resource_name or "-", str(t.transaction_id), t.action or "-",
+            fmt.status_cell(t.status), t.step or "-",
+            "-" if t.progress is None else f"{t.progress * 100:.0f}%",
+            fmt.clean(t.detail) if t.detail else "-",
+            fmt.relative_time(t.updated_at),
+        ])
+        colors.append([None, None, None, fmt.status_color(t.status), None, None, None, "dim"])
+    fmt.render_table(
+        ["POD", "TXN", "ACTION", "STATUS", "STEP", "PROGRESS", "DETAIL", "UPDATED"],
+        rows, colors=colors, color=color)
+
+
+def _cmd_transactions(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    transactions = client.list_transactions(args.workspace)
+    _emit(output, [t.raw for t in transactions], [str(t.transaction_id) for t in transactions],
+          lambda: _print_transactions(transactions, color))
+    return 0
+
+
 def _cmd_storages(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     statuses = _parse_status_filter(args.status)
     code = _reject_unknown_statuses(statuses, POD_STATUSES)
@@ -1170,6 +1204,7 @@ _HANDLERS: dict[str, Handler] = {
     "pods": _cmd_pods,
     "pod": _cmd_pod,
     "pod-metrics": _cmd_pod_metrics,
+    "transactions": _cmd_transactions, "txn": _cmd_transactions,
     "storages": _cmd_storages,
     "storage": _cmd_storage,
     "machines": _cmd_machines, "m": _cmd_machines,

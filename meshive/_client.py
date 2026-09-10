@@ -56,6 +56,7 @@ from .models import (
     ResourceAction,
     Serving,
     Storage,
+    Transaction,
     StorageCreated,
     StorageEstimate,
     Task,
@@ -496,6 +497,15 @@ class Meshive(_BaseClient):
         data = self._get("/storages", params={"workspace": workspace})
         return [Storage.from_dict(d) for d in data.get("storages", [])]
 
+    def list_transactions(self, workspace: str) -> list[Transaction]:
+        """진행 중인 pod 작업 목록 (GET /transactions?workspace=).
+
+        pod 이 `creating` 에서 오래 머무를 때 이유를 여기서 본다 — 이미지 pull 진행률,
+        자산 fetch, 실패 진단. 끝난 작업은 목록에서 빠지므로 **빈 목록은 "진행 중인 것 없음"**
+        이지 "실패 없음" 이 아니다."""
+        return [Transaction.from_dict(d)
+                for d in self._get("/transactions", params={"workspace": workspace})]
+
     def get_storage(self, storage_name: str, workspace: str) -> Storage:
         """스토리지 단건 (GET /storages/{storage_name}?workspace=). 인자 순서는 get_pod 와 동일."""
         segment = _path_segment(storage_name, "storage_name")
@@ -912,6 +922,11 @@ class AsyncMeshive(_BaseClient):
         """워크스페이스의 스토리지(볼륨) 목록 (GET /storages?workspace=)."""
         data = await self._get("/storages", params={"workspace": workspace})
         return [Storage.from_dict(d) for d in data.get("storages", [])]
+
+    async def list_transactions(self, workspace: str) -> list[Transaction]:
+        """진행 중인 pod 작업 목록 (GET /transactions?workspace=). sync 판과 동일 계약."""
+        data = await self._get("/transactions", params={"workspace": workspace})
+        return [Transaction.from_dict(d) for d in data]
 
     async def get_storage(self, storage_name: str, workspace: str) -> Storage:
         """스토리지 단건 (GET /storages/{storage_name}?workspace=)."""

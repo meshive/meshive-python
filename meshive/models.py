@@ -286,6 +286,61 @@ class WorkspaceDetail:
 
 
 @dataclass
+class Transaction:
+    """진행 중인 pod 작업 하나. `status: creating` 이 왜 길어지는지 알려주는 유일한 수단.
+
+    `step` 이 현재 단계이고, 이미지 pull/자산 fetch 처럼 진행률이 있는 단계는 `progress`
+    (0.0~1.0) 가 채워진다. 진행률을 알 수 없는 단계는 None 이다 — **0.0 으로 읽지 말 것**.
+    실패 사유는 `detail`. 원문 진단(container status, k8s events, OOM 분류)은 `.raw`.
+    """
+
+    transaction_id: int
+    resource_name: str          # statefulset 이름 (pod 이름의 `-0` 앞부분)
+    user_alias: str             # 유저가 붙인 pod 이름
+    action: str                 # create | start | stop | restart | reallocate ...
+    status: str                 # todo | in_progress | retry | failed ...
+    step: str = ""              # 현재(마지막) 단계
+    step_status: str = ""
+    detail: str = ""            # 사람이 읽는 설명 / 실패 사유
+    progress: float | None = None   # 0.0~1.0, 알 수 없으면 None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Transaction":
+        steps = [x for x in (d.get("transactionSteps") or []) if isinstance(x, dict)]
+        last = steps[-1] if steps else {}
+        # 진행률은 단계마다 키가 다르다(이미지 pull / 자산 fetch / 스토리지 준비).
+        # 셋 다 progressPercent(0~100) 로 같은 좌표계를 쓴다 — 키 부재는 None 유지.
+        percent = None
+        for key in ("imagePullProgress", "assetFetchProgress", "storagePrepareProgress"):
+            value = last.get(key)
+            if isinstance(value, dict) and value.get("progressPercent") is not None:
+                percent = _as_float(value.get("progressPercent")) / 100.0
+                break
+        diagnostic = last.get("failureDiagnostic") or {}
+        detail = str(last.get("detail", "") or "")
+        if not detail and isinstance(diagnostic, dict):
+            detail = str(diagnostic.get("failureReason")
+                         or diagnostic.get("oomReason") or "")
+        return cls(
+            transaction_id=int(d.get("transactionId") or 0),
+            resource_name=str(d.get("resourceName", "") or ""),
+            user_alias=str(d.get("userAlias", "") or ""),
+            action=str(d.get("action", "") or ""),
+            status=str(d.get("status", "") or ""),
+            step=str(last.get("step", "") or ""),
+            step_status=str(last.get("status", "") or ""),
+            detail=detail,
+            progress=percent,
+            created_at=_parse_dt(d.get("createdAt")),
+            updated_at=_parse_dt(d.get("updatedAt")),
+            raw=d,
+        )
+
+
+@dataclass
 class Storage:
     """GET /v1/sdk/storages[/{storage_name}] 항목 (StorageMetaData) — 워크스페이스 볼륨(PV).
 

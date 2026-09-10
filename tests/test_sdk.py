@@ -944,3 +944,67 @@ def test_cli_money_helpers_delegate_to_the_public_formatter():
     for value in ("0.06770833", "2.1", "0.015", None, ""):
         assert fmt.money_hourly(value) == meshive.format_hourly(value)
         assert fmt.money(value) == meshive.format_usd(value)
+
+
+TRANSACTION = {
+    "transactionId": 73213,
+    "namespace": "team-ns",
+    "nodeName": "node-1",
+    "userAlias": "sdk-real-0910-w05pod",
+    "resource": "statefulset",
+    "resourceName": "9eb176aae9309fb8",
+    "action": "create",
+    "status": "in_progress",
+    "createdAt": "2026-09-10T07:55:07.081000Z",
+    "updatedAt": "2026-09-10T07:58:00.000000Z",
+    "doneAt": None,
+    "transactionSteps": [
+        {"step": "prepare_storage", "status": "done", "detail": "",
+         "updatedAt": "2026-09-10T07:55:20.000000Z"},
+        {"step": "pull_image", "status": "in_progress", "detail": "",
+         "updatedAt": "2026-09-10T07:58:00.000000Z",
+         "imagePullProgress": {"totalBytes": 100, "downloadedBytes": 42,
+                               "progressPercent": 42.0,
+                               "completedLayers": 3, "totalLayers": 9}},
+    ],
+}
+
+
+def test_list_transactions_parses_in_flight_step():
+    """`creating` 이 왜 안 끝나는지 — 마지막 스텝과 진행률이 나와야 한다."""
+    seen = {}
+    txns = sync_client(_capture([TRANSACTION], seen)).list_transactions("team-ns")
+    assert seen["path"] == "/v1/sdk/transactions" and seen["params"] == {"workspace": "team-ns"}
+    t = txns[0]
+    assert t.transaction_id == 73213 and t.action == "create" and t.status == "in_progress"
+    assert t.step == "pull_image" and t.step_status == "in_progress"
+    assert t.progress == pytest.approx(0.42)
+    assert t.user_alias == "sdk-real-0910-w05pod"
+    assert t.raw["transactionSteps"][1]["imagePullProgress"]["totalLayers"] == 9
+
+
+def test_transaction_progress_is_none_when_unknown():
+    """진행률 없는 스텝을 0% 로 읽으면 '멈춘 것처럼' 보인다 — None 이어야 한다."""
+    payload = dict(TRANSACTION, transactionSteps=[
+        {"step": "create_statefulset", "status": "in_progress", "detail": "",
+         "updatedAt": "2026-09-10T07:55:20.000000Z"}])
+    t = sync_client(_capture([payload], {})).list_transactions("team-ns")[0]
+    assert t.progress is None and t.step == "create_statefulset"
+
+
+def test_transaction_failure_reason_surfaces_as_detail():
+    """detail 이 비어도 진단의 failure_reason 은 올라와야 한다 — stall 류는 그게 유일한 단서."""
+    payload = dict(TRANSACTION, status="failed", transactionSteps=[
+        {"step": "pull_image", "status": "failed", "detail": "",
+         "updatedAt": "2026-09-10T08:00:00.000000Z",
+         "failureDiagnostic": {"failureReason": "image pull stalled for 600s"}}])
+    t = sync_client(_capture([payload], {})).list_transactions("team-ns")[0]
+    assert t.status == "failed" and t.detail == "image pull stalled for 600s"
+
+
+def test_async_list_transactions_mirrors_sync():
+    async def run():
+        async with async_client(_capture([TRANSACTION], {})) as client:
+            return await client.list_transactions("team-ns")
+    txns = asyncio.run(run())
+    assert txns[0].step == "pull_image" and txns[0].progress == pytest.approx(0.42)

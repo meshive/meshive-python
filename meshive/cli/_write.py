@@ -32,6 +32,17 @@ def _emit(output: str, raw: object, ids: list[str], show: Callable[[], None]) ->
         show()
 
 
+def _emit_estimate(output: str, estimate: PodEstimate | StorageEstimate | TaskEstimate, show: Callable[[], None]) -> None:
+    """`--estimate` 출력. json 은 서버 payload 만, table 은 견적 표, name 은 credit·asset-storage 처럼 헤드라인 숫자
+    하나 — 시간당 견적을 표와 같은 반올림(3자리)으로 `$`·천 단위 쉼표 없이. 단가를 모르면(CPU 프리셋 태스크) 안 찍는다."""
+    ids: list[str] = []
+    if output == "name":
+        price = fmt.money_hourly(estimate.price_per_hour)
+        if price != "-":
+            ids.append(price.replace("$", "").replace(",", ""))
+    _emit(output, estimate.raw, ids, show)
+
+
 def _confirm(args: argparse.Namespace, question: str) -> bool:
     """--yes 면 통과. 아니면 TTY 에서 묻고, 비대화형이면 안내 후 거절."""
     if getattr(args, "yes", False):
@@ -174,12 +185,11 @@ def _wait_for_new_pod(client: Meshive, workspace: str, name: str, until: str, ti
 def cmd_pod_create(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     kwargs = _pod_kwargs(args)
     estimate = client.estimate_pod(args.name, args.template, workspace=args.workspace, **kwargs)
-    if args.estimate or output == "table":
-        _print_pod_estimate(estimate, color)
     if args.estimate:
-        if output == "json":
-            print(json.dumps(estimate.raw, indent=2, ensure_ascii=False))
+        _emit_estimate(output, estimate, lambda: _print_pod_estimate(estimate, color))
         return 0
+    if output == "table":      # 확인을 묻기 전에 견적을 보여 준다 — json/name 출력에는 섞지 않는다
+        _print_pod_estimate(estimate, color)
     if not _confirm(args, f"Create pod '{args.name}' at {fmt.money_hourly(estimate.price_per_hour)}/hr?"):
         return 2
     created = client.create_pod(args.name, args.template, workspace=args.workspace, **kwargs)
@@ -244,12 +254,11 @@ def cmd_storage_create(client: Meshive, args: argparse.Namespace, output: str, c
     kwargs = dict(storage_type=args.type, disk_type=args.disk, encrypted=args.encrypted, region=args.region,
                   max_price_per_hour=args.max_price)
     estimate = client.estimate_storage(args.name, args.size, workspace=args.workspace, **kwargs)
-    if args.estimate or output == "table":
-        _print_storage_estimate(estimate, color)
     if args.estimate:
-        if output == "json":
-            print(json.dumps(estimate.raw, indent=2, ensure_ascii=False))
+        _emit_estimate(output, estimate, lambda: _print_storage_estimate(estimate, color))
         return 0
+    if output == "table":
+        _print_storage_estimate(estimate, color)
     if not _confirm(args, f"Create {args.size} GiB {estimate.storage_type} storage '{args.name}' "
                           f"at {fmt.money_hourly(estimate.price_per_hour)}/hr?"):
         return 2
@@ -336,12 +345,11 @@ def cmd_task_submit(client: Meshive, args: argparse.Namespace, output: str, colo
                   max_duration=args.max_duration, webhook_url=args.webhook, input_assets=_parse_input_assets(args.input_asset),
                   max_price_per_hour=args.max_price)
     estimate = client.estimate_task(args.name, script or "", workspace=args.workspace, **kwargs)
-    if args.estimate or output == "table":
-        _print_task_estimate(estimate, color)
     if args.estimate:
-        if output == "json":
-            print(json.dumps(estimate.raw, indent=2, ensure_ascii=False))
+        _emit_estimate(output, estimate, lambda: _print_task_estimate(estimate, color))
         return 0
+    if output == "table":
+        _print_task_estimate(estimate, color)
     cost = fmt.money(estimate.max_cost) if estimate.max_cost is not None else "an unknown amount"
     if not _confirm(args, f"Submit task '{args.name}' (up to {cost})?"):
         return 2

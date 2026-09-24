@@ -1,4 +1,5 @@
 """CLI 쓰기 커맨드 — 인자 파싱 → SDK 호출 인자, 확인(--yes/비대화형), --estimate, 출력 포맷."""
+import copy
 import importlib
 import json
 
@@ -13,6 +14,8 @@ ESTIMATE = {"pricePerHourUsd": "0.068423", "breakdown": {"gpu": "0.068423"},
             "resources": {"gpu_model": "RTX 3060", "vram_gb": 12, "gpu_count": 1, "vcpu": 4, "ram_gb": 12, "disk_gb": 25,
                           "rental_type": "demand"},
             "availability": {"available_gpus": 2}, "template": {"id": 457, "name": "VSCode"}, "volumes": [], "note": "Estimated"}
+STORAGE_ESTIMATE = {"pricePerHourUsd": "0.000097", "pricePerGbMonthUsd": "0.07", "storageType": "nfs", "maxSizeGb": 305}
+TASK_ESTIMATE = {"pricePerHourUsd": None, "maxCostUsd": None, "maxDurationS": 3600, "resources": {}, "note": "CPU"}
 TASK = {"externalId": "task_1", "name": "train", "namespaceName": "ws", "status": "queued", "podName": "task-1",
         "image": "img", "gpuModel": None, "gpuCount": 0, "cpuCores": 2, "ramGb": 8, "pricePerHour": "0",
         "costSoFar": "0", "totalCost": "0"}
@@ -61,8 +64,7 @@ class FakeClient:
 
     def estimate_storage(self, *a, **kw):
         self._rec("estimate_storage", *a, **kw)
-        return StorageEstimate.from_dict({"pricePerHourUsd": "0.000097", "pricePerGbMonthUsd": "0.07", "sizeGb": a[1],
-                                          "storageType": "nfs", "maxSizeGb": 305})
+        return StorageEstimate.from_dict({**STORAGE_ESTIMATE, "sizeGb": a[1]})
 
     def create_storage(self, *a, **kw):
         self._rec("create_storage", *a, **kw)
@@ -71,7 +73,7 @@ class FakeClient:
 
     def estimate_task(self, *a, **kw):
         self._rec("estimate_task", *a, **kw)
-        return TaskEstimate.from_dict({"pricePerHourUsd": None, "maxCostUsd": None, "maxDurationS": 3600, "resources": {}, "note": "CPU"})
+        return TaskEstimate.from_dict(TASK_ESTIMATE)
 
     def submit_task(self, *a, **kw):
         self._rec("submit_task", *a, **kw)
@@ -251,3 +253,68 @@ def test_storage_estimate_shows_disk_type(capsys):
     assert cli.main(["storage-create", "ws", "vol", "--size", "10", "--disk", "SSD", "--estimate"]) == 0
     assert "nfs / NVMe" in capsys.readouterr().out       # FakeClient 응답에 diskType 이 없어 기본 NVMe
     assert _last("estimate_storage")[2]["disk_type"] == "SSD"
+
+
+# --estimate 는 pod-create·storage-create·task-submit 공통 — 출력 포맷별 동작을 세 커맨드에 같이 건다.
+ESTIMATE_ARGV = {
+    "pod-create": ["pod-create", "ws", "p", "--template", "457", "--gpu", "RTX 3060", "--estimate"],
+    "storage-create": ["storage-create", "ws", "vol", "--size", "10", "--estimate"],
+    "task-submit": ["task-submit", "ws", "t", "--script-text", "print(1)", "--image", "img", "--cpu-preset", "micro-2c8g",
+                    "--estimate"],
+}
+
+
+def _created_nothing():
+    return all(c[0] not in ("create_pod", "create_storage", "submit_task") for c in FakeClient.instances[-1].calls)
+
+
+@pytest.mark.parametrize("flag", [["-o", "json"], ["--json"]])
+@pytest.mark.parametrize("command, payload", [("pod-create", ESTIMATE), ("storage-create", {**STORAGE_ESTIMATE, "sizeGb": 10}),
+                                              ("task-submit", TASK_ESTIMATE)])
+def test_estimate_json_is_only_the_server_payload(capsys, command, payload, flag):
+    """`--estimate -o json` 은 서버 견적 payload 하나만 — 사람용 견적 표가 앞에 붙어 jq·json.loads 가 깨졌다
+    (dev 실측: storage-create 의 첫 줄들이 `estimate:`·`per GiB·month:`·`size:`, 그 뒤에 JSON)."""
+    expected = copy.deepcopy(payload)     # FakeClient 가 같은 dict 를 raw 로 넘기므로 호출 전 사본과 비교한다
+    assert cli.main(ESTIMATE_ARGV[command] + flag) == 0
+    assert json.loads(capsys.readouterr().out) == expected
+    assert _created_nothing()
+
+
+@pytest.mark.parametrize("command, price", [("pod-create", "0.068\n"), ("storage-create", "0.000\n"),
+                                            ("task-submit", "")])    # CPU 프리셋은 시간당 단가를 모른다 — 찍을 숫자가 없다
+def test_estimate_name_is_just_the_hourly_price(capsys, command, price):
+    """`-o name` 은 credit·asset-storage 처럼 헤드라인 숫자 하나 — 표의 `$0.068/hr` 과 같은 숫자를 `$` 없이.
+    전에는 사람용 견적 표를 그대로 찍었다."""
+    assert cli.main(ESTIMATE_ARGV[command] + ["-o", "name"]) == 0
+    assert capsys.readouterr().out == price
+    assert _created_nothing()
+
+
+@pytest.mark.parametrize("price, shown", [("0.5", "0.500\n"), ("1.0005", "1.001\n"), ("1234.5678", "1234.568\n")])
+def test_estimate_name_rounds_like_the_table(capsys, monkeypatch, price, shown):
+    """단가가 있는 태스크(GPU)도 그 숫자 하나. 반올림은 표와 같은 ROUND_HALF_UP(float 포맷이면 1.0005 → 1.000),
+    천 단위 쉼표는 뺀다 — 표는 `$1,234.568/hr`."""
+    monkeypatch.setattr(FakeClient, "estimate_task",
+                        lambda self, *a, **kw: TaskEstimate.from_dict({**TASK_ESTIMATE, "pricePerHourUsd": price}))
+    argv = ["task-submit", "ws", "t", "--script-text", "print(1)", "--image", "img", "--gpu", "RTX 3060", "--estimate"]
+    assert cli.main(argv + ["-o", "name"]) == 0
+    assert capsys.readouterr().out == shown
+
+
+@pytest.mark.parametrize("command", ESTIMATE_ARGV)
+def test_estimate_table_is_the_default(capsys, command):
+    assert cli.main(ESTIMATE_ARGV[command]) == 0
+    assert capsys.readouterr().out.startswith("estimate:")
+    assert _created_nothing()
+
+
+@pytest.mark.parametrize("command, key, value", [("pod-create", "transactionId", 99), ("storage-create", "transactionId", 5),
+                                                 ("task-submit", "task", TASK)])
+def test_create_shows_the_estimate_first_only_in_table_mode(capsys, command, key, value):
+    """실제로 만들 때 확인 전에 견적 표를 보여 주는 건 table 모드뿐 — -o json 은 수락 응답 하나만 찍는다."""
+    argv = [arg for arg in ESTIMATE_ARGV[command] if arg != "--estimate"] + ["--yes"]
+    assert cli.main(argv) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("estimate:") and "accepted:" in out
+    assert cli.main(argv + ["-o", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)[key] == value

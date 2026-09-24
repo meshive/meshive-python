@@ -27,6 +27,9 @@ pip install -U meshive
 - `pod-metrics` / `machine-metrics`: when the server cannot read a GPU's memory, the GPU line shows `n/a of n/a vram`.
   It showed `0 GB vram`, as if the card had no memory.
 - `storage-create --size` and `pod-create --ram` are in GiB, as they always were; the help now says so.
+- `pod-create`, `storage-create` and `task-submit` with `--estimate`: `-o json` prints only the estimate's JSON; the
+  human-readable estimate came first and broke `jq`. `-o name` prints just the hourly rate as the table rounds it
+  (`0.068`), or nothing when a CPU task's rate cannot be quoted; it printed the whole estimate.
 - New `transactions` command (alias `txn`): the pod operations still in flight in a workspace, with the
   current step, progress and failure detail — why a pod is still `creating`.
 

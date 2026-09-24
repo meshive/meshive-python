@@ -90,7 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Write commands (need a key with the write scope; they ask for confirmation unless --yes):\n"
             "  meshive pod-create <ws> <name> --template ID --gpu MODEL [--estimate]\n"
             "  meshive pod-stop|pod-start|pod-restart|pod-delete <ws> <pod>\n"
-            "  meshive storage-create <ws> <name> --size GB   meshive storage-delete <ws> <pv>\n"
+            "  meshive storage-create <ws> <name> --size GiB  meshive storage-delete <ws> <pv>\n"
             "  meshive task-submit <ws> <name> --script FILE --image IMG --cpu-preset micro-2c8g\n"
             "  meshive logs <ws> <pod>          meshive task-logs <task>\n"
             "\n"
@@ -543,7 +543,7 @@ def _print_pod(pod: Pod, color: bool) -> None:
 def _print_gpu_usages(gpus, color: bool) -> None:
     for g in gpus:
         print(f"gpu {g.gpu_number}:     {fmt.usage(g.core_usage_rate)} core, "
-              f"{fmt.usage(g.vram_usage_rate)} of {fmt.gib(g.vram_size)} vram, {fmt.temperature(g.temp)}")
+              f"{fmt.usage(g.vram_usage_rate)} of {fmt.vram(g.vram_size)} vram, {fmt.temperature(g.temp)}")
 
 
 def _print_pod_metrics(m: PodMetrics, color: bool) -> None:
@@ -558,7 +558,9 @@ def _print_machine_metrics(m: MachineMetrics, color: bool) -> None:
     print(f"machine:   {fmt.clean(m.machine_id)}")
     print(f"cpu:       {m.cpu_cores:g} cores, {fmt.usage(m.cpu_usage_rate)} used, "
           f"{m.cpu_allocated:g} allocated to pods")
-    print(f"ram:       {fmt.gib(m.ram_size)}, {fmt.usage(m.ram_usage_rate)} used, "
+    # 머신 메트릭의 ram_size 만 바이트다(서버가 node_memory_MemTotal_bytes 를 그대로 준다). 할당 RAM·디스크·
+    # VRAM 은 MiB — 같은 식으로 읽으면 64 GiB 머신이 '65,648,036 GB' 로 찍힌다.
+    print(f"ram:       {fmt.gib(m.ram_size / 1024 ** 2)}, {fmt.usage(m.ram_usage_rate)} used, "
           f"{fmt.gib(m.ram_allocated)} allocated to pods")
     _print_gpu_usages(m.gpus, color)
     print(f"root disk: {fmt.gib(m.root_volume_size)}, {fmt.usage(m.root_volume_usage_rate)} used")
@@ -786,7 +788,7 @@ def _print_task(t: Task, color: bool) -> None:
     print(f"pod:         {fmt.clean(t.pod_name or '-')}")
     print(f"image:       {fmt.clean(t.image or '-')}")
     print(f"gpu:         {fmt.clean(_task_gpu(t))}")
-    print(f"cpu/ram:     {t.cpu_cores} cores / {t.ram_gb} GB")
+    print(f"cpu/ram:     {t.cpu_cores} cores / {t.ram_gb} GiB")
     print(f"price/hr:    {fmt.money_hourly(t.price_per_hour)}")
     print(f"cost so far: {fmt.money(t.cost_so_far)}")
     print(f"total cost:  {fmt.money(t.total_cost)}")
@@ -872,7 +874,7 @@ def _print_asset(a: Asset, color: bool) -> None:
 
 def _print_asset_storage(s: AssetStorage, color: bool) -> None:
     print(f"managed:       {fmt.bytes_human(s.managed_bytes)}")
-    print(f"price:         {fmt.money(s.price_per_gb_month)} per GB-month")
+    print(f"price:         {fmt.money(s.price_per_gb_month)} per GiB-month")
     print(f"est. monthly:  {fmt.money(s.estimated_monthly_cost)}")
     state = s.credit_state or "-"
     tone = None

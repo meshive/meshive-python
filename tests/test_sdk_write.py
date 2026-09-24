@@ -193,7 +193,7 @@ def test_task_methods():
         script = kwargs.pop("script", "print(1)")
         with pytest.raises(ValueError):
             c.estimate_task("t", script, workspace="ws", **kwargs)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="256 KiB"):   # 한도는 256 × 1024 바이트 (서버 메시지와 같은 KiB)
         c.estimate_task("t", "x" * (256 * 1024 + 1), workspace="ws", image="img", cpu_preset="micro-2c8g")
 
 

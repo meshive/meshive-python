@@ -140,9 +140,8 @@ def usage(rate: float | None) -> str:
     return f"{rate * 100:.1f}%"
 
 
-def gib(mib: float | None) -> str:
-    """MiB 값 → 'N GB' (웹 콘솔과 동일하게 /1024). 1 GB 미만은 'N MB' 로 — 시스템 파드의
-    수십 MB 가 '0.0 GB' 로 뭉개지지 않게. None/비유한값은 '-'."""
+def _from_mib(mib: float | None, unit: str, small_unit: str) -> str:
+    """MiB 값 → /1024 한 'N {unit}'. 1024 MiB 미만은 'N {small_unit}' 그대로. None/비유한값은 '-'."""
     if mib is None:
         return "-"
     try:
@@ -153,25 +152,38 @@ def gib(mib: float | None) -> str:
         return "-"
     value = raw / 1024
     if 0 < raw < 1024:
-        return f"{raw:.0f} MB"
+        return f"{raw:.0f} {small_unit}"
     if value >= 10 or value == int(value):
-        return f"{value:,.0f} GB"
-    return f"{value:.1f} GB"
+        return f"{value:,.0f} {unit}"
+    return f"{value:.1f} {unit}"
+
+
+def gib(mib: float | None) -> str:
+    """MiB 값 → 'N GiB' (웹 콘솔과 동일하게 /1024, 라벨도 1024 기반). 1 GiB 미만은 'N MiB' 로 —
+    시스템 파드의 수십 MiB 가 '0.0 GiB' 로 뭉개지지 않게. None/비유한값은 '-'."""
+    return _from_mib(mib, "GiB", "MiB")
+
+
+def vram(mib: float | None) -> str:
+    """GPU VRAM(MiB) → 'N GB'. 숫자는 gib() 와 같은 /1024 지만 라벨은 업계 표기 'GB' 를 유지한다 —
+    콘솔도 VRAM 만은 1024 기반 라벨로 바꾸지 않았다('24GB' 카드가 '24 GiB' 로 보이지 않게)."""
+    return _from_mib(mib, "GB", "MB")
 
 
 def mbps(bytes_per_second: float | None) -> str:
-    """바이트/초 → 'N Mbps' (웹 콘솔과 동일: x8 / 1024 / 1024). None/비유한값은 '-'."""
+    """바이트/초 → 'N Mbps'. Mbps 는 비트/초 ÷ 10^6 (10진) — 1024² 로 나누면 1 Gbps 가 954 Mbps 로
+    약 4.6% 낮게 나온다 (웹 콘솔 formatMbps 와 같은 기준). None/비유한값은 '-'."""
     if bytes_per_second is None:
         return "-"
     try:
-        value = float(bytes_per_second) * 8 / 1024 / 1024
+        value = float(bytes_per_second) * 8 / 1_000_000
     except (TypeError, ValueError):
         return "-"
     return f"{value:.1f} Mbps" if math.isfinite(value) else "-"
 
 
 def bytes_human(value: float | int | None) -> str:
-    """바이트 → '1.5 KB' / '12.3 MB' / '2.00 GB' (웹 콘솔 formatBytes 와 동일 규칙, 1024 기준)."""
+    """바이트 → '1.5 KiB' / '12.3 MiB' / '2.00 GiB' (웹 콘솔 formatBytes 와 동일 규칙, 1024 기준)."""
     if value is None:
         return "-"
     try:
@@ -182,7 +194,7 @@ def bytes_human(value: float | int | None) -> str:
         return "-"
     if amount < 1024:
         return f"{int(amount)} B"
-    for unit, size, digits in (("TB", 1024 ** 4, 2), ("GB", 1024 ** 3, 2), ("MB", 1024 ** 2, 1), ("KB", 1024, 1)):
+    for unit, size, digits in (("TiB", 1024 ** 4, 2), ("GiB", 1024 ** 3, 2), ("MiB", 1024 ** 2, 1), ("KiB", 1024, 1)):
         if amount >= size:
             return f"{amount / size:.{digits}f} {unit}"
     return f"{int(amount)} B"  # pragma: no cover - unreachable

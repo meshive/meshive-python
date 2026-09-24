@@ -109,6 +109,8 @@ def test_pod_create_estimate_only(capsys):
     out = capsys.readouterr().out
     # 콘솔과 같은 값이어야 한다 — $/hr 은 3자리, 견적 내역도 줄마다 3자리(Receipt).
     assert "$0.068/hr" in out and "gpu=$0.068" in out and "RTX 3060" in out
+    # RAM·디스크는 쿠버네티스 Gi 로 잡히는 GiB, VRAM 만 업계 표기 GB.
+    assert "RTX 3060 (12 GB)" in out and "4 vCPU / 12 GiB" in out and "25 GiB" in out
     assert not any(c[0] == "create_pod" for c in FakeClient.instances[-1].calls)
 
 
@@ -154,7 +156,8 @@ def test_storage_create_and_estimate(capsys, non_tty):
     assert cli.main(["storage-create", "ws", "vol", "--size", "10", "--type", "nfs", "--encrypted", "--estimate"]) == 0
     # 스토리지 시간당 단가도 3자리 — 2자리면 "$0.00" 이 돼 콘솔("$0.000")과 갈린다.
     storage_out = capsys.readouterr().out
-    assert "$0.000/hr" in storage_out and "per GB·month: $0.07" in storage_out
+    assert "$0.000/hr" in storage_out and "per GiB·month: $0.07" in storage_out
+    assert "10 GiB" in storage_out and "305 GiB" in storage_out     # 크기 = capacity × 1024 MiB
     assert cli.main(["storage-create", "ws", "vol", "--size", "10", "--yes", "-o", "name"]) == 0
     assert capsys.readouterr().out.strip() == "5"
     name, args, kw = _last("create_storage")
@@ -210,6 +213,18 @@ def test_disk_flag_is_gone(capsys):
     with pytest.raises(SystemExit) as exit_:
         cli.main(["pod-create", "ws", "p", "--template", "1", "--disk", "30", "--yes"])
     assert exit_.value.code == 2 and "--disk" in capsys.readouterr().err
+
+
+def test_size_options_say_gib_and_vram_stays_gb(capsys):
+    """--size·--ram 은 원래부터 GiB 였다(capacity × 1024 MiB, 쿠버네티스 Gi) — 도움말도 GiB 로. VRAM 티어만 GB."""
+    for argv, expected in ((["--help"], ["--size GiB"]),
+                           (["storage-create", "--help"], ["--size GiB"]),
+                           (["pod-create", "--help"], ["--ram GiB", "RAM in GiB", "--vram GB"]),
+                           (["task-submit", "--help"], ["--vram GB"])):
+        with pytest.raises(SystemExit):
+            cli.main(argv)
+        out = capsys.readouterr().out
+        assert all(text in out for text in expected), (argv, out)
 
 
 def test_serving_scale_and_resume_confirm_only_when_cost_can_rise(capsys, non_tty):

@@ -406,7 +406,7 @@ class PodMetrics:
     """GET /v1/sdk/pods/{pod_name}/metrics 응답 (ResourceUsage) — 파드 리소스 사용량.
 
     usage rate 는 0.0~1.0, Prometheus 조회 실패 시 None (요청량 필드는 그대로 채워진다).
-    연결 스토리지 사용량은 `.raw["storage"]`.
+    연결 스토리지 사용량은 `.raw["storage"]`. 크기(ram_size·ephemeral_storage_*·gpus[].vram_size)는 MiB.
     """
 
     pod_name: str
@@ -443,6 +443,9 @@ class MachineMetrics:
 
     *_allocated 는 현재 파드들이 예약한 양. 디스크 온도(diskTemperatures)·네트워크
     인터페이스명은 `.raw`.
+
+    단위: ram_size 만 **바이트**다(노드 MemTotal — 서버가 Prometheus 값을 그대로 준다). ram_allocated·
+    root/pv_volume_size·gpus[].vram_size 는 MiB, network_receive/transmit 은 바이트/초.
     """
 
     machine_id: str

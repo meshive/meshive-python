@@ -911,15 +911,48 @@ def test_async_assets_mirror_sync():
     assert seen["params"] == {"workspace": "team-ns"}
 
 
-def test_format_gib_uses_mb_below_one_gigabyte():
+def test_format_gib_uses_mib_below_one_gibibyte():
     from meshive.cli import _format as fmt
 
-    assert fmt.gib(0) == "0 GB"
-    assert fmt.gib(512) == "512 MB"
-    assert fmt.gib(1024) == "1 GB"
-    assert fmt.gib(1536) == "1.5 GB"
-    assert fmt.gib(131072) == "128 GB"
+    # MiB 값을 /1024 — 숫자는 원래 1024 기반이었고 라벨만 GB 였다. 콘솔처럼 GiB/MiB 로 적는다.
+    assert fmt.gib(0) == "0 GiB"
+    assert fmt.gib(512) == "512 MiB"
+    assert fmt.gib(1024) == "1 GiB"
+    assert fmt.gib(1536) == "1.5 GiB"
+    assert fmt.gib(131072) == "128 GiB"
     assert fmt.gib(None) == "-"
+
+
+def test_format_vram_keeps_the_gb_label():
+    from meshive.cli import _format as fmt
+
+    # DCGM framebuffer MiB → 카드 이름과 같은 "GB". 4060 Ti 16GB 는 15946 MiB 로 보고된다(dev 실측).
+    assert fmt.vram(24576) == "24 GB"
+    assert fmt.vram(15946) == "16 GB"
+    assert fmt.vram(None) == "-"
+
+
+def test_format_mbps_is_decimal_bits_per_second():
+    from meshive.cli import _format as fmt
+
+    # 바이트/초 × 8 ÷ 10^6. 1024² 로 나누면 1 Gbps(125,000,000 B/s)가 953.7 Mbps 로 나온다.
+    assert fmt.mbps(125_000_000) == "1000.0 Mbps"
+    assert fmt.mbps(12_500_000) == "100.0 Mbps"
+    assert fmt.mbps(0) == "0.0 Mbps"
+    assert fmt.mbps(None) == "-"
+    assert fmt.mbps("abc") == "-"
+
+
+def test_format_bytes_human_uses_binary_labels():
+    from meshive.cli import _format as fmt
+
+    assert fmt.bytes_human(512) == "512 B"
+    assert fmt.bytes_human(150_000) == "146.5 KiB"
+    assert fmt.bytes_human(1_500_000) == "1.4 MiB"
+    assert fmt.bytes_human(2 * 1024 ** 3) == "2.00 GiB"
+    assert fmt.bytes_human(3 * 1024 ** 4) == "3.00 TiB"
+    # 10진 20.69 GB 파일은 19.27 GiB — 1024 로 나눈 숫자에는 1024 기반 라벨을 붙인다.
+    assert fmt.bytes_human(20_690_000_000) == "19.27 GiB"
 
 
 # --- 표시 헬퍼: 웹 콘솔과 같은 금액 -------------------------------------------

@@ -126,9 +126,10 @@ class FakeClient:
                           51200, 12288, raw={"podName": pod_name})
 
     def get_machine_metrics(self, machine_id):
-        return MachineMetrics(machine_id, 64.0, 0.1, 16.0, 262144.0, 0.5, 65536.0,
+        # ram_size 는 서버가 주는 그대로 바이트(256 GiB), 네트워크는 바이트/초(12.5 MB/s = 100 Mbps).
+        return MachineMetrics(machine_id, 64.0, 0.1, 16.0, 256 * 1024 ** 3, 0.5, 65536.0,
                               [GpuUsage(0, 0.0, 0.1, 81920.0, 40.0)],
-                              512000.0, 0.3, 4096000.0, 0.7, 1310720.0, 655360.0,
+                              512000.0, 0.3, 4096000.0, 0.7, 12_500_000.0, 625_000.0,
                               raw={"machineId": machine_id})
 
     def list_gpus(self, *, rental_type="demand", min_vram=None):
@@ -539,7 +540,7 @@ def test_workspace_detail_output(capsys):
     out = capsys.readouterr().out
     assert "Team" in out and "ns" in out
     assert "$2.100" in out and "$40.50" in out          # price/hr 은 3자리, avg/day 는 2자리
-    assert "128 GB" in out and "500 GB" in out           # ram/storage: MiB → GB
+    assert "128 GiB" in out and "500 GiB" in out         # ram/storage: MiB → GiB (콘솔과 같은 1024 기반 라벨)
     assert "RESOURCE" in out and "pod" in out            # resource table
     assert "2026-08-30" in out and "$1.75" in out        # daily cost + total
 
@@ -563,7 +564,7 @@ def test_storages_output_and_filters(capsys):
     assert cli.main(["storages", "ns"]) == 0
     out = capsys.readouterr().out
     assert "pv-data" in out and "pv-local" in out and "datasets" in out
-    assert "100 GB" in out and "60.0%" in out
+    assert "100 GiB" in out and "60.0%" in out
     assert out.index("NAME") < out.index("ID")
 
     assert cli.main(["storages", "ns", "--type", "hostPath"]) == 0   # 대소문자 무시
@@ -586,7 +587,7 @@ def test_storage_single_output(capsys):
     out = capsys.readouterr().out
     assert "pv-data" in out and "pod-run" in out
     assert "encrypted: yes" in out and "under maintenance" in out
-    assert "100 GB, 60.0% used (40 GB free)" in out
+    assert "100 GiB, 60.0% used (40 GiB free)" in out
     assert cli.main(["storage", "ns", "pv-data", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == {"pvName": "pv-data"}
 
@@ -595,9 +596,9 @@ def test_pod_metrics_output(capsys):
     assert cli.main(["pod-metrics", "ns", "pod-1"]) == 0
     out = capsys.readouterr().out
     assert "8 cores, 25.0% used" in out
-    assert "32 GB, n/a used" in out                       # 측정 불가 → n/a (0% 와 구분)
-    assert "gpu 0:" in out and "24 GB vram" in out and "61°C" in out
-    assert "12 GB used of 50 GB" in out
+    assert "32 GiB, n/a used" in out                      # 측정 불가 → n/a (0% 와 구분)
+    assert "gpu 0:" in out and "24 GB vram" in out and "61°C" in out   # VRAM 만은 업계 표기 GB 유지
+    assert "12 GiB used of 50 GiB" in out
     assert cli.main(["pod-metrics", "ns", "pod-1", "-o", "name"]) == 0
     assert capsys.readouterr().out.splitlines() == ["pod-1"]
 
@@ -606,10 +607,11 @@ def test_machine_metrics_output(capsys):
     assert cli.main(["machine-metrics", "mac-1"]) == 0
     out = capsys.readouterr().out
     assert "64 cores, 10.0% used, 16 allocated" in out
-    assert "256 GB, 50.0% used, 64 GB allocated" in out
-    assert "root disk: 500 GB, 30.0% used" in out
-    assert "pv disk:   4,000 GB, 70.0% used" in out
-    assert "rx 10.0 Mbps, tx 5.0 Mbps" in out             # bytes/s → Mbps (웹과 동일 환산)
+    assert "ram:       256 GiB, 50.0% used, 64 GiB allocated" in out   # ram_size 는 바이트, 할당은 MiB
+    assert "10.0% of 80 GB vram" in out
+    assert "root disk: 500 GiB, 30.0% used" in out
+    assert "pv disk:   4,000 GiB, 70.0% used" in out
+    assert "rx 100.0 Mbps, tx 5.0 Mbps" in out            # 바이트/초 × 8 ÷ 10^6 (1024² 면 95.4 / 4.8)
     assert cli.main(["machine-metrics", "mac-1", "-o", "name"]) == 0
     assert capsys.readouterr().out.splitlines() == ["mac-1"]
 
@@ -771,7 +773,7 @@ def test_task_single_output(capsys):
     assert cli.main(["task", "task_a"]) == 0
     out = capsys.readouterr().out
     assert "task_a" in out and "succeeded" in out
-    assert "exit code:   0" in out and "6 cores / 24 GB" in out
+    assert "exit code:   0" in out and "6 cores / 24 GiB" in out
     assert cli.main(["task", "task_a", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["scriptContent"] == "print(1)"
 
@@ -782,7 +784,7 @@ def test_assets_output_filters_and_paging(capsys):
     assert cli.main(["assets", "ns"]) == 0
     out = capsys.readouterr().out
     assert "imagenet-mini" in out and "asset_data" in out and "style-lora" in out
-    assert "2.00 GB" in out and "146.5 KB" in out             # bytes → human
+    assert "2.00 GiB" in out and "146.5 KiB" in out           # bytes → human (1024 기준·1024 기반 라벨)
     assert "managed" in out and "s3" in out                    # storage provider labels
     assert "Page 1 of 3 (45 assets)" in out                    # 서버 total 기준 페이지 힌트
     assert FakeClient.last_call == ("list_assets", ("ns",),
@@ -826,7 +828,7 @@ def test_asset_single_output(capsys):
     assert cli.main(["asset", "asset_data"]) == 0
     out = capsys.readouterr().out
     assert "imagenet-mini" in out and "asset_data" in out and "a@b.com" in out
-    assert "1.4 MB in 2 files" in out                          # 최신 READY 버전 기준
+    assert "1.4 MiB in 2 files" in out                         # 최신 READY 버전 기준
     assert "in use:     yes (pod trainer)" in out
     assert "v2" in out and "uploading" in out and "v1" in out and "ready" in out
     assert "v2 import failed: repo not found" in out
@@ -839,8 +841,8 @@ def test_asset_single_output(capsys):
 def test_asset_storage_output_and_name(capsys):
     assert cli.main(["asset-storage", "ns"]) == 0
     out = capsys.readouterr().out
-    assert "managed:       2.00 GB" in out
-    assert "$0.02 per GB-month" in out and "$0.03" in out
+    assert "managed:       2.00 GiB" in out
+    assert "$0.02 per GiB-month" in out and "$0.03" in out   # 자산 저장 과금은 GiB 당
     assert "grace (uploads block in" in out
     assert "none (pods and tasks cannot start)" in out
     assert cli.main(["asset-storage", "ns", "-o", "name"]) == 0

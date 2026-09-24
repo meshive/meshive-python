@@ -12,6 +12,26 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## Unreleased
+
+### CLI
+
+- Sizes use the same 1024-based units as the console: RAM, storage and disk sizes in GiB (MiB below 1 GiB), file and
+  asset sizes in KiB/MiB/GiB/TiB, storage prices per GiB·month. The numbers were already 1024-based; only the labels
+  said GB/MB/KB. GPU VRAM keeps the usual GB label (`24 GB vram`, `80 GB`).
+- `machine-metrics`: network throughput is decimal Mbps (bits per second ÷ 1,000,000). It was divided by 1024², so
+  1 Gbps of traffic showed as 953.7 Mbps.
+- `machine-metrics`: RAM is the machine's total memory as its operating system reports it, a little below the
+  installed size. The server sends it in bytes and the CLI read it as MiB, so a machine with 64 GiB installed showed
+  `65,648,036 GB`; it now shows `63 GiB`.
+- `storage-create --size` and `pod-create --ram` are in GiB, as they always were; the help now says so.
+
+### SDK
+
+- `MachineMetrics.ram_size` is in bytes (the machine's total memory); its other sizes are MiB and its network rates
+  are bytes per second. The value has not changed; the documentation wrongly said MiB.
+- The script size error says `256 KiB`.
+
 ## v0.1.1
 
 Fixes from the 2026-09-09 review of the write surface (server-side changes ship with the matching Meshive release).

@@ -219,7 +219,7 @@ def task_body(name: str, script: str, *, image: str | None, template_id: int | N
     if not script_text.strip():
         raise ValueError("script must be a non-empty string (Python source)")
     if len(script_text.encode("utf-8")) > MAX_SCRIPT_BYTES:
-        raise ValueError(f"script exceeds {MAX_SCRIPT_BYTES // 1024} KB; upload large code as an asset instead")
+        raise ValueError(f"script exceeds {MAX_SCRIPT_BYTES // 1024} KiB; upload large code as an asset instead")
     if not image and template_id is None:
         raise ValueError("pass image or template_id")
     if isinstance(max_duration, bool) or not isinstance(max_duration, int) or not TASK_DURATION_RANGE[0] <= max_duration <= TASK_DURATION_RANGE[1]:

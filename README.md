@@ -134,8 +134,10 @@ List output shows two columns:
 
 ### Sizes and rates
 
-RAM, storage and VRAM are shown in GB (the same conversion the console uses); usage rates in
-percent, with `n/a` when a measurement is unavailable; network throughput in Mbps.
+RAM and storage are shown in GiB (MiB below 1 GiB) and file sizes in KiB/MiB/GiB/TiB — the same
+1024-based units the console uses. GPU VRAM keeps the usual GB label (`24 GB vram`). Usage rates are
+in percent, with `n/a` when a measurement is unavailable; network throughput is in Mbps (bits per
+second ÷ 1,000,000).
 
 ### Write commands (Read & write key)
 

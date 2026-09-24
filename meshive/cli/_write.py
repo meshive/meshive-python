@@ -113,8 +113,8 @@ def _print_pod_estimate(est: PodEstimate, color: bool) -> None:
           else f"CPU ({res.get('cpu_model', '-')})")
     _kv([("estimate", fmt.paint(f"{fmt.money_hourly(est.price_per_hour)}/hr", "green", color)),
          ("hardware", hw),
-         ("vcpu / ram", f"{res.get('vcpu')} vCPU / {res.get('ram_gb')} GB"),
-         ("disk", f"{res.get('disk_gb')} GB"),
+         ("vcpu / ram", f"{res.get('vcpu')} vCPU / {res.get('ram_gb')} GiB"),
+         ("disk", f"{res.get('disk_gb')} GiB"),
          ("rental", str(res.get("rental_type", "-"))),
          ("template", f"{est.template.get('name', '-')} (#{est.template.get('id', '-')})"),
          ("breakdown", ", ".join(f"{k}={fmt.money_hourly(v)}" for k, v in est.breakdown.items()) or "-"),
@@ -235,8 +235,8 @@ def _pod_action(method: str, needs_confirm: bool, question: str):
 
 def _print_storage_estimate(est: StorageEstimate, color: bool) -> None:
     _kv([("estimate", fmt.paint(f"{fmt.money_hourly(est.price_per_hour)}/hr", "green", color)),
-         ("per GB·month", fmt.money(est.price_per_gb_month)), ("size", f"{est.size_gb} GB"),
-         ("type", f"{est.storage_type} / {est.disk_type}"), ("max size", f"{est.max_size_gb} GB")])
+         ("per GiB·month", fmt.money(est.price_per_gb_month)), ("size", f"{est.size_gb} GiB"),
+         ("type", f"{est.storage_type} / {est.disk_type}"), ("max size", f"{est.max_size_gb} GiB")])
     print(fmt.paint(est.note, "dim", color))
 
 
@@ -250,7 +250,7 @@ def cmd_storage_create(client: Meshive, args: argparse.Namespace, output: str, c
         if output == "json":
             print(json.dumps(estimate.raw, indent=2, ensure_ascii=False))
         return 0
-    if not _confirm(args, f"Create {args.size} GB {estimate.storage_type} storage '{args.name}' "
+    if not _confirm(args, f"Create {args.size} GiB {estimate.storage_type} storage '{args.name}' "
                           f"at {fmt.money_hourly(estimate.price_per_hour)}/hr?"):
         return 2
     created = client.create_storage(args.name, args.size, workspace=args.workspace, **kwargs)
@@ -390,7 +390,7 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--vram", type=int, default=None, metavar="GB", help="VRAM tier when a model comes in several.")
     p.add_argument("--spot", action="store_true", help="Spot (preemptible) rental instead of on-demand.")
     p.add_argument("--vcpu", type=int, default=None, metavar="N", help="vCPU (default: recommended for the GPU).")
-    p.add_argument("--ram", type=int, default=None, metavar="GB", help="RAM in GB (default: recommended).")
+    p.add_argument("--ram", type=int, default=None, metavar="GiB", help="RAM in GiB (default: recommended).")
     p.add_argument("--volume", action="append", metavar="PV:/mount", help="Attach an existing storage (repeatable).")
     p.add_argument("--env", action="append", metavar="KEY=VALUE", help="Environment variable (repeatable).")
     p.add_argument("--secret", action="append", metavar="KEY", help="Mark an --env key as secret (repeatable).")
@@ -428,7 +428,7 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     # --- storages ---
     p = sub.add_parser("storage-create", parents=[common], help="Create a storage volume (shows the estimate first).")
     p.add_argument("workspace"); p.add_argument("name", help="Storage name (label).")
-    p.add_argument("--size", type=int, required=True, metavar="GB")
+    p.add_argument("--size", type=int, required=True, metavar="GiB")
     p.add_argument("--type", default="nfs", choices=["nfs", "hostPath"], help="nfs (network, default) or hostPath (local).")
     p.add_argument("--disk", default="NVMe", choices=["NVMe", "SSD", "HDD"])
     p.add_argument("--encrypted", action="store_true", help="At-rest encryption (network storage, --type nfs, only).")

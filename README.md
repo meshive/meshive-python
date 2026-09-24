@@ -1,7 +1,7 @@
 ## Install
 
 ```bash
-pip install "meshive==0.1.1"
+pip install "meshive==0.1.2"
 ```
 
 Docs: [SDK & CLI reference](https://docs.meshive.ai/sdk-cli/) · [Quickstart](https://docs.meshive.ai/getting-started/quickstart-client/) · [Serverless API](https://docs.meshive.ai/api-reference/) · [GPU pricing](https://docs.meshive.ai/documentation/pricing/)
@@ -45,7 +45,7 @@ Commands that spend credit or delete something show an estimate and ask for conf
 Resuming a serving and changes that can raise its cost also require confirmation. `--yes` does
 not replace `--allow-data-loss` for an unattended pod move that can lose unpreserved files.
 
-Automatic HTTP retries reuse a key, but **rerunning a CLI command creates a new key**. CLI 0.1.1
+Automatic HTTP retries reuse a key, but **rerunning a CLI command creates a new key**. CLI 0.1.2
 has no `--idempotency-key` or operation lookup command, and terminal errors do not print recovery
 metadata. A successful write's `-o json` output does carry `idempotencyKey`, `operationMethod`
 and `operationPath`, so record those if you may need to reconcile later. Inspect the resource and transaction before retrying a timed-out write; use the SDK's

@@ -12,7 +12,10 @@ Upgrade with:
 pip install -U meshive
 ```
 
-## Unreleased
+## v0.1.2
+
+Sizes and rates now read the same as in the Meshive web console, a GPU whose memory cannot be read is no longer shown
+as having none, `meshive transactions` shows why a pod is still starting, and `--estimate -o json` prints only JSON.
 
 ### CLI
 

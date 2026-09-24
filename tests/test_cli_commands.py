@@ -33,6 +33,7 @@ from meshive.models import (
     Storage,
     Task,
     Template,
+    Transaction,
     WhoAmI,
     Workspace,
     WorkspaceDetail,
@@ -223,6 +224,17 @@ class FakeClient:
     def get_asset_storage(self, workspace):
         return AssetStorage(2_147_483_648, 0.015, 0.03, "grace", False, None,
                             datetime(2099, 1, 1, tzinfo=UTC), None, False, raw={"managedBytes": 2147483648})
+
+    def list_transactions(self, workspace):
+        FakeClient.last_call = ("list_transactions", (workspace,), {})
+        return [
+            Transaction(73213, "5f0e1d2c3b4a6978", "trainer", "create", "in_progress", "pull_image", "in_progress",
+                        progress=0.42, updated_at=datetime(2026, 9, 10, 7, 58, tzinfo=UTC),
+                        raw={"transactionId": 73213}),
+            # 별칭 없는 pod 의 실패 — 진행률을 모르는 스텝(progress=None)
+            Transaction(73214, "9eb176aae9309fb8", "", "restart", "failed", "pull_image", "failed",
+                        detail="image pull stalled for 600s", raw={"transactionId": 73214}),
+        ]
 
     def close(self):
         self.closed = True
@@ -867,3 +879,28 @@ def test_asset_storage_output_and_name(capsys):
     assert "none (pods and tasks cannot start)" in out
     assert cli.main(["asset-storage", "ns", "-o", "name"]) == 0
     assert capsys.readouterr().out.strip() == "0.03"
+
+
+# --- transactions (in-flight pod operations) ----------------------------------
+
+def test_transactions_output_alias_and_name(capsys):
+    """진행 중 작업이 1건 이상일 때만 표를 그린다 — render_table 인자 오타(TypeError)는 여기서만 드러난다."""
+    assert cli.main(["transactions", "ns"]) == 0
+    out = capsys.readouterr().out
+    assert FakeClient.last_call == ("list_transactions", ("ns",), {})
+    assert "trainer" in out and "9eb176aae9309fb8" in out    # 별칭이 없으면 statefulset 이름
+    assert "73213" in out and "pull_image" in out and "image pull stalled for 600s" in out
+    assert "42%" in out and "0%" not in out                  # 진행률 모름(None)은 '-' — 0% 로 찍지 않는다
+    assert "\033[" not in out                                # tty 가 아니면 색 없음
+
+    assert cli.main(["txn", "ns", "-o", "name"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["73213", "73214"]
+    assert cli.main(["transactions", "ns", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == [{"transactionId": 73213}, {"transactionId": 73214}]
+
+
+def test_transactions_table_paints_status_on_a_tty(monkeypatch, capsys):
+    """색은 render_table 의 `enabled=` 로 켠다 — 인자를 빼 버리면 표는 나와도 색이 조용히 꺼진다."""
+    monkeypatch.setattr(cli.fmt, "color_enabled", lambda stream=None: True)
+    assert cli.main(["transactions", "ns"]) == 0
+    assert "\033[31m● failed" in capsys.readouterr().out    # failed 상태 칸은 빨강

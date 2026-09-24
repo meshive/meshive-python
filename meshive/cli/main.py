@@ -1039,7 +1039,7 @@ def _print_transactions(transactions: list[Transaction], color: bool) -> None:
         colors.append([None, None, None, fmt.status_color(t.status), None, None, None, "dim"])
     fmt.render_table(
         ["POD", "TXN", "ACTION", "STATUS", "STEP", "PROGRESS", "DETAIL", "UPDATED"],
-        rows, colors=colors, color=color)
+        rows, colors=colors, enabled=color)
 
 
 def _cmd_transactions(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:

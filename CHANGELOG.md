@@ -27,6 +27,8 @@ pip install -U meshive
 - `pod-metrics` / `machine-metrics`: when the server cannot read a GPU's memory, the GPU line shows `n/a of n/a vram`.
   It showed `0 GB vram`, as if the card had no memory.
 - `storage-create --size` and `pod-create --ram` are in GiB, as they always were; the help now says so.
+- New `transactions` command (alias `txn`): the pod operations still in flight in a workspace, with the
+  current step, progress and failure detail — why a pod is still `creating`.
 
 ### SDK
 
@@ -38,6 +40,8 @@ pip install -U meshive
 - `MachineMetrics.ram_size` is in bytes (the machine's total memory); its other sizes are MiB and its network rates
   are bytes per second. The value has not changed; the documentation wrongly said MiB.
 - The script size error says `256 KiB`.
+- New `list_transactions(workspace)` (sync and async) returns `list[Transaction]`: `step`, `progress` (`None` when
+  the step reports none — not 0%) and `detail` (the failure reason when known).
 
 ## v0.1.1
 

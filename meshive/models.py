@@ -384,12 +384,17 @@ class Storage:
 
 @dataclass
 class GpuUsage:
-    """GPU 1장의 사용률. rate 는 0.0~1.0, 측정 불가면 None."""
+    """GPU 1장의 사용률. rate 는 0.0~1.0, vram_size 는 총 VRAM(MiB).
+
+    gpu_number 외 필드는 각각 측정 불가면 None — dcgm-exporter 가 못 읽은 계열을 생략하면 서버는 그 필드를
+    null 로 주므로, 온도만 있고 메모리(FB) 값이 없는 GPU 가 정상적으로 온다. vram_size 도 이때 0.0 이 아니라
+    None 이다. 단 FB 두 값이 0 으로 보고되면 서버는 0.0 을 준다 — 이것도 카드 크기가 아니다(CLI 는 둘 다 n/a).
+    """
 
     gpu_number: int
     core_usage_rate: float | None = None
     vram_usage_rate: float | None = None
-    vram_size: float = 0.0
+    vram_size: float | None = None
     temp: float | None = None
 
     @classmethod
@@ -397,7 +402,7 @@ class GpuUsage:
         return cls(gpu_number=_as_int(d.get("gpuNumber")),
                    core_usage_rate=_as_optional_float(d.get("coreUsageRate")),
                    vram_usage_rate=_as_optional_float(d.get("vramUsageRate")),
-                   vram_size=_as_float(d.get("vramSize")),
+                   vram_size=_as_optional_float(d.get("vramSize")),
                    temp=_as_optional_float(d.get("temp")))
 
 

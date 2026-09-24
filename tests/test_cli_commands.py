@@ -616,6 +616,26 @@ def test_machine_metrics_output(capsys):
     assert capsys.readouterr().out.splitlines() == ["mac-1"]
 
 
+def test_gpu_line_shows_na_when_vram_size_is_unknown(monkeypatch, capsys):
+    # GPU 메모리를 못 읽으면 서버는 vramSize 를 null 로(DCGM FB 계열 누락·파드 GPU 조회 실패), FB 두 값이 0 으로
+    # 오면 0 으로 준다. 어느 쪽도 카드 크기가 아니다 — '0 GB vram' 대신 n/a. 서버 JSON → SDK 파싱부터 거친다.
+    gpus = [{"gpuNumber": 0, "coreUsageRate": None, "vramUsageRate": None, "vramSize": None, "temp": 40.0},
+            {"gpuNumber": 1, "coreUsageRate": None, "vramUsageRate": None, "vramSize": 0.0, "temp": 41.0}]
+    monkeypatch.setattr(FakeClient, "get_machine_metrics", lambda self, machine_id: MachineMetrics.from_dict(
+        {"machineId": machine_id, "cpu": {"core": 8}, "ram": {"size": 16 * 1024 ** 3}, "gpu": gpus}))
+    monkeypatch.setattr(FakeClient, "get_pod_metrics", lambda self, pod_name, workspace: PodMetrics.from_dict(
+        {"podName": pod_name, "cpu": {"core": 8}, "ram": {"size": 16384}, "gpu": gpus[:1]}))
+
+    assert cli.main(["machine-metrics", "mac-1"]) == 0
+    out = capsys.readouterr().out
+    assert "gpu 0:     n/a core, n/a of n/a vram, 40°C" in out
+    assert "gpu 1:     n/a core, n/a of n/a vram, 41°C" in out
+    assert "GB vram" not in out
+    assert cli.main(["pod-metrics", "ns", "pod-1"]) == 0
+    out = capsys.readouterr().out
+    assert "gpu 0:     n/a core, n/a of n/a vram, 40°C" in out and "GB vram" not in out
+
+
 def test_gpus_output_and_passthrough(capsys):
     assert cli.main(["gpus"]) == 0
     out = capsys.readouterr().out

@@ -629,6 +629,24 @@ def test_machine_metrics_parses():
     assert m.raw["diskTemperatures"] == {"nvme0": 35.0}
 
 
+def test_gpu_vram_size_unreadable_is_none_not_zero():
+    # DCGM 이 FB(메모리) 계열을 못 읽으면 서버는 vramSize 를 null 로 준다(온도·사용률만 읽힌 GPU 가 정상적으로
+    # 온다). 0.0 으로 채우면 'VRAM 0 인 카드' 가 된다 — 문서 계약대로 gpu_number 외 필드는 측정 불가면 None.
+    unreadable = {"gpuNumber": 0, "coreUsageRate": 0.5, "vramUsageRate": None, "vramSize": None, "temp": 40.0}
+    seen = {}
+    pod = sync_client(_capture({**POD_METRICS, "gpu": [unreadable]}, seen)).get_pod_metrics("pod-1", "team-ns")
+    machine = sync_client(_capture({**MACHINE_METRICS, "gpu": [unreadable]}, seen)).get_machine_metrics("mac-1")
+    for g in (pod.gpus[0], machine.gpus[0]):
+        assert g.vram_size is None and g.vram_usage_rate is None
+        assert g.core_usage_rate == 0.5 and g.temp == 40.0      # 읽힌 값은 그대로
+
+    from meshive.models import GpuUsage
+
+    assert GpuUsage.from_dict({"gpuNumber": 0}).vram_size is None                 # 키가 아예 없어도
+    assert GpuUsage.from_dict({"gpuNumber": 0, "vramSize": 0}).vram_size == 0.0   # 서버가 준 0 은 그대로
+    assert GpuUsage(0).vram_size is None
+
+
 def test_list_gpus_params_and_summary():
     seen = {}
     gpus = sync_client(_capture([GPU_TIER], seen)).list_gpus(rental_type="spot", min_vram=40)

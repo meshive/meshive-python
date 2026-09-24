@@ -24,10 +24,17 @@ pip install -U meshive
 - `machine-metrics`: RAM is the machine's total memory as its operating system reports it, a little below the
   installed size. The server sends it in bytes and the CLI read it as MiB, so a machine with 64 GiB installed showed
   `65,648,036 GB`; it now shows `63 GiB`.
+- `pod-metrics` / `machine-metrics`: when the server cannot read a GPU's memory, the GPU line shows `n/a of n/a vram`.
+  It showed `0 GB vram`, as if the card had no memory.
 - `storage-create --size` and `pod-create --ram` are in GiB, as they always were; the help now says so.
 
 ### SDK
 
+- **Changed** `GpuUsage.vram_size` to `float | None` (default `None`). When a GPU's memory cannot be read the API sends
+  no size (`null`), and the SDK turned that into `0.0` — a card with no memory. It is now `None`, as the documentation
+  already said for every `GpuUsage` field except `gpu_number`. Code that computes with it (`g.vram_size / 1024`) now
+  raises `TypeError` for such a GPU, so check for `None` first; type checkers flag the unchecked uses. A size of `0`
+  (the GPU reported 0 used and 0 free) is not a real size either; the CLI shows both as `n/a`.
 - `MachineMetrics.ram_size` is in bytes (the machine's total memory); its other sizes are MiB and its network rates
   are bytes per second. The value has not changed; the documentation wrongly said MiB.
 - The script size error says `256 KiB`.

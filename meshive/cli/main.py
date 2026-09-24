@@ -542,8 +542,11 @@ def _print_pod(pod: Pod, color: bool) -> None:
 
 def _print_gpu_usages(gpus, color: bool) -> None:
     for g in gpus:
+        # 총 VRAM 을 못 읽으면 서버는 None 을(DCGM FB 계열 누락·GPU 조회 실패), FB 두 값이 0 으로 오면 0 을
+        # 준다 — 어느 쪽도 카드 크기가 아니므로 '0 GB' 가 아니라 사용률처럼 n/a 로 찍는다.
+        size = fmt.vram(g.vram_size) if g.vram_size else "n/a"
         print(f"gpu {g.gpu_number}:     {fmt.usage(g.core_usage_rate)} core, "
-              f"{fmt.usage(g.vram_usage_rate)} of {fmt.vram(g.vram_size)} vram, {fmt.temperature(g.temp)}")
+              f"{fmt.usage(g.vram_usage_rate)} of {size} vram, {fmt.temperature(g.temp)}")
 
 
 def _print_pod_metrics(m: PodMetrics, color: bool) -> None:

@@ -51,11 +51,15 @@ def _confirm(args: argparse.Namespace, question: str) -> bool:
         print("Error: this command spends credit or deletes resources. Re-run with --yes to confirm.",
               file=sys.stderr)
         return False
+    # 질문은 stderr 로 — input() 은 stdout 이 터미널이 아니면 질문을 stdout 에 써서, `-o json > out.json`·`| jq`·
+    # `id=$(… -o name)` 에서 결과에 질문이 섞이고 정작 사람은 질문을 못 본다. 묻기 전에 stdout 은 input() 처럼 비운다 —
+    # 파이프면 블록 버퍼라 앞서 찍은 견적 표가 질문 뒤로 밀린다(비우기 오류도 input() 처럼 무시). 답 없이 EOF 면 거절.
     try:
-        answer = input(f"{question} [y/N] ").strip().lower()
-    except EOFError:
-        return False
-    return answer in ("y", "yes")
+        sys.stdout.flush()
+    except OSError:
+        pass
+    print(f"{question} [y/N] ", end="", file=sys.stderr, flush=True)
+    return sys.stdin.readline().strip().lower() in ("y", "yes")
 
 
 def _kv(pairs: list[tuple[str, str]]) -> None:

@@ -12,6 +12,14 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## Unreleased
+
+### CLI
+
+- Confirmation questions (`[y/N]`) go to stderr. When stdout was redirected (`-o json > out.json`, `| jq`,
+  `id=$(meshive … -o name)`), the question went there instead: it ended up in the output and never showed on screen,
+  so the command seemed to hang.
+
 ## v0.1.2
 
 Sizes and rates now read the same as in the Meshive web console, a GPU whose memory cannot be read is no longer shown

@@ -1,6 +1,7 @@
 """CLI 쓰기 커맨드 — 인자 파싱 → SDK 호출 인자, 확인(--yes/비대화형), --estimate, 출력 포맷."""
 import copy
 import importlib
+import io
 import json
 
 import pytest
@@ -318,3 +319,76 @@ def test_create_shows_the_estimate_first_only_in_table_mode(capsys, command, key
     assert out.startswith("estimate:") and "accepted:" in out
     assert cli.main(argv + ["-o", "json"]) == 0
     assert json.loads(capsys.readouterr().out)[key] == value
+
+
+class _Tty(io.StringIO):
+    """사람이 답하는 터미널 — isatty() 가 True, 답은 한 줄씩."""
+
+    def isatty(self):
+        return True
+
+
+class _CtrlC(_Tty):
+    def readline(self, *a):
+        raise KeyboardInterrupt
+
+
+@pytest.mark.parametrize("argv, answers", [
+    (["pod-create", "ws", "p", "--template", "457"], "y\n"),
+    (["storage-create", "ws", "vol", "--size", "10"], "y\n"),
+    (["task-submit", "ws", "t", "--script-text", "print(1)", "--image", "img", "--cpu-preset", "micro-2c8g"], "y\n"),
+    (["pod-delete", "ws", "p-0"], "y\n"),
+    (["pod-start", "ws", "p-0", "--any-node"], "y\ny\n"),        # 과금 재개 + 데이터 유실 동의, 질문 두 번
+    (["serving-scale", "42", "--max-replicas", "4"], "y\n"),
+    (["serving-resume", "42"], "y\n"),
+])
+def test_confirm_question_goes_to_stderr(capsys, monkeypatch, argv, answers):
+    """확인 질문은 stderr 로 — 터미널에서 답하면서 stdout 을 파일·파이프로 돌리면(`-o json > out.json`, `| jq`)
+    input() 이 질문을 stdout 에 써서 결과 앞에 `Create pod 'p' at $0.068/hr? [y/N] ` 가 붙었고 사람은 질문을 못 봤다."""
+    monkeypatch.setattr("sys.stdin", _Tty(answers))
+    assert cli.main(argv + ["-o", "json"]) == 0
+    captured = capsys.readouterr()
+    assert isinstance(json.loads(captured.out), dict)
+    assert captured.err.count("[y/N]") == answers.count("\n")
+
+
+def test_confirm_keeps_name_output_to_the_id(capsys, monkeypatch):
+    """`id=$(meshive pod-create … -o name)` — 질문이 $id 로 들어가 명령이 멈춘 것처럼 보였다."""
+    monkeypatch.setattr("sys.stdin", _Tty("y\n"))
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "-o", "name"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "99\n" and "[y/N]" in captured.err
+
+
+@pytest.mark.parametrize("answers, code", [("n\n", 2), ("", 2), (None, 130)])     # 거절, 답 없이 EOF, Ctrl-C
+def test_confirm_refused_or_interrupted_changes_nothing(capsys, monkeypatch, answers, code):
+    monkeypatch.setattr("sys.stdin", _CtrlC() if answers is None else _Tty(answers))
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "-o", "json"]) == code
+    captured = capsys.readouterr()
+    assert captured.out == "" and "[y/N]" in captured.err
+    assert _created_nothing()
+
+
+def test_any_node_data_loss_refused_at_the_second_question(capsys, monkeypatch):
+    monkeypatch.setattr("sys.stdin", _Tty("y\nn\n"))              # 과금 재개엔 예, 데이터 유실엔 아니오
+    assert cli.main(["pod-start", "ws", "p-0", "--any-node", "-o", "json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == "" and captured.err.count("[y/N]") == 2
+    assert all(c[0] != "pod_action" for c in FakeClient.instances[-1].calls)
+
+
+def test_confirm_shows_the_estimate_before_asking_when_stdout_is_a_pipe(monkeypatch):
+    """묻기 전에 input() 처럼 stdout 을 비운다 — 파이프(`| tee log`, `2>&1 | tee log`)로 나가는 stdout 은 블록 버퍼라,
+    안 비우면 견적 표가 답한 뒤에야 나오거나 질문보다 뒤에 찍힌다."""
+    pipe = io.BytesIO()
+    monkeypatch.setattr("sys.stdout", io.TextIOWrapper(pipe, encoding="utf-8"))
+    shown = []
+
+    class Human(_Tty):
+        def readline(self, *a):
+            shown.append(pipe.getvalue().decode())     # 답하는 순간까지 파이프로 나간 stdout
+            return "n\n"
+
+    monkeypatch.setattr("sys.stdin", Human())
+    assert cli.main(["pod-create", "ws", "p", "--template", "457"]) == 2
+    assert shown and shown[0].startswith("estimate:")

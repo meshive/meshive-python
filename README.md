@@ -9,7 +9,7 @@ Docs: [SDK & CLI reference](https://docs.meshive.ai/sdk-cli/) · [Quickstart](ht
 ## Authentication
 
 The SDK and CLI authenticate with a **Meshive API Key**. Issue one from the
-[console](https://console.meshive.ai) (workspace Settings → Secret). A **Read only** key can view
+[console](https://console.meshive.ai) (workspace Settings → API keys). A **Read only** key can view
 everything; a **Read & write** key is needed to create, change or delete resources, and it always
 expires (30 days by default, 90 at most).
 New read-only keys also expire (365 days by default and at most); existing keys retain their original expiry policy.

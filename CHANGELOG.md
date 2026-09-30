@@ -20,6 +20,11 @@ pip install -U meshive
   `id=$(meshive … -o name)`), the question went there instead: it ended up in the output and never showed on screen,
   so the command seemed to hang.
 
+### Docs
+
+- The README sends you to the console's **Settings → API keys** to issue a key (it said "Settings → Secret", a menu
+  that no longer exists).
+
 ## v0.1.2
 
 Sizes and rates now read the same as in the Meshive web console, a GPU whose memory cannot be read is no longer shown

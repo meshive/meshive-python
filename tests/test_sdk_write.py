@@ -7,6 +7,7 @@ import pytest
 
 from meshive import (
     NotFoundError,
+    PermissionDeniedError,
     AsyncMeshive,
     ConflictError,
     InsufficientCreditError,
@@ -383,8 +384,14 @@ def test_asset_import_picks_the_source():
     a = sync_client(rec).import_asset("Qwen/Qwen3-0.6B", workspace="ws")
     assert rec.last.url.path == "/v1/sdk/assets/import" and rec.last.headers["Idempotency-Key"]
     assert (a.asset_id, a.file_count, a.resolved_commit) == ("asset_abc", 9, "c0ffee")
+    # 옛 서버: POST /assets/import 는 GET /assets/{id} 와 맞물려 404 가 아니라 405 다(dev 실측 2026-10-03)
     with pytest.raises(NotFoundError, match="does not support asset import"):
-        sync_client(Recorder((404, {"detail": "Not Found"}))).import_asset("Qwen/Qwen3-0.6B", workspace="ws")
+        sync_client(Recorder((405, {"detail": "Method Not Allowed"}))).import_asset("Qwen/Qwen3-0.6B", workspace="ws")
+    with pytest.raises(NotFoundError, match="does not support watched folders"):
+        sync_client(Recorder((404, {"detail": "Not Found"}))).set_watched_folders("p-0", "ws", expected_version=1)
+    with pytest.raises(PermissionDeniedError):     # 다른 오류는 그대로
+        sync_client(Recorder((403, {"detail": {"title": "Forbidden", "message": "admin only"}}))).import_asset(
+            "Qwen/Qwen3-0.6B", workspace="ws")
 
 
 def test_pod_assets_and_watched_folders():

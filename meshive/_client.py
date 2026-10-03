@@ -88,10 +88,11 @@ def _paths_param(paths: str | Iterable[str] | None) -> dict[str, Any] | None:
     return {"path": values} if values else None
 
 
-def _not_supported(err: NotFoundError, what: str) -> NotFoundError:
-    """라우트가 없는 옛 서버의 404(FastAPI 기본 `{"detail": "Not Found"}` — title 없음)를 알아듣게 바꾼다.
-    자산·task 가 없을 때의 404 는 title 이 있으므로 그대로 둔다."""
-    if err.title is not None:
+def _not_supported(err: MeshiveAPIError, what: str) -> MeshiveAPIError:
+    """라우트가 없는 옛 서버의 응답을 알아듣게 바꾼다 — FastAPI 기본 404 `{"detail": "Not Found"}`(title 없음), 또는
+    같은 경로에 다른 메서드만 있을 때의 405(POST /assets/import ↔ GET /assets/{id}). 자산·task 가 없을 때의 404 는
+    title 이 있으므로 그대로 둔다."""
+    if not (err.status_code == 405 or (err.status_code == 404 and err.title is None)):
         return err
     return NotFoundError(404, f"This Meshive API server does not support {what} yet (it predates this SDK "
                               "release). Use the console for now.", raw=err.raw)
@@ -646,7 +647,7 @@ class Meshive(_BaseClient):
         glob(fnmatch) 목록 — 요청당 파일 수 상한이 있어 큰 자산은 나눠 받는다. 링크된 외부 자산은 받을 수 없다."""
         try:
             data = self._get(f"/assets/{_path_segment(asset_id, 'asset_id')}/download-urls", params=_paths_param(paths))
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "asset downloads") from None
         return AssetDownload.from_dict(data, asset_id=asset_id)
 
@@ -662,7 +663,7 @@ class Meshive(_BaseClient):
         """task 결과물 파일과 presigned URL (GET /tasks/{task_id}/outputs)."""
         try:
             data = self._get(f"/tasks/{_path_segment(task_id, 'task_id')}/outputs")
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "task outputs") from None
         return TaskOutputs.from_dict(data, task_id=task_id)
 
@@ -829,7 +830,7 @@ class Meshive(_BaseClient):
         try:
             data = self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/ssh",
                               params={"workspace": _query_value(workspace, "workspace")})
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "SSH access") from None
         return SshAccess.from_dict(data)
 
@@ -839,7 +840,7 @@ class Meshive(_BaseClient):
         """Pod 의 수확 폴더 (GET /pods/{pod}/harvest?workspace=) — 바꾸려면 revision 을 expected_version 으로."""
         try:
             data = self._get(f"/pods/{_path_segment(pod_name, 'pod_name')}/harvest", params={"workspace": workspace})
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "watched folders") from None
         return WatchedFolders.from_dict(data)
 
@@ -849,9 +850,12 @@ class Meshive(_BaseClient):
         """수확 폴더 **전체 교체**(재시작 없이 적용). template = {템플릿 폴더 경로: {"enabled", "include"}},
         user = 사용자 폴더 목록("path" 또는 {"path", "include", "include_existing"}). 버전이 어긋나면 409 — 다시 읽는다."""
         body = _write.watched_folders_body(expected_version, template, user)
-        data = self._send("PUT", f"/pods/{_path_segment(pod_name, 'pod_name')}/harvest",
-                          params={"workspace": _query_value(workspace, "workspace")}, json=body,
-                          idempotency_key=idempotency_key)
+        try:
+            data = self._send("PUT", f"/pods/{_path_segment(pod_name, 'pod_name')}/harvest",
+                              params={"workspace": _query_value(workspace, "workspace")}, json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "watched folders") from None
         return WatchedFolders.from_dict(data)
 
     # --- 자산 import ---------------------------------------------------------------
@@ -867,7 +871,7 @@ class Meshive(_BaseClient):
         try:
             data = self._send("POST", "/assets/import", params={"workspace": _query_value(workspace, "workspace")},
                               json=body, idempotency_key=idempotency_key)
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "asset import") from None
         return AssetImported.from_dict(data)
 
@@ -875,7 +879,7 @@ class Meshive(_BaseClient):
         """워크스페이스 CivitAI 키 id·이름 (GET /civitai-keys?workspace=). 키 등록은 콘솔에서."""
         try:
             return [HfToken.from_dict(d) for d in self._get("/civitai-keys", params={"workspace": workspace})]
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "asset import") from None
 
     # --- 서빙 모델 등록 ---------------------------------------------------------------
@@ -884,14 +888,14 @@ class Meshive(_BaseClient):
         """워크스페이스가 등록한 서빙 모델 (GET /models?workspace=) — deploy_serving 의 registration id."""
         try:
             return [ServingModel.from_dict(d) for d in self._get("/models", params={"workspace": workspace})]
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "model registration") from None
 
     def list_hf_tokens(self, workspace: str) -> list[HfToken]:
         """워크스페이스 Hugging Face 토큰 id·이름 (GET /hf-tokens?workspace=). 토큰 등록은 콘솔에서."""
         try:
             return [HfToken.from_dict(d) for d in self._get("/hf-tokens", params={"workspace": workspace})]
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "model registration") from None
 
     def detect_model(self, huggingface_repo: str, *, workspace: str, hf_token_id: int | None = None) -> ModelDetection:
@@ -900,7 +904,7 @@ class Meshive(_BaseClient):
         try:
             data = self._send("POST", "/models/detect", params={"workspace": _query_value(workspace, "workspace")},
                               json=body)
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "model registration") from None
         return ModelDetection.from_dict(data)
 
@@ -913,7 +917,7 @@ class Meshive(_BaseClient):
         try:
             data = self._send("POST", "/models", params={"workspace": _query_value(workspace, "workspace")}, json=body,
                               idempotency_key=idempotency_key)
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "model registration") from None
         return ResourceAction.from_dict(data, resource="model")
 
@@ -922,7 +926,7 @@ class Meshive(_BaseClient):
         try:
             data = self._send("DELETE", f"/models/{_int_segment(registration_id, 'registration_id')}",
                               idempotency_key=idempotency_key)
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "model registration") from None
         return ResourceAction.from_dict(data, resource="model")
 
@@ -1234,7 +1238,7 @@ class AsyncMeshive(_BaseClient):
         try:
             data = await self._get(f"/assets/{_path_segment(asset_id, 'asset_id')}/download-urls",
                                    params=_paths_param(paths))
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "asset downloads") from None
         return AssetDownload.from_dict(data, asset_id=asset_id)
 
@@ -1250,7 +1254,7 @@ class AsyncMeshive(_BaseClient):
         """task 결과물 파일과 presigned URL (GET /tasks/{task_id}/outputs)."""
         try:
             data = await self._get(f"/tasks/{_path_segment(task_id, 'task_id')}/outputs")
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "task outputs") from None
         return TaskOutputs.from_dict(data, task_id=task_id)
 
@@ -1416,7 +1420,7 @@ class AsyncMeshive(_BaseClient):
         try:
             data = await self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/ssh",
                                     params={"workspace": _query_value(workspace, "workspace")})
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "SSH access") from None
         return SshAccess.from_dict(data)
 
@@ -1427,7 +1431,7 @@ class AsyncMeshive(_BaseClient):
         try:
             data = await self._get(f"/pods/{_path_segment(pod_name, 'pod_name')}/harvest",
                                    params={"workspace": workspace})
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "watched folders") from None
         return WatchedFolders.from_dict(data)
 
@@ -1436,9 +1440,12 @@ class AsyncMeshive(_BaseClient):
                                   idempotency_key: str | None = None) -> WatchedFolders:
         """수확 폴더 전체 교체(재시작 없이 적용). 버전이 어긋나면 409."""
         body = _write.watched_folders_body(expected_version, template, user)
-        data = await self._send("PUT", f"/pods/{_path_segment(pod_name, 'pod_name')}/harvest",
-                                params={"workspace": _query_value(workspace, "workspace")}, json=body,
-                                idempotency_key=idempotency_key)
+        try:
+            data = await self._send("PUT", f"/pods/{_path_segment(pod_name, 'pod_name')}/harvest",
+                                    params={"workspace": _query_value(workspace, "workspace")}, json=body,
+                                    idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "watched folders") from None
         return WatchedFolders.from_dict(data)
 
     # --- 자산 import ---------------------------------------------------------------
@@ -1454,7 +1461,7 @@ class AsyncMeshive(_BaseClient):
             data = await self._send("POST", "/assets/import",
                                     params={"workspace": _query_value(workspace, "workspace")}, json=body,
                                     idempotency_key=idempotency_key)
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "asset import") from None
         return AssetImported.from_dict(data)
 
@@ -1462,7 +1469,7 @@ class AsyncMeshive(_BaseClient):
         """워크스페이스 CivitAI 키 id·이름 (GET /civitai-keys?workspace=)."""
         try:
             return [HfToken.from_dict(d) for d in await self._get("/civitai-keys", params={"workspace": workspace})]
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "asset import") from None
 
     # --- 서빙 모델 등록 ---------------------------------------------------------------
@@ -1471,14 +1478,14 @@ class AsyncMeshive(_BaseClient):
         """워크스페이스가 등록한 서빙 모델 (GET /models?workspace=)."""
         try:
             return [ServingModel.from_dict(d) for d in await self._get("/models", params={"workspace": workspace})]
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "model registration") from None
 
     async def list_hf_tokens(self, workspace: str) -> list[HfToken]:
         """워크스페이스 Hugging Face 토큰 id·이름 (GET /hf-tokens?workspace=)."""
         try:
             return [HfToken.from_dict(d) for d in await self._get("/hf-tokens", params={"workspace": workspace})]
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "model registration") from None
 
     async def detect_model(self, huggingface_repo: str, *, workspace: str,
@@ -1488,7 +1495,7 @@ class AsyncMeshive(_BaseClient):
         try:
             data = await self._send("POST", "/models/detect",
                                     params={"workspace": _query_value(workspace, "workspace")}, json=body)
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "model registration") from None
         return ModelDetection.from_dict(data)
 
@@ -1501,7 +1508,7 @@ class AsyncMeshive(_BaseClient):
         try:
             data = await self._send("POST", "/models", params={"workspace": _query_value(workspace, "workspace")},
                                     json=body, idempotency_key=idempotency_key)
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "model registration") from None
         return ResourceAction.from_dict(data, resource="model")
 
@@ -1510,7 +1517,7 @@ class AsyncMeshive(_BaseClient):
         try:
             data = await self._send("DELETE", f"/models/{_int_segment(registration_id, 'registration_id')}",
                                     idempotency_key=idempotency_key)
-        except NotFoundError as err:
+        except MeshiveAPIError as err:
             raise _not_supported(err, "model registration") from None
         return ResourceAction.from_dict(data, resource="model")
 

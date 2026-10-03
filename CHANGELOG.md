@@ -14,12 +14,17 @@ pip install -U meshive
 
 ## v0.1.3
 
-Asset files and task outputs can be downloaded, `meshive pod` shows a pod's URLs and connect credentials (secret
+Models can be registered for serving and asset files and task outputs downloaded without the console, `meshive pod` shows a pod's URLs and connect credentials (secret
 values only with `--show-secrets`) and why it was stopped or cannot start on its node, assets are read without versions, and transactions and tasks explain input
 asset downloads and output uploads. Confirmation questions no longer break `-o json` and `-o name` output.
 
 ### SDK
 
+- Serving without the console: `detect_model(repo, workspace=)` checks whether a Hugging Face repo can be served,
+  `register_model(repo, workspace=, name=, framework=, hf_token_id=, context_length=)` registers it (no charge — the
+  model downloads when deployed; registering the same repo again returns the existing registration),
+  `list_models(workspace)` gives the registration IDs that `deploy_serving` takes, and `delete_model(id)` removes one
+  that is not deployed. Private repos use a token added in the console, by its ID from `list_hf_tokens(workspace)`.
 - Downloads: `asset_download_urls(asset_id, paths=)` returns each file's short-lived link, `download_asset(asset_id,
   dest, paths=)` saves the files under `dest` with their paths inside the asset, and `task_outputs(task_id)` /
   `download_task_outputs(task_id, dest)` do the same for a task's results. `paths` takes globs such as `config/*`.
@@ -45,6 +50,8 @@ asset downloads and output uploads. Confirmation questions no longer break `-o j
 
 ### CLI
 
+- `meshive model-detect`, `model-register`, `models`, `model-delete` and `hf-tokens` register Hugging Face models for
+  `serving-deploy`. `model-detect` exits 1 when the repo can't be served.
 - `meshive asset-download <id> [-d DIR] [--path GLOB]` saves an asset's files (into `./<id>` by default), and
   `meshive task-outputs <task_id> [--download DIR]` lists or saves a task's output files.
 - `meshive pod` lists the pod's URLs and connect credentials. Secret values are hidden unless you pass

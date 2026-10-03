@@ -155,6 +155,8 @@ meshive storage-delete <workspace> <pv>
 
 meshive task-submit <workspace> train --script train.py --image python:3.12-slim --gpu "RTX 3060"
 meshive task-logs <task>; meshive task-stop <task>
+meshive model-detect <workspace> Qwen/Qwen3-0.6B         # can it be served?
+meshive model-register <workspace> Qwen/Qwen3-0.6B       # prints the model ID (free; downloads when deployed)
 meshive serving-deploy <workspace> <model_id> --price-cap 1.5 --max-replicas 2
 ```
 

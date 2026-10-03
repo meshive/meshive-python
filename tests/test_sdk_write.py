@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from meshive import (
+    NotFoundError,
     AsyncMeshive,
     ConflictError,
     InsufficientCreditError,
@@ -319,3 +320,44 @@ def test_storage_estimate_carries_disk_type():
                                      "storageType": "nfs", "diskType": "SSD", "maxSizeGb": 300})
     assert est.disk_type == "SSD"
     assert StorageEstimate.from_dict({"sizeGb": 1, "maxSizeGb": 1}).disk_type == "NVMe"   # 구 서버 응답
+
+
+def test_model_registration_methods():
+    model = {"id": 12, "sourceId": 3, "modelName": "Qwen3-0.6B", "displayName": "qwen-small", "apiModelId": "qwen-small-ab12",
+             "modelType": "llm", "framework": "vllm", "processingMode": "realtime", "huggingfaceRepo": "Qwen/Qwen3-0.6B",
+             "contextLength": 40960}
+    rec = Recorder((200, [model]))
+    c = sync_client(rec)
+    m, = c.list_models("ws")
+    assert rec.last.url.path == "/v1/sdk/models" and rec.last.url.params["workspace"] == "ws"
+    assert (m.registration_id, m.name, m.api_model_id, m.context_length) == (12, "qwen-small", "qwen-small-ab12", 40960)
+
+    rec = Recorder((200, {"status": "unsupported", "output": "text", "engine": "no", "detail": "GGUF is not supported",
+                          "suggestedRepo": "Qwen/Qwen3-0.6B"}))
+    d = sync_client(rec).detect_model(" Qwen/Qwen3-0.6B-GGUF ", workspace="ws", hf_token_id=4)
+    assert rec.last.url.path == "/v1/sdk/models/detect"
+    assert json.loads(rec.last.content) == {"huggingfaceRepo": "Qwen/Qwen3-0.6B-GGUF", "hfTokenId": 4}
+    assert not d.ok and d.suggested_repo == "Qwen/Qwen3-0.6B" and d.context_length is None
+
+    rec = Recorder((201, {"resource": "model", "id": "12", "workspace": "ws", "action": "register",
+                          "result": {"title": "Already Registered", "registrationId": 12}}))
+    r = sync_client(rec).register_model("Qwen/Qwen3-0.6B", workspace="ws", name="qwen-small", framework="sglang",
+                                        context_length=8192)
+    assert rec.last.method == "POST" and rec.last.headers["Idempotency-Key"]
+    assert json.loads(rec.last.content) == {"huggingfaceRepo": "Qwen/Qwen3-0.6B", "modelName": "qwen-small",
+                                            "framework": "sglang", "contextLength": 8192}
+    assert r.id == "12" and r.resource == "model"
+    with pytest.raises(ValueError):
+        sync_client(rec).register_model("Qwen/Qwen3-0.6B", workspace="ws", framework="comfyui")
+
+    rec = Recorder((200, {"resource": "model", "id": "12", "action": "delete", "result": {"title": "Success"}}))
+    sync_client(rec).delete_model(12)
+    assert rec.last.method == "DELETE" and rec.last.url.path == "/v1/sdk/models/12"
+
+    rec = Recorder((200, [{"id": 4, "label": "hf-main", "createdAt": "2026-10-01T00:00:00Z", "usedByAssetCount": 2}]))
+    t, = sync_client(rec).list_hf_tokens("ws")
+    assert rec.last.url.path == "/v1/sdk/hf-tokens" and (t.token_id, t.label, t.used_by_asset_count) == (4, "hf-main", 2)
+
+    old = sync_client(Recorder((404, {"detail": "Not Found"})))
+    with pytest.raises(NotFoundError, match="does not support model registration"):
+        old.list_models("ws")

@@ -177,6 +177,18 @@ def storage_body(name: str, size_gb: int, *, storage_type: str, disk_type: str, 
 
 # --- 서빙 ---------------------------------------------------------------------
 
+def model_body(huggingface_repo: str, *, hf_token_id: int | None = None, name: str | None = None,
+               framework: str | None = None, context_length: int | None = None) -> dict[str, Any]:
+    """서빙 모델 감지·등록 본문. HF 토큰은 워크스페이스에 등록된 것의 id 로만 받는다(값은 보내지 않는다)."""
+    if framework is not None and framework not in ("vllm", "sglang"):
+        raise ValueError("framework must be 'vllm' or 'sglang'")
+    return _drop_none({
+        "huggingfaceRepo": _require_str(huggingface_repo, "huggingface_repo").strip(),
+        "hfTokenId": _optional_int(hf_token_id, "hf_token_id", minimum=0), "modelName": name or None,
+        "framework": framework, "contextLength": _optional_int(context_length, "context_length"),
+    })
+
+
 def serving_deploy_body(model_registration_id: int, *, price_cap_per_hour: Any, min_replicas: int,
                         max_replicas: int, autoscale: bool, max_context_tokens: int | None,
                         share_idle_capacity: bool) -> dict[str, Any]:

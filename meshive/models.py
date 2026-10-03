@@ -907,6 +907,74 @@ class TaskInputAsset:
 
 
 @dataclass
+class ModelDetection:
+    """POST /v1/sdk/models/detect 응답 — HF repo 를 서빙할 수 있는가(콘솔 등록 모달의 감지)."""
+
+    status: str                    # ok | unsupported | failed (failed = HF 를 못 읽었거나 판정 불가)
+    output: str | None = None      # text | image | video
+    takes_image: bool = False      # 이미지 입력을 받는가 (VLM 등)
+    capability: str | None = None  # text_generation | embedding | text_to_image ...
+    framework: str | None = None   # vllm | sglang
+    detail: str | None = None      # unsupported·failed 사유
+    architecture: str | None = None
+    file_size_bytes: int | None = None
+    context_length: int | None = None   # 감지된 최대 context — 모르면 None
+    suggested_repo: str | None = None   # 지원 안 되는 GGUF 의 원본 후보
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ModelDetection":
+        return cls(status=str(d.get("status", "") or ""), output=d.get("output"), takes_image=bool(d.get("takesImage")),
+                   capability=d.get("cap"), framework=d.get("framework"), detail=d.get("detail"),
+                   architecture=d.get("arch"), file_size_bytes=d.get("fileSizeBytes"),
+                   context_length=d.get("contextLength"), suggested_repo=d.get("suggestedRepo"), raw=d)
+
+
+@dataclass
+class ServingModel:
+    """GET /v1/sdk/models 항목 — 워크스페이스가 등록한 서빙 모델. `registration_id` 를 deploy_serving 에 넘긴다."""
+
+    registration_id: int
+    name: str
+    huggingface_repo: str | None
+    api_model_id: str | None       # 추론 요청의 model 값
+    framework: str
+    model_type: str
+    context_length: int | None = None
+    quantization: str | None = None
+    parameter_count_b: float | None = None
+    min_vram_gb: int | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ServingModel":
+        return cls(registration_id=_as_int(d.get("id")), name=str(d.get("displayName") or d.get("modelName") or ""),
+                   huggingface_repo=d.get("huggingfaceRepo"), api_model_id=d.get("apiModelId"),
+                   framework=str(d.get("framework", "") or ""), model_type=str(d.get("modelType", "") or ""),
+                   context_length=d.get("contextLength"), quantization=d.get("quantization"),
+                   parameter_count_b=d.get("parameterCountB"), min_vram_gb=d.get("minVramGb"), raw=d)
+
+
+@dataclass
+class HfToken:
+    """워크스페이스에 등록된 Hugging Face 토큰 — id 와 이름만(값은 API 가 돌려주지 않는다)."""
+
+    token_id: int
+    label: str
+    created_at: datetime | None = None
+    used_by_asset_count: int = 0
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "HfToken":
+        return cls(token_id=_as_int(d.get("id")), label=str(d.get("label", "") or ""),
+                   created_at=_parse_dt(d.get("createdAt")), used_by_asset_count=_as_int(d.get("usedByAssetCount")))
+
+
+@dataclass
 class Task:
     """GET /v1/sdk/tasks[/{task_id}] 항목 (TaskResponse / TaskDetailResponse) — serverless task.
 

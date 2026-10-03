@@ -9,7 +9,7 @@ import pytest
 
 cli = importlib.import_module("meshive.cli.main")  # cli.__init__ 이 main 함수를 노출해 서브모듈을 가린다
 from meshive.models import (Pod, Logs, PodCreated, PodEstimate, ResourceAction, Serving, StorageCreated, StorageEstimate,
-                            TaskEstimate, TaskSubmitted)
+                            TaskEstimate, TaskSubmitted, ModelDetection, ServingModel)
 
 ESTIMATE = {"pricePerHourUsd": "0.068423", "breakdown": {"gpu": "0.068423"},
             "resources": {"gpu_model": "RTX 3060", "vram_gb": 12, "gpu_count": 1, "vcpu": 4, "ram_gb": 12, "disk_gb": 25,
@@ -84,6 +84,26 @@ class FakeClient:
         self._rec("get_pod_logs", *a, **kw)
         return Logs.from_dict({"podName": a[0], "workspace": a[1], "source": "live", "count": 2,
                                "lines": [{"line": "tick 1"}, {"line": "tick 2"}], "truncated": True})
+
+    def list_models(self, *a, **kw):
+        self._rec("list_models", *a, **kw)
+        return [ServingModel.from_dict({"id": 12, "displayName": "qwen-small", "huggingfaceRepo": "Qwen/Qwen3-0.6B",
+                                        "framework": "vllm", "apiModelId": "qwen-small-ab12", "modelType": "llm"})]
+
+    def detect_model(self, *a, **kw):
+        self._rec("detect_model", *a, **kw)
+        return ModelDetection.from_dict({"status": "unsupported", "output": "text", "detail": "GGUF is not supported",
+                                         "suggestedRepo": "Qwen/Qwen3-0.6B"})
+
+    def register_model(self, *a, **kw):
+        self.calls.append(("register_model", a, kw))   # kw 에 name= 이 있어 _rec 의 위치 인자와 겹친다
+        return ResourceAction.from_dict({"id": "12", "action": "register", "workspace": kw["workspace"],
+                                         "result": {"title": "Already Registered", "apiModelId": "qwen-small-ab12"}},
+                                        resource="model")
+
+    def delete_model(self, *a, **kw):
+        self._rec("delete_model", *a, **kw)
+        return ResourceAction.from_dict({"id": str(a[0]), "action": "delete"}, resource="model")
 
     def close(self):
         pass
@@ -393,3 +413,25 @@ def test_confirm_shows_the_estimate_before_asking_when_stdout_is_a_pipe(monkeypa
     monkeypatch.setattr("sys.stdin", Human())
     assert cli.main(["pod-create", "ws", "p", "--template", "457"]) == 2
     assert shown and shown[0].startswith("estimate:")
+
+
+def test_model_commands(capsys, non_tty):
+    assert cli.main(["models", "ws"]) == 0
+    out = capsys.readouterr().out
+    assert "qwen-small" in out and "12" in out and "qwen-small-ab12" in out
+
+    assert cli.main(["model-detect", "ws", "Qwen/Qwen3-0.6B-GGUF", "--hf-token", "4"]) == 1   # 서빙 불가 → exit 1
+    out = capsys.readouterr().out
+    assert "unsupported" in out and "GGUF is not supported" in out and "Qwen/Qwen3-0.6B" in out
+    assert _last("detect_model")[2] == {"workspace": "ws", "hf_token_id": 4}
+
+    # 등록은 비용이 없어 --yes 없이도(비대화형) 진행한다
+    assert cli.main(["model-register", "ws", "Qwen/Qwen3-0.6B", "--name", "qwen-small", "--framework", "sglang"]) == 0
+    out = capsys.readouterr().out
+    assert "Already registered: model #12" in out and "serving-deploy ws 12" in out
+    assert _last("register_model")[2] == {"workspace": "ws", "name": "qwen-small", "framework": "sglang",
+                                          "hf_token_id": None, "context_length": None}
+
+    assert cli.main(["model-delete", "12"]) == 2                 # 지우기는 확인이 필요하다
+    assert cli.main(["model-delete", "12", "--yes"]) == 0
+    assert _last("delete_model")[1] == (12,)

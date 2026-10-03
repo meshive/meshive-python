@@ -1,5 +1,6 @@
 """CLI 쓰기 커맨드 (0.1.0): pod-create/stop/start/restart/delete, storage-create/delete,
 serving-deploy/scale/pause/resume/delete, task-submit/stop, logs, task-logs.
+0.1.3: models, hf-tokens, model-detect, model-register, model-delete (서빙용 모델 등록).
 
 규칙: 돈이 들거나 되돌릴 수 없는 커맨드(create/start/deploy/submit/delete, 그리고 비용이 늘 수 있는
 serving-scale·serving-resume)는 먼저 견적·요약을 보여주고 `--yes` 가 없으면 확인을 묻는다(TTY 가 아니면 exit 2).
@@ -321,6 +322,75 @@ def _serving_simple(method: str, question: str | None = None, **fixed: Any):
     return handler
 
 
+def cmd_models(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    items = client.list_models(args.workspace)
+
+    def show() -> None:
+        if not items:
+            print("No registered models. Register one with `meshive model-register`.")
+            return
+        fmt.render_table(["NAME", "ID", "REPO", "FRAMEWORK", "API MODEL"],
+                         [[m.name or "-", str(m.registration_id), m.huggingface_repo or "-", m.framework or "-",
+                           m.api_model_id or "-"] for m in items], aligns=["l", "r", "l", "l", "l"], enabled=color)
+
+    _emit(output, [m.raw for m in items], [str(m.registration_id) for m in items], show)
+    return 0
+
+
+def cmd_hf_tokens(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    tokens = client.list_hf_tokens(args.workspace)
+
+    def show() -> None:
+        if not tokens:
+            print("No Hugging Face tokens. Add one in the console to register private models.")
+            return
+        fmt.render_table(["NAME", "ID", "ASSETS", "CREATED"],
+                         [[t.label or "-", str(t.token_id), str(t.used_by_asset_count), fmt.relative_time(t.created_at)]
+                          for t in tokens], aligns=["l", "r", "r", "l"], enabled=color)
+
+    _emit(output, [{"id": t.token_id, "label": t.label} for t in tokens], [str(t.token_id) for t in tokens], show)
+    return 0
+
+
+def cmd_model_detect(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    d = client.detect_model(args.repo, workspace=args.workspace, hf_token_id=args.hf_token)
+
+    def show() -> None:
+        pairs = [("status", fmt.paint(d.status, "green" if d.ok else "red", color))]
+        if d.output:
+            pairs.append(("output", d.output + (" (takes images)" if d.takes_image else "")))
+        for key, value in (("framework", d.framework), ("architecture", d.architecture)):
+            if value:
+                pairs.append((key, value))
+        if d.context_length:
+            pairs.append(("context", f"{d.context_length:,} tokens"))
+        if d.file_size_bytes:
+            pairs.append(("size", fmt.bytes_human(d.file_size_bytes)))
+        if d.detail:
+            pairs.append(("detail", d.detail))
+        if d.suggested_repo:
+            pairs.append(("try instead", d.suggested_repo))
+        _kv(pairs)
+
+    _emit(output, d.raw, [d.status], show)
+    return 0 if d.ok else 1
+
+
+def cmd_model_register(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    # 비용 없음(DB 등록만, 다운로드는 배포 때) → 확인을 묻지 않는다.
+    action = client.register_model(args.repo, workspace=args.workspace, name=args.name, framework=args.framework,
+                                   hf_token_id=args.hf_token, context_length=args.context)
+    result = action.result if isinstance(action.result, dict) else {}
+
+    def show() -> None:
+        verb = "Already registered" if result.get("title") == "Already Registered" else "Registered"
+        print(f"{verb}: model #{fmt.clean(action.id)} (API model {fmt.clean(str(result.get('apiModelId') or '-'))})")
+        print(fmt.paint(f"Deploy it: meshive serving-deploy {args.workspace} {action.id} --price-cap USD", "dim", color))
+
+    _emit(output, action.raw, [action.id], show)
+    return 0
+
+
 def _print_task_estimate(est: TaskEstimate, color: bool) -> None:
     price = f"{fmt.money_hourly(est.price_per_hour)}/hr" if est.price_per_hour is not None else "depends on machine"
     cost = fmt.money(est.max_cost) if est.max_cost is not None else "-"
@@ -336,6 +406,14 @@ def _read_text(path: str | None, label: str) -> str | None:
         return Path(path).read_text(encoding="utf-8")
     except OSError as err:
         raise ValueError(f"cannot read {label} file {path!r}: {err}") from None
+
+
+def cmd_model_delete(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    if not _confirm(args, f"Delete model registration #{args.model_id}?"):
+        return 2
+    action = client.delete_model(args.model_id)
+    _emit(output, action.raw, [action.id], lambda: _print_action(action, color))
+    return 0
 
 
 def cmd_task_submit(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
@@ -451,7 +529,7 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
 
     # --- servings ---
     p = sub.add_parser("serving-deploy", parents=[common], help="Deploy a registered model as a serving.")
-    p.add_argument("workspace"); p.add_argument("model_id", type=int, help="Model registration ID.")
+    p.add_argument("workspace"); p.add_argument("model_id", type=int, help="Model registration ID (see `meshive models`).")
     p.add_argument("--price-cap", required=True, metavar="USD", help="Per-replica hourly price cap.")
     p.add_argument("--min-replicas", type=int, default=1); p.add_argument("--max-replicas", type=int, default=3)
     p.add_argument("--no-autoscale", action="store_true")
@@ -467,6 +545,23 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p = sub.add_parser("serving-pause", parents=[common], help="Pause a serving."); p.add_argument("serving_id", type=int)
     p = sub.add_parser("serving-resume", parents=[common], help="Resume a paused serving (billing resumes)."); p.add_argument("serving_id", type=int); _yes(p)
     p = sub.add_parser("serving-delete", parents=[common], help="Delete a serving."); p.add_argument("serving_id", type=int); _yes(p)
+
+    # --- serving models (0.1.3) ---
+    p = sub.add_parser("models", parents=[common], help="List the models registered for serving (their ID goes to serving-deploy).")
+    p.add_argument("workspace")
+    p = sub.add_parser("hf-tokens", parents=[common], help="List the workspace's Hugging Face tokens (for private repos).")
+    p.add_argument("workspace")
+    p = sub.add_parser("model-detect", parents=[common], help="Check whether a Hugging Face repo can be served (exit 1 if not).")
+    p.add_argument("workspace"); p.add_argument("repo", help="Hugging Face repo, e.g. Qwen/Qwen3-0.6B.")
+    p.add_argument("--hf-token", type=int, default=None, metavar="ID", help="Token ID from `meshive hf-tokens` (private repos).")
+    p = sub.add_parser("model-register", parents=[common], help="Register a Hugging Face model for serving (free; it downloads when deployed).")
+    p.add_argument("workspace"); p.add_argument("repo", help="Hugging Face repo, e.g. Qwen/Qwen3-0.6B.")
+    p.add_argument("--name", default=None, help="Display name (default: the repo name).")
+    p.add_argument("--framework", default=None, choices=["vllm", "sglang"])
+    p.add_argument("--hf-token", type=int, default=None, metavar="ID", help="Token ID from `meshive hf-tokens` (private repos).")
+    p.add_argument("--context", type=int, default=None, metavar="TOKENS", help="Max context (default: detected).")
+    p = sub.add_parser("model-delete", parents=[common], help="Delete a model registration (not while it is deployed).")
+    p.add_argument("model_id", type=int, help="Model registration ID."); _yes(p)
 
     # --- tasks ---
     p = sub.add_parser("task-submit", parents=[common], help="Submit a one-off task (shows the estimate first).")
@@ -513,6 +608,11 @@ HANDLERS: dict[str, Handler] = {
     "serving-pause": _serving_simple("pause_serving", paused=True),
     "serving-resume": _serving_simple("pause_serving", "Resume serving #{id}? Billing resumes.", paused=False),
     "serving-delete": _serving_simple("delete_serving", "Delete serving #{id}?"),
+    "models": cmd_models,
+    "hf-tokens": cmd_hf_tokens,
+    "model-detect": cmd_model_detect,
+    "model-register": cmd_model_register,
+    "model-delete": cmd_model_delete,
     "task-submit": cmd_task_submit,
     "task-stop": cmd_task_stop,
     "logs": cmd_logs,

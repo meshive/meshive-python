@@ -50,16 +50,19 @@ from .models import (
     CreditHistoryEntry,
     Earnings,
     GpuAvailability,
+    HfToken,
     Logs,
     Machine,
     MachineMetrics,
     Member,
+    ModelDetection,
     Pod,
     PodCreated,
     PodEstimate,
     PodMetrics,
     ResourceAction,
     Serving,
+    ServingModel,
     Storage,
     Transaction,
     StorageCreated,
@@ -780,7 +783,8 @@ class Meshive(_BaseClient):
                        min_replicas: int = 1, max_replicas: int = 3, autoscale: bool = True,
                        max_context_tokens: int | None = None, share_idle_capacity: bool = False,
                        idempotency_key: str | None = None) -> ResourceAction:
-        """등록된 모델(registration id) 을 서빙으로 배포(201). 비용 상한 = price_cap_per_hour × max_replicas."""
+        """등록된 모델(registration id — list_models / register_model) 을 서빙으로 배포(201).
+        비용 상한 = price_cap_per_hour × max_replicas."""
         body = _write.serving_deploy_body(model_registration_id, price_cap_per_hour=price_cap_per_hour,
                                           min_replicas=min_replicas, max_replicas=max_replicas, autoscale=autoscale,
                                           max_context_tokens=max_context_tokens, share_idle_capacity=share_idle_capacity)
@@ -807,6 +811,54 @@ class Meshive(_BaseClient):
     def delete_serving(self, serving_id: int | str, *, idempotency_key: str | None = None) -> ResourceAction:
         data = self._send("DELETE", f"/servings/{_int_segment(serving_id, 'serving_id')}", idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="serving")
+
+    # --- 서빙 모델 등록 ---------------------------------------------------------------
+
+    def list_models(self, workspace: str) -> list[ServingModel]:
+        """워크스페이스가 등록한 서빙 모델 (GET /models?workspace=) — deploy_serving 의 registration id."""
+        try:
+            return [ServingModel.from_dict(d) for d in self._get("/models", params={"workspace": workspace})]
+        except NotFoundError as err:
+            raise _not_supported(err, "model registration") from None
+
+    def list_hf_tokens(self, workspace: str) -> list[HfToken]:
+        """워크스페이스 Hugging Face 토큰 id·이름 (GET /hf-tokens?workspace=). 토큰 등록은 콘솔에서."""
+        try:
+            return [HfToken.from_dict(d) for d in self._get("/hf-tokens", params={"workspace": workspace})]
+        except NotFoundError as err:
+            raise _not_supported(err, "model registration") from None
+
+    def detect_model(self, huggingface_repo: str, *, workspace: str, hf_token_id: int | None = None) -> ModelDetection:
+        """HF repo 를 서빙할 수 있는지 감지 (POST /models/detect). 아무것도 만들지 않는다(read 스코프)."""
+        body = _write.model_body(huggingface_repo, hf_token_id=hf_token_id)
+        try:
+            data = self._send("POST", "/models/detect", params={"workspace": _query_value(workspace, "workspace")},
+                              json=body)
+        except NotFoundError as err:
+            raise _not_supported(err, "model registration") from None
+        return ModelDetection.from_dict(data)
+
+    def register_model(self, huggingface_repo: str, *, workspace: str, name: str | None = None,
+                       framework: str | None = None, hf_token_id: int | None = None,
+                       context_length: int | None = None, idempotency_key: str | None = None) -> ResourceAction:
+        """서빙 모델 등록(201) — `id` 가 registration id. 비용 없음(다운로드는 배포 때). 같은 repo 는 기존 등록을 돌려준다."""
+        body = _write.model_body(huggingface_repo, hf_token_id=hf_token_id, name=name, framework=framework,
+                                 context_length=context_length)
+        try:
+            data = self._send("POST", "/models", params={"workspace": _query_value(workspace, "workspace")}, json=body,
+                              idempotency_key=idempotency_key)
+        except NotFoundError as err:
+            raise _not_supported(err, "model registration") from None
+        return ResourceAction.from_dict(data, resource="model")
+
+    def delete_model(self, registration_id: int | str, *, idempotency_key: str | None = None) -> ResourceAction:
+        """등록 삭제 — 그 모델의 배포가 살아 있으면 409."""
+        try:
+            data = self._send("DELETE", f"/models/{_int_segment(registration_id, 'registration_id')}",
+                              idempotency_key=idempotency_key)
+        except NotFoundError as err:
+            raise _not_supported(err, "model registration") from None
+        return ResourceAction.from_dict(data, resource="model")
 
     # --- 쓰기: 태스크 ----------------------------------------------------------------
 
@@ -1256,7 +1308,8 @@ class AsyncMeshive(_BaseClient):
                        min_replicas: int = 1, max_replicas: int = 3, autoscale: bool = True,
                        max_context_tokens: int | None = None, share_idle_capacity: bool = False,
                        idempotency_key: str | None = None) -> ResourceAction:
-        """등록된 모델(registration id) 을 서빙으로 배포(201). 비용 상한 = price_cap_per_hour × max_replicas."""
+        """등록된 모델(registration id — list_models / register_model) 을 서빙으로 배포(201).
+        비용 상한 = price_cap_per_hour × max_replicas."""
         body = _write.serving_deploy_body(model_registration_id, price_cap_per_hour=price_cap_per_hour,
                                           min_replicas=min_replicas, max_replicas=max_replicas, autoscale=autoscale,
                                           max_context_tokens=max_context_tokens, share_idle_capacity=share_idle_capacity)
@@ -1283,6 +1336,55 @@ class AsyncMeshive(_BaseClient):
     async def delete_serving(self, serving_id: int | str, *, idempotency_key: str | None = None) -> ResourceAction:
         data = await self._send("DELETE", f"/servings/{_int_segment(serving_id, 'serving_id')}", idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="serving")
+
+    # --- 서빙 모델 등록 ---------------------------------------------------------------
+
+    async def list_models(self, workspace: str) -> list[ServingModel]:
+        """워크스페이스가 등록한 서빙 모델 (GET /models?workspace=)."""
+        try:
+            return [ServingModel.from_dict(d) for d in await self._get("/models", params={"workspace": workspace})]
+        except NotFoundError as err:
+            raise _not_supported(err, "model registration") from None
+
+    async def list_hf_tokens(self, workspace: str) -> list[HfToken]:
+        """워크스페이스 Hugging Face 토큰 id·이름 (GET /hf-tokens?workspace=)."""
+        try:
+            return [HfToken.from_dict(d) for d in await self._get("/hf-tokens", params={"workspace": workspace})]
+        except NotFoundError as err:
+            raise _not_supported(err, "model registration") from None
+
+    async def detect_model(self, huggingface_repo: str, *, workspace: str,
+                           hf_token_id: int | None = None) -> ModelDetection:
+        """HF repo 를 서빙할 수 있는지 감지 (POST /models/detect)."""
+        body = _write.model_body(huggingface_repo, hf_token_id=hf_token_id)
+        try:
+            data = await self._send("POST", "/models/detect",
+                                    params={"workspace": _query_value(workspace, "workspace")}, json=body)
+        except NotFoundError as err:
+            raise _not_supported(err, "model registration") from None
+        return ModelDetection.from_dict(data)
+
+    async def register_model(self, huggingface_repo: str, *, workspace: str, name: str | None = None,
+                             framework: str | None = None, hf_token_id: int | None = None,
+                             context_length: int | None = None, idempotency_key: str | None = None) -> ResourceAction:
+        """서빙 모델 등록(201) — `id` 가 registration id."""
+        body = _write.model_body(huggingface_repo, hf_token_id=hf_token_id, name=name, framework=framework,
+                                 context_length=context_length)
+        try:
+            data = await self._send("POST", "/models", params={"workspace": _query_value(workspace, "workspace")},
+                                    json=body, idempotency_key=idempotency_key)
+        except NotFoundError as err:
+            raise _not_supported(err, "model registration") from None
+        return ResourceAction.from_dict(data, resource="model")
+
+    async def delete_model(self, registration_id: int | str, *, idempotency_key: str | None = None) -> ResourceAction:
+        """등록 삭제 — 그 모델의 배포가 살아 있으면 409."""
+        try:
+            data = await self._send("DELETE", f"/models/{_int_segment(registration_id, 'registration_id')}",
+                                    idempotency_key=idempotency_key)
+        except NotFoundError as err:
+            raise _not_supported(err, "model registration") from None
+        return ResourceAction.from_dict(data, resource="model")
 
     # --- 쓰기: 태스크 ----------------------------------------------------------------
 

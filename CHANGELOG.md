@@ -22,7 +22,7 @@ longer break `-o json` and `-o name`. Features that need new server routes say s
 
 ### SDK
 
-- `ssh_access(pod, workspace)` returns a one-time SSH login for a pod — `command` (`ssh -p … root@…`), `password`
+- `ssh_access(pod, workspace)` returns a one-time SSH login for a pod — `command` (the `ssh -p …` command to run), `password`
   and `expires_at` (a few minutes) — the same as the console's Connect tab. It needs a read & write key, and each call
   issues a new password. The password and `web_url` (a browser terminal with the password in it) are left out of
   `repr`.

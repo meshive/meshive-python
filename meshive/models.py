@@ -273,7 +273,7 @@ class WatchedFolders:
 class SshAccess:
     """POST /v1/sdk/pods/{pod}/ssh 응답 — 일회용 SSH 접속(몇 분 뒤 만료). 비밀번호는 repr 에서 빠진다."""
 
-    command: str                   # 예: "ssh -p 2222 root@<host>"
+    command: str                   # 예: "ssh -p 2222 gateway@<host>" (사용자 이름은 서버가 정한다)
     password: str = field(repr=False)
     web_url: str = field(default="", repr=False)   # 브라우저 터미널 — 비밀번호가 URL 에 들어 있다
     expires_at: datetime | None = None

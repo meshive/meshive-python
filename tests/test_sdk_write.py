@@ -427,3 +427,15 @@ def test_pod_assets_and_watched_folders():
         sync_client(rec).set_watched_folders("p-0", "ws", expected_version=-1)
     assert sync_client(Recorder((200, {"editable": False, "editableReason": "undecidable", "roots": None}))) \
         .get_watched_folders("p-0", "ws").folders is None
+
+
+def test_ssh_access():
+    rec = Recorder((200, {"password": "pw-123", "sshUrl": "ssh -p 2222 root@m.machine.c.meshive.ai",
+                          "sshWebUrl": "https://m.machine.c.meshive.ai/?password=cHctMTIz", "expiredAt": 1_900_000_000}))
+    a = sync_client(rec).ssh_access("p-0", "ws")
+    assert rec.last.method == "POST" and rec.last.url.path == "/v1/sdk/pods/p-0/ssh"
+    assert rec.last.url.params["workspace"] == "ws"
+    assert a.command.startswith("ssh -p 2222") and a.password == "pw-123" and a.expires_at.year == 2030
+    assert "pw-123" not in repr(a) and "cHctMTIz" not in repr(a)
+    with pytest.raises(NotFoundError, match="does not support SSH access"):
+        sync_client(Recorder((404, {"detail": "Not Found"}))).ssh_access("p-0", "ws")

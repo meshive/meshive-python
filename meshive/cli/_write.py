@@ -180,6 +180,21 @@ def _pod_input_asset(value: str) -> Any:
     return {"asset": asset.strip(), "target_dir": target.strip()} if sep and target.strip() else asset.strip()
 
 
+def cmd_ssh(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    """접속 명령과 일회용 비밀번호만 출력한다 — ssh 를 대신 실행하지 않는다."""
+    access = client.ssh_access(args.pod_name, args.workspace)
+
+    def show() -> None:
+        _kv([("command", access.command), ("password", access.password),
+             ("expires", fmt.relative_time(access.expires_at) if access.expires_at else "-")])
+        if access.web_url:
+            print(fmt.paint(f"Browser terminal: {fmt.clean(access.web_url)}", "dim", color))
+        print(fmt.paint("One-time password — run the command and paste it when asked.", "dim", color))
+
+    _emit(output, access.raw, [access.command], show)
+    return 0
+
+
 def cmd_pod_watch(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     """수확 폴더 보기·바꾸기 — 지금 설정을 읽어 고친 뒤 그 버전으로 전체 교체(다른 곳에서 바뀌었으면 409)."""
     current = client.get_watched_folders(args.pod_name, args.workspace)
@@ -617,6 +632,8 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
             _yes(p)
 
     # --- storages ---
+    p = sub.add_parser("ssh", parents=[common], help="Print a one-time SSH command and password for a pod (read & write key).")
+    p.add_argument("workspace"); p.add_argument("pod_name")
     p = sub.add_parser("pod-watch", parents=[common],
                        help="Show or change a running pod's watched folders (new files become assets; no restart).")
     p.add_argument("workspace"); p.add_argument("pod_name")
@@ -730,6 +747,7 @@ HANDLERS: dict[str, Handler] = {
     "pod-restart": _pod_action("restart_pod", False, ""),
     "pod-delete": _pod_action("delete_pod", True, "Delete pod {pod}?"),
     "pod-watch": cmd_pod_watch,
+    "ssh": cmd_ssh,
     "storage-create": cmd_storage_create,
     "storage-delete": cmd_storage_delete,
     "serving-deploy": cmd_serving_deploy,

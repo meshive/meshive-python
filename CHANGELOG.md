@@ -20,6 +20,10 @@ asset downloads and output uploads. Confirmation questions no longer break `-o j
 
 ### SDK
 
+- `ssh_access(pod, workspace)` returns a one-time SSH login for a pod — `command` (`ssh -p … root@…`), `password`
+  and `expires_at` (a few minutes) — the same as the console's Connect tab. It needs a read & write key, and each call
+  issues a new password. The password and `web_url` (a browser terminal with the password in it) are left out of
+  `repr`.
 - `create_pod` / `estimate_pod` take `input_assets` (Asset Hub assets to place in the pod — `"asset_id"` or
   `{"asset", "target_dir", "role", "paths"}`), `watched_folders` (folders whose new files are uploaded as assets —
   `"path"` or `{"path", "include", "include_existing"}`) and `harvest_destination` (`{"mode": "user_s3",
@@ -63,6 +67,7 @@ asset downloads and output uploads. Confirmation questions no longer break `-o j
 
 ### CLI
 
+- `meshive ssh <workspace> <pod>` prints a one-time SSH command and password; it doesn't run ssh for you.
 - `meshive pod-create` takes `--input-asset ASSET_ID[=DIR]` and `--watch PATH`, and `meshive pod-watch <workspace>
   <pod>` shows a running pod's watched folders and changes them with `--add PATH [--include GLOB] [--existing]`,
   `--remove`, `--on` and `--off`. Adding or turning on a folder asks for confirmation (uploaded files are stored and

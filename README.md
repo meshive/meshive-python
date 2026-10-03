@@ -65,6 +65,7 @@ meshive members <workspace>    # members and roles
 meshive pods <workspace>       # list pods in a workspace
 meshive pods --all             # list pods across every workspace (adds a WORKSPACE column)
 meshive pod-watch <workspace> <pod> --add /workspace/results   # upload new files there as assets
+meshive ssh <workspace> <pod>  # one-time SSH command and password (read & write key)
 meshive pod <workspace> <pod>  # show a single pod: URLs and connect credentials (--show-secrets prints secret values)
 meshive pod-metrics <workspace> <pod>   # live CPU/RAM/GPU/disk usage
 meshive transactions <workspace>        # in-flight pod operations (why a pod is still creating)

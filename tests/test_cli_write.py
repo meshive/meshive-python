@@ -9,7 +9,7 @@ import pytest
 
 cli = importlib.import_module("meshive.cli.main")  # cli.__init__ 이 main 함수를 노출해 서브모듈을 가린다
 from meshive.models import (Pod, Logs, PodCreated, PodEstimate, ResourceAction, Serving, StorageCreated, StorageEstimate,
-                            TaskEstimate, TaskSubmitted, ModelDetection, ServingModel, AssetImported, WatchedFolders)
+                            TaskEstimate, TaskSubmitted, ModelDetection, ServingModel, AssetImported, WatchedFolders, SshAccess)
 
 ESTIMATE = {"pricePerHourUsd": "0.068423", "breakdown": {"gpu": "0.068423"},
             "resources": {"gpu_model": "RTX 3060", "vram_gb": 12, "gpu_count": 1, "vcpu": 4, "ram_gb": 12, "disk_gb": 25,
@@ -116,6 +116,11 @@ class FakeClient:
 
     def set_watched_folders(self, *a, **kw):
         self._rec("set_watched_folders", *a, **kw); return WatchedFolders.from_dict(self.WATCHED)
+
+    def ssh_access(self, *a, **kw):
+        self._rec("ssh_access", *a, **kw)
+        return SshAccess.from_dict({"password": "pw-123", "sshUrl": "ssh -p 2222 root@m.example",
+                                    "sshWebUrl": "https://m.example/?password=x", "expiredAt": 4_000_000_000})
 
     def import_asset(self, *a, **kw):
         self.calls.append(("import_asset", a, kw))
@@ -491,3 +496,12 @@ def test_pod_watch_shows_and_rewrites_with_the_version(capsys, non_tty):
     kw = _last("set_watched_folders")[2]
     assert kw["template"] == {"/workspace/outputs": {"enabled": False, "include": None}} and kw["user"] == []
     assert cli.main(["pod-watch", "ws", "p-0", "--off", "/nope"]) == 2     # 모르는 폴더 → 사용 오류
+
+
+def test_ssh_prints_the_command_and_password_only(capsys):
+    assert cli.main(["ssh", "ws", "p-0"]) == 0
+    out = capsys.readouterr().out
+    assert "ssh -p 2222 root@m.example" in out and "pw-123" in out and "in " in out   # 만료는 앞으로의 시각
+    assert _last("ssh_access")[1] == ("p-0", "ws")
+    assert cli.main(["ssh", "ws", "p-0", "-o", "name"]) == 0
+    assert capsys.readouterr().out.strip() == "ssh -p 2222 root@m.example"

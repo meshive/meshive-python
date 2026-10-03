@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 
 
@@ -267,6 +267,25 @@ class WatchedFolders:
                               since=r.get("since"), blocked_reason=r.get("blockedReason"))
                 for r in roots if isinstance(r, dict)],
             raw=d)
+
+
+@dataclass
+class SshAccess:
+    """POST /v1/sdk/pods/{pod}/ssh 응답 — 일회용 SSH 접속(몇 분 뒤 만료). 비밀번호는 repr 에서 빠진다."""
+
+    command: str                   # 예: "ssh -p 2222 root@<host>"
+    password: str = field(repr=False)
+    web_url: str = field(default="", repr=False)   # 브라우저 터미널 — 비밀번호가 URL 에 들어 있다
+    expires_at: datetime | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SshAccess":
+        expired = d.get("expiredAt")
+        return cls(command=str(d.get("sshUrl", "") or ""), password=str(d.get("password", "") or ""),
+                   web_url=str(d.get("sshWebUrl", "") or ""),
+                   expires_at=None if expired is None else datetime.fromtimestamp(_as_int(expired), tz=timezone.utc),
+                   raw=d)
 
 
 @dataclass

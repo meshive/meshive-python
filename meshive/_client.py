@@ -64,6 +64,7 @@ from .models import (
     ResourceAction,
     Serving,
     ServingModel,
+    SshAccess,
     Storage,
     Transaction,
     WatchedFolders,
@@ -822,6 +823,16 @@ class Meshive(_BaseClient):
         data = self._send("DELETE", f"/servings/{_int_segment(serving_id, 'serving_id')}", idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="serving")
 
+    def ssh_access(self, pod_name: str, workspace: str) -> SshAccess:
+        """일회용 SSH 접속(write 스코프, 몇 분 뒤 만료) — `command` 로 접속하고 `password` 를 입력한다.
+        부를 때마다 새 비밀번호다. 비밀번호를 로그·파일에 남기지 말 것."""
+        try:
+            data = self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/ssh",
+                              params={"workspace": _query_value(workspace, "workspace")})
+        except NotFoundError as err:
+            raise _not_supported(err, "SSH access") from None
+        return SshAccess.from_dict(data)
+
     # --- Watched folders (실행 중 Pod 의 수확 폴더) ------------------------------------
 
     def get_watched_folders(self, pod_name: str, workspace: str) -> WatchedFolders:
@@ -1399,6 +1410,15 @@ class AsyncMeshive(_BaseClient):
     async def delete_serving(self, serving_id: int | str, *, idempotency_key: str | None = None) -> ResourceAction:
         data = await self._send("DELETE", f"/servings/{_int_segment(serving_id, 'serving_id')}", idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="serving")
+
+    async def ssh_access(self, pod_name: str, workspace: str) -> SshAccess:
+        """일회용 SSH 접속(write 스코프, 몇 분 뒤 만료)."""
+        try:
+            data = await self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/ssh",
+                                    params={"workspace": _query_value(workspace, "workspace")})
+        except NotFoundError as err:
+            raise _not_supported(err, "SSH access") from None
+        return SshAccess.from_dict(data)
 
     # --- Watched folders (실행 중 Pod 의 수확 폴더) ------------------------------------
 

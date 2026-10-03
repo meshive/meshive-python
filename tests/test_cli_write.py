@@ -9,7 +9,7 @@ import pytest
 
 cli = importlib.import_module("meshive.cli.main")  # cli.__init__ 이 main 함수를 노출해 서브모듈을 가린다
 from meshive.models import (Pod, Logs, PodCreated, PodEstimate, ResourceAction, Serving, StorageCreated, StorageEstimate,
-                            TaskEstimate, TaskSubmitted, ModelDetection, ServingModel)
+                            TaskEstimate, TaskSubmitted, ModelDetection, ServingModel, AssetImported)
 
 ESTIMATE = {"pricePerHourUsd": "0.068423", "breakdown": {"gpu": "0.068423"},
             "resources": {"gpu_model": "RTX 3060", "vram_gb": 12, "gpu_count": 1, "vcpu": 4, "ram_gb": 12, "disk_gb": 25,
@@ -104,6 +104,11 @@ class FakeClient:
     def delete_model(self, *a, **kw):
         self._rec("delete_model", *a, **kw)
         return ResourceAction.from_dict({"id": str(a[0]), "action": "delete"}, resource="model")
+
+    def import_asset(self, *a, **kw):
+        self.calls.append(("import_asset", a, kw))
+        return AssetImported.from_dict({"assetExternalId": "asset_abc", "name": "llama", "status": "active",
+                                        "ingestSource": "hf_import", "fileCount": 4, "totalBytes": 2048, "isGated": True})
 
     def close(self):
         pass
@@ -435,3 +440,12 @@ def test_model_commands(capsys, non_tty):
     assert cli.main(["model-delete", "12"]) == 2                 # 지우기는 확인이 필요하다
     assert cli.main(["model-delete", "12", "--yes"]) == 0
     assert _last("delete_model")[1] == (12,)
+
+
+def test_asset_import_needs_no_confirmation(capsys, non_tty):
+    assert cli.main(["asset-import", "ws", "meta-llama/Llama-3.1-8B", "--hf-token", "2", "--path", "*.json",
+                     "--type", "model"]) == 0
+    out = capsys.readouterr().out
+    assert "llama (asset_abc)" in out and "4 (2.0 KiB)" in out and "saved token or key" in out
+    assert _last("import_asset")[2] == {"workspace": "ws", "name": None, "asset_type": "model", "revision": None,
+                                        "paths": ["*.json"], "hf_token_id": 2, "civitai_key_id": None}

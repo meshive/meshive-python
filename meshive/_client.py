@@ -42,6 +42,7 @@ from .models import (
     ApiKey,
     Asset,
     AssetDownload,
+    AssetImported,
     AssetPage,
     AssetStorage,
     DownloadFile,
@@ -812,6 +813,30 @@ class Meshive(_BaseClient):
         data = self._send("DELETE", f"/servings/{_int_segment(serving_id, 'serving_id')}", idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="serving")
 
+    # --- 자산 import ---------------------------------------------------------------
+
+    def import_asset(self, target: str, *, workspace: str, name: str | None = None, asset_type: str | None = None,
+                     revision: str | None = None, paths: str | Iterable[str] | None = None,
+                     hf_token_id: int | None = None, civitai_key_id: int | None = None,
+                     idempotency_key: str | None = None) -> AssetImported:
+        """HF repo(`owner/name`·URL)·CivitAI URL·직링크를 자산으로 링크 등록(201, 바로 ready). 바이트를 복사하지 않아
+        저장 요금이 없다 — Pod·task 가 쓸 때 원본에서 받는다. 비공개·gated 원본은 콘솔에 등록한 토큰·키 id 로."""
+        body = _write.asset_import_body(target, name=name, asset_type=asset_type, revision=revision, paths=paths,
+                                        hf_token_id=hf_token_id, civitai_key_id=civitai_key_id)
+        try:
+            data = self._send("POST", "/assets/import", params={"workspace": _query_value(workspace, "workspace")},
+                              json=body, idempotency_key=idempotency_key)
+        except NotFoundError as err:
+            raise _not_supported(err, "asset import") from None
+        return AssetImported.from_dict(data)
+
+    def list_civitai_keys(self, workspace: str) -> list[HfToken]:
+        """워크스페이스 CivitAI 키 id·이름 (GET /civitai-keys?workspace=). 키 등록은 콘솔에서."""
+        try:
+            return [HfToken.from_dict(d) for d in self._get("/civitai-keys", params={"workspace": workspace})]
+        except NotFoundError as err:
+            raise _not_supported(err, "asset import") from None
+
     # --- 서빙 모델 등록 ---------------------------------------------------------------
 
     def list_models(self, workspace: str) -> list[ServingModel]:
@@ -1336,6 +1361,30 @@ class AsyncMeshive(_BaseClient):
     async def delete_serving(self, serving_id: int | str, *, idempotency_key: str | None = None) -> ResourceAction:
         data = await self._send("DELETE", f"/servings/{_int_segment(serving_id, 'serving_id')}", idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="serving")
+
+    # --- 자산 import ---------------------------------------------------------------
+
+    async def import_asset(self, target: str, *, workspace: str, name: str | None = None,
+                           asset_type: str | None = None, revision: str | None = None,
+                           paths: str | Iterable[str] | None = None, hf_token_id: int | None = None,
+                           civitai_key_id: int | None = None, idempotency_key: str | None = None) -> AssetImported:
+        """HF repo·CivitAI URL·직링크를 자산으로 링크 등록(201, 바로 ready)."""
+        body = _write.asset_import_body(target, name=name, asset_type=asset_type, revision=revision, paths=paths,
+                                        hf_token_id=hf_token_id, civitai_key_id=civitai_key_id)
+        try:
+            data = await self._send("POST", "/assets/import",
+                                    params={"workspace": _query_value(workspace, "workspace")}, json=body,
+                                    idempotency_key=idempotency_key)
+        except NotFoundError as err:
+            raise _not_supported(err, "asset import") from None
+        return AssetImported.from_dict(data)
+
+    async def list_civitai_keys(self, workspace: str) -> list[HfToken]:
+        """워크스페이스 CivitAI 키 id·이름 (GET /civitai-keys?workspace=)."""
+        try:
+            return [HfToken.from_dict(d) for d in await self._get("/civitai-keys", params={"workspace": workspace})]
+        except NotFoundError as err:
+            raise _not_supported(err, "asset import") from None
 
     # --- 서빙 모델 등록 ---------------------------------------------------------------
 

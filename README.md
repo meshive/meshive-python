@@ -77,6 +77,7 @@ meshive template <id>          # show a template
 
 meshive assets <workspace>     # assets in a workspace (datasets, models, outputs, ...); --page/--page-size
 meshive asset <id>             # show an asset with its files
+meshive asset-import <workspace> Qwen/Qwen3-0.6B   # link a Hugging Face repo, CivitAI model or file URL as an asset
 meshive asset-download <id>    # save its files (-d DIR, --path GLOB); task-outputs <task> --download DIR for task results
 meshive asset-storage <workspace>   # managed asset storage, monthly cost, credit status
 

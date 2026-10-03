@@ -20,6 +20,11 @@ asset downloads and output uploads. Confirmation questions no longer break `-o j
 
 ### SDK
 
+- `import_asset(target, workspace=, …)` links a Hugging Face repo (`owner/name` or its URL), a CivitAI model or a
+  direct file URL as an asset. Nothing is copied, so there is no storage charge and the asset is ready at once; pods
+  and tasks download it from the source when they start. Narrow it with `paths`, pin a Hugging Face `revision`, and
+  reach private or gated sources with a token or key saved in the console (`hf_token_id` / `civitai_key_id`, listed by
+  `list_hf_tokens` / `list_civitai_keys`). Errors such as a gated repo come back with the server's message.
 - Serving without the console: `detect_model(repo, workspace=)` checks whether a Hugging Face repo can be served,
   `register_model(repo, workspace=, name=, framework=, hf_token_id=, context_length=)` registers it (no charge — the
   model downloads when deployed; registering the same repo again returns the existing registration),
@@ -50,6 +55,8 @@ asset downloads and output uploads. Confirmation questions no longer break `-o j
 
 ### CLI
 
+- `meshive asset-import <workspace> <repo|url>` links a source as an asset (no confirmation — it costs nothing), and
+  `meshive civitai-keys` lists the workspace's CivitAI keys.
 - `meshive model-detect`, `model-register`, `models`, `model-delete` and `hf-tokens` register Hugging Face models for
   `serving-deploy`. `model-detect` exits 1 when the repo can't be served.
 - `meshive asset-download <id> [-d DIR] [--path GLOB]` saves an asset's files (into `./<id>` by default), and

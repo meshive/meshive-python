@@ -9,6 +9,7 @@ import warnings
 from collections.abc import Iterable, Mapping
 from decimal import Decimal, InvalidOperation
 from typing import Any
+from urllib.parse import urlparse
 
 RENTAL_TYPES = ("demand", "spot")
 PLACEMENTS = ("same_node", "any_node")
@@ -186,6 +187,37 @@ def model_body(huggingface_repo: str, *, hf_token_id: int | None = None, name: s
         "huggingfaceRepo": _require_str(huggingface_repo, "huggingface_repo").strip(),
         "hfTokenId": _optional_int(hf_token_id, "hf_token_id", minimum=0), "modelName": name or None,
         "framework": framework, "contextLength": _optional_int(context_length, "context_length"),
+    })
+
+
+def asset_import_body(target: str, *, name: str | None = None, asset_type: str | None = None,
+                      revision: str | None = None, paths: Iterable[str] | None = None,
+                      hf_token_id: int | None = None, civitai_key_id: int | None = None) -> dict[str, Any]:
+    """`target` 하나로 source 를 고른다 — `owner/name` 또는 huggingface.co URL = huggingface, civitai.com URL =
+    civitai, 그 밖의 http(s) URL = 직링크 1파일(url). 토큰·키는 워크스페이스에 등록된 것의 id 로만."""
+    target = _require_str(target, "target").strip()
+    parsed = urlparse(target)
+    body: dict[str, Any] = {}
+    if parsed.scheme in ("http", "https"):
+        host = (parsed.hostname or "").lower()
+        if host in ("huggingface.co", "www.huggingface.co"):
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) < 2:
+                raise ValueError(f"not a Hugging Face repo URL: {target!r}")
+            body.update(source="huggingface", hfRepo="/".join(parts[:2]))
+        elif host.endswith("civitai.com"):
+            body.update(source="civitai", sourceUrl=target)
+        else:
+            body.update(source="url", sourceUrl=target)
+    elif target.count("/") == 1 and " " not in target:
+        body.update(source="huggingface", hfRepo=target)
+    else:
+        raise ValueError("target must be a Hugging Face repo (owner/name) or an http(s) URL")
+    return _drop_none({
+        **body, "hfRevision": revision or None, "hfTokenId": _optional_int(hf_token_id, "hf_token_id", minimum=0),
+        "civitaiKeyId": _optional_int(civitai_key_id, "civitai_key_id", minimum=0),
+        "pathFilters": [p for p in ([paths] if isinstance(paths, str) else paths or []) if p] or None,
+        "name": name or None, "assetType": asset_type.strip().lower() if asset_type else None,
     })
 
 

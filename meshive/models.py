@@ -961,7 +961,7 @@ class ServingModel:
 
 @dataclass
 class HfToken:
-    """워크스페이스에 등록된 Hugging Face 토큰 — id 와 이름만(값은 API 가 돌려주지 않는다)."""
+    """워크스페이스에 등록된 Hugging Face 토큰(또는 CivitAI 키) — id 와 이름만(값은 API 가 돌려주지 않는다)."""
 
     token_id: int
     label: str
@@ -1291,6 +1291,28 @@ class TaskOutputs:
             storage_provider=str(destination.get("provider", "") or ""),
             raw=d,
         )
+
+
+@dataclass
+class AssetImported:
+    """POST /v1/sdk/assets/import 응답 — 링크로 등록된 자산(바이트는 복사하지 않고 바로 ready)."""
+
+    asset_id: str
+    name: str
+    status: str
+    ingest_source: str            # hf_import | civitai_import | url_import
+    file_count: int
+    total_bytes: int
+    is_gated: bool = False        # 원본이 토큰·키 없이는 안 읽힌다 — 기동 때도 저장된 토큰이 필요하다
+    resolved_commit: str | None = None   # HF: 고정된 commit (등록 뒤 바뀌지 않는다)
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AssetImported":
+        return cls(asset_id=str(d.get("assetExternalId", "") or ""), name=str(d.get("name", "") or ""),
+                   status=str(d.get("status", "") or ""), ingest_source=str(d.get("ingestSource", "") or ""),
+                   file_count=_as_int(d.get("fileCount")), total_bytes=_as_int(d.get("totalBytes")),
+                   is_gated=bool(d.get("isGated", False)), resolved_commit=d.get("resolvedCommit"), raw=d)
 
 
 @dataclass

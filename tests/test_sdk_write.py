@@ -361,3 +361,27 @@ def test_model_registration_methods():
     old = sync_client(Recorder((404, {"detail": "Not Found"})))
     with pytest.raises(NotFoundError, match="does not support model registration"):
         old.list_models("ws")
+
+
+def test_asset_import_picks_the_source():
+    from meshive import _write
+
+    assert _write.asset_import_body("Qwen/Qwen3-0.6B", paths="*.safetensors", hf_token_id=2) == {
+        "source": "huggingface", "hfRepo": "Qwen/Qwen3-0.6B", "hfTokenId": 2, "pathFilters": ["*.safetensors"]}
+    assert _write.asset_import_body("https://huggingface.co/Qwen/Qwen3-0.6B/tree/main", revision="v1")["hfRepo"] == \
+        "Qwen/Qwen3-0.6B"
+    assert _write.asset_import_body("https://civitai.com/models/4384", asset_type="Checkpoint") == {
+        "source": "civitai", "sourceUrl": "https://civitai.com/models/4384", "assetType": "checkpoint"}
+    assert _write.asset_import_body("https://example.com/w/a.bin")["source"] == "url"
+    for bad in ("not a repo", "a/b/c", "https://huggingface.co/onlyowner"):
+        with pytest.raises(ValueError):
+            _write.asset_import_body(bad)
+
+    rec = Recorder((201, {"assetExternalId": "asset_abc", "name": "Qwen3-0.6B", "status": "active",
+                          "ingestSource": "hf_import", "fileCount": 9, "totalBytes": 1500, "isGated": False,
+                          "resolvedCommit": "c0ffee"}))
+    a = sync_client(rec).import_asset("Qwen/Qwen3-0.6B", workspace="ws")
+    assert rec.last.url.path == "/v1/sdk/assets/import" and rec.last.headers["Idempotency-Key"]
+    assert (a.asset_id, a.file_count, a.resolved_commit) == ("asset_abc", 9, "c0ffee")
+    with pytest.raises(NotFoundError, match="does not support asset import"):
+        sync_client(Recorder((404, {"detail": "Not Found"}))).import_asset("Qwen/Qwen3-0.6B", workspace="ws")

@@ -1,6 +1,6 @@
 """CLI 쓰기 커맨드 (0.1.0): pod-create/stop/start/restart/delete, storage-create/delete,
 serving-deploy/scale/pause/resume/delete, task-submit/stop, logs, task-logs.
-0.1.3: models, hf-tokens, model-detect, model-register, model-delete (서빙용 모델 등록).
+0.1.3: models, hf-tokens, model-detect, model-register, model-delete (서빙용 모델 등록), asset-import, civitai-keys.
 
 규칙: 돈이 들거나 되돌릴 수 없는 커맨드(create/start/deploy/submit/delete, 그리고 비용이 늘 수 있는
 serving-scale·serving-resume)는 먼저 견적·요약을 보여주고 `--yes` 가 없으면 확인을 묻는다(TTY 가 아니면 exit 2).
@@ -408,6 +408,40 @@ def _read_text(path: str | None, label: str) -> str | None:
         raise ValueError(f"cannot read {label} file {path!r}: {err}") from None
 
 
+def cmd_asset_import(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    # 링크 등록이라 비용이 없다(저장 요금 0, 바이트는 쓸 때 원본에서) → 확인을 묻지 않는다.
+    a = client.import_asset(args.target, workspace=args.workspace, name=args.name, asset_type=args.type,
+                            revision=args.revision, paths=args.path, hf_token_id=args.hf_token,
+                            civitai_key_id=args.civitai_key)
+
+    def show() -> None:
+        _kv([("asset", f"{a.name} ({a.asset_id})"), ("status", a.status), ("source", a.ingest_source),
+             ("files", f"{a.file_count} ({fmt.bytes_human(a.total_bytes)})")] +
+            ([("commit", a.resolved_commit)] if a.resolved_commit else []))
+        note = "Linked, not copied: pods and tasks download it from the source when they start."
+        if a.is_gated:
+            note += " The source needs its saved token or key at that time too."
+        print(fmt.paint(note, "dim", color))
+
+    _emit(output, a.raw, [a.asset_id], show)
+    return 0
+
+
+def cmd_civitai_keys(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    keys = client.list_civitai_keys(args.workspace)
+
+    def show() -> None:
+        if not keys:
+            print("No CivitAI keys. Add one in the console for models that need it.")
+            return
+        fmt.render_table(["NAME", "ID", "ASSETS", "CREATED"],
+                         [[k.label or "-", str(k.token_id), str(k.used_by_asset_count), fmt.relative_time(k.created_at)]
+                          for k in keys], aligns=["l", "r", "r", "l"], enabled=color)
+
+    _emit(output, [{"id": k.token_id, "label": k.label} for k in keys], [str(k.token_id) for k in keys], show)
+    return 0
+
+
 def cmd_model_delete(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     if not _confirm(args, f"Delete model registration #{args.model_id}?"):
         return 2
@@ -546,6 +580,20 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p = sub.add_parser("serving-resume", parents=[common], help="Resume a paused serving (billing resumes)."); p.add_argument("serving_id", type=int); _yes(p)
     p = sub.add_parser("serving-delete", parents=[common], help="Delete a serving."); p.add_argument("serving_id", type=int); _yes(p)
 
+    # --- asset import (0.1.3) ---
+    p = sub.add_parser("asset-import", parents=[common],
+                       help="Link a Hugging Face repo, CivitAI model or file URL as an asset (no copy, no storage charge).")
+    p.add_argument("workspace")
+    p.add_argument("target", help="owner/name or a huggingface.co, civitai.com or direct file URL.")
+    p.add_argument("--name", default=None, help="Asset name (default: from the source).")
+    p.add_argument("--type", default=None, choices=["dataset", "model", "adapter", "checkpoint", "config", "file"])
+    p.add_argument("--revision", default=None, help="Hugging Face branch, tag or commit (default: main).")
+    p.add_argument("--path", action="append", metavar="GLOB", help="Only link matching files (repeatable).")
+    p.add_argument("--hf-token", type=int, default=None, metavar="ID", help="Token ID from `meshive hf-tokens`.")
+    p.add_argument("--civitai-key", type=int, default=None, metavar="ID", help="Key ID from `meshive civitai-keys`.")
+    p = sub.add_parser("civitai-keys", parents=[common], help="List the workspace's CivitAI keys.")
+    p.add_argument("workspace")
+
     # --- serving models (0.1.3) ---
     p = sub.add_parser("models", parents=[common], help="List the models registered for serving (their ID goes to serving-deploy).")
     p.add_argument("workspace")
@@ -609,6 +657,8 @@ HANDLERS: dict[str, Handler] = {
     "serving-resume": _serving_simple("pause_serving", "Resume serving #{id}? Billing resumes.", paused=False),
     "serving-delete": _serving_simple("delete_serving", "Delete serving #{id}?"),
     "models": cmd_models,
+    "asset-import": cmd_asset_import,
+    "civitai-keys": cmd_civitai_keys,
     "hf-tokens": cmd_hf_tokens,
     "model-detect": cmd_model_detect,
     "model-register": cmd_model_register,

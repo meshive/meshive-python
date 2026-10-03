@@ -12,7 +12,11 @@ Upgrade with:
 pip install -U meshive
 ```
 
-## Unreleased
+## v0.1.3
+
+`meshive pod` shows a pod's URLs and connect credentials (secret values only with `--show-secrets`) and why it was
+stopped or cannot start on its node, assets are read without versions, and transactions and tasks explain input
+asset downloads and output uploads. Confirmation questions no longer break `-o json` and `-o name` output.
 
 ### SDK
 

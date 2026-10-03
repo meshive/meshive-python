@@ -14,9 +14,11 @@ pip install -U meshive
 
 ## v0.1.3
 
-Models can be registered for serving and asset files and task outputs downloaded without the console, `meshive pod` shows a pod's URLs and connect credentials (secret
-values only with `--show-secrets`) and why it was stopped or cannot start on its node, assets are read without versions, and transactions and tasks explain input
-asset downloads and output uploads. Confirmation questions no longer break `-o json` and `-o name` output.
+The SDK, CLI and MCP now cover what the console added on the server: register Hugging Face models for serving, link
+Hugging Face, CivitAI and URL sources as assets, attach assets and watched folders to pods, download asset files and
+task outputs, and get a one-time SSH login. `meshive pod` shows a pod's URLs and connect credentials (secret values
+only with `--show-secrets`) and why it stopped, assets are read without versions, and confirmation questions no
+longer break `-o json` and `-o name`. Features that need new server routes say so on a server that predates them.
 
 ### SDK
 

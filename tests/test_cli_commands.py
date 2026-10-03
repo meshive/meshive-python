@@ -15,7 +15,9 @@ from meshive.models import (
     Asset,
     AssetPage,
     AssetStorage,
-    AssetVersion,
+    AssetFile,
+    AssetUsage,
+    ConnectCredential,
     Credit,
     CreditHistoryEntry,
     DailyCost,
@@ -23,15 +25,18 @@ from meshive.models import (
     Earnings,
     GpuAvailability,
     GpuUsage,
+    InitLog,
     Machine,
     MachineMetrics,
     Member,
     Pod,
+    PodEndpoint,
     PodMetrics,
     ResourceCondition,
     Serving,
     Storage,
     Task,
+    TaskInputAsset,
     Template,
     Transaction,
     WhoAmI,
@@ -58,7 +63,7 @@ class FakeClient:
     def list_workspaces(self):
         return [
             Workspace("ns", "Team", "d", 1, "active", "1.0",
-                      WorkspaceResources(2, 0, 0), raw={"namespaceName": "ns"}),
+                      WorkspaceResources(2, 0, 0), raw={"namespaceName": "ns"}, member_role="viewer"),
             Workspace("ns2", "Team2", "d", 1, "active", "1.0",
                       WorkspaceResources(1, 0, 0), raw={"namespaceName": "ns2"}),
         ]
@@ -75,7 +80,10 @@ class FakeClient:
 
     def get_pod(self, pod_name, workspace):
         return Pod(pod_name, workspace, "alias", "running", "on_demand", "0.9", False,
-                   raw={"podName": pod_name})
+                   raw={"podName": pod_name},
+                   endpoints=[PodEndpoint("ComfyUI", 8188, "connect", "https://c.meshive.ai", None, True, "ready")],
+                   connect_credentials=[ConnectCredential("ACCESS_PASSWORD", "s3cret-pw", True, True),
+                                        ConnectCredential("USERNAME", "admin")])
 
     def wait_for_pod(self, pod_name, workspace, *, until, timeout):
         FakeClient.last_wait = {"pod_name": pod_name, "workspace": workspace,
@@ -197,7 +205,10 @@ class FakeClient:
     def get_task(self, task_id):
         return Task(task_id, "train", "ns", "succeeded", "task-a", "python:3.12", "NVIDIA RTX 4090",
                     1, 6, 24, "1.0", "0.5", "0.5", exit_code=0,
-                    raw={"externalId": task_id, "scriptContent": "print(1)"})
+                    raw={"externalId": task_id, "scriptContent": "print(1)"},
+                    output_upload_state="uploading", output_files_declared=4, output_files_completed=1,
+                    output_bytes_declared=4096, output_bytes_completed=1024, output_upload_last_error="AccessDenied",
+                    input_assets=[TaskInputAsset("asset_w", "weights", "/inputs/w")])
 
     def list_assets(self, workspace, *, asset_type=None, status=None, page=1, page_size=20):
         FakeClient.last_call = ("list_assets", (workspace,),
@@ -205,21 +216,24 @@ class FakeClient:
         if page_size < 1:  # 실제 SDK 의 범위 검증을 흉내
             raise ValueError("page_size must be an integer between 1 and 100")
         items = [
-            Asset("asset_data", "imagenet-mini", "dataset", "active", None, "meshive_r2", 2, 2_147_483_648, 3,
+            Asset("asset_data", "imagenet-mini", "dataset", "active", None, "meshive_r2", 2_147_483_648, 3,
                   True, namespace_name=workspace, raw={"assetExternalId": "asset_data"}),
             Asset("asset_lora", "style-lora", "adapter", "source_missing", "bucket unreachable", "user_s3",
-                  1, 150_000, 1, False, namespace_name=workspace, raw={"assetExternalId": "asset_lora"}),
+                  150_000, 1, False, namespace_name=workspace, raw={"assetExternalId": "asset_lora"}),
+            # 아직 재지 않은 링크 자산 — 크기를 모른다(0 이 아니다)
+            Asset("asset_link", "hf-link", "model", "active", None, "external", None, None, False,
+                  namespace_name=workspace, raw={"assetExternalId": "asset_link"}),
         ]
         return AssetPage(items, total=45, page=page, page_size=page_size,
                          raw={"total": 45, "page": page, "pageSize": page_size, "items": [a.raw for a in items]})
 
     def get_asset(self, asset_id):
-        versions = [AssetVersion(2, "uploading", 0, 0, "hf_import", "meshive_r2", None, False, "repo not found"),
-                    AssetVersion(1, "ready", 1_500_000, 2, "web_upload", "meshive_r2", None, False, None)]
-        return Asset(asset_id, "imagenet-mini", "dataset", "active", None, "meshive_r2", 1, 1_500_000, 2, True,
-                     namespace_name="ns", created_by="a@b.com", latest_version=versions[1], versions=versions,
-                     raw={"assetExternalId": asset_id,
-                          "activeUsageContexts": [{"kind": "pod", "name": "trainer", "identifier": "pod-run"}]})
+        return Asset(asset_id, "imagenet-mini", "dataset", "active", None, "meshive_r2", 1_500_000, 2, True,
+                     namespace_name="ns", created_by="a@b.com", upload_status="failed", ingest_source="hf_import",
+                     import_failure_reason="repo not found",
+                     files=[AssetFile("a.bin", 1_000_000, "ready"), AssetFile("b.bin", 500_000, "ready")],
+                     active_usage_contexts=[AssetUsage("pod", "pod-run", "trainer", "running")],
+                     raw={"assetExternalId": asset_id})
 
     def get_asset_storage(self, workspace):
         return AssetStorage(2_147_483_648, 0.015, 0.03, "grace", False, None,
@@ -234,6 +248,10 @@ class FakeClient:
             # 별칭 없는 pod 의 실패 — 진행률을 모르는 스텝(progress=None)
             Transaction(73214, "9eb176aae9309fb8", "", "restart", "failed", "pull_image", "failed",
                         detail="image pull stalled for 600s", raw={"transactionId": 73214}),
+            Transaction(73215, "aa11", "comfy", "create", "failed", "fetch_assets", "failed",
+                        detail="source fetch failed", raw={"transactionId": 73215}, live=False, phase="verifying",
+                        init_logs=[InitLog("source-fetch", [f"line {i}" for i in range(15)] + ["\x1b[31mHTTP 403"],
+                                           True)]),
         ]
 
     def close(self):
@@ -267,6 +285,7 @@ def test_workspaces_output(capsys):
     out = capsys.readouterr().out
     assert "ns" in out and "active" in out
     assert "Team" in out  # NAME(workspace_name) shown alongside ID(namespace_name)
+    assert "ROLE" in out and "viewer" in out
     assert out.index("NAME") < out.index("ID")  # NAME first, then ID
 
 
@@ -372,6 +391,17 @@ def test_pods_single_workspace_has_no_workspace_column(capsys):
 def test_pod_json_output(capsys):
     assert cli.main(["pod", "team-ns", "pod-1", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == {"podName": "pod-1"}
+
+
+def test_pod_connect_info_hides_secrets_by_default(capsys):
+    assert cli.main(["pod", "team-ns", "pod-1"]) == 0
+    out = capsys.readouterr().out
+    assert "ComfyUI" in out and "https://c.meshive.ai" in out and "ready" in out
+    assert "ACCESS_PASSWORD" in out and "s3cret-pw" not in out and "--show-secrets" in out
+    assert "admin" in out                                    # 비밀이 아닌 값은 그대로
+    assert cli.main(["pod", "team-ns", "pod-1", "--show-secrets"]) == 0
+    out = capsys.readouterr().out
+    assert "s3cret-pw" in out and "hidden" not in out
 
 
 def test_machines_output(capsys):
@@ -806,6 +836,9 @@ def test_task_single_output(capsys):
     out = capsys.readouterr().out
     assert "task_a" in out and "succeeded" in out
     assert "exit code:   0" in out and "6 cores / 24 GiB" in out
+    assert "outputs:     uploading, 1 of 4 files, 1.0 KiB of 4.0 KiB" in out
+    assert "upload error: AccessDenied" in out
+    assert "weights" in out and "/inputs/w" in out          # 입력 자산 표
     assert cli.main(["task", "task_a", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["scriptContent"] == "print(1)"
 
@@ -819,6 +852,9 @@ def test_assets_output_filters_and_paging(capsys):
     assert "2.00 GiB" in out and "146.5 KiB" in out           # bytes → human (1024 기준·1024 기반 라벨)
     assert "managed" in out and "s3" in out                    # storage provider labels
     assert "Page 1 of 3 (45 assets)" in out                    # 서버 total 기준 페이지 힌트
+    assert "VERSIONS" not in out                               # 자산에 버전이 없다
+    link = next(line for line in out.splitlines() if "hf-link" in line)
+    assert " 0 B" not in link and "-" in link                  # 모르는 크기는 0 이 아니라 '-'
     assert FakeClient.last_call == ("list_assets", ("ns",),
                                     {"asset_type": None, "status": None, "page": 1, "page_size": 20})
 
@@ -839,7 +875,7 @@ def test_assets_output_filters_and_paging(capsys):
         cli.main(["assets", "ns", "--type", "video"])          # argparse choices
 
     assert cli.main(["assets", "ns", "-o", "name"]) == 0
-    assert capsys.readouterr().out.splitlines() == ["asset_data", "asset_lora"]
+    assert capsys.readouterr().out.splitlines() == ["asset_data", "asset_lora", "asset_link"]
 
 
 def test_assets_page_past_the_end_is_explained(capsys):
@@ -860,10 +896,12 @@ def test_asset_single_output(capsys):
     assert cli.main(["asset", "asset_data"]) == 0
     out = capsys.readouterr().out
     assert "imagenet-mini" in out and "asset_data" in out and "a@b.com" in out
-    assert "1.4 MiB in 2 files" in out                         # 최신 READY 버전 기준
+    assert "1.4 MiB in 2 files" in out
+    assert "upload:     failed" in out and "source:     hf_import" in out
     assert "in use:     yes (pod trainer)" in out
-    assert "v2" in out and "uploading" in out and "v1" in out and "ready" in out
-    assert "v2 import failed: repo not found" in out
+    assert "a.bin" in out and "976.6 KiB" in out and "b.bin" in out    # 파일 표
+    assert "import failed: repo not found" in out
+    assert "VERSION" not in out
     assert cli.main(["asset", "asset_data", "-o", "name"]) == 0
     assert capsys.readouterr().out.splitlines() == ["asset_data"]
     assert cli.main(["asset", "asset_data", "--json"]) == 0
@@ -891,12 +929,17 @@ def test_transactions_output_alias_and_name(capsys):
     assert "trainer" in out and "9eb176aae9309fb8" in out    # 별칭이 없으면 statefulset 이름
     assert "73213" in out and "pull_image" in out and "image pull stalled for 600s" in out
     assert "42%" in out and "0%" not in out                  # 진행률 모름(None)은 '-' — 0% 로 찍지 않는다
+    assert "verifying" in out                                # 바이트가 멈춘 구간 이름
+    assert "txn 73215 source-fetch log (before restart):" in out
+    assert "line 6" in out and "line 5\n" not in out          # 끝 10줄만
+    assert "HTTP 403" in out and "\x1b[31m" not in out         # 로그 줄의 제어문자는 걷어낸다
     assert "\033[" not in out                                # tty 가 아니면 색 없음
 
     assert cli.main(["txn", "ns", "-o", "name"]) == 0
-    assert capsys.readouterr().out.splitlines() == ["73213", "73214"]
+    assert capsys.readouterr().out.splitlines() == ["73213", "73214", "73215"]
     assert cli.main(["transactions", "ns", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out) == [{"transactionId": 73213}, {"transactionId": 73214}]
+    assert json.loads(capsys.readouterr().out) == [{"transactionId": 73213}, {"transactionId": 73214},
+                                                   {"transactionId": 73215}]
 
 
 def test_transactions_table_paints_status_on_a_tty(monkeypatch, capsys):

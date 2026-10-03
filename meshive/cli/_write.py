@@ -107,14 +107,11 @@ def _parse_ports(values: list[str] | None) -> list[dict[str, Any]]:
 def _parse_input_assets(values: list[str] | None) -> list[dict[str, Any]]:
     out = []
     for item in values or []:
-        asset, sep, version = item.partition(":")
-        entry: dict[str, Any] = {"asset": asset.strip()}
+        asset, sep, _ = item.partition(":")
         if sep:
-            try:
-                entry["version"] = int(version)
-            except ValueError:
-                raise ValueError(f"--input-asset expects ASSET_ID[:VERSION], got {item!r}") from None
-        out.append(entry)
+            # 0.1.2 까지 받던 ASSET_ID:VERSION — 자산에 버전이 없어 서버도 무시했다. 스크립트가 깨지지 않게 경고만.
+            print(f"Warning: {item!r}: assets no longer have versions; using {asset.strip()!r}.", file=sys.stderr)
+        out.append({"asset": asset.strip()})
     return out
 
 
@@ -487,7 +484,7 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--cpu-preset", default=None, metavar="PRESET", help="CPU task preset, e.g. micro-2c8g (instead of --gpu).")
     p.add_argument("--max-duration", type=int, default=3600, metavar="SECONDS", help="Hard stop (3600..86400).")
     p.add_argument("--webhook", default=None, metavar="URL")
-    p.add_argument("--input-asset", action="append", metavar="ASSET_ID[:VERSION]")
+    p.add_argument("--input-asset", action="append", metavar="ASSET_ID")
     p.add_argument("--max-price", default=None, metavar="USD", help="Final compute USD/hour cap; storage and Asset Hub charges are separate.")
     p.add_argument("--estimate", action="store_true", help="Only show the estimate; submit nothing.")
     _yes(p)

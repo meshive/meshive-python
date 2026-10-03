@@ -173,11 +173,12 @@ def test_task_submit_from_file(tmp_path, capsys):
     assert cli.main(["task-submit", "ws", "train", "--script", str(script), "--image", "python:3.12-slim",
                      "--cpu-preset", "micro-2c8g", "--arg=--epochs", "--arg", "3", "--input-asset", "asset_a:2",
                      "--max-duration", "7200", "--yes"]) == 0
-    out = capsys.readouterr().out
-    assert "task_1" in out and "task-logs task_1" in out
+    captured = capsys.readouterr()
+    assert "task_1" in captured.out and "task-logs task_1" in captured.out
+    assert "no longer have versions" in captured.err           # 옛 ASSET_ID:VERSION 은 경고하고 무시
     name, args, kw = _last("submit_task")
     assert args == ("train", "print('hi', flush=True)\n") and kw["cpu_preset"] == "micro-2c8g"
-    assert kw["args"] == ["--epochs", "3"] and kw["input_assets"] == [{"asset": "asset_a", "version": 2}] and kw["max_duration"] == 7200
+    assert kw["args"] == ["--epochs", "3"] and kw["input_assets"] == [{"asset": "asset_a"}] and kw["max_duration"] == 7200
 
 
 def test_task_submit_missing_script_file(capsys):

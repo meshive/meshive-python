@@ -64,7 +64,7 @@ meshive members <workspace>    # members and roles
 
 meshive pods <workspace>       # list pods in a workspace
 meshive pods --all             # list pods across every workspace (adds a WORKSPACE column)
-meshive pod <workspace> <pod>  # show a single pod
+meshive pod <workspace> <pod>  # show a single pod: URLs and connect credentials (--show-secrets prints secret values)
 meshive pod-metrics <workspace> <pod>   # live CPU/RAM/GPU/disk usage
 meshive transactions <workspace>        # in-flight pod operations (why a pod is still creating)
 
@@ -76,7 +76,7 @@ meshive templates              # official templates (--workspace <id> adds its c
 meshive template <id>          # show a template
 
 meshive assets <workspace>     # assets in a workspace (datasets, models, outputs, ...); --page/--page-size
-meshive asset <id>             # show an asset with its versions
+meshive asset <id>             # show an asset with its files
 meshive asset-storage <workspace>   # managed asset storage, monthly cost, credit status
 
 meshive servings <workspace>   # serverless serving deployments

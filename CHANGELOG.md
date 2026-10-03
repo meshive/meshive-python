@@ -14,8 +14,37 @@ pip install -U meshive
 
 ## Unreleased
 
+### SDK
+
+- `Pod` has the pod's connection details: `endpoints` (name, port, URL, `readiness` ready/preparing/interrupted, read
+  the same way as the console's Connect tab) and `connect_credentials` (the values the template shows on Connect,
+  such as ComfyUI's auto-generated `ACCESS_PASSWORD`). Secret values are left out of `repr`.
+- `Pod` also has its state fields: `billing_active`, `same_node_unavailable_reason`, `can_restart_on_same_node` /
+  `_any_node`, `waiting_mode`, `stop_reason_code` / `_detail` / `_at`, `container_running_at`, `cpu_premium` /
+  `uptime_premium` / `internet_premium` and `is_downloader`. A field the server did not send is `None`, not `False`.
+- `Workspace.member_role`: `admin`, `billing` or `viewer`. A viewer key cannot make changes.
+- `Transaction` has `live` and `phase` (`verifying`, `waiting_for_storage`) while input assets download, and
+  `init_logs`: the end of the download container's log when it failed (the server removes URLs and tokens first).
+- `Task` has `input_assets`, `failed_asset_id`, the output upload progress (`output_upload_state`,
+  `output_files_*`, `output_bytes_*`, `output_upload_last_error`) and `outputs_purged_at`.
+- Assets no longer have versions. `Asset` reads the asset's own `size_bytes`, `file_count`, `upload_status`, `stale`,
+  `ingest_source`, `kind` and `import_failure_reason`, and `get_asset` adds `files` and `active_usage_contexts`. An
+  external asset whose size was never measured has `size_bytes` and `file_count` of `None` instead of 0.
+  `Asset.version_count`, `latest_version` and `versions` still work but raise a `DeprecationWarning` and will be
+  removed in 0.2, together with `AssetVersion`. `input_assets[].version` is ignored (the server already ignored it).
+
 ### CLI
 
+- `meshive pod` lists the pod's URLs and connect credentials. Secret values are hidden unless you pass
+  `--show-secrets`. It also says when the system stopped the pod and why, why it cannot start on its node now, and
+  what it is waiting for. `-o json` prints the server's payload as before, secret values included.
+- `meshive workspaces` has a ROLE column.
+- `meshive transactions` names the stage when downloaded bytes stop moving (`verifying`, `waiting for storage`) and,
+  when an input asset download failed, prints the last 10 lines of that container's log.
+- `meshive task` shows the output upload progress and its last error, the input assets, and which asset a failed
+  download stopped on.
+- `meshive assets` drops the VERSIONS column and shows `-` for a size that was never measured. `meshive asset` lists
+  the asset's files instead of a version table. `--input-asset ASSET_ID:VERSION` warns and uses the asset.
 - Confirmation questions (`[y/N]`) go to stderr. When stdout was redirected (`-o json > out.json`, `| jq`,
   `id=$(meshive … -o name)`), the question went there instead: it ended up in the output and never showed on screen,
   so the command seemed to hang.

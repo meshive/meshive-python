@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
@@ -80,6 +81,9 @@ class Workspace:
     created_at: datetime | None = None
     updated_at: datetime | None = None
     raw: dict = field(default_factory=dict, repr=False)
+    # 키 주인의 이 워크스페이스 역할 — admin | billing | viewer. viewer 는 쓰기가 403 이다.
+    # 표시용이지 권한 판정이 아니다(서버가 쓰기마다 다시 본다). 서버가 모르면 None.
+    member_role: str | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Workspace":
@@ -93,16 +97,61 @@ class Workspace:
             resources=WorkspaceResources.from_dict(d.get("resources")),
             created_at=_parse_dt(d.get("createdAt")),
             updated_at=_parse_dt(d.get("updatedAt")),
+            member_role=d.get("memberRole"),
             raw=d,
         )
+
+
+@dataclass
+class PodEndpoint:
+    """Pod 의 열린 포트 하나 (template.endpoints[]) — 콘솔 Connect 탭의 URL 줄."""
+
+    name: str                  # userAlias (예: "ComfyUI", "Jupyter")
+    port: int                  # containerPort
+    port_type: str             # connect | http | tcp | ...
+    external_url: str | None
+    internal_url: str | None
+    is_external: bool
+    # 콘솔과 같은 판정: readinessState(preparing|ready|interrupted)가 있으면 그것, 없으면 isReady 로 ready|preparing.
+    readiness: str
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PodEndpoint":
+        state = d.get("readinessState")
+        if state not in ("preparing", "ready", "interrupted"):
+            state = "ready" if d.get("isReady") else "preparing"
+        return cls(
+            name=str(d.get("userAlias", "") or ""),
+            port=_as_int(d.get("containerPort")),
+            port_type=str(d.get("portType", "") or ""),
+            external_url=d.get("externalUrl") or None,
+            internal_url=d.get("internalUrl") or None,
+            is_external=bool(d.get("isExternal", False)),
+            readiness=state,
+        )
+
+
+@dataclass
+class ConnectCredential:
+    """접속에 필요한 값 하나 — 템플릿이 showOnConnect 로 표시한 env (예: ComfyUI 의 ACCESS_PASSWORD).
+
+    `is_secret` 값은 API 키만 있으면 누구나 읽는 응답에 들어 있다. 화면·로그에 그대로 찍지 말 것 —
+    repr 에서 빠지고, CLI 는 `--show-secrets` 없이는 가린다.
+    """
+
+    key: str
+    value: str = field(repr=False)
+    is_secret: bool = False
+    is_auto_generated: bool = False   # 템플릿이 Pod 마다 만든 값(사용자가 정하지 않음)
 
 
 @dataclass
 class Pod:
     """GET /v1/sdk/pods[/{name}] 항목 (PodMetaData).
 
-    자주 쓰는 top-level 스칼라만 타입화. machine/template/request/linkedStorages
-    등 중첩 구조는 `.raw` 로 접근한다.
+    자주 쓰는 top-level 스칼라와 접속 정보(endpoints·connect_credentials)를 타입화.
+    machine/template/request/linkedStorages 등 나머지 중첩 구조는 `.raw` 로 접근한다.
+    서버가 주지 않은 값은 None 이다(옛 서버) — False/0 으로 읽지 말 것.
     """
 
     pod_name: str
@@ -116,9 +165,27 @@ class Pod:
     raw: dict = field(default_factory=dict, repr=False)
     has_unpreserved_workspace: bool | None = None
     storage_rate_per_hour: str = "0"
+    endpoints: list[PodEndpoint] = field(default_factory=list)
+    connect_credentials: list[ConnectCredential] = field(default_factory=list)
+    billing_active: bool | None = None          # compute 과금 중인가 (정지 Pod 의 storage 과금은 별개)
+    is_downloader: bool | None = None           # 시스템 자산 다운로드 Pod (무료, 사용자가 못 지운다)
+    cpu_premium: bool | None = None
+    uptime_premium: bool | None = None
+    internet_premium: bool | None = None
+    # 원래 노드에서 지금 시작할 수 없는 이유(stopped·waiting 에만): spec_mismatch | hardware_changed |
+    # node_unavailable | requirement_unmet | capacity. 시작할 수 있거나 판정할 수 없으면 None.
+    same_node_unavailable_reason: str | None = None
+    can_restart_on_same_node: bool | None = None   # stopped 에서만 계산된다
+    can_restart_on_any_node: bool | None = None
+    waiting_mode: str | None = None              # waiting 일 때 same_node | any_node
+    stop_reason_code: str | None = None          # None 또는 "user" = 사용자 정지, 그 외는 시스템 자동 정지
+    stop_reason_detail: str | None = None
+    stop_reason_at: datetime | None = None
+    container_running_at: datetime | None = None  # connect Pod 의 컨테이너가 Running 이 된 시각
 
     @classmethod
     def from_dict(cls, d: dict) -> "Pod":
+        template = d.get("template") or {}
         return cls(
             pod_name=d.get("podName", ""),
             namespace_name=d.get("namespaceName", ""),
@@ -130,6 +197,27 @@ class Pod:
             has_unpreserved_workspace=d.get("hasUnpreservedWorkspace"),
             storage_rate_per_hour=str(d.get("storageRatePerHour", "0")),
             created_at=_parse_dt(d.get("createdAt")),
+            endpoints=[PodEndpoint.from_dict(e) for e in template.get("endpoints") or [] if isinstance(e, dict)],
+            # 콘솔 CredentialLedger 와 같은 선택 — showOnConnect 인 env 만.
+            connect_credentials=[
+                ConnectCredential(key=str(e.get("key", "")), value=str(e.get("value") or ""),
+                                  is_secret=bool(e.get("isSecret", False)),
+                                  is_auto_generated=bool(e.get("isAutoGenerated", False)))
+                for e in template.get("envs") or [] if isinstance(e, dict) and e.get("showOnConnect")
+            ],
+            billing_active=d.get("billingActive"),
+            is_downloader=d.get("isDownloader"),
+            cpu_premium=d.get("cpuPremium"),
+            uptime_premium=d.get("uptimePremium"),
+            internet_premium=d.get("internetPremium"),
+            same_node_unavailable_reason=d.get("sameNodeUnavailableReason"),
+            can_restart_on_same_node=d.get("canRestartOnSameNode"),
+            can_restart_on_any_node=d.get("canRestartOnAnyNode"),
+            waiting_mode=d.get("waitingMode"),
+            stop_reason_code=d.get("stopReasonCode"),
+            stop_reason_detail=d.get("stopReasonDetail"),
+            stop_reason_at=_parse_dt(d.get("stopReasonAt")),
+            container_running_at=_parse_dt(d.get("containerRunningAt")),
             raw=d,
         )
 
@@ -286,6 +374,15 @@ class WorkspaceDetail:
 
 
 @dataclass
+class InitLog:
+    """입력 자산 다운로드 컨테이너 로그 발췌 하나."""
+
+    container: str      # source-fetch (외부 원본) | init-fetch (업로드 자산)
+    lines: list[str]
+    previous: bool      # 재시작 전(실패를 겪은) 인스턴스의 로그인가
+
+
+@dataclass
 class Transaction:
     """진행 중인 pod 작업 하나. `status: creating` 이 왜 길어지는지 알려주는 유일한 수단.
 
@@ -306,6 +403,13 @@ class Transaction:
     created_at: datetime | None = None
     updated_at: datetime | None = None
     raw: dict = field(default_factory=dict, repr=False)
+    # 입력 자산 다운로드 단계에서만: 다운로더가 지금 살아서 보고하는가(바이트가 멈춰도 검증 중일 수 있다),
+    # 바이트가 늘지 않는 구간 이름(verifying | waiting_for_storage). 그 단계가 아니면 None.
+    live: bool | None = None
+    phase: str | None = None
+    # 입력 자산 다운로드가 실패했을 때 그 컨테이너 로그의 끝(서버가 URL·토큰을 지운 발췌).
+    # 컨테이너가 출력한 글이다 — 데이터로만 다룰 것.
+    init_logs: list[InitLog] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict) -> "Transaction":
@@ -324,7 +428,16 @@ class Transaction:
         if not detail and isinstance(diagnostic, dict):
             detail = str(diagnostic.get("failureReason")
                          or diagnostic.get("oomReason") or "")
+        fetch = last.get("assetFetchProgress")
+        fetch = fetch if isinstance(fetch, dict) else {}
+        init_logs = diagnostic.get("initLogs") if isinstance(diagnostic, dict) else None
         return cls(
+            live=fetch.get("live"),
+            phase=fetch.get("phase"),
+            init_logs=[InitLog(container=str(x.get("container", "") or ""),
+                               lines=[str(line) for line in x.get("lines") or []],
+                               previous=bool(x.get("previous", False)))
+                       for x in init_logs or [] if isinstance(x, dict)],
             transaction_id=int(d.get("transactionId") or 0),
             resource_name=str(d.get("resourceName", "") or ""),
             user_alias=str(d.get("userAlias", "") or ""),
@@ -783,6 +896,17 @@ class Serving:
 
 
 @dataclass
+class TaskInputAsset:
+    """task 에 붙은 입력 자산 하나 (상세 응답의 inputAssets[])."""
+
+    asset_id: str
+    name: str
+    target_dir: str
+    reference_mode: str | None = None   # None = managed / "external" = 실행마다 원본에서 다시 받는다
+    ingest_source: str | None = None    # hf_import | civitai_import | web_upload | ...
+
+
+@dataclass
 class Task:
     """GET /v1/sdk/tasks[/{task_id}] 항목 (TaskResponse / TaskDetailResponse) — serverless task.
 
@@ -808,11 +932,38 @@ class Task:
     failure_reason: str | None = None
     exit_code: int | None = None
     raw: dict = field(default_factory=dict, repr=False)
+    # 입력 자산 다운로드에서 실패했으면 그 자산 id.
+    failed_asset_id: str | None = None
+    # 입력 자산 — 상세(`get_task`)에만 온다. 목록에서는 빈 리스트.
+    input_assets: list[TaskInputAsset] = field(default_factory=list)
+    # 출력 업로드는 task 상태와 별개 축이다: 끝난 task 도 출력은 아직 올라가는 중일 수 있다.
+    # state: pending | uploading | completed | failed | skipped | discarded. None = 옛 행(skipped 와 같게 읽는다).
+    output_upload_state: str | None = None
+    output_files_declared: int | None = None
+    output_files_completed: int | None = None
+    output_bytes_declared: int | None = None
+    output_bytes_completed: int | None = None
+    output_upload_last_error: str | None = None   # 마지막 업로드 실패 사유 (자격증명 오류 등)
+    outputs_purged_at: datetime | None = None      # 출력이 지워진 시각
 
     @classmethod
     def from_dict(cls, d: dict) -> "Task":
         exit_code = d.get("exitCode")
         return cls(
+            failed_asset_id=d.get("failedAssetExternalId"),
+            input_assets=[TaskInputAsset(asset_id=str(a.get("assetExternalId", "") or ""),
+                                         name=str(a.get("name", "") or ""),
+                                         target_dir=str(a.get("targetDir", "") or ""),
+                                         reference_mode=a.get("referenceMode"),
+                                         ingest_source=a.get("ingestSource"))
+                          for a in d.get("inputAssets") or [] if isinstance(a, dict)],
+            output_upload_state=d.get("outputUploadState"),
+            output_files_declared=d.get("outputFilesDeclared"),
+            output_files_completed=d.get("outputFilesCompleted"),
+            output_bytes_declared=d.get("outputBytesDeclared"),
+            output_bytes_completed=d.get("outputBytesCompleted"),
+            output_upload_last_error=d.get("outputUploadLastError"),
+            outputs_purged_at=_parse_dt(d.get("outputsPurgedAt")),
             task_id=d.get("externalId", ""),
             name=d.get("name", ""),
             namespace_name=d.get("namespaceName", ""),
@@ -842,7 +993,11 @@ _READY = "ready"
 
 @dataclass
 class AssetVersion:
-    """자산 버전 1건 (AssetVersionSummary / AssetVersionDetail). 상세의 파일 목록은 `.raw["files"]`."""
+    """[Deprecated — 0.2 에서 제거] 자산 버전 1건. 서버에 자산 버전은 더 이상 없다.
+
+    서버가 옛 SDK 를 위해 자산 요약을 versionNumber=1 인 단일 버전처럼 되비춘 값이다.
+    `Asset` 의 자산 레벨 필드(size_bytes·file_count·upload_status·files …)를 쓸 것.
+    """
 
     version_number: int
     status: str                # uploading | ready | ...
@@ -875,13 +1030,48 @@ class AssetVersion:
         return not self.deleted and self.status.lower() == _READY
 
 
+def _warn_versions(name: str) -> None:
+    warnings.warn(f"Asset.{name} is deprecated and will be removed in meshive 0.2: assets no longer have "
+                  "versions. Use Asset.size_bytes, file_count, upload_status and files.",
+                  DeprecationWarning, stacklevel=3)
+
+
+@dataclass
+class AssetFile:
+    """자산의 파일 하나 (상세 응답의 files[])."""
+
+    path: str                  # relativePath — 자산 안의 상대 경로
+    size_bytes: int
+    status: str
+    file_id: str | None = None  # fileExternalId
+    content_hash: str | None = None
+    created_at: datetime | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AssetFile":
+        return cls(path=str(d.get("relativePath", "") or ""), size_bytes=_as_int(d.get("sizeBytes")),
+                   status=str(d.get("status", "") or ""), file_id=d.get("fileExternalId"),
+                   content_hash=d.get("contentHash"), created_at=_parse_dt(d.get("createdAt")))
+
+
+@dataclass
+class AssetUsage:
+    """자산을 지금 쓰는 곳 하나 (상세 응답의 activeUsageContexts[]) — 삭제·변경을 막는 이유."""
+
+    kind: str                  # pod | task | serving ...
+    identifier: str
+    name: str
+    status: str
+    role: str | None = None
+
+
 @dataclass
 class Asset:
     """GET /v1/sdk/assets 의 행(AssetListRow) 또는 /assets/{id} 의 상세(AssetDetailResponse).
 
-    목록 행은 최신 READY 버전 요약(latest_version)만, 상세는 버전 스택(versions, 최신순)을
-    담는다. size_bytes / file_count 는 최신 READY 버전 기준. 병합 안내·pickle 뱃지·사용 중
-    컨텍스트(activeUsageContexts) 등은 `.raw`.
+    자산에는 버전이 없다 — 크기·파일 수·업로드 상태는 자산 자체의 값이다. 파일 목록(files)과
+    사용 중인 곳(active_usage_contexts)은 상세에만 온다. pickle 뱃지 등 나머지는 `.raw`.
+    `version_count`·`latest_version`·`versions` 는 deprecated(0.2 에서 제거).
     """
 
     asset_id: str              # assetExternalId ("asset_…", 조회 키)
@@ -889,32 +1079,28 @@ class Asset:
     asset_type: str            # dataset | model | adapter | checkpoint | output | config | file
     status: str                # active | source_missing | frozen | deleted | purged | merged
     status_reason: str | None
-    storage_provider: str      # meshive_r2 (managed) | user_s3 | external, 버전이 없으면 ""
-    version_count: int         # READY·미삭제 버전 수
-    size_bytes: int
-    file_count: int
+    storage_provider: str      # meshive_r2 (managed) | user_s3 | external, 모르면 ""
+    # 외부 원본을 아직 재지 않은 링크 자산은 크기·파일 수를 모른다 → None (0 이 아니다).
+    size_bytes: int | None
+    file_count: int | None
     in_use: bool
     namespace_name: str = ""
     created_by: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
-    latest_version: AssetVersion | None = None
-    versions: list[AssetVersion] = field(default_factory=list)   # 상세 응답에서만 채워진다
     raw: dict = field(default_factory=dict, repr=False)
+    upload_status: str = ""    # uploading | ready | failed
+    stale: bool = False        # uploading 인데 끝낼 Pod 이 이미 없다 (콘솔 "Interrupted")
+    ingest_source: str = ""    # web_upload | hf_import | civitai_import | harvest | task_output | ...
+    import_failure_reason: str | None = None
+    kind: str | None = None
+    semantic_type: str | None = None   # 목록 행에만 온다
+    files: list[AssetFile] = field(default_factory=list)                   # 상세에만
+    active_usage_contexts: list[AssetUsage] = field(default_factory=list)  # 상세에만
 
     @classmethod
     def from_dict(cls, d: dict, *, namespace_name: str = "") -> "Asset":
-        versions = [AssetVersion.from_dict(v) for v in d.get("versions") or [] if isinstance(v, dict)]
-        latest_raw = d.get("latestVersion")
-        latest = AssetVersion.from_dict(latest_raw) if isinstance(latest_raw, dict) else None
-        ready = [v for v in versions if v.is_ready]
-        if latest is None and ready:
-            latest = max(ready, key=lambda v: v.version_number)
-        version_count = _as_int(d["versionCount"]) if "versionCount" in d else len(ready)
-        size_bytes = (_as_int(d["latestTotalSizeBytes"]) if "latestTotalSizeBytes" in d
-                      else (latest.total_size_bytes if latest else 0))
-        file_count = (_as_int(d["latestFileCount"]) if "latestFileCount" in d
-                      else (latest.file_count if latest else 0))
+        measured = d.get("sizeMeasured") is not False
         return cls(
             asset_id=d.get("assetExternalId", ""),
             name=d.get("name", ""),
@@ -922,18 +1108,53 @@ class Asset:
             status=str(d.get("status", "") or ""),
             status_reason=d.get("statusReason"),
             storage_provider=str(d.get("storageProvider") or ""),
-            version_count=version_count,
-            size_bytes=size_bytes,
-            file_count=file_count,
+            size_bytes=_as_int(d.get("totalSizeBytes")) if measured else None,
+            file_count=_as_int(d.get("fileCount")) if measured else None,
             in_use=bool(d.get("inUse", False)),
             namespace_name=d.get("namespaceName") or namespace_name,
             created_by=d.get("createdBy"),
             created_at=_parse_dt(d.get("createdAt")),
             updated_at=_parse_dt(d.get("updatedAt")),
-            latest_version=latest,
-            versions=versions,
+            upload_status=str(d.get("uploadStatus", "") or ""),
+            stale=bool(d.get("stale", False)),
+            ingest_source=str(d.get("ingestSource", "") or ""),
+            import_failure_reason=d.get("importFailureReason"),
+            kind=d.get("kind"),
+            semantic_type=d.get("semanticType"),
+            files=[AssetFile.from_dict(f) for f in d.get("files") or [] if isinstance(f, dict)],
+            active_usage_contexts=[
+                AssetUsage(kind=str(c.get("kind", "") or ""), identifier=str(c.get("identifier", "") or ""),
+                           name=str(c.get("name", "") or ""), status=str(c.get("status", "") or ""),
+                           role=c.get("role"))
+                for c in d.get("activeUsageContexts") or [] if isinstance(c, dict)],
             raw=d,
         )
+
+    # --- deprecated: 서버가 옛 SDK 용으로 되비추는 버전 필드(Phase C 에서 사라진다) -----------------
+
+    def _raw_versions(self) -> list[AssetVersion]:
+        return [AssetVersion.from_dict(v) for v in self.raw.get("versions") or [] if isinstance(v, dict)]
+
+    @property
+    def versions(self) -> list[AssetVersion]:
+        _warn_versions("versions")
+        return self._raw_versions()
+
+    @property
+    def latest_version(self) -> AssetVersion | None:
+        _warn_versions("latest_version")
+        latest = self.raw.get("latestVersion")
+        if isinstance(latest, dict):
+            return AssetVersion.from_dict(latest)
+        ready = [v for v in self._raw_versions() if v.is_ready]
+        return max(ready, key=lambda v: v.version_number) if ready else None
+
+    @property
+    def version_count(self) -> int:
+        _warn_versions("version_count")
+        if "versionCount" in self.raw:
+            return _as_int(self.raw["versionCount"])
+        return len([v for v in self._raw_versions() if v.is_ready])
 
 
 @dataclass

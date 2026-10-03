@@ -176,14 +176,15 @@ def test_task_methods():
     rec = Recorder((202, {"task": task, "estimate": {"pricePerHourUsd": "0.068", "maxCostUsd": "0.068", "maxDurationS": 3600,
                                                     "resources": {"gpu_count": 1}}}))
     c = sync_client(rec)
-    submitted = c.submit_task("train", "print('x', flush=True)", workspace="ws", image="python:3.12-slim",
-                              gpu_model="RTX 3060", env={"HF_TOKEN": "x"}, secret_keys=["HF_TOKEN"], args=["--epochs", "3"],
-                              input_assets=["asset_a", {"asset": "asset_b", "version": 2, "target_dir": "/inputs/b"}],
-                              max_duration=7200)
+    with pytest.warns(DeprecationWarning, match="no longer have versions"):
+        submitted = c.submit_task("train", "print('x', flush=True)", workspace="ws", image="python:3.12-slim",
+                                  gpu_model="RTX 3060", env={"HF_TOKEN": "x"}, secret_keys=["HF_TOKEN"], args=["--epochs", "3"],
+                                  input_assets=["asset_a", {"asset": "asset_b", "version": 2, "target_dir": "/inputs/b"}],
+                                  max_duration=7200)
     assert isinstance(submitted, TaskSubmitted) and submitted.task.task_id == "task_1" and submitted.estimate.max_cost == "0.068"
     body = rec.body()
     assert body["gpuModel"] == "RTX 3060" and "cpuPreset" not in body and body["maxDurationS"] == 7200
-    assert body["inputAssets"] == [{"asset": "asset_a"}, {"asset": "asset_b", "version": 2, "targetDir": "/inputs/b"}]
+    assert body["inputAssets"] == [{"asset": "asset_a"}, {"asset": "asset_b", "targetDir": "/inputs/b"}]   # version 은 안 보낸다
     assert body["args"] == ["--epochs", "3"] and body["secretKeys"] == ["HF_TOKEN"]
     c.stop_task("task_1")
     assert rec.last.url.path == "/v1/sdk/tasks/task_1/stop"

@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterable, Mapping
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -235,7 +236,9 @@ def task_body(name: str, script: str, *, image: str | None, template_id: int | N
             asset = _require_str(item.get("asset") or item.get("asset_id"), "input_assets[].asset")
             entry: dict[str, Any] = {"asset": asset}
             if item.get("version") is not None:
-                entry["version"] = _optional_int(item.get("version"), "input_assets[].version")
+                # 자산에 버전이 없다 — 서버도 무시하던 값이라 보내지 않는다. 0.2 에서 받는 것 자체를 없앤다.
+                warnings.warn("input_assets[].version is ignored: assets no longer have versions",
+                              DeprecationWarning, stacklevel=3)
             if item.get("target_dir"):
                 entry["targetDir"] = str(item["target_dir"])
             assets.append(entry)

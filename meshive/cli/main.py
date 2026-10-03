@@ -180,6 +180,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--wait-timeout", type=float, default=600.0, metavar="SECONDS",
         help="Give up waiting after this long (default: 600).",
     )
+    p_pod.add_argument("--show-secrets", action="store_true",
+                       help="Print secret connect credentials (e.g. ACCESS_PASSWORD) instead of hiding them.")
 
     p_pod_metrics = sub.add_parser("pod-metrics", parents=[common],
                                    help="Show live resource usage (CPU/RAM/GPU/disk) of a pod.")
@@ -430,9 +432,10 @@ def _filter_servings(servings: list[Serving], statuses: set[str], name: str | No
 # =============================================================================
 
 def _pod_price(pod: Pod) -> str:
-    """웹 pod 페이지와 동일: running 일 때만 가격, 아니면 '-'.
-    (꺼진/대기 중인 pod 는 과금되지 않으므로 가격을 노출하지 않는다.)"""
-    return fmt.money_hourly(pod.price_per_hour) if pod.status.lower() == "running" else "-"
+    """웹 pod 페이지와 동일: compute 과금 중일 때만 가격, 아니면 '-'.
+    서버의 billing_active 가 기준이고, 그 값을 안 주는 옛 서버면 running 으로 판정한다."""
+    billed = pod.billing_active if pod.billing_active is not None else pod.status.lower() == "running"
+    return fmt.money_hourly(pod.price_per_hour) if billed else "-"
 
 
 def _print_whoami(me: WhoAmI, color: bool) -> None:
@@ -448,15 +451,15 @@ def _print_workspaces(workspaces: list[Workspace], color: bool) -> None:
         return
     # NAME = workspace_name(유저 라벨), ID = namespace_name(조회 키).
     rows = [
-        [ws.workspace_name or "-", ws.namespace_name, fmt.status_cell(ws.status),
+        [ws.workspace_name or "-", ws.namespace_name, ws.member_role or "-", fmt.status_cell(ws.status),
          str(ws.resources.pod), fmt.money_hourly(ws.price_per_hour)]
         for ws in workspaces
     ]
-    colors = [[None, None, fmt.status_color(ws.status), None, None] for ws in workspaces]
+    colors = [[None, None, None, fmt.status_color(ws.status), None, None] for ws in workspaces]
     fmt.render_table(
-        ["NAME", "ID", "STATUS", "PODS", "PRICE/HR"],
+        ["NAME", "ID", "ROLE", "STATUS", "PODS", "PRICE/HR"],
         rows,
-        aligns=["l", "l", "l", "r", "r"],
+        aligns=["l", "l", "l", "l", "r", "r"],
         colors=colors,
         enabled=color,
     )
@@ -524,7 +527,7 @@ def _print_pods(pods: list[Pod], color: bool, show_workspace: bool = False) -> N
     fmt.render_table(headers, rows, aligns=aligns, colors=colors, enabled=color)
 
 
-def _print_pod(pod: Pod, color: bool) -> None:
+def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
     created = "-"
     if pod.created_at:
         created = f"{fmt.relative_time(pod.created_at)} ({pod.created_at.isoformat()})"
@@ -535,9 +538,39 @@ def _print_pod(pod: Pod, color: bool) -> None:
     print(f"rental:    {fmt.clean(pod.rental_type)}")
     print(f"price/hr:  {_pod_price(pod)}")
     print(f"created:   {created}")
-    # maintenance 는 진행 중일 때만 노출 (boolean 나열 대신 의미 있을 때만).
+    # 아래 줄들은 해당할 때만 찍는다 (boolean 나열 대신 의미 있을 때만).
+    premiums = [n for n, on in (("cpu", pod.cpu_premium), ("uptime", pod.uptime_premium),
+                                ("internet", pod.internet_premium)) if on]
+    if premiums:
+        print(f"premium:   {', '.join(premiums)}")
+    if pod.waiting_mode:
+        print(f"waiting:   for {fmt.clean(pod.waiting_mode.replace('_', ' '))}")
+    if pod.stop_reason_code and pod.stop_reason_code != "user":
+        reason = pod.stop_reason_code + (f": {pod.stop_reason_detail}" if pod.stop_reason_detail else "")
+        print(fmt.paint(fmt.clean(f"stopped by the system ({reason})"), "yellow", color))
+    if pod.same_node_unavailable_reason:
+        print(fmt.paint(fmt.clean(f"can't start on its node now: {pod.same_node_unavailable_reason.replace('_', ' ')}"),
+                        "yellow", color))
     if pod.is_maintenance:
         print(fmt.paint("⚠ under maintenance", "yellow", color))
+    if pod.endpoints:
+        print()
+        rows = [[e.name or "-", str(e.port), e.external_url or e.internal_url or "-", e.readiness]
+                for e in pod.endpoints]
+        colors = [[None, None, None, "green" if e.readiness == "ready" else "yellow"] for e in pod.endpoints]
+        fmt.render_table(["ENDPOINT", "PORT", "URL", "STATE"], rows, aligns=["l", "r", "l", "l"],
+                         colors=colors, enabled=color)
+    if pod.connect_credentials:
+        print()
+        hidden = False
+        rows = []
+        for c in pod.connect_credentials:
+            masked = c.is_secret and not show_secrets
+            hidden = hidden or masked
+            rows.append([c.key, "••••••••" if masked else c.value])
+        fmt.render_table(["CREDENTIAL", "VALUE"], rows, enabled=color)
+        if hidden:
+            print(fmt.paint("Secret values are hidden. Add --show-secrets to print them.", "dim", color))
 
 
 def _print_gpu_usages(gpus, color: bool) -> None:
@@ -802,6 +835,21 @@ def _print_task(t: Task, color: bool) -> None:
         print(f"exit code:   {t.exit_code}")
     if t.failure_reason:
         print(fmt.paint(fmt.clean(f"failure:     {t.failure_reason}"), "red", color))
+    if t.failed_asset_id:
+        print(fmt.paint(fmt.clean(f"failed on:   input asset {t.failed_asset_id}"), "red", color))
+    if t.output_upload_state and t.output_upload_state not in ("skipped", "discarded"):
+        files = f"{t.output_files_completed or 0} of {t.output_files_declared or 0} files"
+        size = f"{fmt.bytes_human(t.output_bytes_completed)} of {fmt.bytes_human(t.output_bytes_declared)}"
+        print(f"outputs:     {fmt.clean(t.output_upload_state)}, {files}, {size}")
+    if t.output_upload_last_error:
+        print(fmt.paint(fmt.clean(f"upload error: {t.output_upload_last_error}"), "red", color))
+    if t.outputs_purged_at:
+        print(f"outputs:     deleted {fmt.relative_time(t.outputs_purged_at)}")
+    if t.input_assets:
+        print()
+        rows = [[a.name or "-", a.asset_id, a.target_dir or "-"] for a in t.input_assets]
+        colors = [[None, None, "red" if a.asset_id == t.failed_asset_id else None] for a in t.input_assets]
+        fmt.render_table(["INPUT", "ID", "DIR"], rows, colors=colors, enabled=color)
 
 
 _STORAGE_PROVIDER_LABELS = {"meshive_r2": "managed", "user_s3": "s3", "external": "external"}
@@ -822,13 +870,13 @@ def _print_assets(assets: list[Asset], page: AssetPage, color: bool) -> None:
         colors = []
         for a in assets:
             rows.append([a.name or "-", a.asset_id, a.asset_type or "-", fmt.status_cell(a.status),
-                         str(a.version_count), fmt.bytes_human(a.size_bytes), str(a.file_count),
+                         fmt.bytes_human(a.size_bytes), "-" if a.file_count is None else str(a.file_count),
                          _storage_label(a.storage_provider), fmt.relative_time(a.updated_at)])
-            colors.append([None, None, None, fmt.status_color(a.status), None, None, None, None, "dim"])
+            colors.append([None, None, None, fmt.status_color(a.status), None, None, None, "dim"])
         fmt.render_table(
-            ["NAME", "ID", "TYPE", "STATUS", "VERSIONS", "SIZE", "FILES", "STORAGE", "UPDATED"],
+            ["NAME", "ID", "TYPE", "STATUS", "SIZE", "FILES", "STORAGE", "UPDATED"],
             rows,
-            aligns=["l", "l", "l", "l", "r", "r", "r", "l", "l"],
+            aligns=["l", "l", "l", "l", "r", "r", "l", "l"],
             colors=colors,
             enabled=color,
         )
@@ -851,28 +899,33 @@ def _print_asset(a: Asset, color: bool) -> None:
     print(f"type:       {fmt.clean(a.asset_type or '-')}")
     print(f"status:     {fmt.paint(fmt.clean(status), fmt.status_color(a.status), color)}")
     print(f"storage:    {fmt.clean(_storage_label(a.storage_provider))}")
-    print(f"size:       {fmt.bytes_human(a.size_bytes)} in {a.file_count} file{'s' if a.file_count != 1 else ''} (latest ready version)")
+    if a.size_bytes is None:
+        print("size:       not measured yet")
+    else:
+        print(f"size:       {fmt.bytes_human(a.size_bytes)} in {a.file_count} file{'s' if a.file_count != 1 else ''}")
+    if a.upload_status and a.upload_status != "ready":
+        upload = "interrupted" if a.stale else a.upload_status
+        print(f"upload:     {fmt.paint(fmt.clean(upload), 'red' if upload in ('failed', 'interrupted') else 'yellow', color)}")
+    print(f"source:     {fmt.clean(a.ingest_source or '-')}")
     print(f"created by: {fmt.clean(a.created_by or '-')}")
     print(f"created:    {fmt.relative_time(a.created_at)}")
     print(f"updated:    {fmt.relative_time(a.updated_at)}")
-    contexts = [c for c in a.raw.get("activeUsageContexts") or [] if isinstance(c, dict)]
     if a.in_use:
-        where = ", ".join(f"{c.get('kind', '?')} {c.get('name') or c.get('identifier') or '?'}" for c in contexts)
+        where = ", ".join(f"{c.kind or '?'} {c.name or c.identifier or '?'}" for c in a.active_usage_contexts)
         print(f"in use:     yes{f' ({fmt.clean(where)})' if where else ''}")
-    if a.versions:
+    if a.import_failure_reason:
+        print(fmt.paint(fmt.clean(f"import failed: {a.import_failure_reason}"), "red", color))
+    if a.files:
         print()
-        rows = []
-        colors = []
-        for v in a.versions:
-            cell = fmt.status_cell(v.status) + (" (deleted)" if v.deleted else "")
-            rows.append([f"v{v.version_number}", cell, fmt.bytes_human(v.total_size_bytes), str(v.file_count),
-                         v.ingest_source or "-", _storage_label(v.storage_provider), fmt.relative_time(v.created_at)])
-            colors.append([None, "gray" if v.deleted else fmt.status_color(v.status), None, None, None, None, "dim"])
-        fmt.render_table(["VERSION", "STATUS", "SIZE", "FILES", "SOURCE", "STORAGE", "CREATED"], rows,
-                         aligns=["l", "l", "r", "r", "l", "l", "l"], colors=colors, enabled=color)
-        failed = [v for v in a.versions if v.import_failure_reason]
-        for v in failed:
-            print(fmt.paint(fmt.clean(f"v{v.version_number} import failed: {v.import_failure_reason}"), "red", color))
+        shown = a.files[:_ASSET_FILE_ROWS]
+        rows = [[f.path, fmt.bytes_human(f.size_bytes), fmt.status_cell(f.status)] for f in shown]
+        colors = [[None, None, fmt.status_color(f.status)] for f in shown]
+        fmt.render_table(["FILE", "SIZE", "STATUS"], rows, aligns=["l", "r", "l"], colors=colors, enabled=color)
+        if len(a.files) > len(shown):
+            print(fmt.paint(f"... and {len(a.files) - len(shown)} more files (-o json lists them all).", "dim", color))
+
+
+_ASSET_FILE_ROWS = 50
 
 
 def _print_asset_storage(s: AssetStorage, color: bool) -> None:
@@ -1011,7 +1064,7 @@ def _cmd_pod(client: Meshive, args: argparse.Namespace, output: str, color: bool
                             until=args.wait, timeout=args.wait_timeout)
         if args.wait else client.get_pod(args.pod_name, args.workspace)
     )
-    _emit(output, pod.raw, [pod.pod_name], lambda: _print_pod(pod, color))
+    _emit(output, pod.raw, [pod.pod_name], lambda: _print_pod(pod, color, args.show_secrets))
     return 0
 
 
@@ -1032,7 +1085,7 @@ def _print_transactions(transactions: list[Transaction], color: bool) -> None:
         rows.append([
             t.user_alias or t.resource_name or "-", str(t.transaction_id), t.action or "-",
             fmt.status_cell(t.status), t.step or "-",
-            "-" if t.progress is None else f"{t.progress * 100:.0f}%",
+            _txn_progress(t),
             fmt.clean(t.detail) if t.detail else "-",
             fmt.relative_time(t.updated_at),
         ])
@@ -1040,6 +1093,27 @@ def _print_transactions(transactions: list[Transaction], color: bool) -> None:
     fmt.render_table(
         ["POD", "TXN", "ACTION", "STATUS", "STEP", "PROGRESS", "DETAIL", "UPDATED"],
         rows, colors=colors, enabled=color)
+    # 입력 자산 다운로드 실패면 그 컨테이너 로그 끝을 몇 줄 — 콘솔 실패 카드와 같은 발췌(서버가 정제).
+    for t in transactions:
+        for log in t.init_logs:
+            if not log.lines:
+                continue
+            print()
+            print(fmt.paint(f"txn {t.transaction_id} {log.container} log"
+                            f"{' (before restart)' if log.previous else ''}:", "dim", color))
+            for line in log.lines[-_INIT_LOG_LINES:]:
+                print(f"  {fmt.clean(line)}")
+
+
+_INIT_LOG_LINES = 10
+
+
+def _txn_progress(t: Transaction) -> str:
+    """진행률, 바이트가 멈춘 구간이면 그 이름(verifying · waiting for storage)을 붙인다."""
+    cell = "-" if t.progress is None else f"{t.progress * 100:.0f}%"
+    if t.phase:
+        cell = t.phase.replace("_", " ") if cell == "-" else f"{cell} {t.phase.replace('_', ' ')}"
+    return cell
 
 
 def _cmd_transactions(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:

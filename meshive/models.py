@@ -439,6 +439,14 @@ class WorkspaceDetail:
         )
 
 
+def _step_order(step: dict) -> tuple:
+    """(updatedAt, 진행 중인가) — 시각이 없는 옛 데이터는 같은 값이라 호출부의 순번(뒤쪽)이 이긴다."""
+    at = _parse_dt(step.get("updatedAt")) or datetime.min
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return at, str(step.get("status", "")).lower() in ("in_progress", "retry")
+
+
 @dataclass
 class InitLog:
     """입력 자산 다운로드 컨테이너 로그 발췌 하나."""
@@ -480,7 +488,10 @@ class Transaction:
     @classmethod
     def from_dict(cls, d: dict) -> "Transaction":
         steps = [x for x in (d.get("transactionSteps") or []) if isinstance(x, dict)]
-        last = steps[-1] if steps else {}
+        # 서버는 단계를 진행 순서가 아니라 단계 이름순으로 준다(dev 실측 2026-10-03 — image_pull 이 진행 중인데 목록 끝은
+        # 끝난 start). 콘솔 TransactionBox 처럼 updatedAt 이 가장 늦은 단계가 지금 단계이고, 같은 시각이면 진행 중인
+        # 단계를 고른다(앞 단계 완료와 다음 단계 시작이 같은 순간에 찍힌다).
+        last = steps[max(range(len(steps)), key=lambda i: (*_step_order(steps[i]), i))] if steps else {}
         # 진행률은 단계마다 키가 다르다(이미지 pull / 자산 fetch / 스토리지 준비).
         # 셋 다 progressPercent(0~100) 로 같은 좌표계를 쓴다 — 키 부재는 None 유지.
         percent = None

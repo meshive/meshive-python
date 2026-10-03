@@ -1150,6 +1150,23 @@ def test_transaction_fetch_liveness_and_init_logs():
     assert pulling.live is None and pulling.phase is None and pulling.init_logs == []
 
 
+def test_transaction_current_step_is_the_latest_not_the_last_listed():
+    """서버는 단계를 이름순으로 준다 — 목록 끝(start, 완료)이 아니라 updatedAt 이 가장 늦은 진행 중 단계가 지금 단계다.
+    dev 실측(2026-10-03, tx 15640): fetch_assets 완료와 image_pull 시작이 같은 시각."""
+    t = Transaction.from_dict({"transactionId": 15640, "status": "in_progress", "transactionSteps": [
+        {"step": "create_statefulset", "status": "done", "updatedAt": "2026-10-03T10:53:07Z"},
+        {"step": "fetch_assets", "status": "done", "updatedAt": "2026-10-03T10:53:22Z",
+         "assetFetchProgress": {"progressPercent": 100.0, "live": False}},
+        {"step": "image_pull", "status": "in_progress", "updatedAt": "2026-10-03T10:53:22Z",
+         "imagePullProgress": {"progressPercent": 40.0}},
+        {"step": "start", "status": "done", "updatedAt": "2026-10-03T10:53:02Z", "detail": "Starting Pod creation process"},
+    ]})
+    assert (t.step, t.step_status, t.progress, t.detail) == ("image_pull", "in_progress", 0.4, "")
+    assert t.live is None    # 지금 단계가 자산 다운로드가 아니다
+    legacy = Transaction.from_dict({"transactionId": 1, "transactionSteps": [{"step": "a"}, {"step": "b"}]})
+    assert legacy.step == "b"                # 시각이 없으면 예전처럼 목록 뒤쪽
+
+
 def test_async_list_transactions_mirrors_sync():
     async def run():
         async with async_client(_capture([TRANSACTION], {})) as client:

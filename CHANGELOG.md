@@ -90,6 +90,9 @@ longer break `-o json` and `-o name`. Features that need new server routes say s
   download stopped on.
 - `meshive assets` drops the VERSIONS column and shows `-` for a size that was never measured. `meshive asset` lists
   the asset's files instead of a version table. `--input-asset ASSET_ID:VERSION` warns and uses the asset.
+- `Transaction.step` (and `progress`, `detail`, `live`, `phase`, `init_logs`) reads the step that is happening now. The
+  server lists steps by name, so 0.1.2 read whichever came last alphabetically — `meshive transactions` could show a
+  finished `start` while the image was still being pulled.
 - Confirmation questions (`[y/N]`) go to stderr. When stdout was redirected (`-o json > out.json`, `| jq`,
   `id=$(meshive … -o name)`), the question went there instead: it ended up in the output and never showed on screen,
   so the command seemed to hang.

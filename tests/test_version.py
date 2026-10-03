@@ -4,7 +4,8 @@ import meshive
 from meshive import _version
 
 
-SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+([.-].+)?$")
+# PEP 440 프리릴리스(0.1.0rc1)도 허용 — rc 는 dev 에서 태그해 PyPI 에 올리고 `pip install --pre` 로만 받는다.
+SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+((a|b|rc)\d+)?([.-].+)?$")
 
 
 def test_version_is_semver():

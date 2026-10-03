@@ -1,5 +1,6 @@
 import argparse
 import importlib
+from pathlib import Path
 import json
 from datetime import date, datetime, timezone
 
@@ -15,24 +16,32 @@ from meshive.models import (
     Asset,
     AssetPage,
     AssetStorage,
-    AssetVersion,
+    AssetFile,
+    AssetUsage,
+    ConnectCredential,
     Credit,
     CreditHistoryEntry,
     DailyCost,
     DailyEarning,
+    DownloadFile,
     Earnings,
     GpuAvailability,
     GpuUsage,
+    InitLog,
     Machine,
     MachineMetrics,
     Member,
     Pod,
+    PodEndpoint,
     PodMetrics,
     ResourceCondition,
     Serving,
     Storage,
     Task,
+    TaskInputAsset,
+    TaskOutputs,
     Template,
+    Transaction,
     WhoAmI,
     Workspace,
     WorkspaceDetail,
@@ -57,7 +66,7 @@ class FakeClient:
     def list_workspaces(self):
         return [
             Workspace("ns", "Team", "d", 1, "active", "1.0",
-                      WorkspaceResources(2, 0, 0), raw={"namespaceName": "ns"}),
+                      WorkspaceResources(2, 0, 0), raw={"namespaceName": "ns"}, member_role="viewer"),
             Workspace("ns2", "Team2", "d", 1, "active", "1.0",
                       WorkspaceResources(1, 0, 0), raw={"namespaceName": "ns2"}),
         ]
@@ -74,7 +83,10 @@ class FakeClient:
 
     def get_pod(self, pod_name, workspace):
         return Pod(pod_name, workspace, "alias", "running", "on_demand", "0.9", False,
-                   raw={"podName": pod_name})
+                   raw={"podName": pod_name},
+                   endpoints=[PodEndpoint("ComfyUI", 8188, "connect", "https://c.meshive.ai", None, True, "ready")],
+                   connect_credentials=[ConnectCredential("ACCESS_PASSWORD", "s3cret-pw", True, True),
+                                        ConnectCredential("USERNAME", "admin")])
 
     def wait_for_pod(self, pod_name, workspace, *, until, timeout):
         FakeClient.last_wait = {"pod_name": pod_name, "workspace": workspace,
@@ -126,9 +138,10 @@ class FakeClient:
                           51200, 12288, raw={"podName": pod_name})
 
     def get_machine_metrics(self, machine_id):
-        return MachineMetrics(machine_id, 64.0, 0.1, 16.0, 262144.0, 0.5, 65536.0,
+        # ram_size 는 서버가 주는 그대로 바이트(256 GiB), 네트워크는 바이트/초(12.5 MB/s = 100 Mbps).
+        return MachineMetrics(machine_id, 64.0, 0.1, 16.0, 256 * 1024 ** 3, 0.5, 65536.0,
                               [GpuUsage(0, 0.0, 0.1, 81920.0, 40.0)],
-                              512000.0, 0.3, 4096000.0, 0.7, 1310720.0, 655360.0,
+                              512000.0, 0.3, 4096000.0, 0.7, 12_500_000.0, 625_000.0,
                               raw={"machineId": machine_id})
 
     def list_gpus(self, *, rental_type="demand", min_vram=None):
@@ -195,7 +208,10 @@ class FakeClient:
     def get_task(self, task_id):
         return Task(task_id, "train", "ns", "succeeded", "task-a", "python:3.12", "NVIDIA RTX 4090",
                     1, 6, 24, "1.0", "0.5", "0.5", exit_code=0,
-                    raw={"externalId": task_id, "scriptContent": "print(1)"})
+                    raw={"externalId": task_id, "scriptContent": "print(1)"},
+                    output_upload_state="uploading", output_files_declared=4, output_files_completed=1,
+                    output_bytes_declared=4096, output_bytes_completed=1024, output_upload_last_error="AccessDenied",
+                    input_assets=[TaskInputAsset("asset_w", "weights", "/inputs/w")])
 
     def list_assets(self, workspace, *, asset_type=None, status=None, page=1, page_size=20):
         FakeClient.last_call = ("list_assets", (workspace,),
@@ -203,25 +219,60 @@ class FakeClient:
         if page_size < 1:  # 실제 SDK 의 범위 검증을 흉내
             raise ValueError("page_size must be an integer between 1 and 100")
         items = [
-            Asset("asset_data", "imagenet-mini", "dataset", "active", None, "meshive_r2", 2, 2_147_483_648, 3,
+            Asset("asset_data", "imagenet-mini", "dataset", "active", None, "meshive_r2", 2_147_483_648, 3,
                   True, namespace_name=workspace, raw={"assetExternalId": "asset_data"}),
             Asset("asset_lora", "style-lora", "adapter", "source_missing", "bucket unreachable", "user_s3",
-                  1, 150_000, 1, False, namespace_name=workspace, raw={"assetExternalId": "asset_lora"}),
+                  150_000, 1, False, namespace_name=workspace, raw={"assetExternalId": "asset_lora"}),
+            # 아직 재지 않은 링크 자산 — 크기를 모른다(0 이 아니다)
+            Asset("asset_link", "hf-link", "model", "active", None, "external", None, None, False,
+                  namespace_name=workspace, raw={"assetExternalId": "asset_link"}),
         ]
         return AssetPage(items, total=45, page=page, page_size=page_size,
                          raw={"total": 45, "page": page, "pageSize": page_size, "items": [a.raw for a in items]})
 
     def get_asset(self, asset_id):
-        versions = [AssetVersion(2, "uploading", 0, 0, "hf_import", "meshive_r2", None, False, "repo not found"),
-                    AssetVersion(1, "ready", 1_500_000, 2, "web_upload", "meshive_r2", None, False, None)]
-        return Asset(asset_id, "imagenet-mini", "dataset", "active", None, "meshive_r2", 1, 1_500_000, 2, True,
-                     namespace_name="ns", created_by="a@b.com", latest_version=versions[1], versions=versions,
-                     raw={"assetExternalId": asset_id,
-                          "activeUsageContexts": [{"kind": "pod", "name": "trainer", "identifier": "pod-run"}]})
+        return Asset(asset_id, "imagenet-mini", "dataset", "active", None, "meshive_r2", 1_500_000, 2, True,
+                     namespace_name="ns", created_by="a@b.com", upload_status="failed", ingest_source="hf_import",
+                     import_failure_reason="repo not found",
+                     files=[AssetFile("a.bin", 1_000_000, "ready"), AssetFile("b.bin", 500_000, "ready")],
+                     active_usage_contexts=[AssetUsage("pod", "pod-run", "trainer", "running")],
+                     raw={"assetExternalId": asset_id})
+
+    def download_asset(self, asset_id, dest, *, paths=None):
+        FakeClient.last_call = ("download_asset", (asset_id, str(dest)), {"paths": paths})
+        target = Path(dest) / "config" / "a.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"12345")
+        return [target]
+
+    def task_outputs(self, task_id):
+        return TaskOutputs(task_id, [DownloadFile("result.csv", "https://r2/x", 2048)], False, "meshive_r2",
+                           raw={"files": [{"filename": "result.csv"}]})
+
+    def download_task_outputs(self, task_id, dest):
+        target = Path(dest) / "result.csv"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"ok")
+        return [target]
 
     def get_asset_storage(self, workspace):
         return AssetStorage(2_147_483_648, 0.015, 0.03, "grace", False, None,
                             datetime(2099, 1, 1, tzinfo=UTC), None, False, raw={"managedBytes": 2147483648})
+
+    def list_transactions(self, workspace):
+        FakeClient.last_call = ("list_transactions", (workspace,), {})
+        return [
+            Transaction(73213, "5f0e1d2c3b4a6978", "trainer", "create", "in_progress", "pull_image", "in_progress",
+                        progress=0.42, updated_at=datetime(2026, 9, 10, 7, 58, tzinfo=UTC),
+                        raw={"transactionId": 73213}),
+            # 별칭 없는 pod 의 실패 — 진행률을 모르는 스텝(progress=None)
+            Transaction(73214, "9eb176aae9309fb8", "", "restart", "failed", "pull_image", "failed",
+                        detail="image pull stalled for 600s", raw={"transactionId": 73214}),
+            Transaction(73215, "aa11", "comfy", "create", "failed", "fetch_assets", "failed",
+                        detail="source fetch failed", raw={"transactionId": 73215}, live=False, phase="verifying",
+                        init_logs=[InitLog("source-fetch", [f"line {i}" for i in range(15)] + ["\x1b[31mHTTP 403"],
+                                           True)]),
+        ]
 
     def close(self):
         self.closed = True
@@ -254,6 +305,7 @@ def test_workspaces_output(capsys):
     out = capsys.readouterr().out
     assert "ns" in out and "active" in out
     assert "Team" in out  # NAME(workspace_name) shown alongside ID(namespace_name)
+    assert "ROLE" in out and "viewer" in out
     assert out.index("NAME") < out.index("ID")  # NAME first, then ID
 
 
@@ -359,6 +411,17 @@ def test_pods_single_workspace_has_no_workspace_column(capsys):
 def test_pod_json_output(capsys):
     assert cli.main(["pod", "team-ns", "pod-1", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == {"podName": "pod-1"}
+
+
+def test_pod_connect_info_hides_secrets_by_default(capsys):
+    assert cli.main(["pod", "team-ns", "pod-1"]) == 0
+    out = capsys.readouterr().out
+    assert "ComfyUI" in out and "https://c.meshive.ai" in out and "ready" in out
+    assert "ACCESS_PASSWORD" in out and "s3cret-pw" not in out and "--show-secrets" in out
+    assert "admin" in out                                    # 비밀이 아닌 값은 그대로
+    assert cli.main(["pod", "team-ns", "pod-1", "--show-secrets"]) == 0
+    out = capsys.readouterr().out
+    assert "s3cret-pw" in out and "hidden" not in out
 
 
 def test_machines_output(capsys):
@@ -538,8 +601,8 @@ def test_workspace_detail_output(capsys):
     assert cli.main(["workspace", "ns"]) == 0
     out = capsys.readouterr().out
     assert "Team" in out and "ns" in out
-    assert "$2.10" in out and "$40.50" in out           # price/hr, avg/day
-    assert "128 GB" in out and "500 GB" in out           # ram/storage: MiB → GB
+    assert "$2.100" in out and "$40.50" in out          # price/hr 은 3자리, avg/day 는 2자리
+    assert "128 GiB" in out and "500 GiB" in out         # ram/storage: MiB → GiB (콘솔과 같은 1024 기반 라벨)
     assert "RESOURCE" in out and "pod" in out            # resource table
     assert "2026-08-30" in out and "$1.75" in out        # daily cost + total
 
@@ -563,7 +626,7 @@ def test_storages_output_and_filters(capsys):
     assert cli.main(["storages", "ns"]) == 0
     out = capsys.readouterr().out
     assert "pv-data" in out and "pv-local" in out and "datasets" in out
-    assert "100 GB" in out and "60.0%" in out
+    assert "100 GiB" in out and "60.0%" in out
     assert out.index("NAME") < out.index("ID")
 
     assert cli.main(["storages", "ns", "--type", "hostPath"]) == 0   # 대소문자 무시
@@ -586,7 +649,7 @@ def test_storage_single_output(capsys):
     out = capsys.readouterr().out
     assert "pv-data" in out and "pod-run" in out
     assert "encrypted: yes" in out and "under maintenance" in out
-    assert "100 GB, 60.0% used (40 GB free)" in out
+    assert "100 GiB, 60.0% used (40 GiB free)" in out
     assert cli.main(["storage", "ns", "pv-data", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == {"pvName": "pv-data"}
 
@@ -595,9 +658,9 @@ def test_pod_metrics_output(capsys):
     assert cli.main(["pod-metrics", "ns", "pod-1"]) == 0
     out = capsys.readouterr().out
     assert "8 cores, 25.0% used" in out
-    assert "32 GB, n/a used" in out                       # 측정 불가 → n/a (0% 와 구분)
-    assert "gpu 0:" in out and "24 GB vram" in out and "61°C" in out
-    assert "12 GB used of 50 GB" in out
+    assert "32 GiB, n/a used" in out                      # 측정 불가 → n/a (0% 와 구분)
+    assert "gpu 0:" in out and "24 GB vram" in out and "61°C" in out   # VRAM 만은 업계 표기 GB 유지
+    assert "12 GiB used of 50 GiB" in out
     assert cli.main(["pod-metrics", "ns", "pod-1", "-o", "name"]) == 0
     assert capsys.readouterr().out.splitlines() == ["pod-1"]
 
@@ -606,18 +669,39 @@ def test_machine_metrics_output(capsys):
     assert cli.main(["machine-metrics", "mac-1"]) == 0
     out = capsys.readouterr().out
     assert "64 cores, 10.0% used, 16 allocated" in out
-    assert "256 GB, 50.0% used, 64 GB allocated" in out
-    assert "root disk: 500 GB, 30.0% used" in out
-    assert "pv disk:   4,000 GB, 70.0% used" in out
-    assert "rx 10.0 Mbps, tx 5.0 Mbps" in out             # bytes/s → Mbps (웹과 동일 환산)
+    assert "ram:       256 GiB, 50.0% used, 64 GiB allocated" in out   # ram_size 는 바이트, 할당은 MiB
+    assert "10.0% of 80 GB vram" in out
+    assert "root disk: 500 GiB, 30.0% used" in out
+    assert "pv disk:   4,000 GiB, 70.0% used" in out
+    assert "rx 100.0 Mbps, tx 5.0 Mbps" in out            # 바이트/초 × 8 ÷ 10^6 (1024² 면 95.4 / 4.8)
     assert cli.main(["machine-metrics", "mac-1", "-o", "name"]) == 0
     assert capsys.readouterr().out.splitlines() == ["mac-1"]
+
+
+def test_gpu_line_shows_na_when_vram_size_is_unknown(monkeypatch, capsys):
+    # GPU 메모리를 못 읽으면 서버는 vramSize 를 null 로(DCGM FB 계열 누락·파드 GPU 조회 실패), FB 두 값이 0 으로
+    # 오면 0 으로 준다. 어느 쪽도 카드 크기가 아니다 — '0 GB vram' 대신 n/a. 서버 JSON → SDK 파싱부터 거친다.
+    gpus = [{"gpuNumber": 0, "coreUsageRate": None, "vramUsageRate": None, "vramSize": None, "temp": 40.0},
+            {"gpuNumber": 1, "coreUsageRate": None, "vramUsageRate": None, "vramSize": 0.0, "temp": 41.0}]
+    monkeypatch.setattr(FakeClient, "get_machine_metrics", lambda self, machine_id: MachineMetrics.from_dict(
+        {"machineId": machine_id, "cpu": {"core": 8}, "ram": {"size": 16 * 1024 ** 3}, "gpu": gpus}))
+    monkeypatch.setattr(FakeClient, "get_pod_metrics", lambda self, pod_name, workspace: PodMetrics.from_dict(
+        {"podName": pod_name, "cpu": {"core": 8}, "ram": {"size": 16384}, "gpu": gpus[:1]}))
+
+    assert cli.main(["machine-metrics", "mac-1"]) == 0
+    out = capsys.readouterr().out
+    assert "gpu 0:     n/a core, n/a of n/a vram, 40°C" in out
+    assert "gpu 1:     n/a core, n/a of n/a vram, 41°C" in out
+    assert "GB vram" not in out
+    assert cli.main(["pod-metrics", "ns", "pod-1"]) == 0
+    out = capsys.readouterr().out
+    assert "gpu 0:     n/a core, n/a of n/a vram, 40°C" in out and "GB vram" not in out
 
 
 def test_gpus_output_and_passthrough(capsys):
     assert cli.main(["gpus"]) == 0
     out = capsys.readouterr().out
-    assert "NVIDIA H100" in out and "80 GB" in out and "$2.50" in out
+    assert "NVIDIA H100" in out and "80 GB" in out and "$2.500" in out   # $/hr 은 3자리
     assert FakeClient.last_call == ("list_gpus", (), {"rental_type": "demand", "min_vram": None})
 
     assert cli.main(["gpus", "--rental", "spot", "--vram", "40", "--model", "h100"]) == 0
@@ -771,7 +855,10 @@ def test_task_single_output(capsys):
     assert cli.main(["task", "task_a"]) == 0
     out = capsys.readouterr().out
     assert "task_a" in out and "succeeded" in out
-    assert "exit code:   0" in out and "6 cores / 24 GB" in out
+    assert "exit code:   0" in out and "6 cores / 24 GiB" in out
+    assert "outputs:     uploading, 1 of 4 files, 1.0 KiB of 4.0 KiB" in out
+    assert "upload error: AccessDenied" in out
+    assert "weights" in out and "/inputs/w" in out          # 입력 자산 표
     assert cli.main(["task", "task_a", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["scriptContent"] == "print(1)"
 
@@ -782,9 +869,12 @@ def test_assets_output_filters_and_paging(capsys):
     assert cli.main(["assets", "ns"]) == 0
     out = capsys.readouterr().out
     assert "imagenet-mini" in out and "asset_data" in out and "style-lora" in out
-    assert "2.00 GB" in out and "146.5 KB" in out             # bytes → human
+    assert "2.00 GiB" in out and "146.5 KiB" in out           # bytes → human (1024 기준·1024 기반 라벨)
     assert "managed" in out and "s3" in out                    # storage provider labels
     assert "Page 1 of 3 (45 assets)" in out                    # 서버 total 기준 페이지 힌트
+    assert "VERSIONS" not in out                               # 자산에 버전이 없다
+    link = next(line for line in out.splitlines() if "hf-link" in line)
+    assert " 0 B" not in link and "-" in link                  # 모르는 크기는 0 이 아니라 '-'
     assert FakeClient.last_call == ("list_assets", ("ns",),
                                     {"asset_type": None, "status": None, "page": 1, "page_size": 20})
 
@@ -805,7 +895,7 @@ def test_assets_output_filters_and_paging(capsys):
         cli.main(["assets", "ns", "--type", "video"])          # argparse choices
 
     assert cli.main(["assets", "ns", "-o", "name"]) == 0
-    assert capsys.readouterr().out.splitlines() == ["asset_data", "asset_lora"]
+    assert capsys.readouterr().out.splitlines() == ["asset_data", "asset_lora", "asset_link"]
 
 
 def test_assets_page_past_the_end_is_explained(capsys):
@@ -826,10 +916,12 @@ def test_asset_single_output(capsys):
     assert cli.main(["asset", "asset_data"]) == 0
     out = capsys.readouterr().out
     assert "imagenet-mini" in out and "asset_data" in out and "a@b.com" in out
-    assert "1.4 MB in 2 files" in out                          # 최신 READY 버전 기준
+    assert "1.4 MiB in 2 files" in out
+    assert "upload:     failed" in out and "source:     hf_import" in out
     assert "in use:     yes (pod trainer)" in out
-    assert "v2" in out and "uploading" in out and "v1" in out and "ready" in out
-    assert "v2 import failed: repo not found" in out
+    assert "a.bin" in out and "976.6 KiB" in out and "b.bin" in out    # 파일 표
+    assert "import failed: repo not found" in out
+    assert "VERSION" not in out
     assert cli.main(["asset", "asset_data", "-o", "name"]) == 0
     assert capsys.readouterr().out.splitlines() == ["asset_data"]
     assert cli.main(["asset", "asset_data", "--json"]) == 0
@@ -839,9 +931,57 @@ def test_asset_single_output(capsys):
 def test_asset_storage_output_and_name(capsys):
     assert cli.main(["asset-storage", "ns"]) == 0
     out = capsys.readouterr().out
-    assert "managed:       2.00 GB" in out
-    assert "$0.015 per GB-month" in out and "$0.03" in out
+    assert "managed:       2.00 GiB" in out
+    assert "$0.02 per GiB-month" in out and "$0.03" in out   # 자산 저장 과금은 GiB 당
     assert "grace (uploads block in" in out
     assert "none (pods and tasks cannot start)" in out
     assert cli.main(["asset-storage", "ns", "-o", "name"]) == 0
     assert capsys.readouterr().out.strip() == "0.03"
+
+
+# --- transactions (in-flight pod operations) ----------------------------------
+
+def test_transactions_output_alias_and_name(capsys):
+    """진행 중 작업이 1건 이상일 때만 표를 그린다 — render_table 인자 오타(TypeError)는 여기서만 드러난다."""
+    assert cli.main(["transactions", "ns"]) == 0
+    out = capsys.readouterr().out
+    assert FakeClient.last_call == ("list_transactions", ("ns",), {})
+    assert "trainer" in out and "9eb176aae9309fb8" in out    # 별칭이 없으면 statefulset 이름
+    assert "73213" in out and "pull_image" in out and "image pull stalled for 600s" in out
+    assert "42%" in out and "0%" not in out                  # 진행률 모름(None)은 '-' — 0% 로 찍지 않는다
+    assert "verifying" in out                                # 바이트가 멈춘 구간 이름
+    assert "txn 73215 source-fetch log (before restart):" in out
+    assert "line 6" in out and "line 5\n" not in out          # 끝 10줄만
+    assert "HTTP 403" in out and "\x1b[31m" not in out         # 로그 줄의 제어문자는 걷어낸다
+    assert "\033[" not in out                                # tty 가 아니면 색 없음
+
+    assert cli.main(["txn", "ns", "-o", "name"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["73213", "73214", "73215"]
+    assert cli.main(["transactions", "ns", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == [{"transactionId": 73213}, {"transactionId": 73214},
+                                                   {"transactionId": 73215}]
+
+
+def test_transactions_table_paints_status_on_a_tty(monkeypatch, capsys):
+    """색은 render_table 의 `enabled=` 로 켠다 — 인자를 빼 버리면 표는 나와도 색이 조용히 꺼진다."""
+    monkeypatch.setattr(cli.fmt, "color_enabled", lambda stream=None: True)
+    assert cli.main(["transactions", "ns"]) == 0
+    assert "\033[31m● failed" in capsys.readouterr().out    # failed 상태 칸은 빨강
+
+
+def test_asset_download_saves_under_asset_id_by_default(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["asset-download", "asset_data", "--path", "config/*"]) == 0
+    out = capsys.readouterr().out
+    assert FakeClient.last_call == ("download_asset", ("asset_data", "asset_data"), {"paths": ["config/*"]})
+    assert "asset_data/config/a.json" in out and "5 B" in out and "1 file downloaded." in out
+    assert cli.main(["asset-download", "asset_data", "-d", "out", "-o", "name"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["out/config/a.json"]
+
+
+def test_task_outputs_lists_and_downloads(tmp_path, capsys):
+    assert cli.main(["task-outputs", "task_a"]) == 0
+    out = capsys.readouterr().out
+    assert "result.csv" in out and "2.0 KiB" in out
+    assert cli.main(["task-outputs", "task_a", "--download", str(tmp_path)]) == 0
+    assert "result.csv" in capsys.readouterr().out and (tmp_path / "result.csv").read_bytes() == b"ok"

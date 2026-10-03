@@ -8,6 +8,7 @@ from collections.abc import Callable
 import httpx
 
 from . import _format as fmt
+from . import _write as write_cli
 from .. import _config, _credentials
 from .._version import __version__
 from .._client import Meshive
@@ -30,6 +31,7 @@ from ..models import (
     Storage,
     Task,
     Template,
+    Transaction,
     WhoAmI,
     Workspace,
     WorkspaceDetail,
@@ -84,6 +86,13 @@ def build_parser() -> argparse.ArgumentParser:
             "  meshive machines               List your machines (as a host)\n"
             "  meshive machine <id>           Show a single machine\n"
             "  meshive earnings               Show your earnings (as a host)\n"
+            "\n"
+            "Write commands (need a key with the write scope; they ask for confirmation unless --yes):\n"
+            "  meshive pod-create <ws> <name> --template ID --gpu MODEL [--estimate]\n"
+            "  meshive pod-stop|pod-start|pod-restart|pod-delete <ws> <pod>\n"
+            "  meshive storage-create <ws> <name> --size GiB  meshive storage-delete <ws> <pv>\n"
+            "  meshive task-submit <ws> <name> --script FILE --image IMG --cpu-preset micro-2c8g\n"
+            "  meshive logs <ws> <pod>          meshive task-logs <task>\n"
             "\n"
             "Run `meshive <command> --help` for filters and options.\n"
             "Scripting: `-o name` prints just the IDs, one per line (pipe into xargs).\n"
@@ -171,11 +180,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--wait-timeout", type=float, default=600.0, metavar="SECONDS",
         help="Give up waiting after this long (default: 600).",
     )
+    p_pod.add_argument("--show-secrets", action="store_true",
+                       help="Print secret connect credentials (e.g. ACCESS_PASSWORD) instead of hiding them.")
 
     p_pod_metrics = sub.add_parser("pod-metrics", parents=[common],
                                    help="Show live resource usage (CPU/RAM/GPU/disk) of a pod.")
     p_pod_metrics.add_argument("workspace", help="Workspace ID (namespace name).")
     p_pod_metrics.add_argument("pod_name", help="Pod ID (pod name). See ID column of `meshive pods`.")
+
+    # --- transactions ---------------------------------------------------------
+    p_txn = sub.add_parser("transactions", parents=[common], aliases=["txn"],
+                           help="Show in-flight pod operations (why a pod is still creating).")
+    p_txn.add_argument("workspace", help="Workspace ID (namespace name).")
 
     # --- storages -------------------------------------------------------------
     p_storages = sub.add_parser("storages", parents=[common],
@@ -289,6 +305,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_task = sub.add_parser("task", parents=[common], help="Show a single task.")
     p_task.add_argument("task_id", help="Task ID (task_...). See ID column of `meshive tasks`.")
 
+    p_task_out = sub.add_parser("task-outputs", parents=[common], help="List a task's output files, or download them.")
+    p_task_out.add_argument("task_id", help="Task ID (task_...).")
+    p_task_out.add_argument("--download", default=None, metavar="DIR", help="Save the files into DIR.")
+
     # --- assets (Asset Hub) ---------------------------------------------------
     p_assets = sub.add_parser("assets", parents=[common],
                               help="List assets in a workspace (datasets, models, outputs, ...).")
@@ -303,14 +323,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_assets.add_argument("--page-size", type=int, default=20, metavar="N", dest="page_size",
                           help="Assets per page, 1-100 (default: 20).")
 
-    p_asset = sub.add_parser("asset", parents=[common], help="Show a single asset with its versions.")
+    p_asset = sub.add_parser("asset", parents=[common], help="Show a single asset with its files.")
     p_asset.add_argument("asset_id", help="Asset ID (asset_...). See ID column of `meshive assets`.")
+
+    p_asset_dl = sub.add_parser("asset-download", parents=[common],
+                                help="Download an asset's files, keeping their paths inside the asset.")
+    p_asset_dl.add_argument("asset_id", help="Asset ID (asset_...).")
+    p_asset_dl.add_argument("-d", "--dir", default=None, metavar="DIR",
+                            help="Where to save (default: ./<asset_id>). Existing files are overwritten.")
+    p_asset_dl.add_argument("--path", action="append", metavar="GLOB",
+                            help="Only files whose path matches (fnmatch, repeatable), e.g. 'config/*'.")
 
     p_asset_storage = sub.add_parser("asset-storage", parents=[common],
                                      help="Show a workspace's managed asset storage, its cost, and credit status.")
     p_asset_storage.add_argument("workspace", help="Workspace ID (namespace name).")
 
     # --- account --------------------------------------------------------------
+    write_cli.add_parsers(sub, common)
+
     sub.add_parser("api-keys", parents=[common], aliases=["keys"],
                    help="List your API keys (prefixes only; the secret is never shown).")
     sub.add_parser("credit", parents=[common],
@@ -414,9 +444,10 @@ def _filter_servings(servings: list[Serving], statuses: set[str], name: str | No
 # =============================================================================
 
 def _pod_price(pod: Pod) -> str:
-    """웹 pod 페이지와 동일: running 일 때만 가격, 아니면 '-'.
-    (꺼진/대기 중인 pod 는 과금되지 않으므로 가격을 노출하지 않는다.)"""
-    return fmt.money(pod.price_per_hour) if pod.status.lower() == "running" else "-"
+    """웹 pod 페이지와 동일: compute 과금 중일 때만 가격, 아니면 '-'.
+    서버의 billing_active 가 기준이고, 그 값을 안 주는 옛 서버면 running 으로 판정한다."""
+    billed = pod.billing_active if pod.billing_active is not None else pod.status.lower() == "running"
+    return fmt.money_hourly(pod.price_per_hour) if billed else "-"
 
 
 def _print_whoami(me: WhoAmI, color: bool) -> None:
@@ -432,15 +463,15 @@ def _print_workspaces(workspaces: list[Workspace], color: bool) -> None:
         return
     # NAME = workspace_name(유저 라벨), ID = namespace_name(조회 키).
     rows = [
-        [ws.workspace_name or "-", ws.namespace_name, fmt.status_cell(ws.status),
-         str(ws.resources.pod), fmt.money(ws.price_per_hour)]
+        [ws.workspace_name or "-", ws.namespace_name, ws.member_role or "-", fmt.status_cell(ws.status),
+         str(ws.resources.pod), fmt.money_hourly(ws.price_per_hour)]
         for ws in workspaces
     ]
-    colors = [[None, None, fmt.status_color(ws.status), None, None] for ws in workspaces]
+    colors = [[None, None, None, fmt.status_color(ws.status), None, None] for ws in workspaces]
     fmt.render_table(
-        ["NAME", "ID", "STATUS", "PODS", "PRICE/HR"],
+        ["NAME", "ID", "ROLE", "STATUS", "PODS", "PRICE/HR"],
         rows,
-        aligns=["l", "l", "l", "r", "r"],
+        aligns=["l", "l", "l", "l", "r", "r"],
         colors=colors,
         enabled=color,
     )
@@ -449,7 +480,7 @@ def _print_workspaces(workspaces: list[Workspace], color: bool) -> None:
 def _print_workspace(ws: WorkspaceDetail, color: bool) -> None:
     print(f"name:      {fmt.clean(ws.workspace_name or '-')}")  # 유저 라벨
     print(f"id:        {fmt.clean(ws.namespace_name)}")         # 조회 키
-    print(f"price/hr:  {fmt.money(ws.price_per_hour)}")
+    print(f"price/hr:  {fmt.money_hourly(ws.price_per_hour)}")
     print(f"avg/day:   {fmt.money(ws.weekly_avg_daily_cost)}  (last 7 days)")
     print(f"gpus:      {ws.gpus}")
     print(f"vcpus:     {ws.vcpus}")
@@ -508,7 +539,7 @@ def _print_pods(pods: list[Pod], color: bool, show_workspace: bool = False) -> N
     fmt.render_table(headers, rows, aligns=aligns, colors=colors, enabled=color)
 
 
-def _print_pod(pod: Pod, color: bool) -> None:
+def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
     created = "-"
     if pod.created_at:
         created = f"{fmt.relative_time(pod.created_at)} ({pod.created_at.isoformat()})"
@@ -519,15 +550,48 @@ def _print_pod(pod: Pod, color: bool) -> None:
     print(f"rental:    {fmt.clean(pod.rental_type)}")
     print(f"price/hr:  {_pod_price(pod)}")
     print(f"created:   {created}")
-    # maintenance 는 진행 중일 때만 노출 (boolean 나열 대신 의미 있을 때만).
+    # 아래 줄들은 해당할 때만 찍는다 (boolean 나열 대신 의미 있을 때만).
+    premiums = [n for n, on in (("cpu", pod.cpu_premium), ("uptime", pod.uptime_premium),
+                                ("internet", pod.internet_premium)) if on]
+    if premiums:
+        print(f"premium:   {', '.join(premiums)}")
+    if pod.waiting_mode:
+        print(f"waiting:   for {fmt.clean(pod.waiting_mode.replace('_', ' '))}")
+    if pod.stop_reason_code and pod.stop_reason_code != "user":
+        reason = pod.stop_reason_code + (f": {pod.stop_reason_detail}" if pod.stop_reason_detail else "")
+        print(fmt.paint(fmt.clean(f"stopped by the system ({reason})"), "yellow", color))
+    if pod.same_node_unavailable_reason:
+        print(fmt.paint(fmt.clean(f"can't start on its node now: {pod.same_node_unavailable_reason.replace('_', ' ')}"),
+                        "yellow", color))
     if pod.is_maintenance:
         print(fmt.paint("⚠ under maintenance", "yellow", color))
+    if pod.endpoints:
+        print()
+        rows = [[e.name or "-", str(e.port), e.external_url or e.internal_url or "-", e.readiness]
+                for e in pod.endpoints]
+        colors = [[None, None, None, "green" if e.readiness == "ready" else "yellow"] for e in pod.endpoints]
+        fmt.render_table(["ENDPOINT", "PORT", "URL", "STATE"], rows, aligns=["l", "r", "l", "l"],
+                         colors=colors, enabled=color)
+    if pod.connect_credentials:
+        print()
+        hidden = False
+        rows = []
+        for c in pod.connect_credentials:
+            masked = c.is_secret and not show_secrets
+            hidden = hidden or masked
+            rows.append([c.key, "••••••••" if masked else c.value])
+        fmt.render_table(["CREDENTIAL", "VALUE"], rows, enabled=color)
+        if hidden:
+            print(fmt.paint("Secret values are hidden. Add --show-secrets to print them.", "dim", color))
 
 
 def _print_gpu_usages(gpus, color: bool) -> None:
     for g in gpus:
+        # 총 VRAM 을 못 읽으면 서버는 None 을(DCGM FB 계열 누락·GPU 조회 실패), FB 두 값이 0 으로 오면 0 을
+        # 준다 — 어느 쪽도 카드 크기가 아니므로 '0 GB' 가 아니라 사용률처럼 n/a 로 찍는다.
+        size = fmt.vram(g.vram_size) if g.vram_size else "n/a"
         print(f"gpu {g.gpu_number}:     {fmt.usage(g.core_usage_rate)} core, "
-              f"{fmt.usage(g.vram_usage_rate)} of {fmt.gib(g.vram_size)} vram, {fmt.temperature(g.temp)}")
+              f"{fmt.usage(g.vram_usage_rate)} of {size} vram, {fmt.temperature(g.temp)}")
 
 
 def _print_pod_metrics(m: PodMetrics, color: bool) -> None:
@@ -542,7 +606,9 @@ def _print_machine_metrics(m: MachineMetrics, color: bool) -> None:
     print(f"machine:   {fmt.clean(m.machine_id)}")
     print(f"cpu:       {m.cpu_cores:g} cores, {fmt.usage(m.cpu_usage_rate)} used, "
           f"{m.cpu_allocated:g} allocated to pods")
-    print(f"ram:       {fmt.gib(m.ram_size)}, {fmt.usage(m.ram_usage_rate)} used, "
+    # 머신 메트릭의 ram_size 만 바이트다(서버가 node_memory_MemTotal_bytes 를 그대로 준다). 할당 RAM·디스크·
+    # VRAM 은 MiB — 같은 식으로 읽으면 64 GiB 머신이 '65,648,036 GB' 로 찍힌다.
+    print(f"ram:       {fmt.gib(m.ram_size / 1024 ** 2)}, {fmt.usage(m.ram_usage_rate)} used, "
           f"{fmt.gib(m.ram_allocated)} allocated to pods")
     _print_gpu_usages(m.gpus, color)
     print(f"root disk: {fmt.gib(m.root_volume_size)}, {fmt.usage(m.root_volume_usage_rate)} used")
@@ -560,7 +626,7 @@ def _print_storages(storages: list[Storage], color: bool) -> None:
     for s in storages:
         rows.append([
             s.user_alias or "-", s.pv_name, s.storage_type or "-", fmt.status_cell(s.status),
-            fmt.gib(s.total_size), fmt.usage(s.usage_rate), fmt.money(s.price_per_hour),
+            fmt.gib(s.total_size), fmt.usage(s.usage_rate), fmt.money_hourly(s.price_per_hour),
             str(len(s.linked_pods)), fmt.relative_time(s.created_at),
         ])
         colors.append([None, None, None, fmt.status_color(s.status), None, None, None, None, "dim"])
@@ -583,7 +649,7 @@ def _print_storage(s: Storage, color: bool) -> None:
     print(f"type:      {fmt.clean(s.storage_type or '-')}")
     print(f"status:    {fmt.paint(fmt.clean(fmt.status_cell(s.status)), fmt.status_color(s.status), color)}")
     print(f"size:      {fmt.gib(s.total_size)}, {fmt.usage(s.usage_rate)} used ({fmt.gib(s.available_size)} free)")
-    print(f"price/hr:  {fmt.money(s.price_per_hour)}")
+    print(f"price/hr:  {fmt.money_hourly(s.price_per_hour)}")
     print(f"pods:      {fmt.clean(', '.join(s.linked_pods)) if s.linked_pods else '-'}")
     print(f"encrypted: {fmt.yes_no(s.encrypted)}")
     print(f"created:   {created}")
@@ -649,7 +715,7 @@ def _print_gpus(gpus: list[GpuAvailability], color: bool) -> None:
     if not gpus:
         print("No GPUs available.")
         return
-    rows = [[g.gpu_model, f"{g.vram} GB", g.rental_type or "-", fmt.money(g.price_per_hour),
+    rows = [[g.gpu_model, f"{g.vram} GB", g.rental_type or "-", fmt.money_hourly(g.price_per_hour),
              str(g.available_gpus), str(g.max_gpus_per_pod), str(g.machine_count)] for g in gpus]
     fmt.render_table(
         ["GPU", "VRAM", "RENTAL", "PRICE/HR", "AVAILABLE", "MAX/POD", "MACHINES"],
@@ -710,7 +776,7 @@ def _print_servings(servings: list[Serving], color: bool) -> None:
         healthy = "-" if s.healthy_replicas is None else str(s.healthy_replicas)
         rows.append([_serving_label(s), str(s.serving_id), _serving_status_cell(s),
                      f"{s.current_replicas} ({s.min_replicas}-{s.max_replicas})", healthy,
-                     fmt.money(s.price_per_hour) if s.billing_active else "-"])
+                     fmt.money_hourly(s.price_per_hour) if s.billing_active else "-"])
         colors.append([None, None, fmt.status_color(s.status), None, None, None])
     fmt.render_table(
         ["NAME", "ID", "STATUS", "REPLICAS", "HEALTHY", "PRICE/HR"],
@@ -731,7 +797,7 @@ def _print_serving(s: Serving, color: bool) -> None:
     print(f"status:    {fmt.paint(fmt.clean(_serving_status_cell(s)), fmt.status_color(s.status), color)}")
     print(f"replicas:  {s.current_replicas} running, {s.min_replicas}-{s.max_replicas} configured{healthy}")
     print(f"endpoint:  {fmt.clean(s.endpoint_url or '-')}")
-    print(f"price/hr:  {fmt.money(s.price_per_hour) if s.billing_active else '-'}")
+    print(f"price/hr:  {fmt.money_hourly(s.price_per_hour) if s.billing_active else '-'}")
 
 
 def _task_gpu(t: Task) -> str:
@@ -770,8 +836,8 @@ def _print_task(t: Task, color: bool) -> None:
     print(f"pod:         {fmt.clean(t.pod_name or '-')}")
     print(f"image:       {fmt.clean(t.image or '-')}")
     print(f"gpu:         {fmt.clean(_task_gpu(t))}")
-    print(f"cpu/ram:     {t.cpu_cores} cores / {t.ram_gb} GB")
-    print(f"price/hr:    {fmt.money(t.price_per_hour)}")
+    print(f"cpu/ram:     {t.cpu_cores} cores / {t.ram_gb} GiB")
+    print(f"price/hr:    {fmt.money_hourly(t.price_per_hour)}")
     print(f"cost so far: {fmt.money(t.cost_so_far)}")
     print(f"total cost:  {fmt.money(t.total_cost)}")
     print(f"created:     {when(t.created_at)}")
@@ -781,6 +847,21 @@ def _print_task(t: Task, color: bool) -> None:
         print(f"exit code:   {t.exit_code}")
     if t.failure_reason:
         print(fmt.paint(fmt.clean(f"failure:     {t.failure_reason}"), "red", color))
+    if t.failed_asset_id:
+        print(fmt.paint(fmt.clean(f"failed on:   input asset {t.failed_asset_id}"), "red", color))
+    if t.output_upload_state and t.output_upload_state not in ("skipped", "discarded"):
+        files = f"{t.output_files_completed or 0} of {t.output_files_declared or 0} files"
+        size = f"{fmt.bytes_human(t.output_bytes_completed)} of {fmt.bytes_human(t.output_bytes_declared)}"
+        print(f"outputs:     {fmt.clean(t.output_upload_state)}, {files}, {size}")
+    if t.output_upload_last_error:
+        print(fmt.paint(fmt.clean(f"upload error: {t.output_upload_last_error}"), "red", color))
+    if t.outputs_purged_at:
+        print(f"outputs:     deleted {fmt.relative_time(t.outputs_purged_at)}")
+    if t.input_assets:
+        print()
+        rows = [[a.name or "-", a.asset_id, a.target_dir or "-"] for a in t.input_assets]
+        colors = [[None, None, "red" if a.asset_id == t.failed_asset_id else None] for a in t.input_assets]
+        fmt.render_table(["INPUT", "ID", "DIR"], rows, colors=colors, enabled=color)
 
 
 _STORAGE_PROVIDER_LABELS = {"meshive_r2": "managed", "user_s3": "s3", "external": "external"}
@@ -801,13 +882,13 @@ def _print_assets(assets: list[Asset], page: AssetPage, color: bool) -> None:
         colors = []
         for a in assets:
             rows.append([a.name or "-", a.asset_id, a.asset_type or "-", fmt.status_cell(a.status),
-                         str(a.version_count), fmt.bytes_human(a.size_bytes), str(a.file_count),
+                         fmt.bytes_human(a.size_bytes), "-" if a.file_count is None else str(a.file_count),
                          _storage_label(a.storage_provider), fmt.relative_time(a.updated_at)])
-            colors.append([None, None, None, fmt.status_color(a.status), None, None, None, None, "dim"])
+            colors.append([None, None, None, fmt.status_color(a.status), None, None, None, "dim"])
         fmt.render_table(
-            ["NAME", "ID", "TYPE", "STATUS", "VERSIONS", "SIZE", "FILES", "STORAGE", "UPDATED"],
+            ["NAME", "ID", "TYPE", "STATUS", "SIZE", "FILES", "STORAGE", "UPDATED"],
             rows,
-            aligns=["l", "l", "l", "l", "r", "r", "r", "l", "l"],
+            aligns=["l", "l", "l", "l", "r", "r", "l", "l"],
             colors=colors,
             enabled=color,
         )
@@ -830,33 +911,38 @@ def _print_asset(a: Asset, color: bool) -> None:
     print(f"type:       {fmt.clean(a.asset_type or '-')}")
     print(f"status:     {fmt.paint(fmt.clean(status), fmt.status_color(a.status), color)}")
     print(f"storage:    {fmt.clean(_storage_label(a.storage_provider))}")
-    print(f"size:       {fmt.bytes_human(a.size_bytes)} in {a.file_count} file{'s' if a.file_count != 1 else ''} (latest ready version)")
+    if a.size_bytes is None:
+        print("size:       not measured yet")
+    else:
+        print(f"size:       {fmt.bytes_human(a.size_bytes)} in {a.file_count} file{'s' if a.file_count != 1 else ''}")
+    if a.upload_status and a.upload_status != "ready":
+        upload = "interrupted" if a.stale else a.upload_status
+        print(f"upload:     {fmt.paint(fmt.clean(upload), 'red' if upload in ('failed', 'interrupted') else 'yellow', color)}")
+    print(f"source:     {fmt.clean(a.ingest_source or '-')}")
     print(f"created by: {fmt.clean(a.created_by or '-')}")
     print(f"created:    {fmt.relative_time(a.created_at)}")
     print(f"updated:    {fmt.relative_time(a.updated_at)}")
-    contexts = [c for c in a.raw.get("activeUsageContexts") or [] if isinstance(c, dict)]
     if a.in_use:
-        where = ", ".join(f"{c.get('kind', '?')} {c.get('name') or c.get('identifier') or '?'}" for c in contexts)
+        where = ", ".join(f"{c.kind or '?'} {c.name or c.identifier or '?'}" for c in a.active_usage_contexts)
         print(f"in use:     yes{f' ({fmt.clean(where)})' if where else ''}")
-    if a.versions:
+    if a.import_failure_reason:
+        print(fmt.paint(fmt.clean(f"import failed: {a.import_failure_reason}"), "red", color))
+    if a.files:
         print()
-        rows = []
-        colors = []
-        for v in a.versions:
-            cell = fmt.status_cell(v.status) + (" (deleted)" if v.deleted else "")
-            rows.append([f"v{v.version_number}", cell, fmt.bytes_human(v.total_size_bytes), str(v.file_count),
-                         v.ingest_source or "-", _storage_label(v.storage_provider), fmt.relative_time(v.created_at)])
-            colors.append([None, "gray" if v.deleted else fmt.status_color(v.status), None, None, None, None, "dim"])
-        fmt.render_table(["VERSION", "STATUS", "SIZE", "FILES", "SOURCE", "STORAGE", "CREATED"], rows,
-                         aligns=["l", "l", "r", "r", "l", "l", "l"], colors=colors, enabled=color)
-        failed = [v for v in a.versions if v.import_failure_reason]
-        for v in failed:
-            print(fmt.paint(fmt.clean(f"v{v.version_number} import failed: {v.import_failure_reason}"), "red", color))
+        shown = a.files[:_ASSET_FILE_ROWS]
+        rows = [[f.path, fmt.bytes_human(f.size_bytes), fmt.status_cell(f.status)] for f in shown]
+        colors = [[None, None, fmt.status_color(f.status)] for f in shown]
+        fmt.render_table(["FILE", "SIZE", "STATUS"], rows, aligns=["l", "r", "l"], colors=colors, enabled=color)
+        if len(a.files) > len(shown):
+            print(fmt.paint(f"... and {len(a.files) - len(shown)} more files (-o json lists them all).", "dim", color))
+
+
+_ASSET_FILE_ROWS = 50
 
 
 def _print_asset_storage(s: AssetStorage, color: bool) -> None:
     print(f"managed:       {fmt.bytes_human(s.managed_bytes)}")
-    print(f"price:         ${s.price_per_gb_month:.3f} per GB-month")
+    print(f"price:         {fmt.money(s.price_per_gb_month)} per GiB-month")
     print(f"est. monthly:  {fmt.money(s.estimated_monthly_cost)}")
     state = s.credit_state or "-"
     tone = None
@@ -990,13 +1076,62 @@ def _cmd_pod(client: Meshive, args: argparse.Namespace, output: str, color: bool
                             until=args.wait, timeout=args.wait_timeout)
         if args.wait else client.get_pod(args.pod_name, args.workspace)
     )
-    _emit(output, pod.raw, [pod.pod_name], lambda: _print_pod(pod, color))
+    _emit(output, pod.raw, [pod.pod_name], lambda: _print_pod(pod, color, args.show_secrets))
     return 0
 
 
 def _cmd_pod_metrics(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     metrics = client.get_pod_metrics(args.pod_name, args.workspace)
     _emit(output, metrics.raw, [metrics.pod_name], lambda: _print_pod_metrics(metrics, color))
+    return 0
+
+
+def _print_transactions(transactions: list[Transaction], color: bool) -> None:
+    if not transactions:
+        # 끝난 작업은 목록에서 빠진다 — 빈 목록은 "실패 없음" 이 아니라 "진행 중 없음" 이다.
+        print("No in-flight pod operations.")
+        return
+    rows = []
+    colors = []
+    for t in transactions:
+        rows.append([
+            t.user_alias or t.resource_name or "-", str(t.transaction_id), t.action or "-",
+            fmt.status_cell(t.status), t.step or "-",
+            _txn_progress(t),
+            fmt.clean(t.detail) if t.detail else "-",
+            fmt.relative_time(t.updated_at),
+        ])
+        colors.append([None, None, None, fmt.status_color(t.status), None, None, None, "dim"])
+    fmt.render_table(
+        ["POD", "TXN", "ACTION", "STATUS", "STEP", "PROGRESS", "DETAIL", "UPDATED"],
+        rows, colors=colors, enabled=color)
+    # 입력 자산 다운로드 실패면 그 컨테이너 로그 끝을 몇 줄 — 콘솔 실패 카드와 같은 발췌(서버가 정제).
+    for t in transactions:
+        for log in t.init_logs:
+            if not log.lines:
+                continue
+            print()
+            print(fmt.paint(f"txn {t.transaction_id} {log.container} log"
+                            f"{' (before restart)' if log.previous else ''}:", "dim", color))
+            for line in log.lines[-_INIT_LOG_LINES:]:
+                print(f"  {fmt.clean(line)}")
+
+
+_INIT_LOG_LINES = 10
+
+
+def _txn_progress(t: Transaction) -> str:
+    """진행률, 바이트가 멈춘 구간이면 그 이름(verifying · waiting for storage)을 붙인다."""
+    cell = "-" if t.progress is None else f"{t.progress * 100:.0f}%"
+    if t.phase:
+        cell = t.phase.replace("_", " ") if cell == "-" else f"{cell} {t.phase.replace('_', ' ')}"
+    return cell
+
+
+def _cmd_transactions(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    transactions = client.list_transactions(args.workspace)
+    _emit(output, [t.raw for t in transactions], [str(t.transaction_id) for t in transactions],
+          lambda: _print_transactions(transactions, color))
     return 0
 
 
@@ -1123,6 +1258,42 @@ def _cmd_asset(client: Meshive, args: argparse.Namespace, output: str, color: bo
     return 0
 
 
+def _print_saved(paths: list, color: bool) -> None:
+    if not paths:
+        print("No files to download.")
+        return
+    for path in paths:
+        print(f"saved  {fmt.clean(str(path))}  {fmt.paint(fmt.bytes_human(path.stat().st_size), 'dim', color)}")
+    print(fmt.paint(f"{len(paths)} file{'s' if len(paths) != 1 else ''} downloaded.", "dim", color))
+
+
+def _cmd_asset_download(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    # URL 은 download_asset 이 한 번만 받는다 — 무결제 계정의 일일 반출량은 발급마다 집계된다.
+    paths = client.download_asset(args.asset_id, args.dir or args.asset_id, paths=args.path)
+    _emit(output, [str(p) for p in paths], [str(p) for p in paths], lambda: _print_saved(paths, color))
+    return 0
+
+
+def _cmd_task_outputs(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    if args.download:
+        paths = client.download_task_outputs(args.task_id, args.download)
+        _emit(output, [str(p) for p in paths], [str(p) for p in paths], lambda: _print_saved(paths, color))
+        return 0
+    outs = client.task_outputs(args.task_id)
+
+    def show() -> None:
+        if outs.expired:
+            print("The outputs were deleted.")
+        elif not outs.files:
+            print("No output files.")
+        else:
+            fmt.render_table(["FILE", "SIZE"], [[f.path, fmt.bytes_human(f.size_bytes)] for f in outs.files],
+                             aligns=["l", "r"], enabled=color)
+
+    _emit(output, outs.raw, [f.path for f in outs.files], show)
+    return 0
+
+
 def _cmd_asset_storage(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     storage = client.get_asset_storage(args.workspace)
     # 단일 값 리소스: -o name 은 월 예상 비용 하나만.
@@ -1160,6 +1331,7 @@ _HANDLERS: dict[str, Handler] = {
     "pods": _cmd_pods,
     "pod": _cmd_pod,
     "pod-metrics": _cmd_pod_metrics,
+    "transactions": _cmd_transactions, "txn": _cmd_transactions,
     "storages": _cmd_storages,
     "storage": _cmd_storage,
     "machines": _cmd_machines, "m": _cmd_machines,
@@ -1175,10 +1347,13 @@ _HANDLERS: dict[str, Handler] = {
     "task": _cmd_task,
     "assets": _cmd_assets,
     "asset": _cmd_asset,
+    "asset-download": _cmd_asset_download,
+    "task-outputs": _cmd_task_outputs,
     "asset-storage": _cmd_asset_storage,
     "api-keys": _cmd_api_keys, "keys": _cmd_api_keys,
     "credit": _cmd_credit,
     "credit-history": _cmd_credit_history,
+    **write_cli.HANDLERS,
 }
 
 

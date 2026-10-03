@@ -9,7 +9,7 @@ import pytest
 
 cli = importlib.import_module("meshive.cli.main")  # cli.__init__ 이 main 함수를 노출해 서브모듈을 가린다
 from meshive.models import (Pod, Logs, PodCreated, PodEstimate, ResourceAction, Serving, StorageCreated, StorageEstimate,
-                            TaskEstimate, TaskSubmitted, ModelDetection, ServingModel, AssetImported)
+                            TaskEstimate, TaskSubmitted, ModelDetection, ServingModel, AssetImported, WatchedFolders)
 
 ESTIMATE = {"pricePerHourUsd": "0.068423", "breakdown": {"gpu": "0.068423"},
             "resources": {"gpu_model": "RTX 3060", "vram_gb": 12, "gpu_count": 1, "vcpu": 4, "ram_gb": 12, "disk_gb": 25,
@@ -104,6 +104,18 @@ class FakeClient:
     def delete_model(self, *a, **kw):
         self._rec("delete_model", *a, **kw)
         return ResourceAction.from_dict({"id": str(a[0]), "action": "delete"}, resource="model")
+
+    WATCHED = {"version": "4:cd", "editable": True, "roots": [
+        {"role": "output", "path": "/workspace/outputs", "origin": "template", "enabled": True, "include": ["*.png"],
+         "includeOverride": None},
+        {"role": "user", "path": "/workspace/logs", "origin": "user", "enabled": True, "include": [],
+         "includeOverride": ["*.txt"]}]}
+
+    def get_watched_folders(self, *a, **kw):
+        self._rec("get_watched_folders", *a, **kw); return WatchedFolders.from_dict(self.WATCHED)
+
+    def set_watched_folders(self, *a, **kw):
+        self._rec("set_watched_folders", *a, **kw); return WatchedFolders.from_dict(self.WATCHED)
 
     def import_asset(self, *a, **kw):
         self.calls.append(("import_asset", a, kw))
@@ -449,3 +461,33 @@ def test_asset_import_needs_no_confirmation(capsys, non_tty):
     assert "llama (asset_abc)" in out and "4 (2.0 KiB)" in out and "saved token or key" in out
     assert _last("import_asset")[2] == {"workspace": "ws", "name": None, "asset_type": "model", "revision": None,
                                         "paths": ["*.json"], "hf_token_id": 2, "civitai_key_id": None}
+
+
+def test_pod_create_input_assets_and_watch(capsys):
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--gpu", "RTX 3060", "--estimate",
+                     "--input-asset", "asset_a", "--input-asset", "asset_b=/workspace/models", "--watch", "/workspace/out"]) == 0
+    kw = _last("estimate_pod")[2]
+    assert kw["input_assets"] == ["asset_a", {"asset": "asset_b", "target_dir": "/workspace/models"}]
+    assert kw["watched_folders"] == ["/workspace/out"]
+
+
+def test_pod_watch_shows_and_rewrites_with_the_version(capsys, non_tty):
+    assert cli.main(["pod-watch", "ws", "p-0"]) == 0
+    out = capsys.readouterr().out
+    assert "/workspace/outputs" in out and "template" in out and "*.png" in out and "*.txt" in out
+    assert not any(c[0] == "set_watched_folders" for c in FakeClient.instances[-1].calls)
+
+    # 늘리는 변경은 확인이 필요하다(수확 저장 과금)
+    assert cli.main(["pod-watch", "ws", "p-0", "--add", "/workspace/ckpt", "--include", "*.pt"]) == 2
+    assert cli.main(["pod-watch", "ws", "p-0", "--add", "/workspace/ckpt", "--include", "*.pt", "--existing", "--yes"]) == 0
+    kw = _last("set_watched_folders")[2]
+    assert kw["expected_version"] == 4
+    assert kw["template"] == {"/workspace/outputs": {"enabled": True, "include": None}}
+    assert kw["user"] == [{"path": "/workspace/logs", "include": ["*.txt"], "enabled": True},
+                          {"path": "/workspace/ckpt", "include": ["*.pt"], "include_existing": True}]
+
+    # 줄이는 변경은 바로
+    assert cli.main(["pod-watch", "ws", "p-0", "--off", "/workspace/outputs", "--remove", "/workspace/logs"]) == 0
+    kw = _last("set_watched_folders")[2]
+    assert kw["template"] == {"/workspace/outputs": {"enabled": False, "include": None}} and kw["user"] == []
+    assert cli.main(["pod-watch", "ws", "p-0", "--off", "/nope"]) == 2     # 모르는 폴더 → 사용 오류

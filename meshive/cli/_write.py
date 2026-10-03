@@ -169,7 +169,73 @@ def _pod_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         ports=_parse_ports(args.port), command=args.overwrite_command, internet_premium=args.internet_premium,
         uptime_premium=args.uptime_premium, cpu_premium=args.cpu_premium, region=args.region,
         max_price_per_hour=args.max_price,
+        input_assets=[_pod_input_asset(v) for v in args.pod_input_asset or []] or None,
+        watched_folders=args.watch or None,
     )
+
+
+def _pod_input_asset(value: str) -> Any:
+    """ASSET_ID 또는 ASSET_ID=/target/dir."""
+    asset, sep, target = value.partition("=")
+    return {"asset": asset.strip(), "target_dir": target.strip()} if sep and target.strip() else asset.strip()
+
+
+def cmd_pod_watch(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    """수확 폴더 보기·바꾸기 — 지금 설정을 읽어 고친 뒤 그 버전으로 전체 교체(다른 곳에서 바뀌었으면 409)."""
+    current = client.get_watched_folders(args.pod_name, args.workspace)
+    changing = args.add or args.remove or args.on or args.off
+    if changing:
+        if current.folders is None or current.revision is None:
+            print(f"Error: this pod's watched folders can't be changed now ({current.editable_reason or 'unknown'}).",
+                  file=sys.stderr)
+            return 1
+        template = {f.path: {"enabled": f.enabled, "include": f.include_override}
+                    for f in current.folders if f.origin == "template"}
+        user = [{"path": f.path, "include": f.include_override, "enabled": f.enabled}
+                for f in current.folders if f.origin == "user"]
+        for path in args.on or []:
+            _toggle(template, user, path, True)
+        for path in args.off or []:
+            _toggle(template, user, path, False)
+        user = [u for u in user if u["path"] not in set(args.remove or [])]
+        for path in args.add or []:
+            user.append({"path": path, "include": args.include or None, "include_existing": args.existing})
+        if (args.add or args.on) and not _confirm(args, f"Watch more folders on {args.pod_name}? "
+                                                        "New files there are uploaded as assets (managed storage is billed)."):
+            return 2
+        current = client.set_watched_folders(args.pod_name, args.workspace, expected_version=current.revision,
+                                             template=template, user=user)
+
+    def show() -> None:
+        if current.folders is None:
+            print(f"Watched folders can't be read now ({current.editable_reason or 'unknown'}).")
+            return
+        if not current.folders:
+            print("No watched folders.")
+        else:
+            fmt.render_table(
+                ["FOLDER", "FROM", "STATE", "FILES"],
+                [[f.path, f.origin, "blocked (network storage)" if f.blocked_reason else ("on" if f.enabled else "off"),
+                  ", ".join(f.include_override if f.include_override is not None else f.include) or "all"]
+                 for f in current.folders], enabled=color)
+        if current.restart_hint:
+            print(fmt.paint("Restart the pod to apply the change.", "yellow", color))
+        elif not current.editable and current.editable_reason:
+            print(fmt.paint(f"Can't be changed now: {current.editable_reason.replace('_', ' ')}.", "dim", color))
+
+    _emit(output, current.raw, [f.path for f in current.folders or []], show)
+    return 0
+
+
+def _toggle(template: dict[str, Any], user: list[dict[str, Any]], path: str, enabled: bool) -> None:
+    if path in template:
+        template[path]["enabled"] = enabled
+        return
+    for folder in user:
+        if folder["path"] == path:
+            folder["enabled"] = enabled
+            return
+    raise ValueError(f"{path} is not a watched folder of this pod (use --add for a new one)")
 
 
 def _wait_for_new_pod(client: Meshive, workspace: str, name: str, until: str, timeout: float) -> str | None:
@@ -523,6 +589,10 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--uptime-premium", action="store_true")
     p.add_argument("--cpu-premium", action="store_true")
     p.add_argument("--max-price", default=None, metavar="USD", help="Cap the final compute USD/hour rate; storage/Asset Hub charges are separate.")
+    p.add_argument("--input-asset", action="append", dest="pod_input_asset", metavar="ASSET_ID[=DIR]",
+                   help="Attach an Asset Hub asset (repeatable); default place /inputs/<name> or the template's path.")
+    p.add_argument("--watch", action="append", metavar="PATH",
+                   help="Upload new files in this folder as assets (repeatable); see `meshive pod-watch`.")
     p.add_argument("--estimate", action="store_true", help="Only show the estimate; create nothing.")
     p.add_argument("--wait", default=None, metavar="STATUS", help="After creating, wait until the pod reaches STATUS (e.g. running).")
     p.add_argument("--wait-timeout", type=float, default=600.0, metavar="SECONDS")
@@ -547,6 +617,16 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
             _yes(p)
 
     # --- storages ---
+    p = sub.add_parser("pod-watch", parents=[common],
+                       help="Show or change a running pod's watched folders (new files become assets; no restart).")
+    p.add_argument("workspace"); p.add_argument("pod_name")
+    p.add_argument("--add", action="append", metavar="PATH", help="Watch a new folder (repeatable).")
+    p.add_argument("--include", action="append", metavar="GLOB", help="With --add: only matching files (repeatable).")
+    p.add_argument("--existing", action="store_true", help="With --add: also upload files already there.")
+    p.add_argument("--remove", action="append", metavar="PATH", help="Stop watching a folder you added.")
+    p.add_argument("--on", action="append", metavar="PATH", help="Turn a folder back on.")
+    p.add_argument("--off", action="append", metavar="PATH", help="Turn a folder off (template folders too).")
+    _yes(p)
     p = sub.add_parser("storage-create", parents=[common], help="Create a storage volume (shows the estimate first).")
     p.add_argument("workspace"); p.add_argument("name", help="Storage name (label).")
     p.add_argument("--size", type=int, required=True, metavar="GiB")
@@ -649,6 +729,7 @@ HANDLERS: dict[str, Handler] = {
     "pod-start": _pod_action("start_pod", True, "Start pod {pod} (billing resumes)?"),
     "pod-restart": _pod_action("restart_pod", False, ""),
     "pod-delete": _pod_action("delete_pod", True, "Delete pod {pod}?"),
+    "pod-watch": cmd_pod_watch,
     "storage-create": cmd_storage_create,
     "storage-delete": cmd_storage_delete,
     "serving-deploy": cmd_serving_deploy,

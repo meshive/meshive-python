@@ -110,7 +110,8 @@ def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: i
              rental_type: str, vcpu: int | None, ram_gb: int | None,
              volumes: Any, env: Mapping[str, Any] | None, secret_keys: Iterable[str] | None, ports: Any,
              command: str | None, internet_premium: bool, uptime_premium: bool, cpu_premium: bool,
-             region: str | None, max_price_per_hour: Any) -> dict[str, Any]:
+             region: str | None, max_price_per_hour: Any, input_assets: Any = None, watched_folders: Any = None,
+             harvest_destination: Any = None) -> dict[str, Any]:
     if isinstance(template_id, bool) or not isinstance(template_id, int) or template_id < 0:
         raise ValueError("template_id must be a non-negative integer")
     if isinstance(gpu_count, bool) or not isinstance(gpu_count, int) or not 1 <= gpu_count <= 8:
@@ -136,7 +137,75 @@ def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: i
         "cpuPremium": bool(cpu_premium),
         "region": region.strip() if isinstance(region, str) and region.strip() else None,
         "maxPricePerHourUsd": _price(max_price_per_hour, "max_price_per_hour"),
+        "inputAssets": _pod_input_assets(input_assets) or None,
+        "watchedFolders": _watched_folders(watched_folders) or None,
+        "harvestDestination": _harvest_destination(harvest_destination),
     })
+
+
+def _pod_input_assets(items: Any) -> list[dict[str, Any]]:
+    """Pod 입력 자산 — "asset_id" 또는 {"asset", "target_dir", "role", "paths"} (paths = 자산 안 일부 파일·폴더)."""
+    out = []
+    for item in items or []:
+        if isinstance(item, str):
+            out.append({"asset": _require_str(item, "input_assets[]")})
+        elif isinstance(item, Mapping):
+            paths = item.get("paths")
+            out.append(_drop_none({
+                "asset": _require_str(item.get("asset") or item.get("asset_id"), "input_assets[].asset"),
+                "targetDir": item.get("target_dir") or None, "role": item.get("role") or None,
+                "includePaths": ([paths] if isinstance(paths, str) else list(paths)) if paths else None,
+            }))
+        else:
+            raise ValueError("input_assets items must be asset ids or mappings")
+    return out
+
+
+def _watched_folders(items: Any) -> list[dict[str, Any]]:
+    """수확 폴더 — "path" 또는 {"path", "include", "include_existing", "enabled"}. include_existing=True 면 지금 있는 파일도 올린다."""
+    out = []
+    for item in items or []:
+        if isinstance(item, str):
+            out.append({"path": _require_str(item, "watched_folders[]")})
+        elif isinstance(item, Mapping):
+            include = item.get("include")
+            out.append(_drop_none({
+                "path": _require_str(item.get("path"), "watched_folders[].path"),
+                "include": ([include] if isinstance(include, str) else list(include)) if include else None,
+                "includeExisting": bool(item.get("include_existing", False)),
+                # 끈 채로 두는 폴더(set_watched_folders 가 읽은 값을 돌려보낼 때). 없으면 서버 기본 = 켜짐.
+                "enabled": None if item.get("enabled") is None else bool(item["enabled"]),
+            }))
+        else:
+            raise ValueError("watched_folders items must be paths or mappings")
+    return out
+
+
+def _harvest_destination(value: Any) -> dict[str, Any] | None:
+    """수확 파일이 갈 곳 — None/"managed"(기본) 또는 {"mode": "user_s3", "credential_id": N}."""
+    if value is None or value == "managed":
+        return None
+    if isinstance(value, Mapping):
+        mode = value.get("mode", "managed")
+        if mode not in ("managed", "user_s3"):
+            raise ValueError("harvest_destination.mode must be 'managed' or 'user_s3'")
+        return _drop_none({"mode": mode, "credentialId": _optional_int(value.get("credential_id"),
+                                                                       "harvest_destination.credential_id", minimum=0)})
+    raise ValueError("harvest_destination must be 'managed' or a mapping")
+
+
+def watched_folders_body(expected_version: int, template: Mapping[str, Any] | None,
+                         user: Any) -> dict[str, Any]:
+    """PUT …/harvest 본문 — 전체 교체. template = {경로: {"enabled", "include"}}, user = 폴더 목록."""
+    if isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < 0:
+        raise ValueError("expected_version must be a non-negative integer (WatchedFolders.revision)")
+    toggles = {}
+    for path, toggle in (template or {}).items():
+        toggle = toggle or {}
+        toggles[_require_str(path, "template path")] = _drop_none({
+            "enabled": bool(toggle.get("enabled", True)),
+            "include": list(toggle["include"]) if toggle.get("include") is not None else None})
+    return {"expectedVersion": expected_version, "template": toggles, "user": _watched_folders(user)}
 
 
 def placement(value: str) -> str:

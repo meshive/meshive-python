@@ -223,6 +223,53 @@ class Pod:
 
 
 @dataclass
+class WatchedFolder:
+    """수확(Watched folders) 폴더 하나 — 새 파일이 자산으로 올라간다."""
+
+    path: str
+    origin: str                    # template (템플릿이 정한 폴더) | user (사용자가 더한 폴더)
+    enabled: bool
+    role: str = ""
+    include: list[str] = field(default_factory=list)   # 템플릿 include
+    include_override: list[str] | None = None          # None = 템플릿 include, [] = 전부, [..] = 이것만
+    since: str | None = None       # 사용자 폴더: 이 시각 뒤에 생긴 파일만(None = 기존 파일도)
+    blocked_reason: str | None = None   # network_storage = NFS 위라 수확하지 않는다(켤 수 없다)
+
+
+@dataclass
+class WatchedFolders:
+    """GET /v1/sdk/pods/{pod}/harvest — Pod 의 수확 폴더 전체와 편집 가능 여부."""
+
+    version: str | None            # "3:ab12…" — 바꿀 때 revision(앞 숫자)을 expected_version 으로 보낸다
+    editable: bool
+    editable_reason: str | None = None   # no_sidecar | busy | undecidable
+    applied: bool | None = None          # 사이드카가 이 버전을 받았는가(모르면 None)
+    restart_hint: bool = False           # 재시작해야 적용된다
+    folders: list[WatchedFolder] | None = None   # None = 판정할 수 없음
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def revision(self) -> int | None:
+        head = (self.version or "").split(":", 1)[0]
+        return int(head) if head.isdigit() else None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "WatchedFolders":
+        roots = d.get("roots")
+        return cls(
+            version=d.get("version"), editable=bool(d.get("editable", False)),
+            editable_reason=d.get("editableReason"), applied=d.get("applied"),
+            restart_hint=bool(d.get("restartHint", False)),
+            folders=None if roots is None else [
+                WatchedFolder(path=str(r.get("path", "")), origin=str(r.get("origin", "")),
+                              enabled=bool(r.get("enabled", True)), role=str(r.get("role", "") or ""),
+                              include=list(r.get("include") or []), include_override=r.get("includeOverride"),
+                              since=r.get("since"), blocked_reason=r.get("blockedReason"))
+                for r in roots if isinstance(r, dict)],
+            raw=d)
+
+
+@dataclass
 class Machine:
     """GET /v1/sdk/machines[/{machine_id}] 항목 — host 가 등록한 머신.
 

@@ -66,6 +66,7 @@ from .models import (
     ServingModel,
     Storage,
     Transaction,
+    WatchedFolders,
     StorageCreated,
     StorageEstimate,
     Task,
@@ -694,13 +695,16 @@ class Meshive(_BaseClient):
                      volumes: Any = None, env: dict[str, str] | None = None, secret_keys: Iterable[str] | None = None,
                      ports: Any = None, command: str | None = None, internet_premium: bool = False,
                      uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
-                     max_price_per_hour: Any = None) -> PodEstimate:
+                     max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
+                     harvest_destination: Any = None) -> PodEstimate:
         """파드 견적 — 아무것도 만들지 않는다(read 스코프로 충분). create_pod 와 인자가 같다."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
                                internet_premium=internet_premium, uptime_premium=uptime_premium,
-                               cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour)
+                               cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour,
+                               input_assets=input_assets, watched_folders=watched_folders,
+                               harvest_destination=harvest_destination)
         return PodEstimate.from_dict(self._send("POST", "/pods/estimate",
                                                  params={"workspace": _query_value(workspace, "workspace")}, json=body))
 
@@ -710,15 +714,20 @@ class Meshive(_BaseClient):
                    volumes: Any = None, env: dict[str, str] | None = None, secret_keys: Iterable[str] | None = None,
                    ports: Any = None, command: str | None = None, internet_premium: bool = False,
                    uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
-                   max_price_per_hour: Any = None, idempotency_key: str | None = None) -> PodCreated:
+                   max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
+                   harvest_destination: Any = None, idempotency_key: str | None = None) -> PodCreated:
         """파드 생성(202 수락). 시간당 요금이 발생한다 — 먼저 estimate_pod 로 가격을 확인하고,
         max_price_per_hour 는 최종 compute 시간당 요금 상한이다. 초과 배치는 비동기로 실패할 수 있다.
-        스토리지(자동 PV 포함)와 자산 보관 요금은 별도이며 상한에서 제외된다."""
+        스토리지(자동 PV 포함)와 자산 보관 요금은 별도이며 상한에서 제외된다.
+        input_assets 는 Asset Hub 자산을 붙이고("asset_id" 또는 {"asset", "target_dir", "role", "paths"}),
+        watched_folders 는 새 파일을 자산으로 올릴 폴더("path" 또는 {"path", "include", "include_existing"})."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
                                internet_premium=internet_premium, uptime_premium=uptime_premium,
-                               cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour)
+                               cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour,
+                               input_assets=input_assets, watched_folders=watched_folders,
+                               harvest_destination=harvest_destination)
         return PodCreated.from_dict(self._send("POST", "/pods", params={"workspace": _query_value(workspace, "workspace")},
                                                 json=body, idempotency_key=idempotency_key))
 
@@ -812,6 +821,27 @@ class Meshive(_BaseClient):
     def delete_serving(self, serving_id: int | str, *, idempotency_key: str | None = None) -> ResourceAction:
         data = self._send("DELETE", f"/servings/{_int_segment(serving_id, 'serving_id')}", idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="serving")
+
+    # --- Watched folders (실행 중 Pod 의 수확 폴더) ------------------------------------
+
+    def get_watched_folders(self, pod_name: str, workspace: str) -> WatchedFolders:
+        """Pod 의 수확 폴더 (GET /pods/{pod}/harvest?workspace=) — 바꾸려면 revision 을 expected_version 으로."""
+        try:
+            data = self._get(f"/pods/{_path_segment(pod_name, 'pod_name')}/harvest", params={"workspace": workspace})
+        except NotFoundError as err:
+            raise _not_supported(err, "watched folders") from None
+        return WatchedFolders.from_dict(data)
+
+    def set_watched_folders(self, pod_name: str, workspace: str, *, expected_version: int,
+                            template: dict[str, Any] | None = None, user: Any = None,
+                            idempotency_key: str | None = None) -> WatchedFolders:
+        """수확 폴더 **전체 교체**(재시작 없이 적용). template = {템플릿 폴더 경로: {"enabled", "include"}},
+        user = 사용자 폴더 목록("path" 또는 {"path", "include", "include_existing"}). 버전이 어긋나면 409 — 다시 읽는다."""
+        body = _write.watched_folders_body(expected_version, template, user)
+        data = self._send("PUT", f"/pods/{_path_segment(pod_name, 'pod_name')}/harvest",
+                          params={"workspace": _query_value(workspace, "workspace")}, json=body,
+                          idempotency_key=idempotency_key)
+        return WatchedFolders.from_dict(data)
 
     # --- 자산 import ---------------------------------------------------------------
 
@@ -1243,13 +1273,16 @@ class AsyncMeshive(_BaseClient):
                      volumes: Any = None, env: dict[str, str] | None = None, secret_keys: Iterable[str] | None = None,
                      ports: Any = None, command: str | None = None, internet_premium: bool = False,
                      uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
-                     max_price_per_hour: Any = None) -> PodEstimate:
+                     max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
+                     harvest_destination: Any = None) -> PodEstimate:
         """파드 견적 — 아무것도 만들지 않는다(read 스코프로 충분). create_pod 와 인자가 같다."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
                                internet_premium=internet_premium, uptime_premium=uptime_premium,
-                               cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour)
+                               cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour,
+                               input_assets=input_assets, watched_folders=watched_folders,
+                               harvest_destination=harvest_destination)
         return PodEstimate.from_dict(await self._send("POST", "/pods/estimate",
                                                  params={"workspace": _query_value(workspace, "workspace")}, json=body))
 
@@ -1259,15 +1292,20 @@ class AsyncMeshive(_BaseClient):
                    volumes: Any = None, env: dict[str, str] | None = None, secret_keys: Iterable[str] | None = None,
                    ports: Any = None, command: str | None = None, internet_premium: bool = False,
                    uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
-                   max_price_per_hour: Any = None, idempotency_key: str | None = None) -> PodCreated:
+                   max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
+                   harvest_destination: Any = None, idempotency_key: str | None = None) -> PodCreated:
         """파드 생성(202 수락). 시간당 요금이 발생한다 — 먼저 estimate_pod 로 가격을 확인하고,
         max_price_per_hour 는 최종 compute 시간당 요금 상한이다. 초과 배치는 비동기로 실패할 수 있다.
-        스토리지(자동 PV 포함)와 자산 보관 요금은 별도이며 상한에서 제외된다."""
+        스토리지(자동 PV 포함)와 자산 보관 요금은 별도이며 상한에서 제외된다.
+        input_assets 는 Asset Hub 자산을 붙이고("asset_id" 또는 {"asset", "target_dir", "role", "paths"}),
+        watched_folders 는 새 파일을 자산으로 올릴 폴더("path" 또는 {"path", "include", "include_existing"})."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
                                internet_premium=internet_premium, uptime_premium=uptime_premium,
-                               cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour)
+                               cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour,
+                               input_assets=input_assets, watched_folders=watched_folders,
+                               harvest_destination=harvest_destination)
         return PodCreated.from_dict(await self._send("POST", "/pods", params={"workspace": _query_value(workspace, "workspace")},
                                                 json=body, idempotency_key=idempotency_key))
 
@@ -1361,6 +1399,27 @@ class AsyncMeshive(_BaseClient):
     async def delete_serving(self, serving_id: int | str, *, idempotency_key: str | None = None) -> ResourceAction:
         data = await self._send("DELETE", f"/servings/{_int_segment(serving_id, 'serving_id')}", idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="serving")
+
+    # --- Watched folders (실행 중 Pod 의 수확 폴더) ------------------------------------
+
+    async def get_watched_folders(self, pod_name: str, workspace: str) -> WatchedFolders:
+        """Pod 의 수확 폴더 (GET /pods/{pod}/harvest?workspace=)."""
+        try:
+            data = await self._get(f"/pods/{_path_segment(pod_name, 'pod_name')}/harvest",
+                                   params={"workspace": workspace})
+        except NotFoundError as err:
+            raise _not_supported(err, "watched folders") from None
+        return WatchedFolders.from_dict(data)
+
+    async def set_watched_folders(self, pod_name: str, workspace: str, *, expected_version: int,
+                                  template: dict[str, Any] | None = None, user: Any = None,
+                                  idempotency_key: str | None = None) -> WatchedFolders:
+        """수확 폴더 전체 교체(재시작 없이 적용). 버전이 어긋나면 409."""
+        body = _write.watched_folders_body(expected_version, template, user)
+        data = await self._send("PUT", f"/pods/{_path_segment(pod_name, 'pod_name')}/harvest",
+                                params={"workspace": _query_value(workspace, "workspace")}, json=body,
+                                idempotency_key=idempotency_key)
+        return WatchedFolders.from_dict(data)
 
     # --- 자산 import ---------------------------------------------------------------
 

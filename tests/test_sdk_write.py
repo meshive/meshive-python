@@ -385,3 +385,45 @@ def test_asset_import_picks_the_source():
     assert (a.asset_id, a.file_count, a.resolved_commit) == ("asset_abc", 9, "c0ffee")
     with pytest.raises(NotFoundError, match="does not support asset import"):
         sync_client(Recorder((404, {"detail": "Not Found"}))).import_asset("Qwen/Qwen3-0.6B", workspace="ws")
+
+
+def test_pod_assets_and_watched_folders():
+    rec = Recorder((202, {"name": "p", "workspace": "ws", "transactionId": 1, "estimate": {"pricePerHourUsd": "1"}}))
+    sync_client(rec).create_pod("p", 457, workspace="ws", gpu_model="RTX 3060",
+                                input_assets=["asset_a", {"asset": "asset_b", "target_dir": "/workspace/models",
+                                                          "role": "checkpoint", "paths": "unet/"}],
+                                watched_folders=["/workspace/out", {"path": "/workspace/logs", "include": "*.txt",
+                                                                    "include_existing": True}],
+                                harvest_destination={"mode": "user_s3", "credential_id": 5})
+    body = rec.body()
+    assert body["inputAssets"] == [{"asset": "asset_a"}, {"asset": "asset_b", "targetDir": "/workspace/models",
+                                                          "role": "checkpoint", "includePaths": ["unet/"]}]
+    assert body["watchedFolders"] == [{"path": "/workspace/out"},
+                                      {"path": "/workspace/logs", "include": ["*.txt"], "includeExisting": True}]
+    assert body["harvestDestination"] == {"mode": "user_s3", "credentialId": 5}
+    rec = Recorder((200, {"pricePerHourUsd": "1"}))
+    sync_client(rec).estimate_pod("p", 457, workspace="ws")
+    assert not {"inputAssets", "watchedFolders", "harvestDestination"} & rec.body().keys()   # 안 쓰면 안 보낸다
+
+    config = {"version": "3:ab", "editable": True, "applied": True, "roots": [
+        {"role": "output", "path": "/workspace/outputs", "origin": "template", "enabled": True, "include": ["*.png"],
+         "includeOverride": None},
+        {"role": "user", "path": "/data", "origin": "user", "enabled": False, "include": [], "includeOverride": ["*.csv"],
+         "since": "2026-10-03T00:00:00Z", "blockedReason": "network_storage"}]}
+    rec = Recorder((200, config))
+    w = sync_client(rec).get_watched_folders("p-0", "ws")
+    assert rec.last.url.path == "/v1/sdk/pods/p-0/harvest" and w.revision == 3 and w.applied is True
+    assert [(f.path, f.origin, f.enabled, f.blocked_reason) for f in w.folders] == [
+        ("/workspace/outputs", "template", True, None), ("/data", "user", False, "network_storage")]
+
+    rec = Recorder((200, config))
+    sync_client(rec).set_watched_folders("p-0", "ws", expected_version=3,
+                                         template={"/workspace/outputs": {"enabled": False}},
+                                         user=[{"path": "/data", "include": ["*.csv"], "enabled": False}])
+    assert rec.last.method == "PUT" and rec.last.headers["Idempotency-Key"]
+    assert rec.body() == {"expectedVersion": 3, "template": {"/workspace/outputs": {"enabled": False}},
+                          "user": [{"path": "/data", "include": ["*.csv"], "includeExisting": False, "enabled": False}]}
+    with pytest.raises(ValueError):
+        sync_client(rec).set_watched_folders("p-0", "ws", expected_version=-1)
+    assert sync_client(Recorder((200, {"editable": False, "editableReason": "undecidable", "roots": None}))) \
+        .get_watched_folders("p-0", "ws").folders is None

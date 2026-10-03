@@ -20,6 +20,14 @@ asset downloads and output uploads. Confirmation questions no longer break `-o j
 
 ### SDK
 
+- `create_pod` / `estimate_pod` take `input_assets` (Asset Hub assets to place in the pod — `"asset_id"` or
+  `{"asset", "target_dir", "role", "paths"}`), `watched_folders` (folders whose new files are uploaded as assets —
+  `"path"` or `{"path", "include", "include_existing"}`) and `harvest_destination` (`{"mode": "user_s3",
+  "credential_id": …}` for your own bucket), the same choices as the console's Assets step. The server checks them as
+  it does for the console and its messages come back as they are (for example, a folder on network storage can't be
+  watched). `get_watched_folders(pod, workspace)` and `set_watched_folders(pod, workspace, expected_version=, template=,
+  user=)` read and replace a running pod's watched folders without a restart; pass `WatchedFolders.revision` as
+  `expected_version`, and re-read on a 409 because someone else changed them.
 - `import_asset(target, workspace=, …)` links a Hugging Face repo (`owner/name` or its URL), a CivitAI model or a
   direct file URL as an asset. Nothing is copied, so there is no storage charge and the asset is ready at once; pods
   and tasks download it from the source when they start. Narrow it with `paths`, pin a Hugging Face `revision`, and
@@ -55,6 +63,10 @@ asset downloads and output uploads. Confirmation questions no longer break `-o j
 
 ### CLI
 
+- `meshive pod-create` takes `--input-asset ASSET_ID[=DIR]` and `--watch PATH`, and `meshive pod-watch <workspace>
+  <pod>` shows a running pod's watched folders and changes them with `--add PATH [--include GLOB] [--existing]`,
+  `--remove`, `--on` and `--off`. Adding or turning on a folder asks for confirmation (uploaded files are stored and
+  billed); removing or turning off applies at once.
 - `meshive asset-import <workspace> <repo|url>` links a source as an asset (no confirmation — it costs nothing), and
   `meshive civitai-keys` lists the workspace's CivitAI keys.
 - `meshive model-detect`, `model-register`, `models`, `model-delete` and `hf-tokens` register Hugging Face models for

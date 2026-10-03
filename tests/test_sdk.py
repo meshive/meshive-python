@@ -1156,3 +1156,87 @@ def test_async_list_transactions_mirrors_sync():
             return await client.list_transactions("team-ns")
     txns = asyncio.run(run())
     assert txns[0].step == "pull_image" and txns[0].progress == pytest.approx(0.42)
+
+
+# --- downloads (G05) ----------------------------------------------------------
+
+DOWNLOAD_URLS = {"expiresIn": 3600, "items": [{
+    "assetExternalId": "asset_abc", "name": "weights", "expectedFileCount": 2, "files": [
+        {"fileId": 1, "relativePath": "model.safetensors", "sizeBytes": 5, "contentHash": None,
+         "url": "https://r2.test/k/model.safetensors?sig=1"},
+        {"fileId": 2, "relativePath": "config/config.json", "sizeBytes": 2, "contentHash": "h",
+         "url": "https://r2.test/k/config/config.json?sig=2"}]}]}
+
+
+def _download_handler(urls_payload, seen, bodies=None):
+    bodies = bodies or {"/k/model.safetensors": b"hello", "/k/config/config.json": b"{}"}
+
+    def handler(request):
+        if request.url.host == "r2.test":
+            seen.setdefault("storage_auth", []).append(request.headers.get("authorization"))
+            return httpx.Response(200, content=bodies[request.url.path])
+        seen["path"] = request.url.path
+        seen["query"] = request.url.query.decode()
+        return httpx.Response(200, json=urls_payload)
+    return handler
+
+
+def test_asset_download_urls_and_download(tmp_path):
+    seen = {}
+    client = sync_client(_download_handler(DOWNLOAD_URLS, seen))
+    d = client.asset_download_urls("asset_abc", paths=["config/*", "*.safetensors"])
+    assert seen["path"] == "/v1/sdk/assets/asset_abc/download-urls"
+    assert seen["query"] == "path=config%2F%2A&path=%2A.safetensors"
+    assert d.complete and d.expires_in == 3600 and [f.path for f in d.files] == ["model.safetensors",
+                                                                                 "config/config.json"]
+    written = client.download_asset("asset_abc", tmp_path)
+    assert [p.relative_to(tmp_path).as_posix() for p in written] == ["model.safetensors", "config/config.json"]
+    assert (tmp_path / "model.safetensors").read_bytes() == b"hello"
+    assert not list(tmp_path.rglob("*.part"))
+    assert seen["storage_auth"] == [None, None]          # Meshive 키는 스토리지로 가지 않는다
+
+
+def test_download_refuses_paths_outside_dest_and_incomplete_signing(tmp_path):
+    evil = {"expiresIn": 60, "items": [{"assetExternalId": "asset_abc", "name": "x", "expectedFileCount": 1,
+                                        "files": [{"relativePath": "../escape.txt", "url": "https://r2.test/e"}]}]}
+    client = sync_client(_download_handler(evil, {}, {"/e": b"x"}))
+    with pytest.raises(ValueError, match="outside"):
+        client.download_asset("asset_abc", tmp_path / "out")
+    assert not (tmp_path / "escape.txt").exists()
+
+    partial = {**DOWNLOAD_URLS, "items": [{**DOWNLOAD_URLS["items"][0], "expectedFileCount": 3}]}
+    client = sync_client(_download_handler(partial, {}))
+    with pytest.raises(MeshiveError, match="2 of 3 files"):
+        client.download_asset("asset_abc", tmp_path)
+
+
+def test_downloads_on_an_older_server_explain_themselves():
+    client = sync_client(lambda r: httpx.Response(404, json={"detail": "Not Found"}))
+    with pytest.raises(NotFoundError, match="does not support asset downloads"):
+        client.asset_download_urls("asset_abc")
+    with pytest.raises(NotFoundError, match="does not support task outputs"):
+        client.task_outputs("task_1")
+    # 진짜 없는 자산의 404(title 있음)는 그대로
+    client = sync_client(lambda r: httpx.Response(404, json={"detail": {"title": "Asset Not Found",
+                                                                        "message": "The asset does not exist."}}))
+    with pytest.raises(NotFoundError, match="The asset does not exist"):
+        client.asset_download_urls("asset_abc")
+
+
+def test_task_outputs_and_async_download(tmp_path):
+    payload = {"expired": False, "destination": {"provider": "meshive_r2"}, "files": [
+        {"id": "task_1", "filename": "result.csv", "sizeBytes": 2, "url": "https://r2.test/inline",
+         "downloadUrl": "https://r2.test/attach"}]}
+    seen = {}
+    handler = _download_handler(payload, seen, {"/attach": b"ok"})
+    outs = sync_client(handler).task_outputs("task_1")
+    assert seen["path"] == "/v1/sdk/tasks/task_1/outputs"
+    assert outs.storage_provider == "meshive_r2" and not outs.expired
+    assert [(f.path, f.url, f.size_bytes) for f in outs.files] == [("result.csv", "https://r2.test/attach", 2)]
+
+    async def run():
+        async with async_client(handler) as client:
+            return await client.download_task_outputs("task_1", tmp_path)
+
+    written = asyncio.run(run())
+    assert [p.name for p in written] == ["result.csv"] and (tmp_path / "result.csv").read_bytes() == b"ok"

@@ -305,6 +305,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_task = sub.add_parser("task", parents=[common], help="Show a single task.")
     p_task.add_argument("task_id", help="Task ID (task_...). See ID column of `meshive tasks`.")
 
+    p_task_out = sub.add_parser("task-outputs", parents=[common], help="List a task's output files, or download them.")
+    p_task_out.add_argument("task_id", help="Task ID (task_...).")
+    p_task_out.add_argument("--download", default=None, metavar="DIR", help="Save the files into DIR.")
+
     # --- assets (Asset Hub) ---------------------------------------------------
     p_assets = sub.add_parser("assets", parents=[common],
                               help="List assets in a workspace (datasets, models, outputs, ...).")
@@ -319,8 +323,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_assets.add_argument("--page-size", type=int, default=20, metavar="N", dest="page_size",
                           help="Assets per page, 1-100 (default: 20).")
 
-    p_asset = sub.add_parser("asset", parents=[common], help="Show a single asset with its versions.")
+    p_asset = sub.add_parser("asset", parents=[common], help="Show a single asset with its files.")
     p_asset.add_argument("asset_id", help="Asset ID (asset_...). See ID column of `meshive assets`.")
+
+    p_asset_dl = sub.add_parser("asset-download", parents=[common],
+                                help="Download an asset's files, keeping their paths inside the asset.")
+    p_asset_dl.add_argument("asset_id", help="Asset ID (asset_...).")
+    p_asset_dl.add_argument("-d", "--dir", default=None, metavar="DIR",
+                            help="Where to save (default: ./<asset_id>). Existing files are overwritten.")
+    p_asset_dl.add_argument("--path", action="append", metavar="GLOB",
+                            help="Only files whose path matches (fnmatch, repeatable), e.g. 'config/*'.")
 
     p_asset_storage = sub.add_parser("asset-storage", parents=[common],
                                      help="Show a workspace's managed asset storage, its cost, and credit status.")
@@ -1246,6 +1258,42 @@ def _cmd_asset(client: Meshive, args: argparse.Namespace, output: str, color: bo
     return 0
 
 
+def _print_saved(paths: list, color: bool) -> None:
+    if not paths:
+        print("No files to download.")
+        return
+    for path in paths:
+        print(f"saved  {fmt.clean(str(path))}  {fmt.paint(fmt.bytes_human(path.stat().st_size), 'dim', color)}")
+    print(fmt.paint(f"{len(paths)} file{'s' if len(paths) != 1 else ''} downloaded.", "dim", color))
+
+
+def _cmd_asset_download(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    # URL 은 download_asset 이 한 번만 받는다 — 무결제 계정의 일일 반출량은 발급마다 집계된다.
+    paths = client.download_asset(args.asset_id, args.dir or args.asset_id, paths=args.path)
+    _emit(output, [str(p) for p in paths], [str(p) for p in paths], lambda: _print_saved(paths, color))
+    return 0
+
+
+def _cmd_task_outputs(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    if args.download:
+        paths = client.download_task_outputs(args.task_id, args.download)
+        _emit(output, [str(p) for p in paths], [str(p) for p in paths], lambda: _print_saved(paths, color))
+        return 0
+    outs = client.task_outputs(args.task_id)
+
+    def show() -> None:
+        if outs.expired:
+            print("The outputs were deleted.")
+        elif not outs.files:
+            print("No output files.")
+        else:
+            fmt.render_table(["FILE", "SIZE"], [[f.path, fmt.bytes_human(f.size_bytes)] for f in outs.files],
+                             aligns=["l", "r"], enabled=color)
+
+    _emit(output, outs.raw, [f.path for f in outs.files], show)
+    return 0
+
+
 def _cmd_asset_storage(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     storage = client.get_asset_storage(args.workspace)
     # 단일 값 리소스: -o name 은 월 예상 비용 하나만.
@@ -1299,6 +1347,8 @@ _HANDLERS: dict[str, Handler] = {
     "task": _cmd_task,
     "assets": _cmd_assets,
     "asset": _cmd_asset,
+    "asset-download": _cmd_asset_download,
+    "task-outputs": _cmd_task_outputs,
     "asset-storage": _cmd_asset_storage,
     "api-keys": _cmd_api_keys, "keys": _cmd_api_keys,
     "credit": _cmd_credit,

@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import time
 import uuid
 from collections.abc import Iterable
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -39,8 +41,11 @@ from .exceptions import (
 from .models import (
     ApiKey,
     Asset,
+    AssetDownload,
     AssetPage,
     AssetStorage,
+    DownloadFile,
+    TaskOutputs,
     Credit,
     CreditHistoryEntry,
     Earnings,
@@ -67,6 +72,42 @@ from .models import (
     Workspace,
     WorkspaceDetail,
 )
+
+
+def _paths_param(paths: str | Iterable[str] | None) -> dict[str, Any] | None:
+    """자산 파일 경로 glob(fnmatch) — 반복 쿼리 `path=a&path=b`. 없으면 전체."""
+    if not paths:
+        return None
+    values = [paths] if isinstance(paths, str) else [p for p in paths if p]
+    return {"path": values} if values else None
+
+
+def _not_supported(err: NotFoundError, what: str) -> NotFoundError:
+    """라우트가 없는 옛 서버의 404(FastAPI 기본 `{"detail": "Not Found"}` — title 없음)를 알아듣게 바꾼다.
+    자산·task 가 없을 때의 404 는 title 이 있으므로 그대로 둔다."""
+    if err.title is not None:
+        return err
+    return NotFoundError(404, f"This Meshive API server does not support {what} yet (it predates this SDK "
+                              "release). Use the console for now.", raw=err.raw)
+
+
+def _download_target(dest: str | os.PathLike[str], rel: str) -> Path:
+    """dest 아래 rel 자리. 서버가 준 경로가 dest 밖(절대 경로·`..`)을 가리키면 쓰지 않는다."""
+    root = Path(dest).resolve()
+    target = (root / rel).resolve()
+    if not rel or target == root or not target.is_relative_to(root):
+        raise ValueError(f"refusing to write {rel!r} outside {root}")
+    return target
+
+
+def _download_failed(file: DownloadFile, status_code: int) -> MeshiveAPIError:
+    return MeshiveAPIError(status_code, f"Downloading {file.path} failed (HTTP {status_code}). Download links "
+                                        "expire; request new ones and try again.")
+
+
+def _incomplete(download: AssetDownload) -> MeshiveError:
+    return MeshiveError(f"Only {len(download.files)} of {download.expected_file_count} files of "
+                        f"{download.asset_id} could be signed. Try again in a moment.")
 
 
 def _path_segment(value: str, name: str) -> str:
@@ -585,12 +626,61 @@ class Meshive(_BaseClient):
         return AssetPage.from_dict(data, namespace_name=workspace)
 
     def get_asset(self, asset_id: str) -> Asset:
-        """자산 상세 — 버전 스택과 파일 목록 포함 (GET /assets/{asset_id})."""
+        """자산 상세 — 파일 목록과 사용 중인 곳 포함 (GET /assets/{asset_id})."""
         return Asset.from_dict(self._get(f"/assets/{_path_segment(asset_id, 'asset_id')}"))
 
     def get_asset_storage(self, workspace: str) -> AssetStorage:
         """managed 자산 저장량/월 예상 비용/크레딧 차단 상태 (GET /assets/storage-summary?workspace=)."""
         return AssetStorage.from_dict(self._get("/assets/storage-summary", params={"workspace": workspace}))
+
+    # --- 다운로드 (read 스코프) ------------------------------------------------------
+
+    def asset_download_urls(self, asset_id: str, *, paths: str | Iterable[str] | None = None) -> AssetDownload:
+        """자산 파일별 presigned GET URL (GET /assets/{asset_id}/download-urls?path=). `paths` 는 파일 경로
+        glob(fnmatch) 목록 — 요청당 파일 수 상한이 있어 큰 자산은 나눠 받는다. 링크된 외부 자산은 받을 수 없다."""
+        try:
+            data = self._get(f"/assets/{_path_segment(asset_id, 'asset_id')}/download-urls", params=_paths_param(paths))
+        except NotFoundError as err:
+            raise _not_supported(err, "asset downloads") from None
+        return AssetDownload.from_dict(data, asset_id=asset_id)
+
+    def download_asset(self, asset_id: str, dest: str | os.PathLike[str], *,
+                       paths: str | Iterable[str] | None = None) -> list[Path]:
+        """자산 파일을 `dest` 아래 자산 안 상대 경로 그대로 내려받고, 쓴 파일 경로를 돌려준다(있으면 덮어쓴다)."""
+        download = self.asset_download_urls(asset_id, paths=paths)
+        if not download.complete:
+            raise _incomplete(download)
+        return [self._save(f, dest) for f in download.files]
+
+    def task_outputs(self, task_id: str) -> TaskOutputs:
+        """task 결과물 파일과 presigned URL (GET /tasks/{task_id}/outputs)."""
+        try:
+            data = self._get(f"/tasks/{_path_segment(task_id, 'task_id')}/outputs")
+        except NotFoundError as err:
+            raise _not_supported(err, "task outputs") from None
+        return TaskOutputs.from_dict(data, task_id=task_id)
+
+    def download_task_outputs(self, task_id: str, dest: str | os.PathLike[str]) -> list[Path]:
+        """task 결과물을 `dest` 아래로 내려받고, 쓴 파일 경로를 돌려준다."""
+        return [self._save(f, dest) for f in self.task_outputs(task_id).files]
+
+    def _save(self, file: DownloadFile, dest: str | os.PathLike[str]) -> Path:
+        # presigned URL 이라 인증 헤더 없이 보낸다 — Meshive 키를 스토리지로 보내지 않는다.
+        target = _download_target(dest, file.path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        part = target.with_name(target.name + ".part")
+        try:
+            with self._client.stream("GET", file.url) as response:
+                if response.status_code >= 400:
+                    raise _download_failed(file, response.status_code)
+                with open(part, "wb") as fh:
+                    for chunk in response.iter_bytes():
+                        fh.write(chunk)
+            os.replace(part, target)
+        except BaseException:
+            part.unlink(missing_ok=True)
+            raise
+        return target
 
     # --- 쓰기: 파드 (write 스코프) ---------------------------------------------------
 
@@ -1010,13 +1100,63 @@ class AsyncMeshive(_BaseClient):
         return AssetPage.from_dict(data, namespace_name=workspace)
 
     async def get_asset(self, asset_id: str) -> Asset:
-        """자산 상세 — 버전 스택과 파일 목록 포함 (GET /assets/{asset_id})."""
+        """자산 상세 — 파일 목록과 사용 중인 곳 포함 (GET /assets/{asset_id})."""
         return Asset.from_dict(await self._get(f"/assets/{_path_segment(asset_id, 'asset_id')}"))
 
     async def get_asset_storage(self, workspace: str) -> AssetStorage:
         """managed 자산 저장량/월 예상 비용/크레딧 차단 상태 (GET /assets/storage-summary?workspace=)."""
         data = await self._get("/assets/storage-summary", params={"workspace": workspace})
         return AssetStorage.from_dict(data)
+
+    # --- 다운로드 (read 스코프) ------------------------------------------------------
+
+    async def asset_download_urls(self, asset_id: str, *,
+                                  paths: str | Iterable[str] | None = None) -> AssetDownload:
+        """자산 파일별 presigned GET URL (GET /assets/{asset_id}/download-urls?path=)."""
+        try:
+            data = await self._get(f"/assets/{_path_segment(asset_id, 'asset_id')}/download-urls",
+                                   params=_paths_param(paths))
+        except NotFoundError as err:
+            raise _not_supported(err, "asset downloads") from None
+        return AssetDownload.from_dict(data, asset_id=asset_id)
+
+    async def download_asset(self, asset_id: str, dest: str | os.PathLike[str], *,
+                             paths: str | Iterable[str] | None = None) -> list[Path]:
+        """자산 파일을 `dest` 아래 상대 경로 그대로 내려받고, 쓴 파일 경로를 돌려준다."""
+        download = await self.asset_download_urls(asset_id, paths=paths)
+        if not download.complete:
+            raise _incomplete(download)
+        return [await self._save(f, dest) for f in download.files]
+
+    async def task_outputs(self, task_id: str) -> TaskOutputs:
+        """task 결과물 파일과 presigned URL (GET /tasks/{task_id}/outputs)."""
+        try:
+            data = await self._get(f"/tasks/{_path_segment(task_id, 'task_id')}/outputs")
+        except NotFoundError as err:
+            raise _not_supported(err, "task outputs") from None
+        return TaskOutputs.from_dict(data, task_id=task_id)
+
+    async def download_task_outputs(self, task_id: str, dest: str | os.PathLike[str]) -> list[Path]:
+        """task 결과물을 `dest` 아래로 내려받고, 쓴 파일 경로를 돌려준다."""
+        return [await self._save(f, dest) for f in (await self.task_outputs(task_id)).files]
+
+    async def _save(self, file: DownloadFile, dest: str | os.PathLike[str]) -> Path:
+        # presigned URL 이라 인증 헤더 없이 보낸다 — Meshive 키를 스토리지로 보내지 않는다.
+        target = _download_target(dest, file.path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        part = target.with_name(target.name + ".part")
+        try:
+            async with self._client.stream("GET", file.url) as response:
+                if response.status_code >= 400:
+                    raise _download_failed(file, response.status_code)
+                with open(part, "wb") as fh:
+                    async for chunk in response.aiter_bytes():
+                        fh.write(chunk)
+            os.replace(part, target)
+        except BaseException:
+            part.unlink(missing_ok=True)
+            raise
+        return target
 
     # --- 쓰기: 파드 (write 스코프) ---------------------------------------------------
 

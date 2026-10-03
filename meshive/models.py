@@ -1158,6 +1158,74 @@ class Asset:
 
 
 @dataclass
+class DownloadFile:
+    """다운로드할 파일 하나 — presigned URL 은 짧게 산다(`expires_in`). URL 에 Meshive 키를 붙이지 말 것."""
+
+    path: str                  # 자산 안 상대 경로 / task 결과물 파일 이름
+    url: str
+    size_bytes: int | None = None
+    content_hash: str | None = None
+
+
+@dataclass
+class AssetDownload:
+    """GET /v1/sdk/assets/{id}/download-urls 응답 — 자산 파일별 presigned URL."""
+
+    asset_id: str
+    name: str
+    files: list[DownloadFile]
+    expires_in: int            # URL 유효 시간(초)
+    # 서버가 발급했어야 할 파일 수. files 가 이보다 적으면 일부 서명이 실패한 것이다(다시 요청).
+    expected_file_count: int | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def complete(self) -> bool:
+        return self.expected_file_count is None or len(self.files) >= self.expected_file_count
+
+    @classmethod
+    def from_dict(cls, d: dict, *, asset_id: str = "") -> "AssetDownload":
+        items = [i for i in d.get("items") or [] if isinstance(i, dict)]
+        item = items[0] if items else {}
+        expected = item.get("expectedFileCount")
+        return cls(
+            asset_id=item.get("assetExternalId") or asset_id,
+            name=str(item.get("name", "") or ""),
+            files=[DownloadFile(path=str(f.get("relativePath", "")), url=str(f.get("url", "")),
+                                size_bytes=f.get("sizeBytes"), content_hash=f.get("contentHash"))
+                   for f in item.get("files") or [] if isinstance(f, dict)],
+            expires_in=_as_int(d.get("expiresIn")),
+            expected_file_count=None if expected is None else _as_int(expected),
+            raw=d,
+        )
+
+
+@dataclass
+class TaskOutputs:
+    """GET /v1/sdk/tasks/{id}/outputs 응답 — task 결과물 파일과 presigned URL(수 시간 유효)."""
+
+    task_id: str
+    files: list[DownloadFile]
+    expired: bool              # 결과물이 지워졌다(자산 삭제 등) — files 가 비어 있다
+    storage_provider: str      # meshive_r2 (managed) | user_s3
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict, *, task_id: str = "") -> "TaskOutputs":
+        destination = d.get("destination") or {}
+        return cls(
+            task_id=task_id,
+            # downloadUrl 은 첨부(attachment)로 서명된 것 — 없으면 미리보기 url 로도 받을 수 있다.
+            files=[DownloadFile(path=str(f.get("filename", "")), url=str(f.get("downloadUrl") or f.get("url") or ""),
+                                size_bytes=f.get("sizeBytes"))
+                   for f in d.get("files") or [] if isinstance(f, dict)],
+            expired=bool(d.get("expired", False)),
+            storage_provider=str(destination.get("provider", "") or ""),
+            raw=d,
+        )
+
+
+@dataclass
 class AssetPage:
     """GET /v1/sdk/assets 응답 한 페이지. `for asset in page` 로 항목을 순회한다."""
 

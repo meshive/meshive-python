@@ -1,5 +1,6 @@
 import argparse
 import importlib
+from pathlib import Path
 import json
 from datetime import date, datetime, timezone
 
@@ -22,6 +23,7 @@ from meshive.models import (
     CreditHistoryEntry,
     DailyCost,
     DailyEarning,
+    DownloadFile,
     Earnings,
     GpuAvailability,
     GpuUsage,
@@ -37,6 +39,7 @@ from meshive.models import (
     Storage,
     Task,
     TaskInputAsset,
+    TaskOutputs,
     Template,
     Transaction,
     WhoAmI,
@@ -234,6 +237,23 @@ class FakeClient:
                      files=[AssetFile("a.bin", 1_000_000, "ready"), AssetFile("b.bin", 500_000, "ready")],
                      active_usage_contexts=[AssetUsage("pod", "pod-run", "trainer", "running")],
                      raw={"assetExternalId": asset_id})
+
+    def download_asset(self, asset_id, dest, *, paths=None):
+        FakeClient.last_call = ("download_asset", (asset_id, str(dest)), {"paths": paths})
+        target = Path(dest) / "config" / "a.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"12345")
+        return [target]
+
+    def task_outputs(self, task_id):
+        return TaskOutputs(task_id, [DownloadFile("result.csv", "https://r2/x", 2048)], False, "meshive_r2",
+                           raw={"files": [{"filename": "result.csv"}]})
+
+    def download_task_outputs(self, task_id, dest):
+        target = Path(dest) / "result.csv"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"ok")
+        return [target]
 
     def get_asset_storage(self, workspace):
         return AssetStorage(2_147_483_648, 0.015, 0.03, "grace", False, None,
@@ -947,3 +967,21 @@ def test_transactions_table_paints_status_on_a_tty(monkeypatch, capsys):
     monkeypatch.setattr(cli.fmt, "color_enabled", lambda stream=None: True)
     assert cli.main(["transactions", "ns"]) == 0
     assert "\033[31m● failed" in capsys.readouterr().out    # failed 상태 칸은 빨강
+
+
+def test_asset_download_saves_under_asset_id_by_default(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["asset-download", "asset_data", "--path", "config/*"]) == 0
+    out = capsys.readouterr().out
+    assert FakeClient.last_call == ("download_asset", ("asset_data", "asset_data"), {"paths": ["config/*"]})
+    assert "asset_data/config/a.json" in out and "5 B" in out and "1 file downloaded." in out
+    assert cli.main(["asset-download", "asset_data", "-d", "out", "-o", "name"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["out/config/a.json"]
+
+
+def test_task_outputs_lists_and_downloads(tmp_path, capsys):
+    assert cli.main(["task-outputs", "task_a"]) == 0
+    out = capsys.readouterr().out
+    assert "result.csv" in out and "2.0 KiB" in out
+    assert cli.main(["task-outputs", "task_a", "--download", str(tmp_path)]) == 0
+    assert "result.csv" in capsys.readouterr().out and (tmp_path / "result.csv").read_bytes() == b"ok"

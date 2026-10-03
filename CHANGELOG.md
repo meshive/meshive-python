@@ -14,12 +14,18 @@ pip install -U meshive
 
 ## v0.1.3
 
-`meshive pod` shows a pod's URLs and connect credentials (secret values only with `--show-secrets`) and why it was
-stopped or cannot start on its node, assets are read without versions, and transactions and tasks explain input
+Asset files and task outputs can be downloaded, `meshive pod` shows a pod's URLs and connect credentials (secret
+values only with `--show-secrets`) and why it was stopped or cannot start on its node, assets are read without versions, and transactions and tasks explain input
 asset downloads and output uploads. Confirmation questions no longer break `-o json` and `-o name` output.
 
 ### SDK
 
+- Downloads: `asset_download_urls(asset_id, paths=)` returns each file's short-lived link, `download_asset(asset_id,
+  dest, paths=)` saves the files under `dest` with their paths inside the asset, and `task_outputs(task_id)` /
+  `download_task_outputs(task_id, dest)` do the same for a task's results. `paths` takes globs such as `config/*`.
+  A read key is enough. The links go to storage without your API key, and a path that would land outside `dest` is
+  refused. Linked assets (fetched from Hugging Face or CivitAI when a pod starts) can't be downloaded. Against a
+  server that predates this, the 404 says so.
 - `Pod` has the pod's connection details: `endpoints` (name, port, URL, `readiness` ready/preparing/interrupted, read
   the same way as the console's Connect tab) and `connect_credentials` (the values the template shows on Connect,
   such as ComfyUI's auto-generated `ACCESS_PASSWORD`). Secret values are left out of `repr`.
@@ -39,6 +45,8 @@ asset downloads and output uploads. Confirmation questions no longer break `-o j
 
 ### CLI
 
+- `meshive asset-download <id> [-d DIR] [--path GLOB]` saves an asset's files (into `./<id>` by default), and
+  `meshive task-outputs <task_id> [--download DIR]` lists or saves a task's output files.
 - `meshive pod` lists the pod's URLs and connect credentials. Secret values are hidden unless you pass
   `--show-secrets`. It also says when the system stopped the pod and why, why it cannot start on its node now, and
   what it is waiting for. `-o json` prints the server's payload as before, secret values included.

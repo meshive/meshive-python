@@ -955,7 +955,7 @@ def _print_asset_storage(s: AssetStorage, color: bool) -> None:
         if s.purge_deadline_at:
             state += f" (managed assets are deleted {fmt.relative_time(s.purge_deadline_at)} unless credit is added)"
     print(f"credit:        {fmt.paint(fmt.clean(state), tone, color)}")
-    print(f"paid balance:  {'available' if s.paid_balance_available else 'none (pods and tasks cannot start)'}")
+    print(f"billing credit: {'available' if s.paid_balance_available else 'none (pods and tasks cannot start)'}")
 
 
 def _print_api_keys(keys: list[ApiKey], color: bool) -> None:
@@ -983,8 +983,6 @@ def _print_api_keys(keys: list[ApiKey], color: bool) -> None:
 
 def _print_credit(c: Credit, color: bool) -> None:
     print(f"balance:         {fmt.money(c.balance)}")
-    print(f"paid:            {fmt.money(c.paid_balance)}")
-    print(f"bonus:           {fmt.money(c.bonus_balance)}  (serverless inference only)")
     if c.auto_recharge:
         recharge = f"on (add {fmt.money(c.auto_recharge_amount)} when below {fmt.money(c.auto_recharge_threshold)})"
     else:

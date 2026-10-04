@@ -61,7 +61,7 @@ class NotFoundError(MeshiveAPIError):
 
 
 class InsufficientCreditError(MeshiveAPIError):
-    """402 — 유료 크레딧 잔액 부족 (파드/스토리지/태스크 생성·시작 시)."""
+    """402 — 워크스페이스 billing 계정의 크레딧 잔액 부족 (파드/스토리지/태스크 생성·시작 시)."""
 
 
 class ConflictError(MeshiveAPIError):

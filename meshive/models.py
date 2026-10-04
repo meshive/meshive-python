@@ -758,8 +758,9 @@ class ApiKey:
 class Credit:
     """GET /v1/sdk/credit 응답 — 크레딧 잔액 (USD).
 
-    balance = paid_balance + bonus_balance. bonus 는 serverless 추론에만 쓸 수 있고,
-    GPU 파드/워크스페이스 실행에는 paid_balance 가 필요하다.
+    잔액은 balance 한 종류다 — 파드·태스크·서버리스 모두 이 잔액에서 빠진다. paid_balance·bonus_balance 는
+    무료 크레딧 폐기(2026-10) 전 실결제/보너스 구분의 흔적으로, 서버는 paid_balance = balance,
+    bonus_balance = 0 을 보낸다(하위호환으로 필드만 남긴다).
     """
 
     balance: float

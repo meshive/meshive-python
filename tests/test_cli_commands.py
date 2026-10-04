@@ -725,7 +725,9 @@ def test_api_keys_output_and_alias(capsys):
 def test_credit_output_and_name(capsys):
     assert cli.main(["credit"]) == 0
     out = capsys.readouterr().out
-    assert "$110.00" in out and "$100.00" in out and "$10.00" in out
+    assert "balance:         $110.00" in out
+    # 무료 크레딧 폐기(2026-10) — paid/bonus 구분 줄은 찍지 않는다(필드는 하위호환으로 모델에 남는다)
+    assert "paid:" not in out and "bonus" not in out
     assert "on (add $50.00 when below $10.00)" in out and "on file" in out
     assert cli.main(["credit", "-o", "name"]) == 0
     assert capsys.readouterr().out.strip() == "110.00"
@@ -934,7 +936,8 @@ def test_asset_storage_output_and_name(capsys):
     assert "managed:       2.00 GiB" in out
     assert "$0.02 per GiB-month" in out and "$0.03" in out   # 자산 저장 과금은 GiB 당
     assert "grace (uploads block in" in out
-    assert "none (pods and tasks cannot start)" in out
+    assert "billing credit: none (pods and tasks cannot start)" in out
+    assert "paid balance:" not in out
     assert cli.main(["asset-storage", "ns", "-o", "name"]) == 0
     assert capsys.readouterr().out.strip() == "0.03"
 

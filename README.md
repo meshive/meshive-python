@@ -55,7 +55,7 @@ explicit `idempotency_key` and `get_operation` for automation that must survive 
 meshive --version
 meshive me                     # current API key's owner
 meshive api-keys               # your API keys (prefixes only — the secret is never shown)
-meshive credit                 # credit balance, paid vs bonus, auto-recharge
+meshive credit                 # credit balance, auto-recharge
 meshive credit-history         # top-ups and refunds (--since/--until YYYY-MM-DD)
 
 meshive workspaces             # list workspaces
@@ -202,7 +202,7 @@ with Meshive() as client:               # reads MESHIVE_API_KEY / MESHIVE_BASE_U
 
     # account
     credit = client.get_credit()
-    print(credit.paid_balance, credit.bonus_balance)
+    print(credit.balance)
     for key in client.list_api_keys():
         print(key.prefix, key.last_used_at)   # prefixes only; the secret is never returned
 

@@ -3,10 +3,13 @@
 Both clients share the request building and response parsing logic (_build_headers, _process);
 only the transport differs (httpx.Client vs httpx.AsyncClient).
 
-Authentication: Meshive API key (READ scope). `Authorization: Bearer meshive_...`.
-Surface: the SDK read API — account (me/api-keys/credit/earnings),
-workspaces (list/detail/members), pods (list/single/metrics), storage, machines (list/single/metrics),
-GPU availability, templates, serverless (servings/tasks), assets (Asset Hub). All GET, so retries are safe.
+Authentication: Meshive API key, `Authorization: Bearer meshive_...`. Reads, estimates, logs and downloads need the
+read scope; creating, changing or deleting pods, storage, servings, tasks, model registrations and asset imports, and
+SSH access, need the write scope.
+Read surface: account (me/api-keys/credit/earnings), workspaces (list/detail/members), pods (list/single/metrics),
+storage, machines (list/single/metrics), GPU availability, templates, serverless (servings/tasks), assets (Asset Hub).
+Retries are safe for both: GETs are idempotent, and writes resend the same Idempotency-Key, so the
+server replays the first response instead of creating twice.
 """
 from __future__ import annotations
 

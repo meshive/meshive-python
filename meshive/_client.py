@@ -1,12 +1,12 @@
-"""Meshive SDK 클라이언트 (동기 Meshive / 비동기 AsyncMeshive).
+"""Meshive SDK clients (sync Meshive / async AsyncMeshive).
 
-두 클라이언트는 요청 구성·응답 파싱 로직(_build_headers, _process)을 공유하고
-transport(httpx.Client vs httpx.AsyncClient)만 다르다.
+Both clients share the request building and response parsing logic (_build_headers, _process);
+only the transport differs (httpx.Client vs httpx.AsyncClient).
 
-인증: Meshive API Key (READ scope). `Authorization: Bearer meshive_...`.
-대상 표면: routers/sdk/app.py 의 read allowlist — 계정(me/api-keys/credit/earnings),
-워크스페이스(목록/상세/멤버), 파드(목록/단건/메트릭), 스토리지, 머신(목록/단건/메트릭),
-GPU 가용량, 템플릿, 서버리스(servings/tasks), 자산(Asset Hub). 전부 GET 이라 재시도가 안전하다.
+Authentication: Meshive API key (READ scope). `Authorization: Bearer meshive_...`.
+Surface: the SDK read API — account (me/api-keys/credit/earnings),
+workspaces (list/detail/members), pods (list/single/metrics), storage, machines (list/single/metrics),
+GPU availability, templates, serverless (servings/tasks), assets (Asset Hub). All GET, so retries are safe.
 """
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ from .models import (
 
 
 def _paths_param(paths: str | Iterable[str] | None) -> dict[str, Any] | None:
-    """자산 파일 경로 glob(fnmatch) — 반복 쿼리 `path=a&path=b`. 없으면 전체."""
+    """Asset file path globs (fnmatch) — repeated query `path=a&path=b`. Everything if omitted."""
     if not paths:
         return None
     values = [paths] if isinstance(paths, str) else [p for p in paths if p]
@@ -89,9 +89,9 @@ def _paths_param(paths: str | Iterable[str] | None) -> dict[str, Any] | None:
 
 
 def _not_supported(err: MeshiveAPIError, what: str) -> MeshiveAPIError:
-    """라우트가 없는 옛 서버의 응답을 알아듣게 바꾼다 — FastAPI 기본 404 `{"detail": "Not Found"}`(title 없음), 또는
-    같은 경로에 다른 메서드만 있을 때의 405(POST /assets/import ↔ GET /assets/{id}). 자산·task 가 없을 때의 404 는
-    title 이 있으므로 그대로 둔다."""
+    """Make responses from older servers without the route understandable — FastAPI's default 404 `{"detail": "Not Found"}` (no title), or
+    the 405 when the same path only has a different method (POST /assets/import ↔ GET /assets/{id}). A 404 for a missing asset or task
+    has a title, so it is left alone."""
     if not (err.status_code == 405 or (err.status_code == 404 and err.title is None)):
         return err
     return NotFoundError(404, f"This Meshive API server does not support {what} yet (it predates this SDK "
@@ -99,7 +99,7 @@ def _not_supported(err: MeshiveAPIError, what: str) -> MeshiveAPIError:
 
 
 def _download_target(dest: str | os.PathLike[str], rel: str) -> Path:
-    """dest 아래 rel 자리. 서버가 준 경로가 dest 밖(절대 경로·`..`)을 가리키면 쓰지 않는다."""
+    """The rel location under dest. Nothing is written if the server-provided path points outside dest (absolute path, `..`)."""
     root = Path(dest).resolve()
     target = (root / rel).resolve()
     if not rel or target == root or not target.is_relative_to(root):
@@ -118,22 +118,22 @@ def _incomplete(download: AssetDownload) -> MeshiveError:
 
 
 def _path_segment(value: str, name: str) -> str:
-    """URL 경로 세그먼트 인코딩. `/`·`?`·`#` 등이 섞인 값이 경로 구조를 바꾸거나
-    (`../me` → 다른 엔드포인트) 쿼리를 주입하지 못하게 percent-encode 한다."""
+    """Encode a URL path segment. Percent-encodes so values containing `/`, `?`, `#`, ... can't change the path structure
+    (`../me` → a different endpoint) or inject a query."""
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
     return quote(value, safe="")
 
 
 def _query_value(value: str, name: str) -> str:
-    """쿼리 파라미터용 문자열 검증. 인코딩은 httpx 가 하므로 여기서 하지 않는다(이중 인코딩 방지)."""
+    """Validate a string for a query parameter. httpx does the encoding, so it isn't done here (avoids double encoding)."""
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
     return value.strip()
 
 
 def _int_segment(value: int | str, name: str) -> str:
-    """정수 ID(template/serving) 경로 세그먼트. bool 은 int 의 서브클래스라 따로 거른다."""
+    """Integer ID (template/serving) path segment. bool is a subclass of int, so it's filtered out separately."""
     if isinstance(value, bool) or not isinstance(value, (int, str)):
         raise ValueError(f"{name} must be an integer")
     try:
@@ -145,15 +145,15 @@ def _int_segment(value: int | str, name: str) -> str:
     return str(number)
 
 
-# --- 쿼리 파라미터 구성 (sync/async 클라이언트가 공유) ----------------------------
-# 서버 표면은 camelCase 쿼리(startDate/rentalType/appType)를 받는다. 값 검증은 서버 왕복
-# 전에 여기서 끝내 "조용히 빈 결과" 대신 ValueError 로 알린다.
+# --- Query parameter building (shared by the sync/async clients) -------------------
+# The server surface takes camelCase queries (startDate/rentalType/appType). Values are validated here,
+# before the round trip, and raise ValueError instead of returning a silent empty result.
 
 _RENTAL_TYPES = ("demand", "spot")
 
 
 def _iso_date(value: date | datetime | str, name: str) -> str:
-    """date/datetime/'YYYY-MM-DD' → 'YYYY-MM-DD'. datetime 은 date 의 서브클래스라 먼저 본다."""
+    """date/datetime/'YYYY-MM-DD' → 'YYYY-MM-DD'. datetime is a subclass of date, so it's checked first."""
     if isinstance(value, datetime):
         return value.date().isoformat()
     if isinstance(value, date):
@@ -168,7 +168,7 @@ def _iso_date(value: date | datetime | str, name: str) -> str:
 
 def _date_range_params(start_date: date | datetime | str | None,
                        end_date: date | datetime | str | None) -> dict[str, str]:
-    """startDate/endDate 쿼리. 둘 다 None 이면 빈 dict (서버 기본: 최근 90일)."""
+    """startDate/endDate query. An empty dict if both are None (server default: last 90 days)."""
     params: dict[str, str] = {}
     if start_date is not None:
         params["startDate"] = _iso_date(start_date, "start_date")
@@ -227,8 +227,8 @@ def _tasks_params(workspace: str, status: str | Iterable[str] | None,
     return params
 
 
-# 예외 message 상한 — 프록시/게이트웨이가 거대한 HTML 등을 돌려줘도 예외 메시지와
-# 로그가 폭주하지 않게 자른다. 원본 전체는 MeshiveAPIError.raw 로 접근 가능.
+# Cap on the exception message — even if a proxy/gateway returns a huge HTML page, exception messages
+# and logs don't blow up. The full original is available as MeshiveAPIError.raw.
 _MAX_ERROR_MESSAGE_LEN = 2000
 
 
@@ -239,7 +239,7 @@ def _truncate(text: str) -> str:
 
 
 def _extract_error(payload: Any) -> tuple[str | None, str]:
-    """서버 detail({"title","message"})에서 (title, message) 추출. 형식이 다르면 best-effort."""
+    """Extract (title, message) from the server's detail ({"title","message"}). Best-effort for other shapes."""
     if isinstance(payload, dict):
         detail = payload.get("detail", payload)
         if isinstance(detail, dict):
@@ -256,12 +256,12 @@ def _retry_after(headers: httpx.Headers) -> float | None:
         value = float(raw)
     except (TypeError, ValueError):
         return None
-    # "inf"/"nan"/음수도 float() 을 통과한다 — 이 값으로 sleep 하는 호출자를 보호.
+    # "inf"/"nan"/negative values also pass float() — protects callers that sleep on this value.
     return value if math.isfinite(value) and value >= 0 else None
 
 
 def _raise_for_status(status_code: int, payload: Any, headers: httpx.Headers) -> None:
-    """4xx/5xx → 적절한 MeshiveAPIError 하위 예외."""
+    """4xx/5xx → the matching MeshiveAPIError subclass."""
     if status_code < 400:
         return
     title, message = _extract_error(payload)
@@ -281,15 +281,15 @@ def _raise_for_status(status_code: int, payload: Any, headers: httpx.Headers) ->
     raise MeshiveAPIError(status_code, message, **common)
 
 
-# --- 재시도 -----------------------------------------------------------------
-# 일시적 실패(rate limit / 게이트웨이 오류 / 커넥션 끊김)만 재시도한다. 다른 4xx 는
-# 재시도해도 결과가 같으므로 즉시 raise. GET 은 멱등이고, 쓰기 요청은 Idempotency-Key 를
-# 같은 값으로 다시 보내므로(서버가 첫 응답을 재생) 이중 생성 없이 재시도할 수 있다.
+# --- Retries -----------------------------------------------------------------
+# Only transient failures (rate limit / gateway errors / dropped connections) are retried. Other 4xx
+# give the same result on retry, so they raise immediately. GET is idempotent, and write requests resend the same
+# Idempotency-Key (the server replays the first response), so they can be retried without double creation.
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 _RETRY_EXCEPTIONS = (httpx.ConnectError, httpx.TimeoutException)
 _RETRY_BACKOFF = 0.5  # 0.5s → 1s → 2s ...
-# Retry-After 가 이보다 길면 기다리지 않고 RateLimitError 를 그대로 올린다 —
-# 스크립트가 영문도 모르고 몇 분씩 멈춰 있는 편이 에러보다 나쁘다.
+# If Retry-After is longer than this, don't wait — raise RateLimitError as-is.
+# A script silently stuck for minutes is worse than an error.
 _MAX_RETRY_AFTER = 60.0
 
 
@@ -307,7 +307,7 @@ class _BaseClient:
         self._base_url = _config.resolve_base_url(base_url)
         self._timeout = timeout
         self._max_retries = max_retries
-        # 추가 헤더(예: MCP 서버가 싣는 X-Meshive-Client). 인증/Accept 는 덮어쓸 수 없다.
+        # Extra headers (e.g. X-Meshive-Client sent by the MCP server). Can't override auth/Accept.
         self._extra_headers = {str(k): str(v) for k, v in (headers or {}).items()
                                if k.lower() not in ("authorization", "accept")}
 
@@ -341,9 +341,9 @@ class _BaseClient:
         return payload
 
     def _retry_delay(self, attempt: int, response: httpx.Response | None = None) -> float | None:
-        """재시도 대기 시간(초). 재시도하지 않을 상황이면 None.
+        """Retry wait time (seconds). None when it shouldn't retry.
 
-        response=None 은 네트워크 예외를 뜻한다 (응답 자체가 없음).
+        response=None means a network exception (no response at all).
         """
         if attempt >= self._max_retries:
             return None
@@ -357,14 +357,14 @@ class _BaseClient:
         return after if after <= _MAX_RETRY_AFTER else None
 
 
-# --- wait_for_pod 공통 판정 ---------------------------------------------------
-# 여기 도달하면 목표 상태로 갈 가능성이 없다 — timeout 을 채우지 않고 바로 실패시킨다.
-# (목표 상태로 지정된 값은 아래 _wait_targets 에서 제외한다.)
+# --- Shared wait_for_pod decisions --------------------------------------------
+# Reaching these means the target state can't happen — fail right away instead of waiting out the timeout.
+# (Values given as the target state are excluded in _wait_targets below.)
 _POD_TERMINAL_STATUSES = frozenset({"error", "terminated"})
 
 
 def _wait_targets(until: str | Iterable[str]) -> tuple[set[str], set[str]]:
-    """until → (목표 상태 set, 즉시 실패로 볼 상태 set). 비교는 소문자 기준."""
+    """until → (set of target states, set of states that fail immediately). Compared in lowercase."""
     values = [until] if isinstance(until, str) else list(until)
     targets = {s.lower() for s in values if s and s.strip()}
     if not targets:
@@ -394,16 +394,16 @@ def _wait_expired(deadline: float, label: str, targets: set[str], last: str) -> 
 
 
 class Meshive(_BaseClient):
-    """동기 Meshive SDK 클라이언트.
+    """Synchronous Meshive SDK client.
 
         from meshive import Meshive
 
-        client = Meshive()                 # MESHIVE_API_KEY / MESHIVE_BASE_URL 사용
+        client = Meshive()                 # uses MESHIVE_API_KEY / MESHIVE_BASE_URL
         me = client.me()
         for ws in client.list_workspaces():
             print(ws.namespace_name)
 
-    컨텍스트 매니저(`with Meshive() as client:`)로 쓰면 연결을 자동 정리한다.
+    Used as a context manager (`with Meshive() as client:`), connections are cleaned up automatically.
     """
 
     def __init__(
@@ -438,7 +438,7 @@ class Meshive(_BaseClient):
 
     def _send(self, method: str, path: str, *, params: dict[str, Any] | None = None,
               json: dict[str, Any] | None = None, idempotency_key: str | None = None) -> Any:
-        """쓰기 요청. Idempotency-Key 를 붙여 보내므로 재시도해도 서버가 첫 응답을 재생한다(이중 생성 없음)."""
+        """Write request. Sent with an Idempotency-Key, so on retry the server replays the first response (no double creation)."""
         url = self._url(path)
         headers = self._build_headers()
         headers["Idempotency-Key"] = idempotency_key or str(uuid.uuid4())
@@ -476,29 +476,29 @@ class Meshive(_BaseClient):
                          params={"method": method, "path": path})
 
     def me(self) -> WhoAmI:
-        """현재 API Key 소유자 정보 (GET /me)."""
+        """Info about the owner of the current API key (GET /me)."""
         return WhoAmI.from_dict(self._get("/me"))
 
     def list_workspaces(self) -> list[Workspace]:
-        """내 워크스페이스 목록 (GET /workspaces)."""
+        """My workspaces (GET /workspaces)."""
         return [Workspace.from_dict(d) for d in self._get("/workspaces")]
 
     def list_pods(self, workspace: str) -> list[Pod]:
-        """워크스페이스의 파드 목록 (GET /pods?workspace=)."""
+        """Pods in a workspace (GET /pods?workspace=)."""
         data = self._get("/pods", params={"workspace": workspace})
         return [Pod.from_dict(d) for d in data.get("pods", [])]
 
     def get_pod(self, pod_name: str, workspace: str) -> Pod:
-        """파드 단건 (GET /pods/{pod_name}?workspace=)."""
+        """A single pod (GET /pods/{pod_name}?workspace=)."""
         segment = _path_segment(pod_name, "pod_name")
         return Pod.from_dict(self._get(f"/pods/{segment}", params={"workspace": workspace}))
 
     def list_machines(self) -> list[Machine]:
-        """host 로 등록한 머신 목록 (GET /machines). workspace 불필요 (host 가 직접 소유)."""
+        """Machines registered as a host (GET /machines). No workspace needed (the host owns them directly)."""
         return [Machine.from_dict(d) for d in self._get("/machines")]
 
     def get_machine(self, machine_id: str) -> Machine:
-        """머신 단건 (GET /machines/{machine_id})."""
+        """A single machine (GET /machines/{machine_id})."""
         return Machine.from_dict(self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}"))
 
     def wait_for_pod(
@@ -510,12 +510,12 @@ class Meshive(_BaseClient):
         timeout: float = 600.0,
         interval: float = 5.0,
     ) -> Pod:
-        """파드가 `until` 상태가 될 때까지 폴링하고 그 시점의 Pod 를 반환.
+        """Poll until the pod reaches the `until` state and return the Pod at that point.
 
             pod = client.wait_for_pod("pod-1", "my-workspace", until="running")
 
-        error/terminated 에 도달하면 timeout 을 채우지 않고 MeshiveError 를 올린다.
-        시간 초과는 WaitTimeoutError (MeshiveError 이자 내장 TimeoutError).
+        On error/terminated it raises MeshiveError without waiting out the timeout.
+        A timeout raises WaitTimeoutError (both a MeshiveError and a built-in TimeoutError).
         """
         targets, terminal = _wait_targets(until)
         deadline = time.monotonic() + timeout
@@ -528,123 +528,123 @@ class Meshive(_BaseClient):
             _wait_expired(deadline, pod_name, targets, last)
             time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
 
-    # --- 0.0.7 확장 read 표면 ------------------------------------------------
+    # --- 0.0.7 read surface extension ------------------------------------------------
 
     def get_workspace(self, workspace: str) -> WorkspaceDetail:
-        """워크스페이스 상세 — 비용/리소스 요약 (GET /workspaces/{namespace})."""
+        """Workspace details — cost/resource summary (GET /workspaces/{namespace})."""
         return WorkspaceDetail.from_dict(
             self._get(f"/workspaces/{_path_segment(workspace, 'workspace')}"))
 
     def list_members(self, workspace: str) -> list[Member]:
-        """워크스페이스 멤버 목록 (GET /members?workspace=)."""
+        """Workspace members (GET /members?workspace=)."""
         data = self._get("/members", params={"workspace": workspace})
         return [Member.from_dict(d) for d in data.get("members", [])]
 
     def list_storages(self, workspace: str) -> list[Storage]:
-        """워크스페이스의 스토리지(볼륨) 목록 (GET /storages?workspace=)."""
+        """Storage (volumes) in a workspace (GET /storages?workspace=)."""
         data = self._get("/storages", params={"workspace": workspace})
         return [Storage.from_dict(d) for d in data.get("storages", [])]
 
     def list_transactions(self, workspace: str) -> list[Transaction]:
-        """진행 중인 pod 작업 목록 (GET /transactions?workspace=).
+        """In-progress pod operations (GET /transactions?workspace=).
 
-        pod 이 `creating` 에서 오래 머무를 때 이유를 여기서 본다 — 이미지 pull 진행률,
-        자산 fetch, 실패 진단. 끝난 작업은 목록에서 빠지므로 **빈 목록은 "진행 중인 것 없음"**
-        이지 "실패 없음" 이 아니다."""
+        When a pod stays in `creating` for long, see why here — image pull progress,
+        asset fetch, failure diagnostics. Finished operations drop out of the list, so **an empty list means "nothing in progress"**,
+        not "no failures"."""
         return [Transaction.from_dict(d)
                 for d in self._get("/transactions", params={"workspace": workspace})]
 
     def get_storage(self, storage_name: str, workspace: str) -> Storage:
-        """스토리지 단건 (GET /storages/{storage_name}?workspace=). 인자 순서는 get_pod 와 동일."""
+        """A single storage (GET /storages/{storage_name}?workspace=). Same argument order as get_pod."""
         segment = _path_segment(storage_name, "storage_name")
         return Storage.from_dict(self._get(f"/storages/{segment}", params={"workspace": workspace}))
 
     def get_pod_metrics(self, pod_name: str, workspace: str) -> PodMetrics:
-        """파드 리소스 사용량 (GET /pods/{pod_name}/metrics?workspace=)."""
+        """Pod resource usage (GET /pods/{pod_name}/metrics?workspace=)."""
         segment = _path_segment(pod_name, "pod_name")
         return PodMetrics.from_dict(
             self._get(f"/pods/{segment}/metrics", params={"workspace": workspace}))
 
     def get_machine_metrics(self, machine_id: str) -> MachineMetrics:
-        """host 머신 실시간 메트릭 (GET /machines/{machine_id}/metrics)."""
+        """Live metrics of a host machine (GET /machines/{machine_id}/metrics)."""
         segment = _path_segment(machine_id, "machine_id")
         return MachineMetrics.from_dict(self._get(f"/machines/{segment}/metrics"))
 
     def list_gpus(self, *, rental_type: str = "demand",
                   min_vram: int | None = None) -> list[GpuAvailability]:
-        """지금 대여 가능한 GPU 티어와 가격 (GET /gpus?rentalType=&vram=)."""
+        """GPU tiers available to rent now, with prices (GET /gpus?rentalType=&vram=)."""
         return [GpuAvailability.from_dict(d)
                 for d in self._get("/gpus", params=_gpus_params(rental_type, min_vram))]
 
     def list_api_keys(self) -> list[ApiKey]:
-        """내 활성 API Key 목록 — prefix 만, 평문 없음 (GET /api-keys)."""
+        """My active API keys — prefixes only, no plaintext (GET /api-keys)."""
         return [ApiKey.from_dict(d) for d in self._get("/api-keys")]
 
     def get_credit(self) -> Credit:
-        """크레딧 잔액 + 자동충전 설정 (GET /credit)."""
+        """Credit balance + auto top-up settings (GET /credit)."""
         return Credit.from_dict(self._get("/credit"))
 
     def list_credit_history(self, *, start_date: date | datetime | str | None = None,
                             end_date: date | datetime | str | None = None) -> list[CreditHistoryEntry]:
-        """크레딧 충전/환불 내역 (GET /credit/history). 기본 최근 90일."""
+        """Credit top-up/refund history (GET /credit/history). Defaults to the last 90 days."""
         data = self._get("/credit/history", params=_date_range_params(start_date, end_date))
         return [CreditHistoryEntry.from_dict(d) for d in data]
 
     def get_earnings(self, *, start_date: date | datetime | str | None = None,
                      end_date: date | datetime | str | None = None) -> Earnings:
-        """host 수익 요약 + 일별 내역 (GET /earnings). 기본 최근 90일."""
+        """Host earnings summary + daily breakdown (GET /earnings). Defaults to the last 90 days."""
         return Earnings.from_dict(self._get("/earnings", params=_date_range_params(start_date, end_date)))
 
     def list_templates(self, workspace: str | None = None, *,
                        app_type: str | None = None) -> list[Template]:
-        """official 템플릿 (+ workspace 지정 시 그 워크스페이스의 custom 템플릿) (GET /templates)."""
+        """Official templates (+ that workspace's custom templates when workspace is given) (GET /templates)."""
         data = self._get("/templates", params=_templates_params(workspace, app_type))
         return [Template.from_dict(d) for d in data]
 
     def get_template(self, template_id: int | str, workspace: str | None = None) -> Template:
-        """템플릿 단건 (GET /templates/{template_id}). custom 템플릿은 workspace 를 함께 넘긴다."""
+        """A single template (GET /templates/{template_id}). Pass workspace along for custom templates."""
         params = {"workspace": workspace} if workspace else None
         segment = _int_segment(template_id, "template_id")
         return Template.from_dict(self._get(f"/templates/{segment}", params=params))
 
     def list_servings(self, workspace: str) -> list[Serving]:
-        """워크스페이스의 serverless serving 배포 목록 (GET /servings?workspace=)."""
+        """Serverless serving deployments in a workspace (GET /servings?workspace=)."""
         return [Serving.from_dict(d) for d in self._get("/servings", params={"workspace": workspace})]
 
     def get_serving(self, serving_id: int | str) -> Serving:
-        """serving 배포 단건 (GET /servings/{serving_id})."""
+        """A single serving deployment (GET /servings/{serving_id})."""
         return Serving.from_dict(self._get(f"/servings/{_int_segment(serving_id, 'serving_id')}"))
 
     def list_tasks(self, workspace: str, *, status: str | Iterable[str] | None = None,
                    limit: int = 50, offset: int = 0) -> list[Task]:
-        """워크스페이스의 serverless task 목록, 최신순 (GET /tasks?workspace=&status=&limit=&offset=)."""
+        """Serverless tasks in a workspace, newest first (GET /tasks?workspace=&status=&limit=&offset=)."""
         data = self._get("/tasks", params=_tasks_params(workspace, status, limit, offset))
         return [Task.from_dict(d) for d in data]
 
     def get_task(self, task_id: str) -> Task:
-        """task 단건 — 스크립트/설정/비용 분해는 `.raw` (GET /tasks/{task_id})."""
+        """A single task — script/settings/cost breakdown are in `.raw` (GET /tasks/{task_id})."""
         return Task.from_dict(self._get(f"/tasks/{_path_segment(task_id, 'task_id')}"))
 
     def list_assets(self, workspace: str, *, asset_type: str | None = None, status: str | None = None,
                     page: int = 1, page_size: int = 20) -> AssetPage:
-        """워크스페이스 자산 목록 한 페이지 (GET /assets?workspace=&assetType=&status=&page=&pageSize=).
-        status 미지정 시 deleted/purged/merged 는 제외된다."""
+        """One page of workspace assets (GET /assets?workspace=&assetType=&status=&page=&pageSize=).
+        Without status, deleted/purged/merged are excluded."""
         data = self._get("/assets", params=_assets_params(workspace, asset_type, status, page, page_size))
         return AssetPage.from_dict(data, namespace_name=workspace)
 
     def get_asset(self, asset_id: str) -> Asset:
-        """자산 상세 — 파일 목록과 사용 중인 곳 포함 (GET /assets/{asset_id})."""
+        """Asset details — including the file list and where it's in use (GET /assets/{asset_id})."""
         return Asset.from_dict(self._get(f"/assets/{_path_segment(asset_id, 'asset_id')}"))
 
     def get_asset_storage(self, workspace: str) -> AssetStorage:
-        """managed 자산 저장량/월 예상 비용/크레딧 차단 상태 (GET /assets/storage-summary?workspace=)."""
+        """Managed asset storage amount / estimated monthly cost / credit block state (GET /assets/storage-summary?workspace=)."""
         return AssetStorage.from_dict(self._get("/assets/storage-summary", params={"workspace": workspace}))
 
-    # --- 다운로드 (read 스코프) ------------------------------------------------------
+    # --- Downloads (read scope) ------------------------------------------------------
 
     def asset_download_urls(self, asset_id: str, *, paths: str | Iterable[str] | None = None) -> AssetDownload:
-        """자산 파일별 presigned GET URL (GET /assets/{asset_id}/download-urls?path=). `paths` 는 파일 경로
-        glob(fnmatch) 목록 — 요청당 파일 수 상한이 있어 큰 자산은 나눠 받는다. 링크된 외부 자산은 받을 수 없다."""
+        """Presigned GET URLs per asset file (GET /assets/{asset_id}/download-urls?path=). `paths` is a list of file path
+        globs (fnmatch) — there's a per-request file limit, so large assets are fetched in parts. Linked external assets can't be downloaded."""
         try:
             data = self._get(f"/assets/{_path_segment(asset_id, 'asset_id')}/download-urls", params=_paths_param(paths))
         except MeshiveAPIError as err:
@@ -653,14 +653,14 @@ class Meshive(_BaseClient):
 
     def download_asset(self, asset_id: str, dest: str | os.PathLike[str], *,
                        paths: str | Iterable[str] | None = None) -> list[Path]:
-        """자산 파일을 `dest` 아래 자산 안 상대 경로 그대로 내려받고, 쓴 파일 경로를 돌려준다(있으면 덮어쓴다)."""
+        """Download asset files under `dest`, keeping their relative paths inside the asset, and return the written paths (existing files are overwritten)."""
         download = self.asset_download_urls(asset_id, paths=paths)
         if not download.complete:
             raise _incomplete(download)
         return [self._save(f, dest) for f in download.files]
 
     def task_outputs(self, task_id: str) -> TaskOutputs:
-        """task 결과물 파일과 presigned URL (GET /tasks/{task_id}/outputs)."""
+        """Task output files and presigned URLs (GET /tasks/{task_id}/outputs)."""
         try:
             data = self._get(f"/tasks/{_path_segment(task_id, 'task_id')}/outputs")
         except MeshiveAPIError as err:
@@ -668,11 +668,11 @@ class Meshive(_BaseClient):
         return TaskOutputs.from_dict(data, task_id=task_id)
 
     def download_task_outputs(self, task_id: str, dest: str | os.PathLike[str]) -> list[Path]:
-        """task 결과물을 `dest` 아래로 내려받고, 쓴 파일 경로를 돌려준다."""
+        """Download task outputs under `dest` and return the written paths."""
         return [self._save(f, dest) for f in self.task_outputs(task_id).files]
 
     def _save(self, file: DownloadFile, dest: str | os.PathLike[str]) -> Path:
-        # presigned URL 이라 인증 헤더 없이 보낸다 — Meshive 키를 스토리지로 보내지 않는다.
+        # Presigned URLs are sent without the auth header — the Meshive key never goes to storage.
         target = _download_target(dest, file.path)
         target.parent.mkdir(parents=True, exist_ok=True)
         part = target.with_name(target.name + ".part")
@@ -689,7 +689,7 @@ class Meshive(_BaseClient):
             raise
         return target
 
-    # --- 쓰기: 파드 (write 스코프) ---------------------------------------------------
+    # --- Writes: pods (write scope) ---------------------------------------------------
 
     def estimate_pod(self, name: str, template_id: int, *, workspace: str, gpu_model: str | None = None,
                      gpu_count: int = 1, gpu_vram_gb: int | None = None, rental_type: str = "demand",
@@ -699,7 +699,7 @@ class Meshive(_BaseClient):
                      uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
                      max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
                      harvest_destination: Any = None) -> PodEstimate:
-        """파드 견적 — 아무것도 만들지 않는다(read 스코프로 충분). create_pod 와 인자가 같다."""
+        """Pod estimate — creates nothing (read scope is enough). Same arguments as create_pod."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
@@ -718,11 +718,11 @@ class Meshive(_BaseClient):
                    uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
                    max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
                    harvest_destination: Any = None, idempotency_key: str | None = None) -> PodCreated:
-        """파드 생성(202 수락). 시간당 요금이 발생한다 — 먼저 estimate_pod 로 가격을 확인하고,
-        max_price_per_hour 는 최종 compute 시간당 요금 상한이다. 초과 배치는 비동기로 실패할 수 있다.
-        스토리지(자동 PV 포함)와 자산 보관 요금은 별도이며 상한에서 제외된다.
-        input_assets 는 Asset Hub 자산을 붙이고("asset_id" 또는 {"asset", "target_dir", "role", "paths"}),
-        watched_folders 는 새 파일을 자산으로 올릴 폴더("path" 또는 {"path", "include", "include_existing"})."""
+        """Create a pod (202 accepted). It is billed hourly — check the price with estimate_pod first;
+        max_price_per_hour caps the final hourly compute price. Placement above it can fail asynchronously.
+        Storage (including the automatic PV) and asset storage charges are separate and not covered by the cap.
+        input_assets attaches Asset Hub assets ("asset_id" or {"asset", "target_dir", "role", "paths"}),
+        watched_folders are folders whose new files are uploaded as assets ("path" or {"path", "include", "include_existing"})."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
@@ -734,15 +734,15 @@ class Meshive(_BaseClient):
                                                 json=body, idempotency_key=idempotency_key))
 
     def stop_pod(self, pod_name: str, workspace: str, *, idempotency_key: str | None = None) -> ResourceAction:
-        """파드 정지(replicas=0). 파드 과금은 멈추고 스토리지 과금은 계속된다."""
+        """Stop a pod (replicas=0). Pod billing stops; storage billing continues."""
         data = self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/stop",
                              params={"workspace": _query_value(workspace, "workspace")}, idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="pod")
 
     def start_pod(self, pod_name: str, workspace: str, *, placement: str = "same_node",
                   allow_data_loss: bool = False, idempotency_key: str | None = None) -> ResourceAction:
-        """정지된 파드 시작. placement: same_node(원래 노드) | any_node(노드 이동 시 보존되지 않은 작업 파일 영구 삭제).
-        allow_data_loss=True 는 이 파드/이동 요청에 대한 별도 데이터 손실 동의다."""
+        """Start a stopped pod. placement: same_node (original node) | any_node (moving nodes permanently deletes work files that aren't preserved).
+        allow_data_loss=True is a separate data-loss consent for this pod/move request."""
         if not isinstance(allow_data_loss, bool):
             raise ValueError("allow_data_loss must be an explicit boolean")
         data = self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/start",
@@ -758,13 +758,13 @@ class Meshive(_BaseClient):
 
     def delete_pod(self, pod_name: str, workspace: str, *, delete_local_storages: Iterable[str] | None = None,
                    idempotency_key: str | None = None) -> ResourceAction:
-        """파드 삭제. 로컬(hostPath) 스토리지는 delete_local_storages 에 pv_name 을 적은 것만 같이 삭제된다."""
+        """Delete a pod. Local (hostPath) storage is deleted along with it only if its pv_name is listed in delete_local_storages."""
         data = self._send("DELETE", f"/pods/{_path_segment(pod_name, 'pod_name')}",
                              params=_write.delete_pod_params(_query_value(workspace, "workspace"), delete_local_storages),
                              idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="pod")
 
-    # --- 쓰기: 스토리지 ---------------------------------------------------------------
+    # --- Writes: storage ---------------------------------------------------------------
 
     def estimate_storage(self, name: str, size_gb: int, *, workspace: str, storage_type: str = "nfs",
                          disk_type: str = "NVMe", encrypted: bool = False, region: str | None = None,
@@ -777,26 +777,26 @@ class Meshive(_BaseClient):
     def create_storage(self, name: str, size_gb: int, *, workspace: str, storage_type: str = "nfs",
                        disk_type: str = "NVMe", encrypted: bool = False, region: str | None = None,
                        max_price_per_hour: Any = None, idempotency_key: str | None = None) -> StorageCreated:
-        """스토리지(PV) 생성(202). 존재하는 동안 용량 기준으로 시간당 과금된다."""
+        """Create storage (PV) (202). Billed hourly by capacity while it exists."""
         body = _write.storage_body(name, size_gb, storage_type=storage_type, disk_type=disk_type, encrypted=encrypted,
                                    region=region, max_price_per_hour=max_price_per_hour)
         return StorageCreated.from_dict(self._send("POST", "/storages", params={"workspace": _query_value(workspace, "workspace")},
                                                     json=body, idempotency_key=idempotency_key))
 
     def delete_storage(self, storage_name: str, workspace: str, *, idempotency_key: str | None = None) -> ResourceAction:
-        """스토리지 삭제. 사용자 파드가 마운트 중이면 ConflictError('Storage In Use', raw.detail.linkedPods)."""
+        """Delete storage. If a user pod has it mounted: ConflictError('Storage In Use', raw.detail.linkedPods)."""
         data = self._send("DELETE", f"/storages/{_path_segment(storage_name, 'storage_name')}",
                              params={"workspace": _query_value(workspace, "workspace")}, idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="storage")
 
-    # --- 쓰기: 서빙 -----------------------------------------------------------------
+    # --- Writes: serving -----------------------------------------------------------------
 
     def deploy_serving(self, model_registration_id: int, *, workspace: str, price_cap_per_hour: Any,
                        min_replicas: int = 1, max_replicas: int = 3, autoscale: bool = True,
                        max_context_tokens: int | None = None, share_idle_capacity: bool = False,
                        idempotency_key: str | None = None) -> ResourceAction:
-        """등록된 모델(registration id — list_models / register_model) 을 서빙으로 배포(201).
-        비용 상한 = price_cap_per_hour × max_replicas."""
+        """Deploy a registered model (registration id — list_models / register_model) as a serving (201).
+        Cost cap = price_cap_per_hour × max_replicas."""
         body = _write.serving_deploy_body(model_registration_id, price_cap_per_hour=price_cap_per_hour,
                                           min_replicas=min_replicas, max_replicas=max_replicas, autoscale=autoscale,
                                           max_context_tokens=max_context_tokens, share_idle_capacity=share_idle_capacity)
@@ -815,7 +815,7 @@ class Meshive(_BaseClient):
 
     def pause_serving(self, serving_id: int | str, *, paused: bool = True,
                       idempotency_key: str | None = None) -> ResourceAction:
-        """paused=True 로 일시정지, False 로 재개."""
+        """paused=True pauses, False resumes."""
         data = self._send("PATCH", f"/servings/{_int_segment(serving_id, 'serving_id')}/pause",
                              json={"paused": bool(paused)}, idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="serving")
@@ -825,8 +825,8 @@ class Meshive(_BaseClient):
         return ResourceAction.from_dict(data, resource="serving")
 
     def ssh_access(self, pod_name: str, workspace: str) -> SshAccess:
-        """일회용 SSH 접속(write 스코프, 몇 분 뒤 만료) — `command` 로 접속하고 `password` 를 입력한다.
-        부를 때마다 새 비밀번호다. 비밀번호를 로그·파일에 남기지 말 것."""
+        """One-time SSH access (write scope, expires after a few minutes) — connect with `command` and enter `password`.
+        Each call returns a new password. Don't leave the password in logs or files."""
         try:
             data = self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/ssh",
                               params={"workspace": _query_value(workspace, "workspace")})
@@ -834,10 +834,10 @@ class Meshive(_BaseClient):
             raise _not_supported(err, "SSH access") from None
         return SshAccess.from_dict(data)
 
-    # --- Watched folders (실행 중 Pod 의 수확 폴더) ------------------------------------
+    # --- Watched folders (harvest folders of a running Pod) ------------------------------------
 
     def get_watched_folders(self, pod_name: str, workspace: str) -> WatchedFolders:
-        """Pod 의 수확 폴더 (GET /pods/{pod}/harvest?workspace=) — 바꾸려면 revision 을 expected_version 으로."""
+        """A Pod's watched folders (GET /pods/{pod}/harvest?workspace=) — to change them, pass revision as expected_version."""
         try:
             data = self._get(f"/pods/{_path_segment(pod_name, 'pod_name')}/harvest", params={"workspace": workspace})
         except MeshiveAPIError as err:
@@ -847,8 +847,8 @@ class Meshive(_BaseClient):
     def set_watched_folders(self, pod_name: str, workspace: str, *, expected_version: int,
                             template: dict[str, Any] | None = None, user: Any = None,
                             idempotency_key: str | None = None) -> WatchedFolders:
-        """수확 폴더 **전체 교체**(재시작 없이 적용). template = {템플릿 폴더 경로: {"enabled", "include"}},
-        user = 사용자 폴더 목록("path" 또는 {"path", "include", "include_existing"}). 버전이 어긋나면 409 — 다시 읽는다."""
+        """**Replace all** watched folders (applies without a restart). template = {template folder path: {"enabled", "include"}},
+        user = list of user folders ("path" or {"path", "include", "include_existing"}). 409 on a version mismatch — read again."""
         body = _write.watched_folders_body(expected_version, template, user)
         try:
             data = self._send("PUT", f"/pods/{_path_segment(pod_name, 'pod_name')}/harvest",
@@ -858,14 +858,14 @@ class Meshive(_BaseClient):
             raise _not_supported(err, "watched folders") from None
         return WatchedFolders.from_dict(data)
 
-    # --- 자산 import ---------------------------------------------------------------
+    # --- Asset import ---------------------------------------------------------------
 
     def import_asset(self, target: str, *, workspace: str, name: str | None = None, asset_type: str | None = None,
                      revision: str | None = None, paths: str | Iterable[str] | None = None,
                      hf_token_id: int | None = None, civitai_key_id: int | None = None,
                      idempotency_key: str | None = None) -> AssetImported:
-        """HF repo(`owner/name`·URL)·CivitAI URL·직링크를 자산으로 링크 등록(201, 바로 ready). 바이트를 복사하지 않아
-        저장 요금이 없다 — Pod·task 가 쓸 때 원본에서 받는다. 비공개·gated 원본은 콘솔에 등록한 토큰·키 id 로."""
+        """Register an HF repo (`owner/name` or URL), CivitAI URL or direct link as a linked asset (201, ready immediately). Bytes aren't copied, so
+        there's no storage charge — Pods and tasks fetch from the source when they use it. For private/gated sources, pass the id of a token/key saved in the console."""
         body = _write.asset_import_body(target, name=name, asset_type=asset_type, revision=revision, paths=paths,
                                         hf_token_id=hf_token_id, civitai_key_id=civitai_key_id)
         try:
@@ -876,30 +876,30 @@ class Meshive(_BaseClient):
         return AssetImported.from_dict(data)
 
     def list_civitai_keys(self, workspace: str) -> list[HfToken]:
-        """워크스페이스 CivitAI 키 id·이름 (GET /civitai-keys?workspace=). 키 등록은 콘솔에서."""
+        """The workspace's CivitAI key ids and names (GET /civitai-keys?workspace=). Keys are added in the console."""
         try:
             return [HfToken.from_dict(d) for d in self._get("/civitai-keys", params={"workspace": workspace})]
         except MeshiveAPIError as err:
             raise _not_supported(err, "asset import") from None
 
-    # --- 서빙 모델 등록 ---------------------------------------------------------------
+    # --- Serving model registration ---------------------------------------------------------------
 
     def list_models(self, workspace: str) -> list[ServingModel]:
-        """워크스페이스가 등록한 서빙 모델 (GET /models?workspace=) — deploy_serving 의 registration id."""
+        """Serving models registered by the workspace (GET /models?workspace=) — the registration id for deploy_serving."""
         try:
             return [ServingModel.from_dict(d) for d in self._get("/models", params={"workspace": workspace})]
         except MeshiveAPIError as err:
             raise _not_supported(err, "model registration") from None
 
     def list_hf_tokens(self, workspace: str) -> list[HfToken]:
-        """워크스페이스 Hugging Face 토큰 id·이름 (GET /hf-tokens?workspace=). 토큰 등록은 콘솔에서."""
+        """The workspace's Hugging Face token ids and names (GET /hf-tokens?workspace=). Tokens are added in the console."""
         try:
             return [HfToken.from_dict(d) for d in self._get("/hf-tokens", params={"workspace": workspace})]
         except MeshiveAPIError as err:
             raise _not_supported(err, "model registration") from None
 
     def detect_model(self, huggingface_repo: str, *, workspace: str, hf_token_id: int | None = None) -> ModelDetection:
-        """HF repo 를 서빙할 수 있는지 감지 (POST /models/detect). 아무것도 만들지 않는다(read 스코프)."""
+        """Detect whether an HF repo can be served (POST /models/detect). Creates nothing (read scope)."""
         body = _write.model_body(huggingface_repo, hf_token_id=hf_token_id)
         try:
             data = self._send("POST", "/models/detect", params={"workspace": _query_value(workspace, "workspace")},
@@ -911,7 +911,7 @@ class Meshive(_BaseClient):
     def register_model(self, huggingface_repo: str, *, workspace: str, name: str | None = None,
                        framework: str | None = None, hf_token_id: int | None = None,
                        context_length: int | None = None, idempotency_key: str | None = None) -> ResourceAction:
-        """서빙 모델 등록(201) — `id` 가 registration id. 비용 없음(다운로드는 배포 때). 같은 repo 는 기존 등록을 돌려준다."""
+        """Register a serving model (201) — `id` is the registration id. No cost (the download happens at deploy). The same repo returns the existing registration."""
         body = _write.model_body(huggingface_repo, hf_token_id=hf_token_id, name=name, framework=framework,
                                  context_length=context_length)
         try:
@@ -922,7 +922,7 @@ class Meshive(_BaseClient):
         return ResourceAction.from_dict(data, resource="model")
 
     def delete_model(self, registration_id: int | str, *, idempotency_key: str | None = None) -> ResourceAction:
-        """등록 삭제 — 그 모델의 배포가 살아 있으면 409."""
+        """Delete a registration — 409 if a deployment of that model is still alive."""
         try:
             data = self._send("DELETE", f"/models/{_int_segment(registration_id, 'registration_id')}",
                               idempotency_key=idempotency_key)
@@ -930,7 +930,7 @@ class Meshive(_BaseClient):
             raise _not_supported(err, "model registration") from None
         return ResourceAction.from_dict(data, resource="model")
 
-    # --- 쓰기: 태스크 ----------------------------------------------------------------
+    # --- Writes: tasks ----------------------------------------------------------------
 
     def estimate_task(self, name: str, script: str, *, workspace: str, image: str | None = None,
                       template_id: int | None = None, requirements: str | None = None,
@@ -953,7 +953,7 @@ class Meshive(_BaseClient):
                     gpu_vram_gb: int | None = None, cpu_preset: str | None = None, max_duration: int = 3600,
                     webhook_url: str | None = None, input_assets: Any = None, max_price_per_hour: Any = None,
                     idempotency_key: str | None = None) -> TaskSubmitted:
-        """단발 태스크 제출(202). 로그를 남기려면 스크립트에서 print(..., flush=True) 를 쓴다(버퍼링 주의)."""
+        """Submit a one-shot task (202). To get logs, use print(..., flush=True) in the script (mind buffering)."""
         body = _write.task_body(name, script, image=image, template_id=template_id, requirements=requirements, env=env,
                                 secret_keys=secret_keys, args=args, gpu_model=gpu_model, gpu_count=gpu_count,
                                 gpu_vram_gb=gpu_vram_gb, cpu_preset=cpu_preset, max_duration=max_duration,
@@ -965,19 +965,19 @@ class Meshive(_BaseClient):
         data = self._send("POST", f"/tasks/{_path_segment(task_id, 'task_id')}/stop", idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="task")
 
-    # --- 로그 (read 스코프) -----------------------------------------------------------
+    # --- Logs (read scope) -----------------------------------------------------------
 
     def get_pod_logs(self, pod_name: str, workspace: str, *, tail: int = 200, container: str | None = None,
                      wait: float | None = None) -> Logs:
-        """파드 로그 마지막 tail 줄. 버퍼가 비어 있으면 서버가 로그 워처를 깨워 최대 wait 초(기본 8) 기다린다."""
+        """The last tail lines of a pod's log. If the buffer is empty, the server wakes the log watcher and waits up to wait seconds (default 8)."""
         params = _write.logs_params(tail=tail, wait=wait, container=container)
         params["workspace"] = _query_value(workspace, "workspace")
         return Logs.from_dict(self._get(f"/pods/{_path_segment(pod_name, 'pod_name')}/logs", params))
 
     def get_task_logs(self, task_id: str, *, tail: int = 200, wait: float | None = None,
                       cursor: int | None = None) -> Logs:
-        """태스크 로그 마지막 tail 줄. 외부 provider 태스크는 cursor=None/0 이면 마지막 tail 줄, 응답의 next_cursor 를
-        cursor 로 넘기면 그 뒤에 새로 생긴 줄만 돌아온다(증분). 내부 태스크는 항상 마지막 tail 줄(next_cursor 없음)."""
+        """The last tail lines of a task's log. For external-provider tasks, cursor=None/0 returns the last tail lines, and passing the response's
+        next_cursor as cursor returns only lines added since (incremental). Internal tasks always return the last tail lines (no next_cursor)."""
         params = _write.logs_params(tail=tail, wait=wait, cursor=cursor)
         return Logs.from_dict(self._get(f"/tasks/{_path_segment(task_id, 'task_id')}/logs", params))
 
@@ -992,7 +992,7 @@ class Meshive(_BaseClient):
 
 
 class AsyncMeshive(_BaseClient):
-    """비동기 Meshive SDK 클라이언트 (httpx.AsyncClient 기반).
+    """Asynchronous Meshive SDK client (based on httpx.AsyncClient).
 
         from meshive import AsyncMeshive
 
@@ -1033,7 +1033,7 @@ class AsyncMeshive(_BaseClient):
 
     async def _send(self, method: str, path: str, *, params: dict[str, Any] | None = None,
               json: dict[str, Any] | None = None, idempotency_key: str | None = None) -> Any:
-        """쓰기 요청. Idempotency-Key 를 붙여 보내므로 재시도해도 서버가 첫 응답을 재생한다(이중 생성 없음)."""
+        """Write request. Sent with an Idempotency-Key, so on retry the server replays the first response (no double creation)."""
         url = self._url(path)
         headers = self._build_headers()
         headers["Idempotency-Key"] = idempotency_key or str(uuid.uuid4())
@@ -1071,30 +1071,30 @@ class AsyncMeshive(_BaseClient):
                                params={"method": method, "path": path})
 
     async def me(self) -> WhoAmI:
-        """현재 API Key 소유자 정보 (GET /me)."""
+        """Info about the owner of the current API key (GET /me)."""
         return WhoAmI.from_dict(await self._get("/me"))
 
     async def list_workspaces(self) -> list[Workspace]:
-        """내 워크스페이스 목록 (GET /workspaces)."""
+        """My workspaces (GET /workspaces)."""
         return [Workspace.from_dict(d) for d in await self._get("/workspaces")]
 
     async def list_pods(self, workspace: str) -> list[Pod]:
-        """워크스페이스의 파드 목록 (GET /pods?workspace=)."""
+        """Pods in a workspace (GET /pods?workspace=)."""
         data = await self._get("/pods", params={"workspace": workspace})
         return [Pod.from_dict(d) for d in data.get("pods", [])]
 
     async def get_pod(self, pod_name: str, workspace: str) -> Pod:
-        """파드 단건 (GET /pods/{pod_name}?workspace=)."""
+        """A single pod (GET /pods/{pod_name}?workspace=)."""
         segment = _path_segment(pod_name, "pod_name")
         data = await self._get(f"/pods/{segment}", params={"workspace": workspace})
         return Pod.from_dict(data)
 
     async def list_machines(self) -> list[Machine]:
-        """host 로 등록한 머신 목록 (GET /machines). workspace 불필요 (host 가 직접 소유)."""
+        """Machines registered as a host (GET /machines). No workspace needed (the host owns them directly)."""
         return [Machine.from_dict(d) for d in await self._get("/machines")]
 
     async def get_machine(self, machine_id: str) -> Machine:
-        """머신 단건 (GET /machines/{machine_id})."""
+        """A single machine (GET /machines/{machine_id})."""
         return Machine.from_dict(await self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}"))
 
     async def wait_for_pod(
@@ -1106,7 +1106,7 @@ class AsyncMeshive(_BaseClient):
         timeout: float = 600.0,
         interval: float = 5.0,
     ) -> Pod:
-        """파드가 `until` 상태가 될 때까지 폴링 (동기판 wait_for_pod 와 동일 규칙)."""
+        """Poll until the pod reaches the `until` state (same rules as the sync wait_for_pod)."""
         targets, terminal = _wait_targets(until)
         deadline = time.monotonic() + timeout
         last = ""
@@ -1118,123 +1118,123 @@ class AsyncMeshive(_BaseClient):
             _wait_expired(deadline, pod_name, targets, last)
             await asyncio.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
 
-    # --- 0.0.7 확장 read 표면 (동기판과 동일 규칙) ---------------------------
+    # --- 0.0.7 read surface extension (same rules as the sync client) ---------------------------
 
     async def get_workspace(self, workspace: str) -> WorkspaceDetail:
-        """워크스페이스 상세 (GET /workspaces/{namespace})."""
+        """Workspace details (GET /workspaces/{namespace})."""
         return WorkspaceDetail.from_dict(
             await self._get(f"/workspaces/{_path_segment(workspace, 'workspace')}"))
 
     async def list_members(self, workspace: str) -> list[Member]:
-        """워크스페이스 멤버 목록 (GET /members?workspace=)."""
+        """Workspace members (GET /members?workspace=)."""
         data = await self._get("/members", params={"workspace": workspace})
         return [Member.from_dict(d) for d in data.get("members", [])]
 
     async def list_storages(self, workspace: str) -> list[Storage]:
-        """워크스페이스의 스토리지(볼륨) 목록 (GET /storages?workspace=)."""
+        """Storage (volumes) in a workspace (GET /storages?workspace=)."""
         data = await self._get("/storages", params={"workspace": workspace})
         return [Storage.from_dict(d) for d in data.get("storages", [])]
 
     async def list_transactions(self, workspace: str) -> list[Transaction]:
-        """진행 중인 pod 작업 목록 (GET /transactions?workspace=). sync 판과 동일 계약."""
+        """In-progress pod operations (GET /transactions?workspace=). Same contract as the sync client."""
         data = await self._get("/transactions", params={"workspace": workspace})
         return [Transaction.from_dict(d) for d in data]
 
     async def get_storage(self, storage_name: str, workspace: str) -> Storage:
-        """스토리지 단건 (GET /storages/{storage_name}?workspace=)."""
+        """A single storage (GET /storages/{storage_name}?workspace=)."""
         segment = _path_segment(storage_name, "storage_name")
         data = await self._get(f"/storages/{segment}", params={"workspace": workspace})
         return Storage.from_dict(data)
 
     async def get_pod_metrics(self, pod_name: str, workspace: str) -> PodMetrics:
-        """파드 리소스 사용량 (GET /pods/{pod_name}/metrics?workspace=)."""
+        """Pod resource usage (GET /pods/{pod_name}/metrics?workspace=)."""
         segment = _path_segment(pod_name, "pod_name")
         data = await self._get(f"/pods/{segment}/metrics", params={"workspace": workspace})
         return PodMetrics.from_dict(data)
 
     async def get_machine_metrics(self, machine_id: str) -> MachineMetrics:
-        """host 머신 실시간 메트릭 (GET /machines/{machine_id}/metrics)."""
+        """Live metrics of a host machine (GET /machines/{machine_id}/metrics)."""
         segment = _path_segment(machine_id, "machine_id")
         return MachineMetrics.from_dict(await self._get(f"/machines/{segment}/metrics"))
 
     async def list_gpus(self, *, rental_type: str = "demand",
                         min_vram: int | None = None) -> list[GpuAvailability]:
-        """지금 대여 가능한 GPU 티어와 가격 (GET /gpus?rentalType=&vram=)."""
+        """GPU tiers available to rent now, with prices (GET /gpus?rentalType=&vram=)."""
         data = await self._get("/gpus", params=_gpus_params(rental_type, min_vram))
         return [GpuAvailability.from_dict(d) for d in data]
 
     async def list_api_keys(self) -> list[ApiKey]:
-        """내 활성 API Key 목록 — prefix 만, 평문 없음 (GET /api-keys)."""
+        """My active API keys — prefixes only, no plaintext (GET /api-keys)."""
         return [ApiKey.from_dict(d) for d in await self._get("/api-keys")]
 
     async def get_credit(self) -> Credit:
-        """크레딧 잔액 + 자동충전 설정 (GET /credit)."""
+        """Credit balance + auto top-up settings (GET /credit)."""
         return Credit.from_dict(await self._get("/credit"))
 
     async def list_credit_history(self, *, start_date: date | datetime | str | None = None,
                                   end_date: date | datetime | str | None = None) -> list[CreditHistoryEntry]:
-        """크레딧 충전/환불 내역 (GET /credit/history). 기본 최근 90일."""
+        """Credit top-up/refund history (GET /credit/history). Defaults to the last 90 days."""
         data = await self._get("/credit/history", params=_date_range_params(start_date, end_date))
         return [CreditHistoryEntry.from_dict(d) for d in data]
 
     async def get_earnings(self, *, start_date: date | datetime | str | None = None,
                            end_date: date | datetime | str | None = None) -> Earnings:
-        """host 수익 요약 + 일별 내역 (GET /earnings). 기본 최근 90일."""
+        """Host earnings summary + daily breakdown (GET /earnings). Defaults to the last 90 days."""
         data = await self._get("/earnings", params=_date_range_params(start_date, end_date))
         return Earnings.from_dict(data)
 
     async def list_templates(self, workspace: str | None = None, *,
                              app_type: str | None = None) -> list[Template]:
-        """official 템플릿 (+ workspace 지정 시 custom 템플릿) (GET /templates)."""
+        """Official templates (+ custom templates when workspace is given) (GET /templates)."""
         data = await self._get("/templates", params=_templates_params(workspace, app_type))
         return [Template.from_dict(d) for d in data]
 
     async def get_template(self, template_id: int | str, workspace: str | None = None) -> Template:
-        """템플릿 단건 (GET /templates/{template_id}). custom 템플릿은 workspace 를 함께 넘긴다."""
+        """A single template (GET /templates/{template_id}). Pass workspace along for custom templates."""
         params = {"workspace": workspace} if workspace else None
         segment = _int_segment(template_id, "template_id")
         return Template.from_dict(await self._get(f"/templates/{segment}", params=params))
 
     async def list_servings(self, workspace: str) -> list[Serving]:
-        """워크스페이스의 serverless serving 배포 목록 (GET /servings?workspace=)."""
+        """Serverless serving deployments in a workspace (GET /servings?workspace=)."""
         data = await self._get("/servings", params={"workspace": workspace})
         return [Serving.from_dict(d) for d in data]
 
     async def get_serving(self, serving_id: int | str) -> Serving:
-        """serving 배포 단건 (GET /servings/{serving_id})."""
+        """A single serving deployment (GET /servings/{serving_id})."""
         segment = _int_segment(serving_id, "serving_id")
         return Serving.from_dict(await self._get(f"/servings/{segment}"))
 
     async def list_tasks(self, workspace: str, *, status: str | Iterable[str] | None = None,
                          limit: int = 50, offset: int = 0) -> list[Task]:
-        """워크스페이스의 serverless task 목록, 최신순 (GET /tasks?...)."""
+        """Serverless tasks in a workspace, newest first (GET /tasks?...)."""
         data = await self._get("/tasks", params=_tasks_params(workspace, status, limit, offset))
         return [Task.from_dict(d) for d in data]
 
     async def get_task(self, task_id: str) -> Task:
-        """task 단건 — 스크립트/설정/비용 분해는 `.raw` (GET /tasks/{task_id})."""
+        """A single task — script/settings/cost breakdown are in `.raw` (GET /tasks/{task_id})."""
         return Task.from_dict(await self._get(f"/tasks/{_path_segment(task_id, 'task_id')}"))
 
     async def list_assets(self, workspace: str, *, asset_type: str | None = None,
                           status: str | None = None, page: int = 1, page_size: int = 20) -> AssetPage:
-        """워크스페이스 자산 목록 한 페이지 (GET /assets?...). status 미지정 시 deleted/purged/merged 제외."""
+        """One page of workspace assets (GET /assets?...). Without status, deleted/purged/merged are excluded."""
         data = await self._get("/assets", params=_assets_params(workspace, asset_type, status, page, page_size))
         return AssetPage.from_dict(data, namespace_name=workspace)
 
     async def get_asset(self, asset_id: str) -> Asset:
-        """자산 상세 — 파일 목록과 사용 중인 곳 포함 (GET /assets/{asset_id})."""
+        """Asset details — including the file list and where it's in use (GET /assets/{asset_id})."""
         return Asset.from_dict(await self._get(f"/assets/{_path_segment(asset_id, 'asset_id')}"))
 
     async def get_asset_storage(self, workspace: str) -> AssetStorage:
-        """managed 자산 저장량/월 예상 비용/크레딧 차단 상태 (GET /assets/storage-summary?workspace=)."""
+        """Managed asset storage amount / estimated monthly cost / credit block state (GET /assets/storage-summary?workspace=)."""
         data = await self._get("/assets/storage-summary", params={"workspace": workspace})
         return AssetStorage.from_dict(data)
 
-    # --- 다운로드 (read 스코프) ------------------------------------------------------
+    # --- Downloads (read scope) ------------------------------------------------------
 
     async def asset_download_urls(self, asset_id: str, *,
                                   paths: str | Iterable[str] | None = None) -> AssetDownload:
-        """자산 파일별 presigned GET URL (GET /assets/{asset_id}/download-urls?path=)."""
+        """Presigned GET URLs per asset file (GET /assets/{asset_id}/download-urls?path=)."""
         try:
             data = await self._get(f"/assets/{_path_segment(asset_id, 'asset_id')}/download-urls",
                                    params=_paths_param(paths))
@@ -1244,14 +1244,14 @@ class AsyncMeshive(_BaseClient):
 
     async def download_asset(self, asset_id: str, dest: str | os.PathLike[str], *,
                              paths: str | Iterable[str] | None = None) -> list[Path]:
-        """자산 파일을 `dest` 아래 상대 경로 그대로 내려받고, 쓴 파일 경로를 돌려준다."""
+        """Download asset files under `dest`, keeping their relative paths, and return the written paths."""
         download = await self.asset_download_urls(asset_id, paths=paths)
         if not download.complete:
             raise _incomplete(download)
         return [await self._save(f, dest) for f in download.files]
 
     async def task_outputs(self, task_id: str) -> TaskOutputs:
-        """task 결과물 파일과 presigned URL (GET /tasks/{task_id}/outputs)."""
+        """Task output files and presigned URLs (GET /tasks/{task_id}/outputs)."""
         try:
             data = await self._get(f"/tasks/{_path_segment(task_id, 'task_id')}/outputs")
         except MeshiveAPIError as err:
@@ -1259,11 +1259,11 @@ class AsyncMeshive(_BaseClient):
         return TaskOutputs.from_dict(data, task_id=task_id)
 
     async def download_task_outputs(self, task_id: str, dest: str | os.PathLike[str]) -> list[Path]:
-        """task 결과물을 `dest` 아래로 내려받고, 쓴 파일 경로를 돌려준다."""
+        """Download task outputs under `dest` and return the written paths."""
         return [await self._save(f, dest) for f in (await self.task_outputs(task_id)).files]
 
     async def _save(self, file: DownloadFile, dest: str | os.PathLike[str]) -> Path:
-        # presigned URL 이라 인증 헤더 없이 보낸다 — Meshive 키를 스토리지로 보내지 않는다.
+        # Presigned URLs are sent without the auth header — the Meshive key never goes to storage.
         target = _download_target(dest, file.path)
         target.parent.mkdir(parents=True, exist_ok=True)
         part = target.with_name(target.name + ".part")
@@ -1280,7 +1280,7 @@ class AsyncMeshive(_BaseClient):
             raise
         return target
 
-    # --- 쓰기: 파드 (write 스코프) ---------------------------------------------------
+    # --- Writes: pods (write scope) ---------------------------------------------------
 
     async def estimate_pod(self, name: str, template_id: int, *, workspace: str, gpu_model: str | None = None,
                      gpu_count: int = 1, gpu_vram_gb: int | None = None, rental_type: str = "demand",
@@ -1290,7 +1290,7 @@ class AsyncMeshive(_BaseClient):
                      uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
                      max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
                      harvest_destination: Any = None) -> PodEstimate:
-        """파드 견적 — 아무것도 만들지 않는다(read 스코프로 충분). create_pod 와 인자가 같다."""
+        """Pod estimate — creates nothing (read scope is enough). Same arguments as create_pod."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
@@ -1309,11 +1309,11 @@ class AsyncMeshive(_BaseClient):
                    uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
                    max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
                    harvest_destination: Any = None, idempotency_key: str | None = None) -> PodCreated:
-        """파드 생성(202 수락). 시간당 요금이 발생한다 — 먼저 estimate_pod 로 가격을 확인하고,
-        max_price_per_hour 는 최종 compute 시간당 요금 상한이다. 초과 배치는 비동기로 실패할 수 있다.
-        스토리지(자동 PV 포함)와 자산 보관 요금은 별도이며 상한에서 제외된다.
-        input_assets 는 Asset Hub 자산을 붙이고("asset_id" 또는 {"asset", "target_dir", "role", "paths"}),
-        watched_folders 는 새 파일을 자산으로 올릴 폴더("path" 또는 {"path", "include", "include_existing"})."""
+        """Create a pod (202 accepted). It is billed hourly — check the price with estimate_pod first;
+        max_price_per_hour caps the final hourly compute price. Placement above it can fail asynchronously.
+        Storage (including the automatic PV) and asset storage charges are separate and not covered by the cap.
+        input_assets attaches Asset Hub assets ("asset_id" or {"asset", "target_dir", "role", "paths"}),
+        watched_folders are folders whose new files are uploaded as assets ("path" or {"path", "include", "include_existing"})."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
@@ -1325,15 +1325,15 @@ class AsyncMeshive(_BaseClient):
                                                 json=body, idempotency_key=idempotency_key))
 
     async def stop_pod(self, pod_name: str, workspace: str, *, idempotency_key: str | None = None) -> ResourceAction:
-        """파드 정지(replicas=0). 파드 과금은 멈추고 스토리지 과금은 계속된다."""
+        """Stop a pod (replicas=0). Pod billing stops; storage billing continues."""
         data = await self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/stop",
                              params={"workspace": _query_value(workspace, "workspace")}, idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="pod")
 
     async def start_pod(self, pod_name: str, workspace: str, *, placement: str = "same_node",
                   allow_data_loss: bool = False, idempotency_key: str | None = None) -> ResourceAction:
-        """정지된 파드 시작. placement: same_node(원래 노드) | any_node(노드 이동 시 보존되지 않은 작업 파일 영구 삭제).
-        allow_data_loss=True 는 이 파드/이동 요청에 대한 별도 데이터 손실 동의다."""
+        """Start a stopped pod. placement: same_node (original node) | any_node (moving nodes permanently deletes work files that aren't preserved).
+        allow_data_loss=True is a separate data-loss consent for this pod/move request."""
         if not isinstance(allow_data_loss, bool):
             raise ValueError("allow_data_loss must be an explicit boolean")
         data = await self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/start",
@@ -1349,13 +1349,13 @@ class AsyncMeshive(_BaseClient):
 
     async def delete_pod(self, pod_name: str, workspace: str, *, delete_local_storages: Iterable[str] | None = None,
                    idempotency_key: str | None = None) -> ResourceAction:
-        """파드 삭제. 로컬(hostPath) 스토리지는 delete_local_storages 에 pv_name 을 적은 것만 같이 삭제된다."""
+        """Delete a pod. Local (hostPath) storage is deleted along with it only if its pv_name is listed in delete_local_storages."""
         data = await self._send("DELETE", f"/pods/{_path_segment(pod_name, 'pod_name')}",
                              params=_write.delete_pod_params(_query_value(workspace, "workspace"), delete_local_storages),
                              idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="pod")
 
-    # --- 쓰기: 스토리지 ---------------------------------------------------------------
+    # --- Writes: storage ---------------------------------------------------------------
 
     async def estimate_storage(self, name: str, size_gb: int, *, workspace: str, storage_type: str = "nfs",
                          disk_type: str = "NVMe", encrypted: bool = False, region: str | None = None,
@@ -1368,26 +1368,26 @@ class AsyncMeshive(_BaseClient):
     async def create_storage(self, name: str, size_gb: int, *, workspace: str, storage_type: str = "nfs",
                        disk_type: str = "NVMe", encrypted: bool = False, region: str | None = None,
                        max_price_per_hour: Any = None, idempotency_key: str | None = None) -> StorageCreated:
-        """스토리지(PV) 생성(202). 존재하는 동안 용량 기준으로 시간당 과금된다."""
+        """Create storage (PV) (202). Billed hourly by capacity while it exists."""
         body = _write.storage_body(name, size_gb, storage_type=storage_type, disk_type=disk_type, encrypted=encrypted,
                                    region=region, max_price_per_hour=max_price_per_hour)
         return StorageCreated.from_dict(await self._send("POST", "/storages", params={"workspace": _query_value(workspace, "workspace")},
                                                     json=body, idempotency_key=idempotency_key))
 
     async def delete_storage(self, storage_name: str, workspace: str, *, idempotency_key: str | None = None) -> ResourceAction:
-        """스토리지 삭제. 사용자 파드가 마운트 중이면 ConflictError('Storage In Use', raw.detail.linkedPods)."""
+        """Delete storage. If a user pod has it mounted: ConflictError('Storage In Use', raw.detail.linkedPods)."""
         data = await self._send("DELETE", f"/storages/{_path_segment(storage_name, 'storage_name')}",
                              params={"workspace": _query_value(workspace, "workspace")}, idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="storage")
 
-    # --- 쓰기: 서빙 -----------------------------------------------------------------
+    # --- Writes: serving -----------------------------------------------------------------
 
     async def deploy_serving(self, model_registration_id: int, *, workspace: str, price_cap_per_hour: Any,
                        min_replicas: int = 1, max_replicas: int = 3, autoscale: bool = True,
                        max_context_tokens: int | None = None, share_idle_capacity: bool = False,
                        idempotency_key: str | None = None) -> ResourceAction:
-        """등록된 모델(registration id — list_models / register_model) 을 서빙으로 배포(201).
-        비용 상한 = price_cap_per_hour × max_replicas."""
+        """Deploy a registered model (registration id — list_models / register_model) as a serving (201).
+        Cost cap = price_cap_per_hour × max_replicas."""
         body = _write.serving_deploy_body(model_registration_id, price_cap_per_hour=price_cap_per_hour,
                                           min_replicas=min_replicas, max_replicas=max_replicas, autoscale=autoscale,
                                           max_context_tokens=max_context_tokens, share_idle_capacity=share_idle_capacity)
@@ -1406,7 +1406,7 @@ class AsyncMeshive(_BaseClient):
 
     async def pause_serving(self, serving_id: int | str, *, paused: bool = True,
                       idempotency_key: str | None = None) -> ResourceAction:
-        """paused=True 로 일시정지, False 로 재개."""
+        """paused=True pauses, False resumes."""
         data = await self._send("PATCH", f"/servings/{_int_segment(serving_id, 'serving_id')}/pause",
                              json={"paused": bool(paused)}, idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="serving")
@@ -1416,7 +1416,7 @@ class AsyncMeshive(_BaseClient):
         return ResourceAction.from_dict(data, resource="serving")
 
     async def ssh_access(self, pod_name: str, workspace: str) -> SshAccess:
-        """일회용 SSH 접속(write 스코프, 몇 분 뒤 만료)."""
+        """One-time SSH access (write scope, expires after a few minutes)."""
         try:
             data = await self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/ssh",
                                     params={"workspace": _query_value(workspace, "workspace")})
@@ -1424,10 +1424,10 @@ class AsyncMeshive(_BaseClient):
             raise _not_supported(err, "SSH access") from None
         return SshAccess.from_dict(data)
 
-    # --- Watched folders (실행 중 Pod 의 수확 폴더) ------------------------------------
+    # --- Watched folders (harvest folders of a running Pod) ------------------------------------
 
     async def get_watched_folders(self, pod_name: str, workspace: str) -> WatchedFolders:
-        """Pod 의 수확 폴더 (GET /pods/{pod}/harvest?workspace=)."""
+        """A Pod's watched folders (GET /pods/{pod}/harvest?workspace=)."""
         try:
             data = await self._get(f"/pods/{_path_segment(pod_name, 'pod_name')}/harvest",
                                    params={"workspace": workspace})
@@ -1438,7 +1438,7 @@ class AsyncMeshive(_BaseClient):
     async def set_watched_folders(self, pod_name: str, workspace: str, *, expected_version: int,
                                   template: dict[str, Any] | None = None, user: Any = None,
                                   idempotency_key: str | None = None) -> WatchedFolders:
-        """수확 폴더 전체 교체(재시작 없이 적용). 버전이 어긋나면 409."""
+        """Replace all watched folders (applies without a restart). 409 on a version mismatch."""
         body = _write.watched_folders_body(expected_version, template, user)
         try:
             data = await self._send("PUT", f"/pods/{_path_segment(pod_name, 'pod_name')}/harvest",
@@ -1448,13 +1448,13 @@ class AsyncMeshive(_BaseClient):
             raise _not_supported(err, "watched folders") from None
         return WatchedFolders.from_dict(data)
 
-    # --- 자산 import ---------------------------------------------------------------
+    # --- Asset import ---------------------------------------------------------------
 
     async def import_asset(self, target: str, *, workspace: str, name: str | None = None,
                            asset_type: str | None = None, revision: str | None = None,
                            paths: str | Iterable[str] | None = None, hf_token_id: int | None = None,
                            civitai_key_id: int | None = None, idempotency_key: str | None = None) -> AssetImported:
-        """HF repo·CivitAI URL·직링크를 자산으로 링크 등록(201, 바로 ready)."""
+        """Register an HF repo, CivitAI URL or direct link as a linked asset (201, ready immediately)."""
         body = _write.asset_import_body(target, name=name, asset_type=asset_type, revision=revision, paths=paths,
                                         hf_token_id=hf_token_id, civitai_key_id=civitai_key_id)
         try:
@@ -1466,23 +1466,23 @@ class AsyncMeshive(_BaseClient):
         return AssetImported.from_dict(data)
 
     async def list_civitai_keys(self, workspace: str) -> list[HfToken]:
-        """워크스페이스 CivitAI 키 id·이름 (GET /civitai-keys?workspace=)."""
+        """The workspace's CivitAI key ids and names (GET /civitai-keys?workspace=)."""
         try:
             return [HfToken.from_dict(d) for d in await self._get("/civitai-keys", params={"workspace": workspace})]
         except MeshiveAPIError as err:
             raise _not_supported(err, "asset import") from None
 
-    # --- 서빙 모델 등록 ---------------------------------------------------------------
+    # --- Serving model registration ---------------------------------------------------------------
 
     async def list_models(self, workspace: str) -> list[ServingModel]:
-        """워크스페이스가 등록한 서빙 모델 (GET /models?workspace=)."""
+        """Serving models registered by the workspace (GET /models?workspace=)."""
         try:
             return [ServingModel.from_dict(d) for d in await self._get("/models", params={"workspace": workspace})]
         except MeshiveAPIError as err:
             raise _not_supported(err, "model registration") from None
 
     async def list_hf_tokens(self, workspace: str) -> list[HfToken]:
-        """워크스페이스 Hugging Face 토큰 id·이름 (GET /hf-tokens?workspace=)."""
+        """The workspace's Hugging Face token ids and names (GET /hf-tokens?workspace=)."""
         try:
             return [HfToken.from_dict(d) for d in await self._get("/hf-tokens", params={"workspace": workspace})]
         except MeshiveAPIError as err:
@@ -1490,7 +1490,7 @@ class AsyncMeshive(_BaseClient):
 
     async def detect_model(self, huggingface_repo: str, *, workspace: str,
                            hf_token_id: int | None = None) -> ModelDetection:
-        """HF repo 를 서빙할 수 있는지 감지 (POST /models/detect)."""
+        """Detect whether an HF repo can be served (POST /models/detect)."""
         body = _write.model_body(huggingface_repo, hf_token_id=hf_token_id)
         try:
             data = await self._send("POST", "/models/detect",
@@ -1502,7 +1502,7 @@ class AsyncMeshive(_BaseClient):
     async def register_model(self, huggingface_repo: str, *, workspace: str, name: str | None = None,
                              framework: str | None = None, hf_token_id: int | None = None,
                              context_length: int | None = None, idempotency_key: str | None = None) -> ResourceAction:
-        """서빙 모델 등록(201) — `id` 가 registration id."""
+        """Register a serving model (201) — `id` is the registration id."""
         body = _write.model_body(huggingface_repo, hf_token_id=hf_token_id, name=name, framework=framework,
                                  context_length=context_length)
         try:
@@ -1513,7 +1513,7 @@ class AsyncMeshive(_BaseClient):
         return ResourceAction.from_dict(data, resource="model")
 
     async def delete_model(self, registration_id: int | str, *, idempotency_key: str | None = None) -> ResourceAction:
-        """등록 삭제 — 그 모델의 배포가 살아 있으면 409."""
+        """Delete a registration — 409 if a deployment of that model is still alive."""
         try:
             data = await self._send("DELETE", f"/models/{_int_segment(registration_id, 'registration_id')}",
                                     idempotency_key=idempotency_key)
@@ -1521,7 +1521,7 @@ class AsyncMeshive(_BaseClient):
             raise _not_supported(err, "model registration") from None
         return ResourceAction.from_dict(data, resource="model")
 
-    # --- 쓰기: 태스크 ----------------------------------------------------------------
+    # --- Writes: tasks ----------------------------------------------------------------
 
     async def estimate_task(self, name: str, script: str, *, workspace: str, image: str | None = None,
                       template_id: int | None = None, requirements: str | None = None,
@@ -1544,7 +1544,7 @@ class AsyncMeshive(_BaseClient):
                     gpu_vram_gb: int | None = None, cpu_preset: str | None = None, max_duration: int = 3600,
                     webhook_url: str | None = None, input_assets: Any = None, max_price_per_hour: Any = None,
                     idempotency_key: str | None = None) -> TaskSubmitted:
-        """단발 태스크 제출(202). 로그를 남기려면 스크립트에서 print(..., flush=True) 를 쓴다(버퍼링 주의)."""
+        """Submit a one-shot task (202). To get logs, use print(..., flush=True) in the script (mind buffering)."""
         body = _write.task_body(name, script, image=image, template_id=template_id, requirements=requirements, env=env,
                                 secret_keys=secret_keys, args=args, gpu_model=gpu_model, gpu_count=gpu_count,
                                 gpu_vram_gb=gpu_vram_gb, cpu_preset=cpu_preset, max_duration=max_duration,
@@ -1556,19 +1556,19 @@ class AsyncMeshive(_BaseClient):
         data = await self._send("POST", f"/tasks/{_path_segment(task_id, 'task_id')}/stop", idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="task")
 
-    # --- 로그 (read 스코프) -----------------------------------------------------------
+    # --- Logs (read scope) -----------------------------------------------------------
 
     async def get_pod_logs(self, pod_name: str, workspace: str, *, tail: int = 200, container: str | None = None,
                      wait: float | None = None) -> Logs:
-        """파드 로그 마지막 tail 줄. 버퍼가 비어 있으면 서버가 로그 워처를 깨워 최대 wait 초(기본 8) 기다린다."""
+        """The last tail lines of a pod's log. If the buffer is empty, the server wakes the log watcher and waits up to wait seconds (default 8)."""
         params = _write.logs_params(tail=tail, wait=wait, container=container)
         params["workspace"] = _query_value(workspace, "workspace")
         return Logs.from_dict(await self._get(f"/pods/{_path_segment(pod_name, 'pod_name')}/logs", params))
 
     async def get_task_logs(self, task_id: str, *, tail: int = 200, wait: float | None = None,
                       cursor: int | None = None) -> Logs:
-        """태스크 로그 마지막 tail 줄. 외부 provider 태스크는 cursor=None/0 이면 마지막 tail 줄, 응답의 next_cursor 를
-        cursor 로 넘기면 그 뒤에 새로 생긴 줄만 돌아온다(증분). 내부 태스크는 항상 마지막 tail 줄(next_cursor 없음)."""
+        """The last tail lines of a task's log. For external-provider tasks, cursor=None/0 returns the last tail lines, and passing the response's
+        next_cursor as cursor returns only lines added since (incremental). Internal tasks always return the last tail lines (no next_cursor)."""
         params = _write.logs_params(tail=tail, wait=wait, cursor=cursor)
         return Logs.from_dict(await self._get(f"/tasks/{_path_segment(task_id, 'task_id')}/logs", params))
 

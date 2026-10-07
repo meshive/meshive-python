@@ -1,9 +1,9 @@
-"""CLI 출력 포맷 헬퍼 — 색상/통화/상대시간/테이블 정렬.
+"""CLI output formatting helpers — color / currency / relative time / table alignment.
 
-외부 의존성 없이 ANSI escape 만 사용한다. 색상은 출력이 tty 가 아니거나
-NO_COLOR(관례) / MESHIVE_NO_COLOR 가 설정되면 자동으로 꺼진다 → 파이프/리다이렉트/
---json 에서 깨지지 않는다. 정렬 폭은 색을 입히기 *전* 평문 길이로 계산하므로
-ANSI 코드가 칸 맞춤을 망가뜨리지 않는다.
+ANSI escapes only, no external dependencies. Color turns off automatically when output is not a tty or
+NO_COLOR (convention) / MESHIVE_NO_COLOR is set → nothing breaks in pipes, redirects or
+--json. Alignment widths are computed from the plain text *before* coloring, so
+ANSI codes don't throw off column alignment.
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ _COLORS = {
     "dim": "\033[2m",
 }
 
-# 상태 → 색. 미지의 상태는 cyan 으로 폴백.
+# Status → color. Unknown statuses fall back to cyan.
 _STATUS_COLOR = {
     "running": "green",
     "active": "green",
@@ -43,8 +43,8 @@ _STATUS_COLOR = {
     "pending": "cyan",
     "start_up": "cyan",         # machine setup stage
     "re_verifying": "cyan",     # machine setup stage
-    "succeeded": "green",       # task terminal (성공)
-    "queued": "cyan",           # task 대기/준비 단계
+    "succeeded": "green",       # task terminal (success)
+    "queued": "cyan",           # task waiting/preparing stage
     "scheduling": "cyan",
     "pulling": "cyan",
     "fetching": "cyan",
@@ -53,11 +53,11 @@ _STATUS_COLOR = {
     "expired": "gray",
     "uploading": "cyan",        # asset version
     "frozen": "yellow",         # asset (admin freeze)
-    "source_missing": "red",    # asset (유저 S3 원본 유실)
+    "source_missing": "red",    # asset (user S3 source lost)
     "deleted": "gray",
     "purged": "gray",
     "merged": "gray",
-    "timed_out": "red",         # task terminal (실패 취급)
+    "timed_out": "red",         # task terminal (treated as failure)
     "error": "red",
     "failed": "red",
     "node_not_ready": "red",    # machine state.name
@@ -67,10 +67,10 @@ _STATUS_COLOR = {
 
 _STATUS_ICON = "●"  # ●
 
-# C0/C1 제어문자 (탭·개행 포함) + 유니코드 bidi/서식 제어문자.
-# 서버가 주는 문자열(alias/name 등)에 이스케이프 시퀀스가 섞이면 터미널 조작이,
-# RTL override(U+202E) 등이 섞이면 출력 순서 뒤집기 스푸핑(Trojan Source 류)이
-# 가능하므로 출력 전에 제거한다.
+# C0/C1 control characters (including tab and newline) + Unicode bidi/format control characters.
+# Escape sequences mixed into server-provided strings (alias/name, ...) could manipulate the terminal,
+# and an RTL override (U+202E) could reorder the output for spoofing (Trojan Source style),
+# so they are stripped before printing.
 _CONTROL_CHARS = re.compile(
     "[\x00-\x1f\x7f-\x9f"
     "\u200e\u200f"        # LRM/RLM
@@ -81,7 +81,7 @@ _CONTROL_CHARS = re.compile(
 
 
 def clean(text: str) -> str:
-    """서버 유래 문자열에서 제어문자 제거 (터미널 이스케이프 인젝션 방어)."""
+    """Strip control characters from server-provided strings (defense against terminal escape injection)."""
     return _CONTROL_CHARS.sub("", text)
 
 
@@ -103,21 +103,21 @@ def status_color(status: str) -> str:
 
 
 def status_cell(status: str) -> str:
-    """아이콘 + 상태 텍스트 (색은 호출부에서 paint). 폭 계산용 평문."""
+    """Icon + status text (the caller paints the color). Plain text, for width calculation."""
     return f"{_STATUS_ICON} {status}" if status else f"{_STATUS_ICON} -"
 
 
 def money(value: str | float | None) -> str:
-    """일반 금액 → '$2.10' (2자리). 잔액·일/월 합계·누적 비용·환불 등. 웹 `formatUsd` 와 동일."""
+    """General amount → '$2.10' (2 decimals). Balances, daily/monthly totals, accumulated cost, refunds, etc. Same as the web console."""
     return format_usd(value)
 
 
 def money_hourly(value: str | float | None) -> str:
-    """시간당 요금 → '$0.068' (**3자리 고정**). 웹 `formatHourlyUsd` 와 동일.
+    """Hourly rate → '$0.068' (**always 3 decimals**). Same as the web console.
 
-    화면마다 반올림이 다르면($0.07 vs $0.065) 유저가 청구 금액을 신뢰하지 못한다 — 콘솔이 파드·
-    스토리지·서빙·태스크·GPU·견적 내역의 $/hr 을 전부 3자리로 고정하는 이유고, CLI 도 같은 값을 낸다.
-    (호스트 수익의 earn/hr·current/hr 은 콘솔이 `formatUsd` 2자리라 `money` 를 쓴다 — 콘솔 미러링.)
+    If screens round differently ($0.07 vs $0.065) users can't trust what they're billed — that's why the console fixes
+    $/hr to 3 decimals for pods, storage, serving, tasks, GPUs and estimate breakdowns, and the CLI prints the same values.
+    (Host earnings earn/hr and current/hr use 2 decimals in the console, so they use `money` — mirroring the console.)
     """
     return format_hourly(value)
 
@@ -127,21 +127,21 @@ def yes_no(value: bool) -> str:
 
 
 def percent(rate: float | None) -> str:
-    """비율(0.0~1.0) → '99.9%'. None/비유한값은 '-'."""
+    """Ratio (0.0–1.0) → '99.9%'. None/non-finite → '-'."""
     if rate is None or not math.isfinite(rate):
         return "-"
     return f"{rate * 100:.1f}%"
 
 
 def usage(rate: float | None) -> str:
-    """사용률(0.0~1.0) → '35.0%'. 측정 불가(None)는 'n/a' — 0% 와 구분한다."""
+    """Utilization (0.0–1.0) → '35.0%'. Not measurable (None) → 'n/a', to tell it apart from 0%."""
     if rate is None or not math.isfinite(rate):
         return "n/a"
     return f"{rate * 100:.1f}%"
 
 
 def _from_mib(mib: float | None, unit: str, small_unit: str) -> str:
-    """MiB 값 → /1024 한 'N {unit}'. 1024 MiB 미만은 'N {small_unit}' 그대로. None/비유한값은 '-'."""
+    """MiB value → 'N {unit}' after /1024. Under 1024 MiB stays 'N {small_unit}'. None/non-finite → '-'."""
     if mib is None:
         return "-"
     try:
@@ -159,20 +159,20 @@ def _from_mib(mib: float | None, unit: str, small_unit: str) -> str:
 
 
 def gib(mib: float | None) -> str:
-    """MiB 값 → 'N GiB' (웹 콘솔과 동일하게 /1024, 라벨도 1024 기반). 1 GiB 미만은 'N MiB' 로 —
-    시스템 파드의 수십 MiB 가 '0.0 GiB' 로 뭉개지지 않게. None/비유한값은 '-'."""
+    """MiB value → 'N GiB' (/1024 like the web console, 1024-based label too). Under 1 GiB as 'N MiB' —
+    so a system pod's few dozen MiB don't collapse to '0.0 GiB'. None/non-finite → '-'."""
     return _from_mib(mib, "GiB", "MiB")
 
 
 def vram(mib: float | None) -> str:
-    """GPU VRAM(MiB) → 'N GB'. 숫자는 gib() 와 같은 /1024 지만 라벨은 업계 표기 'GB' 를 유지한다 —
-    콘솔도 VRAM 만은 1024 기반 라벨로 바꾸지 않았다('24GB' 카드가 '24 GiB' 로 보이지 않게)."""
+    """GPU VRAM (MiB) → 'N GB'. The number is /1024 like gib(), but the label keeps the industry 'GB' —
+    the console didn't switch VRAM to a 1024-based label either (so a '24GB' card doesn't show as '24 GiB')."""
     return _from_mib(mib, "GB", "MB")
 
 
 def mbps(bytes_per_second: float | None) -> str:
-    """바이트/초 → 'N Mbps'. Mbps 는 비트/초 ÷ 10^6 (10진) — 1024² 로 나누면 1 Gbps 가 954 Mbps 로
-    약 4.6% 낮게 나온다 (웹 콘솔 formatMbps 와 같은 기준). None/비유한값은 '-'."""
+    """Bytes/sec → 'N Mbps'. Mbps is bits/sec ÷ 10^6 (decimal) — dividing by 1024² makes 1 Gbps read as 954 Mbps,
+    about 4.6% low (same basis as the web console). None/non-finite → '-'."""
     if bytes_per_second is None:
         return "-"
     try:
@@ -183,7 +183,7 @@ def mbps(bytes_per_second: float | None) -> str:
 
 
 def bytes_human(value: float | int | None) -> str:
-    """바이트 → '1.5 KiB' / '12.3 MiB' / '2.00 GiB' (웹 콘솔 formatBytes 와 동일 규칙, 1024 기준)."""
+    """Bytes → '1.5 KiB' / '12.3 MiB' / '2.00 GiB' (same rules as the web console, 1024-based)."""
     if value is None:
         return "-"
     try:
@@ -249,10 +249,10 @@ def render_table(
     enabled: bool = False,
     out: TextIO | None = None,
 ) -> None:
-    """공백 정렬 테이블. aligns: 칸별 'l'/'r'. colors: 칸별 색(None=무색)."""
+    """Space-aligned table. aligns: 'l'/'r' per column. colors: color per column (None = no color)."""
     out = out if out is not None else sys.stdout
     aligns = aligns or ["l"] * len(headers)
-    # 모든 셀은 서버 유래 값일 수 있으므로 제어문자를 걷어낸다 (폭 계산도 정제 후 기준).
+    # Any cell may hold a server-provided value, so strip control characters (widths are computed after cleaning).
     rows = [[clean(cell) for cell in row] for row in rows]
     widths = [len(h) for h in headers]
     for row in rows:

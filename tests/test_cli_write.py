@@ -1,4 +1,4 @@
-"""CLI 쓰기 커맨드 — 인자 파싱 → SDK 호출 인자, 확인(--yes/비대화형), --estimate, 출력 포맷."""
+"""CLI write commands — argument parsing → SDK call arguments, confirmation (--yes/non-interactive), --estimate, output formats."""
 import copy
 import importlib
 import io
@@ -7,7 +7,7 @@ import json
 import pytest
 
 
-cli = importlib.import_module("meshive.cli.main")  # cli.__init__ 이 main 함수를 노출해 서브모듈을 가린다
+cli = importlib.import_module("meshive.cli.main")  # cli.__init__ exposes the main function, which shadows the submodule
 from meshive.models import (Pod, Logs, PodCreated, PodEstimate, ResourceAction, Serving, StorageCreated, StorageEstimate,
                             TaskEstimate, TaskSubmitted, ModelDetection, ServingModel, AssetImported, WatchedFolders, SshAccess)
 
@@ -36,7 +36,7 @@ class FakeClient:
         return Pod.from_dict({"podName": a[0], "namespaceName": a[1], "hasUnpreservedWorkspace": True})
 
     def list_pods(self, *a, **kw):
-        self._rec("list_pods", *a, **kw); return []          # 생성 직후 파드가 아직 없다
+        self._rec("list_pods", *a, **kw); return []          # right after creation the pod doesn't exist yet
 
     def get_serving(self, *a, **kw):
         self._rec("get_serving", *a, **kw)
@@ -96,7 +96,7 @@ class FakeClient:
                                          "suggestedRepo": "Qwen/Qwen3-0.6B"})
 
     def register_model(self, *a, **kw):
-        self.calls.append(("register_model", a, kw))   # kw 에 name= 이 있어 _rec 의 위치 인자와 겹친다
+        self.calls.append(("register_model", a, kw))   # kw has name=, which collides with _rec's positional argument
         return ResourceAction.from_dict({"id": "12", "action": "register", "workspace": kw["workspace"],
                                          "result": {"title": "Already Registered", "apiModelId": "qwen-small-ab12"}},
                                         resource="model")
@@ -152,9 +152,9 @@ def _last(name):
 def test_pod_create_estimate_only(capsys):
     assert cli.main(["pod-create", "ws", "agent-pod", "--template", "457", "--gpu", "RTX 3060", "--estimate"]) == 0
     out = capsys.readouterr().out
-    # 콘솔과 같은 값이어야 한다 — $/hr 은 3자리, 견적 내역도 줄마다 3자리(Receipt).
+    # Must match the console — $/hr with 3 decimals, and each estimate line with 3 decimals too (Receipt).
     assert "$0.068/hr" in out and "gpu=$0.068" in out and "RTX 3060" in out
-    # RAM·디스크는 쿠버네티스 Gi 로 잡히는 GiB, VRAM 만 업계 표기 GB.
+    # RAM and disk are GiB (allocated as Kubernetes Gi); only VRAM uses the industry GB.
     assert "RTX 3060 (12 GB)" in out and "4 vCPU / 12 GiB" in out and "25 GiB" in out
     assert not any(c[0] == "create_pod" for c in FakeClient.instances[-1].calls)
 
@@ -189,7 +189,7 @@ def test_pod_create_bad_env_is_usage_error(capsys):
 def test_pod_stop_and_delete(capsys, non_tty):
     assert cli.main(["pod-stop", "ws", "p-0", "-o", "json"]) == 0
     assert json.loads(capsys.readouterr().out)["action"] == "stop"
-    assert cli.main(["pod-delete", "ws", "p-0"]) == 2            # 비대화형 + --yes 없음
+    assert cli.main(["pod-delete", "ws", "p-0"]) == 2            # non-interactive + no --yes
     assert cli.main(["pod-delete", "ws", "p-0", "--yes", "--delete-local-storage", "pv-1"]) == 0
     name, args, kw = _last("pod_action")
     assert args == ("p-0", "ws") and kw["delete_local_storages"] == ["pv-1"]
@@ -199,10 +199,10 @@ def test_pod_stop_and_delete(capsys, non_tty):
 
 def test_storage_create_and_estimate(capsys, non_tty):
     assert cli.main(["storage-create", "ws", "vol", "--size", "10", "--type", "nfs", "--encrypted", "--estimate"]) == 0
-    # 스토리지 시간당 단가도 3자리 — 2자리면 "$0.00" 이 돼 콘솔("$0.000")과 갈린다.
+    # The hourly storage unit price has 3 decimals too — with 2 it would be "$0.00" and differ from the console ("$0.000").
     storage_out = capsys.readouterr().out
     assert "$0.000/hr" in storage_out and "per GiB·month: $0.07" in storage_out
-    assert "10 GiB" in storage_out and "305 GiB" in storage_out     # 크기 = capacity × 1024 MiB
+    assert "10 GiB" in storage_out and "305 GiB" in storage_out     # size = capacity × 1024 MiB
     assert cli.main(["storage-create", "ws", "vol", "--size", "10", "--yes", "-o", "name"]) == 0
     assert capsys.readouterr().out.strip() == "5"
     name, args, kw = _last("create_storage")
@@ -217,7 +217,7 @@ def test_task_submit_from_file(tmp_path, capsys):
                      "--max-duration", "7200", "--yes"]) == 0
     captured = capsys.readouterr()
     assert "task_1" in captured.out and "task-logs task_1" in captured.out
-    assert "no longer have versions" in captured.err           # 옛 ASSET_ID:VERSION 은 경고하고 무시
+    assert "no longer have versions" in captured.err           # the old ASSET_ID:VERSION warns and is ignored
     name, args, kw = _last("submit_task")
     assert args == ("train", "print('hi', flush=True)\n") and kw["cpu_preset"] == "micro-2c8g"
     assert kw["args"] == ["--epochs", "3"] and kw["input_assets"] == [{"asset": "asset_a"}] and kw["max_duration"] == 7200
@@ -244,7 +244,7 @@ def test_any_node_yes_does_not_imply_data_loss_consent(capsys, non_tty):
 
 
 def test_pod_create_wait_timeout_is_an_error_but_keeps_the_transaction(capsys):
-    """파드가 시간 안에 안 나타나면 exit 1 — 자동화가 `--wait running` 성공으로 오인하면 안 된다. 수락된 transaction 은 출력."""
+    """If the pod doesn't show up in time, exit 1 — automation must not mistake it for `--wait running` success. The accepted transaction is printed."""
     assert cli.main(["pod-create", "ws", "late-pod", "--template", "457", "--yes", "--wait", "running", "--wait-timeout", "0"]) == 1
     captured = capsys.readouterr()
     assert "transaction" in captured.out and "99" in captured.out
@@ -255,14 +255,14 @@ def test_pod_create_wait_timeout_is_an_error_but_keeps_the_transaction(capsys):
 
 
 def test_disk_flag_is_gone(capsys):
-    """시스템 디스크는 서버 공식으로 고정된다 — 받는 척하던 --disk 는 없앤다(argparse 가 usage 오류 2 로 끝낸다)."""
+    """The system disk is fixed by a server-side formula — the --disk flag that pretended to take it is gone (argparse ends with usage error 2)."""
     with pytest.raises(SystemExit) as exit_:
         cli.main(["pod-create", "ws", "p", "--template", "1", "--disk", "30", "--yes"])
     assert exit_.value.code == 2 and "--disk" in capsys.readouterr().err
 
 
 def test_size_options_say_gib_and_vram_stays_gb(capsys):
-    """--size·--ram 은 원래부터 GiB 였다(capacity × 1024 MiB, 쿠버네티스 Gi) — 도움말도 GiB 로. VRAM 티어만 GB."""
+    """--size and --ram were always GiB (capacity × 1024 MiB, Kubernetes Gi) — so the help says GiB too. Only VRAM tiers are GB."""
     for argv, expected in ((["--help"], ["--size GiB"]),
                            (["storage-create", "--help"], ["--size GiB"]),
                            (["pod-create", "--help"], ["--ram GiB", "RAM in GiB", "--vram GB"]),
@@ -274,19 +274,19 @@ def test_size_options_say_gib_and_vram_stays_gb(capsys):
 
 
 def test_serving_scale_and_resume_confirm_only_when_cost_can_rise(capsys, non_tty):
-    # 범위 확대 → 확인 필요(비대화형 + --yes 없음 → 2, 호출 없음)
+    # Wider range → needs confirmation (non-interactive + no --yes → 2, no call)
     assert cli.main(["serving-scale", "42", "--max-replicas", "4"]) == 2
     assert "--yes" in capsys.readouterr().err
     assert all(c[0] != "scale_serving" for c in FakeClient.instances[-1].calls)
     assert cli.main(["serving-scale", "42", "--max-replicas", "4", "--yes"]) == 0
     assert _last("scale_serving")[2]["max_replicas"] == 4
-    # 상한 인상·autoscale 켜기도 확인 대상
+    # Raising the cap and turning on autoscale need confirmation too
     assert cli.main(["serving-scale", "42", "--price-cap", "2"]) == 2
     assert cli.main(["serving-scale", "42", "--autoscale"]) == 2
-    # 줄이는 변경은 --yes 없이 바로 적용
+    # Reductions apply right away without --yes
     assert cli.main(["serving-scale", "42", "--max-replicas", "2", "--price-cap", "1"]) == 0
     assert _last("scale_serving")[2] == {"min_replicas": None, "max_replicas": 2, "autoscale": None, "price_cap_per_hour": "1"}
-    # resume 은 과금 재개 → 확인, pause 는 즉시
+    # resume restarts billing → confirmation; pause is immediate
     assert cli.main(["serving-resume", "42"]) == 2
     assert all(c[0] != "pause_serving" for c in FakeClient.instances[-1].calls)
     assert cli.main(["serving-resume", "42", "-y"]) == 0 and _last("pause_serving")[2]["paused"] is False
@@ -295,11 +295,11 @@ def test_serving_scale_and_resume_confirm_only_when_cost_can_rise(capsys, non_tt
 
 def test_storage_estimate_shows_disk_type(capsys):
     assert cli.main(["storage-create", "ws", "vol", "--size", "10", "--disk", "SSD", "--estimate"]) == 0
-    assert "nfs / NVMe" in capsys.readouterr().out       # FakeClient 응답에 diskType 이 없어 기본 NVMe
+    assert "nfs / NVMe" in capsys.readouterr().out       # the FakeClient response has no diskType, so the default NVMe
     assert _last("estimate_storage")[2]["disk_type"] == "SSD"
 
 
-# --estimate 는 pod-create·storage-create·task-submit 공통 — 출력 포맷별 동작을 세 커맨드에 같이 건다.
+# --estimate is shared by pod-create, storage-create and task-submit — each output format's behavior is checked on all three.
 ESTIMATE_ARGV = {
     "pod-create": ["pod-create", "ws", "p", "--template", "457", "--gpu", "RTX 3060", "--estimate"],
     "storage-create": ["storage-create", "ws", "vol", "--size", "10", "--estimate"],
@@ -316,19 +316,19 @@ def _created_nothing():
 @pytest.mark.parametrize("command, payload", [("pod-create", ESTIMATE), ("storage-create", {**STORAGE_ESTIMATE, "sizeGb": 10}),
                                               ("task-submit", TASK_ESTIMATE)])
 def test_estimate_json_is_only_the_server_payload(capsys, command, payload, flag):
-    """`--estimate -o json` 은 서버 견적 payload 하나만 — 사람용 견적 표가 앞에 붙어 jq·json.loads 가 깨졌다
-    (dev 실측: storage-create 의 첫 줄들이 `estimate:`·`per GiB·month:`·`size:`, 그 뒤에 JSON)."""
-    expected = copy.deepcopy(payload)     # FakeClient 가 같은 dict 를 raw 로 넘기므로 호출 전 사본과 비교한다
+    """`--estimate -o json` prints just the server's estimate payload — the human estimate table used to come first and broke jq/json.loads
+    (observed: storage-create's first lines were `estimate:`, `per GiB·month:`, `size:`, then the JSON)."""
+    expected = copy.deepcopy(payload)     # FakeClient passes the same dict as raw, so compare with a copy made before the call
     assert cli.main(ESTIMATE_ARGV[command] + flag) == 0
     assert json.loads(capsys.readouterr().out) == expected
     assert _created_nothing()
 
 
 @pytest.mark.parametrize("command, price", [("pod-create", "0.068\n"), ("storage-create", "0.000\n"),
-                                            ("task-submit", "")])    # CPU 프리셋은 시간당 단가를 모른다 — 찍을 숫자가 없다
+                                            ("task-submit", "")])    # CPU presets don't know the hourly price — no number to print
 def test_estimate_name_is_just_the_hourly_price(capsys, command, price):
-    """`-o name` 은 credit·asset-storage 처럼 헤드라인 숫자 하나 — 표의 `$0.068/hr` 과 같은 숫자를 `$` 없이.
-    전에는 사람용 견적 표를 그대로 찍었다."""
+    """`-o name` prints one headline number like credit and asset-storage — the same number as the table's `$0.068/hr`, without `$`.
+    It used to print the human estimate table as-is."""
     assert cli.main(ESTIMATE_ARGV[command] + ["-o", "name"]) == 0
     assert capsys.readouterr().out == price
     assert _created_nothing()
@@ -336,8 +336,8 @@ def test_estimate_name_is_just_the_hourly_price(capsys, command, price):
 
 @pytest.mark.parametrize("price, shown", [("0.5", "0.500\n"), ("1.0005", "1.001\n"), ("1234.5678", "1234.568\n")])
 def test_estimate_name_rounds_like_the_table(capsys, monkeypatch, price, shown):
-    """단가가 있는 태스크(GPU)도 그 숫자 하나. 반올림은 표와 같은 ROUND_HALF_UP(float 포맷이면 1.0005 → 1.000),
-    천 단위 쉼표는 뺀다 — 표는 `$1,234.568/hr`."""
+    """A task with a unit price (GPU) prints that one number too. Rounding is the table's ROUND_HALF_UP (float formatting gives 1.0005 → 1.000),
+    and thousands separators are dropped — the table shows `$1,234.568/hr`."""
     monkeypatch.setattr(FakeClient, "estimate_task",
                         lambda self, *a, **kw: TaskEstimate.from_dict({**TASK_ESTIMATE, "pricePerHourUsd": price}))
     argv = ["task-submit", "ws", "t", "--script-text", "print(1)", "--image", "img", "--gpu", "RTX 3060", "--estimate"]
@@ -355,7 +355,7 @@ def test_estimate_table_is_the_default(capsys, command):
 @pytest.mark.parametrize("command, key, value", [("pod-create", "transactionId", 99), ("storage-create", "transactionId", 5),
                                                  ("task-submit", "task", TASK)])
 def test_create_shows_the_estimate_first_only_in_table_mode(capsys, command, key, value):
-    """실제로 만들 때 확인 전에 견적 표를 보여 주는 건 table 모드뿐 — -o json 은 수락 응답 하나만 찍는다."""
+    """Showing the estimate table before confirming a real create is table mode only — -o json prints just the accepted response."""
     argv = [arg for arg in ESTIMATE_ARGV[command] if arg != "--estimate"] + ["--yes"]
     assert cli.main(argv) == 0
     out = capsys.readouterr().out
@@ -365,7 +365,7 @@ def test_create_shows_the_estimate_first_only_in_table_mode(capsys, command, key
 
 
 class _Tty(io.StringIO):
-    """사람이 답하는 터미널 — isatty() 가 True, 답은 한 줄씩."""
+    """A terminal a person answers in — isatty() is True, answers come line by line."""
 
     def isatty(self):
         return True
@@ -381,13 +381,13 @@ class _CtrlC(_Tty):
     (["storage-create", "ws", "vol", "--size", "10"], "y\n"),
     (["task-submit", "ws", "t", "--script-text", "print(1)", "--image", "img", "--cpu-preset", "micro-2c8g"], "y\n"),
     (["pod-delete", "ws", "p-0"], "y\n"),
-    (["pod-start", "ws", "p-0", "--any-node"], "y\ny\n"),        # 과금 재개 + 데이터 유실 동의, 질문 두 번
+    (["pod-start", "ws", "p-0", "--any-node"], "y\ny\n"),        # billing restarts + data-loss consent, two questions
     (["serving-scale", "42", "--max-replicas", "4"], "y\n"),
     (["serving-resume", "42"], "y\n"),
 ])
 def test_confirm_question_goes_to_stderr(capsys, monkeypatch, argv, answers):
-    """확인 질문은 stderr 로 — 터미널에서 답하면서 stdout 을 파일·파이프로 돌리면(`-o json > out.json`, `| jq`)
-    input() 이 질문을 stdout 에 써서 결과 앞에 `Create pod 'p' at $0.068/hr? [y/N] ` 가 붙었고 사람은 질문을 못 봤다."""
+    """Confirmation prompts go to stderr — when answering in a terminal while stdout goes to a file or pipe (`-o json > out.json`, `| jq`),
+    input() wrote the prompt to stdout, so `Create pod 'p' at $0.068/hr? [y/N] ` got prepended to the result and the person never saw it."""
     monkeypatch.setattr("sys.stdin", _Tty(answers))
     assert cli.main(argv + ["-o", "json"]) == 0
     captured = capsys.readouterr()
@@ -396,14 +396,14 @@ def test_confirm_question_goes_to_stderr(capsys, monkeypatch, argv, answers):
 
 
 def test_confirm_keeps_name_output_to_the_id(capsys, monkeypatch):
-    """`id=$(meshive pod-create … -o name)` — 질문이 $id 로 들어가 명령이 멈춘 것처럼 보였다."""
+    """`id=$(meshive pod-create … -o name)` — the prompt went into $id and the command looked hung."""
     monkeypatch.setattr("sys.stdin", _Tty("y\n"))
     assert cli.main(["pod-create", "ws", "p", "--template", "457", "-o", "name"]) == 0
     captured = capsys.readouterr()
     assert captured.out == "99\n" and "[y/N]" in captured.err
 
 
-@pytest.mark.parametrize("answers, code", [("n\n", 2), ("", 2), (None, 130)])     # 거절, 답 없이 EOF, Ctrl-C
+@pytest.mark.parametrize("answers, code", [("n\n", 2), ("", 2), (None, 130)])     # decline, EOF without an answer, Ctrl-C
 def test_confirm_refused_or_interrupted_changes_nothing(capsys, monkeypatch, answers, code):
     monkeypatch.setattr("sys.stdin", _CtrlC() if answers is None else _Tty(answers))
     assert cli.main(["pod-create", "ws", "p", "--template", "457", "-o", "json"]) == code
@@ -413,7 +413,7 @@ def test_confirm_refused_or_interrupted_changes_nothing(capsys, monkeypatch, ans
 
 
 def test_any_node_data_loss_refused_at_the_second_question(capsys, monkeypatch):
-    monkeypatch.setattr("sys.stdin", _Tty("y\nn\n"))              # 과금 재개엔 예, 데이터 유실엔 아니오
+    monkeypatch.setattr("sys.stdin", _Tty("y\nn\n"))              # yes to restarting billing, no to data loss
     assert cli.main(["pod-start", "ws", "p-0", "--any-node", "-o", "json"]) == 2
     captured = capsys.readouterr()
     assert captured.out == "" and captured.err.count("[y/N]") == 2
@@ -421,15 +421,15 @@ def test_any_node_data_loss_refused_at_the_second_question(capsys, monkeypatch):
 
 
 def test_confirm_shows_the_estimate_before_asking_when_stdout_is_a_pipe(monkeypatch):
-    """묻기 전에 input() 처럼 stdout 을 비운다 — 파이프(`| tee log`, `2>&1 | tee log`)로 나가는 stdout 은 블록 버퍼라,
-    안 비우면 견적 표가 답한 뒤에야 나오거나 질문보다 뒤에 찍힌다."""
+    """Flush stdout before asking, as input() does — stdout going to a pipe (`| tee log`, `2>&1 | tee log`) is block-buffered,
+    so without flushing the estimate table shows up only after answering, or after the prompt."""
     pipe = io.BytesIO()
     monkeypatch.setattr("sys.stdout", io.TextIOWrapper(pipe, encoding="utf-8"))
     shown = []
 
     class Human(_Tty):
         def readline(self, *a):
-            shown.append(pipe.getvalue().decode())     # 답하는 순간까지 파이프로 나간 stdout
+            shown.append(pipe.getvalue().decode())     # stdout sent to the pipe up to the moment of answering
             return "n\n"
 
     monkeypatch.setattr("sys.stdin", Human())
@@ -442,19 +442,19 @@ def test_model_commands(capsys, non_tty):
     out = capsys.readouterr().out
     assert "qwen-small" in out and "12" in out and "qwen-small-ab12" in out
 
-    assert cli.main(["model-detect", "ws", "Qwen/Qwen3-0.6B-GGUF", "--hf-token", "4"]) == 1   # 서빙 불가 → exit 1
+    assert cli.main(["model-detect", "ws", "Qwen/Qwen3-0.6B-GGUF", "--hf-token", "4"]) == 1   # can't be served → exit 1
     out = capsys.readouterr().out
     assert "unsupported" in out and "GGUF is not supported" in out and "Qwen/Qwen3-0.6B" in out
     assert _last("detect_model")[2] == {"workspace": "ws", "hf_token_id": 4}
 
-    # 등록은 비용이 없어 --yes 없이도(비대화형) 진행한다
+    # Registration costs nothing, so it proceeds without --yes (non-interactive)
     assert cli.main(["model-register", "ws", "Qwen/Qwen3-0.6B", "--name", "qwen-small", "--framework", "sglang"]) == 0
     out = capsys.readouterr().out
     assert "Already registered: model #12" in out and "serving-deploy ws 12" in out
     assert _last("register_model")[2] == {"workspace": "ws", "name": "qwen-small", "framework": "sglang",
                                           "hf_token_id": None, "context_length": None}
 
-    assert cli.main(["model-delete", "12"]) == 2                 # 지우기는 확인이 필요하다
+    assert cli.main(["model-delete", "12"]) == 2                 # deleting needs confirmation
     assert cli.main(["model-delete", "12", "--yes"]) == 0
     assert _last("delete_model")[1] == (12,)
 
@@ -482,7 +482,7 @@ def test_pod_watch_shows_and_rewrites_with_the_version(capsys, non_tty):
     assert "/workspace/outputs" in out and "template" in out and "*.png" in out and "*.txt" in out
     assert not any(c[0] == "set_watched_folders" for c in FakeClient.instances[-1].calls)
 
-    # 늘리는 변경은 확인이 필요하다(수확 저장 과금)
+    # Changes that add folders need confirmation (harvest storage is billed)
     assert cli.main(["pod-watch", "ws", "p-0", "--add", "/workspace/ckpt", "--include", "*.pt"]) == 2
     assert cli.main(["pod-watch", "ws", "p-0", "--add", "/workspace/ckpt", "--include", "*.pt", "--existing", "--yes"]) == 0
     kw = _last("set_watched_folders")[2]
@@ -491,17 +491,17 @@ def test_pod_watch_shows_and_rewrites_with_the_version(capsys, non_tty):
     assert kw["user"] == [{"path": "/workspace/logs", "include": ["*.txt"], "enabled": True},
                           {"path": "/workspace/ckpt", "include": ["*.pt"], "include_existing": True}]
 
-    # 줄이는 변경은 바로
+    # Reductions apply right away
     assert cli.main(["pod-watch", "ws", "p-0", "--off", "/workspace/outputs", "--remove", "/workspace/logs"]) == 0
     kw = _last("set_watched_folders")[2]
     assert kw["template"] == {"/workspace/outputs": {"enabled": False, "include": None}} and kw["user"] == []
-    assert cli.main(["pod-watch", "ws", "p-0", "--off", "/nope"]) == 2     # 모르는 폴더 → 사용 오류
+    assert cli.main(["pod-watch", "ws", "p-0", "--off", "/nope"]) == 2     # unknown folder → usage error
 
 
 def test_ssh_prints_the_command_and_password_only(capsys):
     assert cli.main(["ssh", "ws", "p-0"]) == 0
     out = capsys.readouterr().out
-    assert "ssh -p 2222 root@m.example" in out and "pw-123" in out and "in " in out   # 만료는 앞으로의 시각
+    assert "ssh -p 2222 root@m.example" in out and "pw-123" in out and "in " in out   # expiry is a time in the future
     assert _last("ssh_access")[1] == ("p-0", "ws")
     assert cli.main(["ssh", "ws", "p-0", "-o", "name"]) == 0
     assert capsys.readouterr().out.strip() == "ssh -p 2222 root@m.example"

@@ -16,8 +16,8 @@ jobs:
         with:
           python-version: "3.13"
       - name: Check tag matches package version
-        # _version.py 를 파일로 직접 읽는다 — 패키지 import 는 __init__ 을 거치며
-        # httpx 등 의존성을 요구해서 의존성 미설치 러너에서 깨진다.
+        # Read _version.py as a file — importing the package goes through __init__, which needs
+        # dependencies such as httpx and breaks on a runner without them installed.
         run: |
           pkg="v$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' meshive/_version.py)"
           if [ -z "${pkg#v}" ] || [ "$pkg" != "$GITHUB_REF_NAME" ]; then
@@ -55,8 +55,8 @@ jobs:
           name: dist
           path: dist/
       - name: Create GitHub Release
-        # 릴리스 노트는 CHANGELOG.md 의 해당 버전 섹션(영어, 사용자 관점)을 쓴다.
-        # 섹션이 없으면 실패한다 — 한국어 커밋/태그 메시지가 공개 노트로 새지 않게.
+        # Release notes come from this version's section in CHANGELOG.md (English, written for users).
+        # Fails if the section is missing — so raw commit/tag messages never become the public notes.
         run: |
           scripts/release-notes.sh "$GITHUB_REF_NAME" > notes.md
           gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md

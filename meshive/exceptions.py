@@ -1,33 +1,33 @@
-"""Meshive SDK 예외 계층.
+"""Meshive SDK exception hierarchy.
 
-서버 에러 포맷: {"detail": {"title": ..., "message": ...}}.
-HTTP 상태코드 → 예외 매핑은 _client._raise_for_status 에서 수행한다.
+Server error format: {"detail": {"title": ..., "message": ...}}.
+HTTP status codes are mapped to exceptions in _client._raise_for_status.
 """
 from __future__ import annotations
 
 
 class MeshiveError(Exception):
-    """모든 Meshive SDK 예외의 베이스."""
+    """Base class of every Meshive SDK exception."""
 
 
 class ConfigurationError(MeshiveError):
-    """API Key 누락 등 클라이언트 설정 문제 (요청을 보내기 전)."""
+    """Client configuration problem such as a missing API key (raised before any request is sent)."""
 
 
 class WaitTimeoutError(MeshiveError, TimeoutError):
-    """wait_for_pod 가 제한 시간 안에 목표 상태에 도달하지 못했을 때.
+    """wait_for_pod did not reach the target state within the time limit.
 
-    내장 TimeoutError 도 겸하므로 `except MeshiveError` / `except TimeoutError`
-    어느 쪽으로 잡아도 걸린다.
+    It is also a built-in TimeoutError, so both `except MeshiveError` and `except TimeoutError`
+    catch it.
     """
 
 
 class MeshiveAPIError(MeshiveError):
-    """서버가 4xx/5xx 를 반환했을 때.
+    """The server returned a 4xx/5xx.
 
-    status_code: HTTP 상태코드
-    title/message: 서버의 detail.title / detail.message (있으면)
-    raw: 파싱된 응답 바디 전체 (dict | str | None)
+    status_code: HTTP status code
+    title/message: the server's detail.title / detail.message (if present)
+    raw: the whole parsed response body (dict | str | None)
     """
 
     def __init__(
@@ -49,29 +49,29 @@ class MeshiveAPIError(MeshiveError):
 
 
 class AuthenticationError(MeshiveAPIError):
-    """401 — API Key 누락/무효/만료, 또는 비활성 계정."""
+    """401 — API key missing, invalid or expired, or the account is inactive."""
 
 
 class PermissionDeniedError(MeshiveAPIError):
-    """403 — 키에 필요한 scope 가 없음."""
+    """403 — the key lacks the required scope."""
 
 
 class NotFoundError(MeshiveAPIError):
-    """404 — 리소스(파드/유저 등) 없음."""
+    """404 — resource (pod, user, ...) not found."""
 
 
 class InsufficientCreditError(MeshiveAPIError):
-    """402 — 워크스페이스 billing 계정의 크레딧 잔액 부족 (파드/스토리지/태스크 생성·시작 시)."""
+    """402 — the workspace's billing account doesn't have enough credit (when creating/starting pods, storage, tasks)."""
 
 
 class ConflictError(MeshiveAPIError):
-    """409 — 현재 상태와 충돌: 재고 없음(No Capacity), 이름 중복(Name Taken), 가격 캡 초과(Price Exceeds Cap),
-    스토리지 사용 중(Storage In Use), 같은 Idempotency-Key 요청 처리 중(Request In Progress) 등.
-    `title` 로 종류를 구분하고, `raw["detail"]` 에 availability/pricePerHourUsd 같은 부가 정보가 있다."""
+    """409 — conflicts with the current state: no capacity (No Capacity), duplicate name (Name Taken), price over the cap (Price Exceeds Cap),
+    storage in use (Storage In Use), a request with the same Idempotency-Key still in progress (Request In Progress), etc.
+    Tell them apart by `title`; `raw["detail"]` carries extra info such as availability/pricePerHourUsd."""
 
 
 class RateLimitError(MeshiveAPIError):
-    """429 — 유저 단위 rate limit 초과. retry_after(초) 가 있으면 노출."""
+    """429 — per-user rate limit exceeded. Exposes retry_after (seconds) when present."""
 
     def __init__(
         self,

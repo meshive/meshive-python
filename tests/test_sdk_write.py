@@ -1,4 +1,4 @@
-"""0.1.0 쓰기 표면 — 요청 조립(경로/쿼리/본문), Idempotency-Key, 재시도, 새 예외, headers=, 로그."""
+"""0.1.0 write surface — request assembly (path/query/body), Idempotency-Key, retries, new exceptions, headers=, logs."""
 import asyncio
 import json
 
@@ -26,7 +26,7 @@ ESTIMATE = {"pricePerHourUsd": "0.068423", "breakdown": {"gpu": "0.068423"}, "re
 
 
 class Recorder:
-    """요청을 기록하고 미리 정한 응답을 순서대로 돌려주는 MockTransport 핸들러."""
+    """MockTransport handler that records requests and returns preset responses in order."""
 
     def __init__(self, *responses):
         self.requests: list[httpx.Request] = []
@@ -45,7 +45,7 @@ class Recorder:
         return json.loads(self.requests[index].content)
 
 
-# --- 파드 --------------------------------------------------------------------
+# --- Pods --------------------------------------------------------------------
 
 def test_estimate_pod_builds_request():
     rec = Recorder((200, ESTIMATE))
@@ -78,7 +78,7 @@ def test_create_pod_uses_given_idempotency_key_and_parses():
     assert isinstance(created, PodCreated) and created.transaction_id == 14765 and created.pod_name is None
     assert created.estimate.price_per_hour == "0.068423"
     assert rec.last.headers["Idempotency-Key"] == "my-key-0001" and rec.last.url.path == "/v1/sdk/pods"
-    assert rec.body()["gpuCount"] == 1 and "gpuModel" not in rec.body()   # CPU 파드: gpuModel 생략
+    assert rec.body()["gpuCount"] == 1 and "gpuModel" not in rec.body()   # CPU pod: gpuModel omitted
 
 
 def test_write_retries_reuse_the_same_idempotency_key(slept):
@@ -116,7 +116,7 @@ def test_pod_validation_errors(kwargs):
         sync_client(Recorder((200, ESTIMATE))).estimate_pod("p", 1, workspace="ws", **kwargs)
 
 
-# --- 예외 --------------------------------------------------------------------
+# --- Exceptions --------------------------------------------------------------------
 
 def test_402_and_409_map_to_new_exceptions():
     rec = Recorder((409, {"detail": {"title": "Price Exceeds Cap", "message": "too expensive", "pricePerHourUsd": "0.1"}}))
@@ -127,7 +127,7 @@ def test_402_and_409_map_to_new_exceptions():
         sync_client(Recorder((402, {"detail": {"title": "Insufficient Credit", "message": "top up"}}))).start_pod("p", "ws")
 
 
-# --- 스토리지 / 서빙 / 태스크 ---------------------------------------------------------
+# --- Storage / serving / tasks ---------------------------------------------------------
 
 def test_storage_methods():
     rec = Recorder((202, {"name": "vol", "workspace": "ws", "transactionId": 5, "pvName": None,
@@ -139,7 +139,7 @@ def test_storage_methods():
     assert rec.body() == {"name": "vol", "sizeGb": 1, "storageType": "nfs", "diskType": "SSD", "encrypted": True}
     c.create_storage("vol", 1, workspace="ws", storage_type="hostpath")
     assert rec.body() == {"name": "vol", "sizeGb": 1, "storageType": "hostPath", "diskType": "NVMe", "encrypted": False}
-    with pytest.raises(ValueError, match="nfs"):          # 암호화는 네트워크 스토리지만 (서버도 hostPath+encrypted 를 422 로 거절)
+    with pytest.raises(ValueError, match="nfs"):          # encryption is network storage only (the server also rejects hostPath+encrypted with 422)
         c.estimate_storage("vol", 1, workspace="ws", storage_type="hostPath", encrypted=True)
     c.delete_storage("pv-1", "ws")
     assert rec.last.method == "DELETE" and rec.last.url.path == "/v1/sdk/storages/pv-1"
@@ -186,7 +186,7 @@ def test_task_methods():
     assert isinstance(submitted, TaskSubmitted) and submitted.task.task_id == "task_1" and submitted.estimate.max_cost == "0.068"
     body = rec.body()
     assert body["gpuModel"] == "RTX 3060" and "cpuPreset" not in body and body["maxDurationS"] == 7200
-    assert body["inputAssets"] == [{"asset": "asset_a"}, {"asset": "asset_b", "targetDir": "/inputs/b"}]   # version 은 안 보낸다
+    assert body["inputAssets"] == [{"asset": "asset_a"}, {"asset": "asset_b", "targetDir": "/inputs/b"}]   # version isn't sent
     assert body["args"] == ["--epochs", "3"] and body["secretKeys"] == ["HF_TOKEN"]
     c.stop_task("task_1")
     assert rec.last.url.path == "/v1/sdk/tasks/task_1/stop"
@@ -196,11 +196,11 @@ def test_task_methods():
         script = kwargs.pop("script", "print(1)")
         with pytest.raises(ValueError):
             c.estimate_task("t", script, workspace="ws", **kwargs)
-    with pytest.raises(ValueError, match="256 KiB"):   # 한도는 256 × 1024 바이트 (서버 메시지와 같은 KiB)
+    with pytest.raises(ValueError, match="256 KiB"):   # the limit is 256 × 1024 bytes (KiB, same as the server message)
         c.estimate_task("t", "x" * (256 * 1024 + 1), workspace="ws", image="img", cpu_preset="micro-2c8g")
 
 
-# --- 로그 --------------------------------------------------------------------
+# --- Logs --------------------------------------------------------------------
 
 def test_logs():
     rec = Recorder((200, {"podName": "p-0", "workspace": "ws", "source": "live", "count": 2, "truncated": False,
@@ -231,7 +231,7 @@ def test_custom_headers_are_sent_but_cannot_override_auth():
     assert rec.last.headers["User-Agent"].startswith("meshive-python/")
 
 
-# --- async 미러 --------------------------------------------------------------------
+# --- async mirror --------------------------------------------------------------------
 
 def test_async_write_methods_mirror_sync():
     rec = Recorder((202, {"name": "p", "workspace": "ws", "transactionId": 3, "estimate": ESTIMATE}))
@@ -296,10 +296,10 @@ def test_data_loss_consent_does_not_coerce_a_string_to_true():
     assert rec.requests == []
 
 
-# --- 서빙 비용 증가 판정 (CLI/MCP 확인 기준) ----------------------------------------------
+# --- Serving cost-increase decision (the CLI/MCP confirmation rule) ----------------------------------------------
 
 def test_serving_scale_raises_cost_covers_range_autoscale_and_cap():
-    """범위 확대·autoscale 켜기·상한 인상만 "비용이 늘 수 있다" — 줄이거나 무제한 상한에 값을 주는 건 아니다."""
+    """Only a wider range, turning on autoscale and a higher cap "can raise cost" — reductions or setting a value on an unlimited cap don't."""
     from meshive.models import Serving
     current = Serving.from_dict({"id": 42, "namespaceName": "ws", "framework": "vllm", "status": "active",
                                  "minReplicas": 1, "maxReplicas": 3, "currentReplicas": 2, "autoScaleEnabled": False,
@@ -320,7 +320,7 @@ def test_storage_estimate_carries_disk_type():
     est = StorageEstimate.from_dict({"pricePerHourUsd": "0.0001", "pricePerGbMonthUsd": "0.07", "sizeGb": 10,
                                      "storageType": "nfs", "diskType": "SSD", "maxSizeGb": 300})
     assert est.disk_type == "SSD"
-    assert StorageEstimate.from_dict({"sizeGb": 1, "maxSizeGb": 1}).disk_type == "NVMe"   # 구 서버 응답
+    assert StorageEstimate.from_dict({"sizeGb": 1, "maxSizeGb": 1}).disk_type == "NVMe"   # older server response
 
 
 def test_model_registration_methods():
@@ -384,12 +384,12 @@ def test_asset_import_picks_the_source():
     a = sync_client(rec).import_asset("Qwen/Qwen3-0.6B", workspace="ws")
     assert rec.last.url.path == "/v1/sdk/assets/import" and rec.last.headers["Idempotency-Key"]
     assert (a.asset_id, a.file_count, a.resolved_commit) == ("asset_abc", 9, "c0ffee")
-    # 옛 서버: POST /assets/import 는 GET /assets/{id} 와 맞물려 404 가 아니라 405 다(dev 실측 2026-10-03)
+    # Older servers: POST /assets/import collides with GET /assets/{id}, so it's 405, not 404 (observed 2026-10-03)
     with pytest.raises(NotFoundError, match="does not support asset import"):
         sync_client(Recorder((405, {"detail": "Method Not Allowed"}))).import_asset("Qwen/Qwen3-0.6B", workspace="ws")
     with pytest.raises(NotFoundError, match="does not support watched folders"):
         sync_client(Recorder((404, {"detail": "Not Found"}))).set_watched_folders("p-0", "ws", expected_version=1)
-    with pytest.raises(PermissionDeniedError):     # 다른 오류는 그대로
+    with pytest.raises(PermissionDeniedError):     # other errors pass through
         sync_client(Recorder((403, {"detail": {"title": "Forbidden", "message": "admin only"}}))).import_asset(
             "Qwen/Qwen3-0.6B", workspace="ws")
 
@@ -410,7 +410,7 @@ def test_pod_assets_and_watched_folders():
     assert body["harvestDestination"] == {"mode": "user_s3", "credentialId": 5}
     rec = Recorder((200, {"pricePerHourUsd": "1"}))
     sync_client(rec).estimate_pod("p", 457, workspace="ws")
-    assert not {"inputAssets", "watchedFolders", "harvestDestination"} & rec.body().keys()   # 안 쓰면 안 보낸다
+    assert not {"inputAssets", "watchedFolders", "harvestDestination"} & rec.body().keys()   # not sent when unused
 
     config = {"version": "3:ab", "editable": True, "applied": True, "roots": [
         {"role": "output", "path": "/workspace/outputs", "origin": "template", "enabled": True, "include": ["*.png"],

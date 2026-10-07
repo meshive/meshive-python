@@ -8,6 +8,7 @@ import pytest
 
 
 cli = importlib.import_module("meshive.cli.main")  # cli.__init__ exposes the main function, which shadows the submodule
+from meshive import Meshive
 from meshive.models import (Pod, Logs, PodCreated, PodEstimate, ResourceAction, Serving, StorageCreated, StorageEstimate,
                             TaskEstimate, TaskSubmitted, ModelDetection, ServingModel, AssetImported, WatchedFolders, SshAccess)
 
@@ -37,6 +38,8 @@ class FakeClient:
 
     def list_pods(self, *a, **kw):
         self._rec("list_pods", *a, **kw); return []          # right after creation the pod doesn't exist yet
+
+    wait_for_new_pod = Meshive.wait_for_new_pod   # the real SDK method, on top of the fake list_pods
 
     def get_serving(self, *a, **kw):
         self._rec("get_serving", *a, **kw)

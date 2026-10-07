@@ -11,13 +11,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import time
 from pathlib import Path
 from typing import Any, Callable
 
 from . import _format as fmt
 from .._client import Meshive
-from ..exceptions import MeshiveError
+from ..exceptions import MeshiveError, WaitTimeoutError
 from ..models import Logs, PodEstimate, ResourceAction, StorageEstimate, TaskEstimate
 
 Handler = Callable[[Meshive, argparse.Namespace, str, bool], int]
@@ -253,18 +252,6 @@ def _toggle(template: dict[str, Any], user: list[dict[str, Any]], path: str, ena
     raise ValueError(f"{path} is not a watched folder of this pod (use --add for a new one)")
 
 
-def _wait_for_new_pod(client: Meshive, workspace: str, name: str, until: str, timeout: float) -> str | None:
-    """Right after creation there is no pod_name — find user_alias == name in the list, then hand off to wait_for_pod."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        for pod in client.list_pods(workspace):
-            if pod.user_alias == name:
-                client.wait_for_pod(pod.pod_name, workspace, until=until, timeout=max(1.0, deadline - time.monotonic()))
-                return pod.pod_name
-        time.sleep(5)
-    return None
-
-
 def cmd_pod_create(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     kwargs = _pod_kwargs(args)
     estimate = client.estimate_pod(args.name, args.template, workspace=args.workspace, **kwargs)
@@ -276,17 +263,21 @@ def cmd_pod_create(client: Meshive, args: argparse.Namespace, output: str, color
     if not _confirm(args, f"Create pod '{args.name}' at {fmt.money_hourly(estimate.price_per_hour)}/hr?"):
         return 2
     created = client.create_pod(args.name, args.template, workspace=args.workspace, **kwargs)
-    pod_name = None
+    pod_name, timed_out = None, None
     if args.wait:
-        pod_name = _wait_for_new_pod(client, args.workspace, args.name, args.wait, args.wait_timeout)
+        try:
+            pod_name = client.wait_for_new_pod(args.name, args.workspace, until=args.wait,
+                                               timeout=args.wait_timeout).pod_name
+        except WaitTimeoutError as exc:
+            timed_out = exc
     _emit(output, created.raw, [pod_name or str(created.transaction_id)], lambda: _kv([
         ("accepted", fmt.yes_no(created.accepted)), ("name", created.name),
         ("pod", pod_name or "(assigned shortly — see `meshive pods`)"),
         ("transaction", str(created.transaction_id))]))
-    if args.wait and pod_name is None:
-        # Accepted, but the pod didn't show up in time — automation must not mistake this for `--wait running` success.
-        print(fmt.clean(f"Error: pod '{args.name}' did not appear within {args.wait_timeout:g}s. The create was accepted "
-                        f"(transaction {created.transaction_id}); check `meshive pods {args.workspace}`."), file=sys.stderr)
+    if timed_out:
+        # Accepted, but the pod didn't show up or get ready in time — automation must not mistake this for `--wait running` success.
+        print(fmt.clean(f"Error: {timed_out} The create was accepted (transaction {created.transaction_id}); "
+                        f"check `meshive pods {args.workspace}`."), file=sys.stderr)
         return 1
     return 0
 

@@ -1490,7 +1490,7 @@ class PodEstimate:
 @dataclass
 class PodCreated:
     """POST /v1/sdk/pods response (202). pod_name is assigned asynchronously, so it is None right after creation —
-    find the pod with user_alias == name in `list_pods()` or use `wait_for_pod_by_name()`."""
+    `wait_for_new_pod(name, workspace)` finds it by name once it shows up and waits until it is running."""
 
     name: str
     workspace: str

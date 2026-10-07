@@ -396,6 +396,11 @@ def _wait_expired(deadline: float, label: str, targets: set[str], last: str) -> 
     )
 
 
+def _new_pod_expired(deadline: float, name: str, timeout: float) -> None:
+    if time.monotonic() >= deadline:
+        raise WaitTimeoutError(f"Pod {name!r} did not appear within {timeout:g}s.")
+
+
 class Meshive(_BaseClient):
     """Synchronous Meshive SDK client.
 
@@ -529,6 +534,34 @@ class Meshive(_BaseClient):
                 return pod
             last = pod.status
             _wait_expired(deadline, pod_name, targets, last)
+            time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+
+    def wait_for_new_pod(
+        self,
+        name: str,
+        workspace: str,
+        *,
+        until: str | Iterable[str] = "running",
+        timeout: float = 600.0,
+        interval: float = 5.0,
+    ) -> Pod:
+        """Wait for a pod just created with `create_pod(name, ...)` to appear and reach `until`, and return it.
+
+            client.create_pod("my-pod", template_id, workspace="my-workspace", gpu_model="RTX 3060")
+            pod = client.wait_for_new_pod("my-pod", "my-workspace", until="running")
+
+        create_pod returns before the pod has an ID, so this finds it by name (user_alias), then waits like
+        wait_for_pod. Raises WaitTimeoutError if it doesn't appear or reach `until` within `timeout` seconds.
+        """
+        if not name:
+            raise ValueError("name is required")  # an empty name would match system pods, which have no label
+        deadline = time.monotonic() + timeout
+        while True:
+            pod = next((p for p in self.list_pods(workspace) if p.user_alias == name), None)
+            if pod is not None:
+                return self.wait_for_pod(pod.pod_name, workspace, until=until,
+                                         timeout=max(deadline - time.monotonic(), 0.0), interval=interval)
+            _new_pod_expired(deadline, name, timeout)
             time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
 
     # --- 0.0.7 read surface extension ------------------------------------------------
@@ -1119,6 +1152,28 @@ class AsyncMeshive(_BaseClient):
                 return pod
             last = pod.status
             _wait_expired(deadline, pod_name, targets, last)
+            await asyncio.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+
+    async def wait_for_new_pod(
+        self,
+        name: str,
+        workspace: str,
+        *,
+        until: str | Iterable[str] = "running",
+        timeout: float = 600.0,
+        interval: float = 5.0,
+    ) -> Pod:
+        """Wait for a pod just created with `create_pod(name, ...)` to appear and reach `until` (same rules as the
+        sync wait_for_new_pod)."""
+        if not name:
+            raise ValueError("name is required")  # an empty name would match system pods, which have no label
+        deadline = time.monotonic() + timeout
+        while True:
+            pod = next((p for p in await self.list_pods(workspace) if p.user_alias == name), None)
+            if pod is not None:
+                return await self.wait_for_pod(pod.pod_name, workspace, until=until,
+                                               timeout=max(deadline - time.monotonic(), 0.0), interval=interval)
+            _new_pod_expired(deadline, name, timeout)
             await asyncio.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
 
     # --- 0.0.7 read surface extension (same rules as the sync client) ---------------------------

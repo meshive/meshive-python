@@ -21,6 +21,7 @@ from meshive import (
     NotFoundError,
     PermissionDeniedError,
     RateLimitError,
+    PodCreationFailedError,
     WaitTimeoutError,
 )
 from meshive import _client, _config
@@ -80,7 +81,7 @@ def async_client(handler, **kwargs):
 
 @pytest.fixture(autouse=True)
 def slept(monkeypatch):
-    """재시도/폴링 대기를 실제로 자지 않고 기록만 한다 (테스트는 횟수·간격만 검증)."""
+    """Records retry/poll waits instead of actually sleeping (tests check only counts and intervals)."""
     recorded: list[float] = []
 
     async def _async_sleep(seconds):
@@ -93,7 +94,7 @@ def slept(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def isolate_config_dir(monkeypatch, tmp_path):
-    """credentials 파일이 resolve_* 에 끼어들지 않도록 빈 임시 디렉토리로 격리."""
+    """Isolate in an empty temp directory so the credentials file doesn't interfere with resolve_*."""
     from meshive import _credentials
 
     monkeypatch.setenv(_credentials.ENV_CONFIG_DIR, str(tmp_path / "cfg"))
@@ -185,12 +186,12 @@ def test_get_pod_parses():
     pod = sync_client(lambda r: httpx.Response(200, json=POD)).get_pod("pod-1", "team-ns")
     assert pod.pod_name == "pod-1"
     assert pod.rental_type == "on_demand"
-    # 서버가 안 준 상태 필드는 None — False 로 위장하지 않는다.
+    # Status fields the server didn't send are None — not disguised as False.
     assert pod.billing_active is None and pod.can_restart_on_same_node is None and pod.endpoints == []
 
 
 def test_pod_connect_info_and_state_fields():
-    """콘솔 Connect 탭과 같은 선택: endpoints 전부, env 는 showOnConnect 인 것만."""
+    """Same selection as the console's Connect tab: every endpoint, and only envs with showOnConnect."""
     pod = Pod.from_dict({
         **POD, "status": "stopped", "billingActive": False, "isDownloader": False, "uptimePremium": True,
         "sameNodeUnavailableReason": "capacity", "canRestartOnSameNode": False, "canRestartOnAnyNode": True,
@@ -215,7 +216,7 @@ def test_pod_connect_info_and_state_fields():
         ("ComfyUI", 8188, "https://x.meshive.ai", None, "interrupted"), ("Jupyter", 8888, "https://j", None, "ready")]
     assert [(c.key, c.value, c.is_secret, c.is_auto_generated) for c in pod.connect_credentials] == [
         ("ACCESS_PASSWORD", "s3cret", True, True), ("USERNAME", "admin", False, False)]
-    assert "s3cret" not in repr(pod)                       # repr 로 비밀값이 새지 않는다
+    assert "s3cret" not in repr(pod)                       # secrets don't leak through repr
     assert pod.billing_active is False and pod.uptime_premium is True and pod.cpu_premium is None
     assert pod.same_node_unavailable_reason == "capacity" and pod.can_restart_on_same_node is False
     assert pod.stop_reason_code == "credit_exhausted" and pod.stop_reason_at.year == 2026
@@ -239,7 +240,7 @@ def test_task_detail_fields():
     assert t.output_upload_last_error == "AccessDenied" and t.outputs_purged_at is None
     assert [(a.asset_id, a.target_dir, a.reference_mode) for a in t.input_assets] == [
         ("asset_b", "/inputs/w", "external")]
-    # 목록 응답(필드 없음)은 None/빈 리스트 — 0 이 아니다
+    # List responses (no such fields) are None/empty list — not 0
     bare = Task.from_dict({"externalId": "task_2"})
     assert bare.output_files_declared is None and bare.input_assets == []
 
@@ -283,7 +284,7 @@ def test_get_machine_parses():
 
 
 def test_machine_tolerates_missing_nested():
-    """trim/부분 응답에도 안 깨진다 (state/specs/earning 없음 → 안전한 기본값)."""
+    """Doesn't break on trimmed/partial responses (no state/specs/earning → safe defaults)."""
     machine = sync_client(
         lambda r: httpx.Response(200, json={"id": "mac-2", "name": "bare"})
     ).get_machine("mac-2")
@@ -379,7 +380,7 @@ def test_async_list_machines_parses():
 # --- retry ------------------------------------------------------------------
 
 def _counting_handler(responses):
-    """호출될 때마다 responses 를 순서대로 반환하는 handler + 호출 횟수 카운터."""
+    """A handler that returns responses in order on each call + a call counter."""
     calls = {"n": 0}
 
     def handler(request):
@@ -401,7 +402,7 @@ def test_retries_429_then_succeeds(slept):
     me = sync_client(handler).me()
     assert me.email == "a@b.com"
     assert calls["n"] == 2
-    assert slept == [2.0]  # Retry-After 를 그대로 존중
+    assert slept == [2.0]  # honors Retry-After as-is
 
 
 def test_retry_uses_backoff_without_retry_after(slept):
@@ -412,14 +413,14 @@ def test_retry_uses_backoff_without_retry_after(slept):
     ])
     sync_client(handler).me()
     assert calls["n"] == 3
-    assert slept == [0.5, 1.0]  # 지수 백오프
+    assert slept == [0.5, 1.0]  # exponential backoff
 
 
 def test_retries_are_capped_then_raise(slept):
     handler, calls = _counting_handler([httpx.Response(429, json={"detail": {"message": "nope"}})])
     with pytest.raises(RateLimitError):
         sync_client(handler).me()
-    assert calls["n"] == 3  # 최초 1회 + max_retries(2)
+    assert calls["n"] == 3  # first attempt + max_retries (2)
 
 
 def test_long_retry_after_is_not_waited_out(slept):
@@ -428,7 +429,7 @@ def test_long_retry_after_is_not_waited_out(slept):
     ])
     with pytest.raises(RateLimitError) as info:
         sync_client(handler).me()
-    assert calls["n"] == 1  # 한 시간 기다리느니 바로 올린다
+    assert calls["n"] == 1  # raise right away rather than wait an hour
     assert info.value.retry_after == 3600.0
     assert slept == []
 
@@ -511,11 +512,20 @@ def test_wait_for_pod_gives_up_on_terminal_status():
     handler, calls = _counting_handler([_pod_with("error")])
     with pytest.raises(MeshiveError, match="terminal status"):
         sync_client(handler).wait_for_pod("pod-1", "team-ns")
-    assert calls["n"] == 1  # timeout 을 채우지 않는다
+    assert calls["n"] == 1  # doesn't wait out the timeout
+
+
+def test_wait_for_pod_reports_why_creation_failed():
+    failed = httpx.Response(200, json={**POD, "status": "terminated",
+                                       "creationFailure": {"reason": "CrashLoopBackOff", "failedAt": None}})
+    handler, _ = _counting_handler([failed])
+    with pytest.raises(PodCreationFailedError, match="CrashLoopBackOff") as exc:
+        sync_client(handler).wait_for_pod("pod-1", "team-ns")
+    assert exc.value.reason == "CrashLoopBackOff" and isinstance(exc.value, MeshiveError)
 
 
 def test_wait_for_pod_can_target_a_terminal_status():
-    """error 를 기다리라고 했으면 error 는 실패가 아니라 목표다."""
+    """If asked to wait for error, error is the target, not a failure."""
     handler, calls = _counting_handler([_pod_with("error")])
     assert sync_client(handler).wait_for_pod("pod-1", "team-ns", until="error").status == "error"
     assert calls["n"] == 1
@@ -552,14 +562,14 @@ def test_async_wait_for_pod(slept):
 
 
 # =============================================================================
-# 0.0.7 확장 read 표면 — URL/쿼리 형태와 파싱
+# 0.0.7 read surface extension — URL/query shape and parsing
 # =============================================================================
 
 def _capture(payload, seen):
-    """요청 URL/쿼리를 seen 에 기록하고 payload 를 돌려주는 handler."""
+    """A handler that records the request URL/query in seen and returns payload."""
     def handler(request):
-        seen["path"] = request.url.path      # 디코드된 경로 (httpx 가 %2F 를 풀어서 준다)
-        seen["url"] = str(request.url)       # 실제 전송된 URL (인코딩 검증용)
+        seen["path"] = request.url.path      # decoded path (httpx unescapes %2F)
+        seen["url"] = str(request.url)       # the URL actually sent (to check encoding)
         seen["params"] = dict(request.url.params)
         return httpx.Response(200, json=payload)
     return handler
@@ -647,7 +657,7 @@ def test_get_workspace_parses():
 def test_get_workspace_encodes_path():
     seen = {}
     sync_client(_capture(WORKSPACE_DETAIL, seen)).get_workspace("a/b")
-    assert seen["url"] == "https://api.test/v1/sdk/workspaces/a%2Fb"   # 경로 구조를 못 바꾼다
+    assert seen["url"] == "https://api.test/v1/sdk/workspaces/a%2Fb"   # can't change the path structure
 
 
 def test_list_members_parses():
@@ -678,7 +688,7 @@ def test_pod_metrics_parses_with_missing_rates():
     m = sync_client(_capture(POD_METRICS, seen)).get_pod_metrics("pod-1", "team-ns")
     assert seen["path"] == "/v1/sdk/pods/pod-1/metrics" and seen["params"] == {"workspace": "team-ns"}
     assert m.cpu_cores == 8 and m.cpu_usage_rate == 0.25
-    assert m.ram_size == 32 and m.ram_usage_rate is None    # 측정 불가 → None (0 과 구분)
+    assert m.ram_size == 32 and m.ram_usage_rate is None    # not measurable → None (distinct from 0)
     assert m.gpus[0].vram_size == 24 and m.gpus[0].temp == 61
     assert m.ephemeral_storage_request == 50 and m.ephemeral_storage_usage == 12
 
@@ -694,20 +704,20 @@ def test_machine_metrics_parses():
 
 
 def test_gpu_vram_size_unreadable_is_none_not_zero():
-    # DCGM 이 FB(메모리) 계열을 못 읽으면 서버는 vramSize 를 null 로 준다(온도·사용률만 읽힌 GPU 가 정상적으로
-    # 온다). 0.0 으로 채우면 'VRAM 0 인 카드' 가 된다 — 문서 계약대로 gpu_number 외 필드는 측정 불가면 None.
+    # When DCGM can't read the FB (memory) metric family, the server sends vramSize as null (GPUs with only temperature and
+    # utilization are normal). Filling in 0.0 would make a 'card with 0 VRAM' — per the documented contract, fields other than gpu_number are None when not measurable.
     unreadable = {"gpuNumber": 0, "coreUsageRate": 0.5, "vramUsageRate": None, "vramSize": None, "temp": 40.0}
     seen = {}
     pod = sync_client(_capture({**POD_METRICS, "gpu": [unreadable]}, seen)).get_pod_metrics("pod-1", "team-ns")
     machine = sync_client(_capture({**MACHINE_METRICS, "gpu": [unreadable]}, seen)).get_machine_metrics("mac-1")
     for g in (pod.gpus[0], machine.gpus[0]):
         assert g.vram_size is None and g.vram_usage_rate is None
-        assert g.core_usage_rate == 0.5 and g.temp == 40.0      # 읽힌 값은 그대로
+        assert g.core_usage_rate == 0.5 and g.temp == 40.0      # values that were read stay as-is
 
     from meshive.models import GpuUsage
 
-    assert GpuUsage.from_dict({"gpuNumber": 0}).vram_size is None                 # 키가 아예 없어도
-    assert GpuUsage.from_dict({"gpuNumber": 0, "vramSize": 0}).vram_size == 0.0   # 서버가 준 0 은 그대로
+    assert GpuUsage.from_dict({"gpuNumber": 0}).vram_size is None                 # even when the key is missing entirely
+    assert GpuUsage.from_dict({"gpuNumber": 0, "vramSize": 0}).vram_size == 0.0   # a 0 sent by the server stays 0
     assert GpuUsage(0).vram_size is None
 
 
@@ -723,7 +733,7 @@ def test_list_gpus_params_and_summary():
 def test_list_gpus_defaults_and_validation():
     seen = {}
     sync_client(_capture([], seen)).list_gpus()
-    assert seen["params"] == {"rentalType": "demand"}   # vram 미지정 → 서버 기본(제한 없음)
+    assert seen["params"] == {"rentalType": "demand"}   # vram not given → server default (no limit)
     with pytest.raises(ValueError):
         sync_client(_capture([], seen)).list_gpus(rental_type="reserved")
     with pytest.raises(ValueError):
@@ -753,11 +763,11 @@ def test_credit_history_dates_and_parse():
     assert seen["path"] == "/v1/sdk/credit/history"
     assert seen["params"] == {"startDate": "2026-07-01", "endDate": "2026-07-31"}
     assert entries[0].entry_id == 3 and entries[0].amount == -12.5 and entries[0].payment_method == "refund"
-    # Stripe 영수증/인보이스 링크는 SDK 표면에 없다 (서버가 보내지도, 모델이 받지도 않는다).
+    # Stripe receipt/invoice links aren't on the SDK surface (the server doesn't send them and the model doesn't take them).
     assert not hasattr(entries[0], "receipt_url") and not hasattr(entries[0], "invoice_url")
 
     client.list_credit_history()
-    assert seen["params"] == {}   # 미지정 → 서버 기본(최근 90일)
+    assert seen["params"] == {}   # not given → server default (last 90 days)
     client.list_credit_history(start_date=dt.datetime(2026, 1, 2, 3, 4))
     assert seen["params"] == {"startDate": "2026-01-02"}
     with pytest.raises(ValueError):
@@ -780,7 +790,7 @@ def test_list_templates_params_and_parse():
     t = templates[0]
     assert t.template_id == 12 and t.is_official is True and t.app_type == "framework"
     assert t.hardware_type == "gpu" and t.image == "meshive/pytorch:2.4"
-    assert t.raw["envs"][0]["key"] == "A"   # 배포 명세는 raw
+    assert t.raw["envs"][0]["key"] == "A"   # the deployment spec is in raw
 
     client.list_templates("team-ns", app_type="IDE")
     assert seen["params"] == {"workspace": "team-ns", "appType": "ide"}
@@ -893,7 +903,7 @@ def test_async_get_workspace_and_gpus():
 
 # --- assets -----------------------------------------------------------------
 
-# 서버(WSB AssetListRow / AssetDetailResponse) 모양: 자산 레벨 필드 + 옛 SDK 용 버전 호환 필드(Phase C 제거).
+# Server response shape: asset-level fields + version compatibility fields for older SDKs (removed in 0.2).
 ASSET_ROW = {
     "assetExternalId": "asset_abc", "name": "imagenet-mini", "assetType": "dataset", "kind": "collection",
     "semanticType": "dataset", "status": "active", "statusReason": None, "createdBy": "a@b.com",
@@ -934,14 +944,14 @@ def test_list_assets_params_and_page():
     assert seen["params"] == {"workspace": "team-ns", "assetType": "dataset", "status": "active",
                               "page": "2", "pageSize": "20"}
     assert (page.total, page.page, page.page_size, page.pages) == (57, 2, 20, 3)
-    assert len(page) == 1 and [a.asset_id for a in page] == ["asset_abc"]   # 순회 가능
+    assert len(page) == 1 and [a.asset_id for a in page] == ["asset_abc"]   # iterable
     a = page.items[0]
-    assert a.namespace_name == "team-ns"        # 목록 행에는 없어 호출 인자로 채운다
+    assert a.namespace_name == "team-ns"        # not in list rows, so filled from the call argument
     assert a.asset_type == "dataset" and a.kind == "collection" and a.semantic_type == "dataset"
     assert a.size_bytes == 2_000_000_000 and a.file_count == 3 and a.upload_status == "ready"
     assert a.ingest_source == "web_upload" and a.stale is False
     assert a.storage_provider == "meshive_r2" and a.in_use is True
-    assert a.files == [] and a.active_usage_contexts == []   # 상세에만 온다
+    assert a.files == [] and a.active_usage_contexts == []   # detail only
 
 
 def test_asset_version_fields_are_deprecated_but_still_read():
@@ -952,7 +962,7 @@ def test_asset_version_fields_are_deprecated_but_still_read():
         assert a.latest_version.version_number == 1 and a.latest_version.is_ready
     with pytest.warns(DeprecationWarning):
         assert a.versions == []
-    assert "version_count" not in {f.name for f in dataclasses.fields(a)}   # MCP 직렬화에서 빠진다
+    assert "version_count" not in {f.name for f in dataclasses.fields(a)}   # left out of MCP serialization
 
 
 def test_unmeasured_linked_asset_size_is_none_not_zero():
@@ -1016,7 +1026,7 @@ def test_async_assets_mirror_sync():
 def test_format_gib_uses_mib_below_one_gibibyte():
     from meshive.cli import _format as fmt
 
-    # MiB 값을 /1024 — 숫자는 원래 1024 기반이었고 라벨만 GB 였다. 콘솔처럼 GiB/MiB 로 적는다.
+    # MiB values /1024 — the numbers were always 1024-based; only the label was GB. Written as GiB/MiB like the console.
     assert fmt.gib(0) == "0 GiB"
     assert fmt.gib(512) == "512 MiB"
     assert fmt.gib(1024) == "1 GiB"
@@ -1028,7 +1038,7 @@ def test_format_gib_uses_mib_below_one_gibibyte():
 def test_format_vram_keeps_the_gb_label():
     from meshive.cli import _format as fmt
 
-    # DCGM framebuffer MiB → 카드 이름과 같은 "GB". 4060 Ti 16GB 는 15946 MiB 로 보고된다(dev 실측).
+    # DCGM framebuffer MiB → "GB" like the card name. A 4060 Ti 16GB reports 15946 MiB (measured).
     assert fmt.vram(24576) == "24 GB"
     assert fmt.vram(15946) == "16 GB"
     assert fmt.vram(None) == "-"
@@ -1037,7 +1047,7 @@ def test_format_vram_keeps_the_gb_label():
 def test_format_mbps_is_decimal_bits_per_second():
     from meshive.cli import _format as fmt
 
-    # 바이트/초 × 8 ÷ 10^6. 1024² 로 나누면 1 Gbps(125,000,000 B/s)가 953.7 Mbps 로 나온다.
+    # Bytes/sec × 8 ÷ 10^6. Dividing by 1024² makes 1 Gbps (125,000,000 B/s) come out as 953.7 Mbps.
     assert fmt.mbps(125_000_000) == "1000.0 Mbps"
     assert fmt.mbps(12_500_000) == "100.0 Mbps"
     assert fmt.mbps(0) == "0.0 Mbps"
@@ -1053,26 +1063,26 @@ def test_format_bytes_human_uses_binary_labels():
     assert fmt.bytes_human(1_500_000) == "1.4 MiB"
     assert fmt.bytes_human(2 * 1024 ** 3) == "2.00 GiB"
     assert fmt.bytes_human(3 * 1024 ** 4) == "3.00 TiB"
-    # 10진 20.69 GB 파일은 19.27 GiB — 1024 로 나눈 숫자에는 1024 기반 라벨을 붙인다.
+    # A 20.69 GB (decimal) file is 19.27 GiB — numbers divided by 1024 get 1024-based labels.
     assert fmt.bytes_human(20_690_000_000) == "19.27 GiB"
 
 
-# --- 표시 헬퍼: 웹 콘솔과 같은 금액 -------------------------------------------
-# SDK 는 서버 숫자를 그대로 돌려준다("0.06770833") — 사람에게 보여줄 때 쓰라고 이 둘을 공개한다.
-# 규칙 소스는 콘솔 `Formatter.tsx`(시간당 3자리 / 그 외 2자리), 반올림은 Intl 과 같은 halfExpand.
+# --- Display helpers: same amounts as the web console -------------------------------------------
+# The SDK returns server numbers as-is ("0.06770833") — these two are public for showing amounts to people.
+# The rules match the console (hourly 3 decimals / everything else 2), rounding is halfExpand like Intl.
 def test_formatting_helpers_are_public_and_match_the_console():
     import meshive
 
-    assert meshive.format_hourly("0.06770833") == "$0.068"     # 워크스페이스 시간당 합계
-    assert meshive.format_hourly("0.00097222") == "$0.001"     # 2자리면 "$0.00" 이 된다
+    assert meshive.format_hourly("0.06770833") == "$0.068"     # workspace hourly total
+    assert meshive.format_hourly("0.00097222") == "$0.001"     # with 2 decimals it would be "$0.00"
     assert meshive.format_usd("12.5") == "$12.50"
-    assert meshive.format_usd("0.015") == "$0.02"              # halfExpand — 콘솔과 같은 방향
+    assert meshive.format_usd("0.015") == "$0.02"              # halfExpand — same direction as the console
     assert meshive.format_hourly(None) == "-" and meshive.format_usd("") == "-"
     assert {"format_hourly", "format_usd"} <= set(meshive.__all__)
 
 
 def test_cli_money_helpers_delegate_to_the_public_formatter():
-    """CLI 와 SDK 가 같은 함수를 쓰는지 — 두 벌이면 언젠가 갈린다."""
+    """Whether the CLI and SDK use the same function — two copies drift apart eventually."""
     import meshive
     from meshive.cli import _format as fmt
 
@@ -1106,7 +1116,7 @@ TRANSACTION = {
 
 
 def test_list_transactions_parses_in_flight_step():
-    """`creating` 이 왜 안 끝나는지 — 마지막 스텝과 진행률이 나와야 한다."""
+    """Why `creating` doesn't finish — the last step and progress must show."""
     seen = {}
     txns = sync_client(_capture([TRANSACTION], seen)).list_transactions("team-ns")
     assert seen["path"] == "/v1/sdk/transactions" and seen["params"] == {"workspace": "team-ns"}
@@ -1119,7 +1129,7 @@ def test_list_transactions_parses_in_flight_step():
 
 
 def test_transaction_progress_is_none_when_unknown():
-    """진행률 없는 스텝을 0% 로 읽으면 '멈춘 것처럼' 보인다 — None 이어야 한다."""
+    """Reading a step without progress as 0% makes it look 'stuck' — it must be None."""
     payload = dict(TRANSACTION, transactionSteps=[
         {"step": "create_statefulset", "status": "in_progress", "detail": "",
          "updatedAt": "2026-09-10T07:55:20.000000Z"}])
@@ -1128,7 +1138,7 @@ def test_transaction_progress_is_none_when_unknown():
 
 
 def test_transaction_failure_reason_surfaces_as_detail():
-    """detail 이 비어도 진단의 failure_reason 은 올라와야 한다 — stall 류는 그게 유일한 단서."""
+    """Even with an empty detail, the diagnostic failure_reason must come through — for stalls it's the only clue."""
     payload = dict(TRANSACTION, status="failed", transactionSteps=[
         {"step": "pull_image", "status": "failed", "detail": "",
          "updatedAt": "2026-09-10T08:00:00.000000Z",
@@ -1151,8 +1161,8 @@ def test_transaction_fetch_liveness_and_init_logs():
 
 
 def test_transaction_current_step_is_the_latest_not_the_last_listed():
-    """서버는 단계를 이름순으로 준다 — 목록 끝(start, 완료)이 아니라 updatedAt 이 가장 늦은 진행 중 단계가 지금 단계다.
-    dev 실측(2026-10-03, tx 15640): fetch_assets 완료와 image_pull 시작이 같은 시각."""
+    """The server sends stages sorted by name — the current stage is the in-progress one with the latest updatedAt, not the end of the list (start, finished).
+    Observed 2026-10-03: fetch_assets finishing and image_pull starting had the same timestamp."""
     t = Transaction.from_dict({"transactionId": 15640, "status": "in_progress", "transactionSteps": [
         {"step": "create_statefulset", "status": "done", "updatedAt": "2026-10-03T10:53:07Z"},
         {"step": "fetch_assets", "status": "done", "updatedAt": "2026-10-03T10:53:22Z",
@@ -1162,9 +1172,9 @@ def test_transaction_current_step_is_the_latest_not_the_last_listed():
         {"step": "start", "status": "done", "updatedAt": "2026-10-03T10:53:02Z", "detail": "Starting Pod creation process"},
     ]})
     assert (t.step, t.step_status, t.progress, t.detail) == ("image_pull", "in_progress", 0.4, "")
-    assert t.live is None    # 지금 단계가 자산 다운로드가 아니다
+    assert t.live is None    # the current stage isn't the asset download
     legacy = Transaction.from_dict({"transactionId": 1, "transactionSteps": [{"step": "a"}, {"step": "b"}]})
-    assert legacy.step == "b"                # 시각이 없으면 예전처럼 목록 뒤쪽
+    assert legacy.step == "b"                # without timestamps, the later list item as before
 
 
 def test_async_list_transactions_mirrors_sync():
@@ -1210,7 +1220,7 @@ def test_asset_download_urls_and_download(tmp_path):
     assert [p.relative_to(tmp_path).as_posix() for p in written] == ["model.safetensors", "config/config.json"]
     assert (tmp_path / "model.safetensors").read_bytes() == b"hello"
     assert not list(tmp_path.rglob("*.part"))
-    assert seen["storage_auth"] == [None, None]          # Meshive 키는 스토리지로 가지 않는다
+    assert seen["storage_auth"] == [None, None]          # the Meshive key doesn't go to storage
 
 
 def test_download_refuses_paths_outside_dest_and_incomplete_signing(tmp_path):
@@ -1233,7 +1243,7 @@ def test_downloads_on_an_older_server_explain_themselves():
         client.asset_download_urls("asset_abc")
     with pytest.raises(NotFoundError, match="does not support task outputs"):
         client.task_outputs("task_1")
-    # 진짜 없는 자산의 404(title 있음)는 그대로
+    # A 404 for a truly missing asset (with a title) stays as-is
     client = sync_client(lambda r: httpx.Response(404, json={"detail": {"title": "Asset Not Found",
                                                                         "message": "The asset does not exist."}}))
     with pytest.raises(NotFoundError, match="The asset does not exist"):

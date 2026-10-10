@@ -13,10 +13,10 @@ cli = importlib.import_module("meshive.cli.main")
 
 @pytest.fixture(autouse=True)
 def isolate_config_dir(monkeypatch, tmp_path):
-    """credentials 를 임시 디렉토리에 격리 (실제 ~/.meshive 건드리지 않도록)."""
+    """Isolate credentials in a temp directory (so the real ~/.meshive isn't touched)."""
     cfg = tmp_path / "cfg"
     monkeypatch.setenv(_credentials.ENV_CONFIG_DIR, str(cfg))
-    # base_url/api_key 환경변수가 테스트에 새지 않도록 제거.
+    # Remove base_url/api_key env vars so they don't leak into tests.
     monkeypatch.delenv(_config.ENV_BASE_URL, raising=False)
     monkeypatch.delenv(_config.ENV_API_KEY, raising=False)
     return cfg
@@ -95,7 +95,7 @@ def test_login_with_flag_saves_and_verifies(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Logged in as u@x.com" in out
     assert _credentials.load()["api_key"] == "meshive_xyz"
-    # prod 기본값이므로 base_url 은 저장하지 않음.
+    # It's the production default, so base_url isn't saved.
     assert "base_url" not in _credentials.load()
 
 
@@ -142,7 +142,7 @@ def test_logout_when_not_logged_in(capsys):
 
 
 def test_me_uses_saved_credentials(monkeypatch, capsys):
-    """login 후 --api-key 없이 me 가 동작 (파일 폴백)."""
+    """me works without --api-key after login (file fallback)."""
     _patch_client(monkeypatch, _ok_me)
     cli.main(["login", "--api-key", "meshive_xyz"])
     capsys.readouterr()

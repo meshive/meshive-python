@@ -4,7 +4,7 @@ import meshive
 from meshive import _version
 
 
-# PEP 440 프리릴리스(0.1.0rc1)도 허용 — rc 는 dev 에서 태그해 PyPI 에 올리고 `pip install --pre` 로만 받는다.
+# PEP 440 pre-releases (0.1.0rc1) are allowed too — an rc is tagged on dev, published to PyPI, and only installed with `pip install --pre`.
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+((a|b|rc)\d+)?([.-].+)?$")
 
 

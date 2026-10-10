@@ -10,6 +10,7 @@ from .exceptions import (
     MeshiveError,
     NotFoundError,
     PermissionDeniedError,
+    PodCreationFailedError,
     RateLimitError,
     WaitTimeoutError,
 )
@@ -73,7 +74,7 @@ version = __version__
 __all__ = [
     "__version__",
     "version",
-    # 표시 헬퍼 (콘솔과 같은 금액)
+    # Display helpers (same amounts as the console)
     "format_hourly",
     "format_usd",
     # clients
@@ -144,4 +145,5 @@ __all__ = [
     "ConflictError",
     "RateLimitError",
     "WaitTimeoutError",
+    "PodCreationFailedError",
 ]

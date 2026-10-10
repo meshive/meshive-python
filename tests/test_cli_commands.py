@@ -52,7 +52,7 @@ UTC = timezone.utc
 
 
 class FakeClient:
-    """meshive.cli.main.Meshive 자리에 주입되는 가짜 클라이언트."""
+    """Fake client injected in place of meshive.cli.main.Meshive."""
 
     last_kwargs = None
 
@@ -105,8 +105,8 @@ class FakeClient:
         return Machine(machine_id, "trainer-node", "gpu", "ONLINE", "NVIDIA H100", 8,
                        2.5, 0.999, "gold", raw={"id": machine_id})
 
-    # --- 0.0.7 확장 read 표면 --------------------------------------------------
-    # 인자 전달을 검증하는 메서드는 last_call 에 (name, args, kwargs) 를 남긴다.
+    # --- 0.0.7 read surface extension --------------------------------------------------
+    # Methods whose argument passing is checked leave (name, args, kwargs) in last_call.
     last_call = None
 
     def get_workspace(self, workspace):
@@ -138,7 +138,7 @@ class FakeClient:
                           51200, 12288, raw={"podName": pod_name})
 
     def get_machine_metrics(self, machine_id):
-        # ram_size 는 서버가 주는 그대로 바이트(256 GiB), 네트워크는 바이트/초(12.5 MB/s = 100 Mbps).
+        # ram_size is bytes as the server sends it (256 GiB), network is bytes/sec (12.5 MB/s = 100 Mbps).
         return MachineMetrics(machine_id, 64.0, 0.1, 16.0, 256 * 1024 ** 3, 0.5, 65536.0,
                               [GpuUsage(0, 0.0, 0.1, 81920.0, 40.0)],
                               512000.0, 0.3, 4096000.0, 0.7, 12_500_000.0, 625_000.0,
@@ -159,7 +159,7 @@ class FakeClient:
 
     def list_credit_history(self, *, start_date=None, end_date=None):
         FakeClient.last_call = ("list_credit_history", (), {"start_date": start_date, "end_date": end_date})
-        if start_date == "bad-date":  # 실제 SDK 의 날짜 검증 실패를 흉내
+        if start_date == "bad-date":  # mimics the real SDK's date validation failure
             raise ValueError("start_date must be a date, datetime, or 'YYYY-MM-DD' string")
         return [CreditHistoryEntry(3, 25.0, True, "credit_card", datetime(2026, 7, 1, tzinfo=UTC), raw={"id": 3}),
                 CreditHistoryEntry(4, -12.5, True, "refund", datetime(2026, 7, 2, tzinfo=UTC), raw={"id": 4})]
@@ -197,7 +197,7 @@ class FakeClient:
 
     def list_tasks(self, workspace, *, status=None, limit=50, offset=0):
         FakeClient.last_call = ("list_tasks", (workspace,), {"status": status, "limit": limit, "offset": offset})
-        if limit < 1:  # 실제 SDK 의 범위 검증을 흉내
+        if limit < 1:  # mimics the real SDK's range validation
             raise ValueError("limit must be an integer between 1 and 200")
         return [Task("task_a", "train", workspace, "running", "task-a", "python:3.12", "NVIDIA RTX 4090",
                      1, 6, 24, "1.0", "0.5", "0", raw={"externalId": "task_a"}),
@@ -216,14 +216,14 @@ class FakeClient:
     def list_assets(self, workspace, *, asset_type=None, status=None, page=1, page_size=20):
         FakeClient.last_call = ("list_assets", (workspace,),
                                 {"asset_type": asset_type, "status": status, "page": page, "page_size": page_size})
-        if page_size < 1:  # 실제 SDK 의 범위 검증을 흉내
+        if page_size < 1:  # mimics the real SDK's range validation
             raise ValueError("page_size must be an integer between 1 and 100")
         items = [
             Asset("asset_data", "imagenet-mini", "dataset", "active", None, "meshive_r2", 2_147_483_648, 3,
                   True, namespace_name=workspace, raw={"assetExternalId": "asset_data"}),
             Asset("asset_lora", "style-lora", "adapter", "source_missing", "bucket unreachable", "user_s3",
                   150_000, 1, False, namespace_name=workspace, raw={"assetExternalId": "asset_lora"}),
-            # 아직 재지 않은 링크 자산 — 크기를 모른다(0 이 아니다)
+            # A link asset not measured yet — its size is unknown (not 0)
             Asset("asset_link", "hf-link", "model", "active", None, "external", None, None, False,
                   namespace_name=workspace, raw={"assetExternalId": "asset_link"}),
         ]
@@ -265,7 +265,7 @@ class FakeClient:
             Transaction(73213, "5f0e1d2c3b4a6978", "trainer", "create", "in_progress", "pull_image", "in_progress",
                         progress=0.42, updated_at=datetime(2026, 9, 10, 7, 58, tzinfo=UTC),
                         raw={"transactionId": 73213}),
-            # 별칭 없는 pod 의 실패 — 진행률을 모르는 스텝(progress=None)
+            # Failure of a pod without an alias — a step with unknown progress (progress=None)
             Transaction(73214, "9eb176aae9309fb8", "", "restart", "failed", "pull_image", "failed",
                         detail="image pull stalled for 600s", raw={"transactionId": 73214}),
             Transaction(73215, "aa11", "comfy", "create", "failed", "fetch_assets", "failed",
@@ -418,7 +418,7 @@ def test_pod_connect_info_hides_secrets_by_default(capsys):
     out = capsys.readouterr().out
     assert "ComfyUI" in out and "https://c.meshive.ai" in out and "ready" in out
     assert "ACCESS_PASSWORD" in out and "s3cret-pw" not in out and "--show-secrets" in out
-    assert "admin" in out                                    # 비밀이 아닌 값은 그대로
+    assert "admin" in out                                    # non-secret values stay as-is
     assert cli.main(["pod", "team-ns", "pod-1", "--show-secrets"]) == 0
     out = capsys.readouterr().out
     assert "s3cret-pw" in out and "hidden" not in out
@@ -446,7 +446,7 @@ def test_machines_type_filter(capsys):
 
 
 def test_machines_status_filter_case_insensitive(capsys):
-    # status enum 검증 없음 — 소문자 입력이 ONLINE 과 매칭돼야 한다.
+    # No status enum validation — lowercase input must match ONLINE.
     assert cli.main(["machines", "--status", "online"]) == 0
     out = capsys.readouterr().out
     assert "mac-gpu" in out
@@ -467,7 +467,7 @@ def test_machines_name_filter(capsys):
 
 
 def test_machines_filter_no_match(capsys):
-    # FakeClient 머신은 gpu/cpu 뿐 → storage 필터는 매칭 0건.
+    # FakeClient machines are only gpu/cpu → the storage filter matches nothing.
     assert cli.main(["machines", "--type", "storage"]) == 0
     assert "No machines." in capsys.readouterr().out
 
@@ -591,7 +591,7 @@ def test_keyboard_interrupt_exits_130(monkeypatch):
 # =============================================================================
 
 def test_every_command_has_a_handler():
-    """서브커맨드/별칭과 _HANDLERS 가 어긋나면 argparse 는 통과하고 실행만 실패한다 — 여기서 고정."""
+    """If subcommands/aliases and _HANDLERS drift apart, argparse passes and only execution fails — pinned here."""
     parser = cli.build_parser()
     sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
     assert set(sub.choices) - {"login", "logout"} == set(cli._HANDLERS)
@@ -601,8 +601,8 @@ def test_workspace_detail_output(capsys):
     assert cli.main(["workspace", "ns"]) == 0
     out = capsys.readouterr().out
     assert "Team" in out and "ns" in out
-    assert "$2.100" in out and "$40.50" in out          # price/hr 은 3자리, avg/day 는 2자리
-    assert "128 GiB" in out and "500 GiB" in out         # ram/storage: MiB → GiB (콘솔과 같은 1024 기반 라벨)
+    assert "$2.100" in out and "$40.50" in out          # price/hr has 3 decimals, avg/day 2
+    assert "128 GiB" in out and "500 GiB" in out         # ram/storage: MiB → GiB (1024-based label like the console)
     assert "RESOURCE" in out and "pod" in out            # resource table
     assert "2026-08-30" in out and "$1.75" in out        # daily cost + total
 
@@ -629,7 +629,7 @@ def test_storages_output_and_filters(capsys):
     assert "100 GiB" in out and "60.0%" in out
     assert out.index("NAME") < out.index("ID")
 
-    assert cli.main(["storages", "ns", "--type", "hostPath"]) == 0   # 대소문자 무시
+    assert cli.main(["storages", "ns", "--type", "hostPath"]) == 0   # case-insensitive
     out = capsys.readouterr().out
     assert "pv-local" in out and "pv-data" not in out
 
@@ -658,8 +658,8 @@ def test_pod_metrics_output(capsys):
     assert cli.main(["pod-metrics", "ns", "pod-1"]) == 0
     out = capsys.readouterr().out
     assert "8 cores, 25.0% used" in out
-    assert "32 GiB, n/a used" in out                      # 측정 불가 → n/a (0% 와 구분)
-    assert "gpu 0:" in out and "24 GB vram" in out and "61°C" in out   # VRAM 만은 업계 표기 GB 유지
+    assert "32 GiB, n/a used" in out                      # not measurable → n/a (distinct from 0%)
+    assert "gpu 0:" in out and "24 GB vram" in out and "61°C" in out   # VRAM alone keeps the industry GB
     assert "12 GiB used of 50 GiB" in out
     assert cli.main(["pod-metrics", "ns", "pod-1", "-o", "name"]) == 0
     assert capsys.readouterr().out.splitlines() == ["pod-1"]
@@ -669,18 +669,18 @@ def test_machine_metrics_output(capsys):
     assert cli.main(["machine-metrics", "mac-1"]) == 0
     out = capsys.readouterr().out
     assert "64 cores, 10.0% used, 16 allocated" in out
-    assert "ram:       256 GiB, 50.0% used, 64 GiB allocated" in out   # ram_size 는 바이트, 할당은 MiB
+    assert "ram:       256 GiB, 50.0% used, 64 GiB allocated" in out   # ram_size is bytes, allocation is MiB
     assert "10.0% of 80 GB vram" in out
     assert "root disk: 500 GiB, 30.0% used" in out
     assert "pv disk:   4,000 GiB, 70.0% used" in out
-    assert "rx 100.0 Mbps, tx 5.0 Mbps" in out            # 바이트/초 × 8 ÷ 10^6 (1024² 면 95.4 / 4.8)
+    assert "rx 100.0 Mbps, tx 5.0 Mbps" in out            # bytes/sec × 8 ÷ 10^6 (with 1024² it would be 95.4 / 4.8)
     assert cli.main(["machine-metrics", "mac-1", "-o", "name"]) == 0
     assert capsys.readouterr().out.splitlines() == ["mac-1"]
 
 
 def test_gpu_line_shows_na_when_vram_size_is_unknown(monkeypatch, capsys):
-    # GPU 메모리를 못 읽으면 서버는 vramSize 를 null 로(DCGM FB 계열 누락·파드 GPU 조회 실패), FB 두 값이 0 으로
-    # 오면 0 으로 준다. 어느 쪽도 카드 크기가 아니다 — '0 GB vram' 대신 n/a. 서버 JSON → SDK 파싱부터 거친다.
+    # When GPU memory can't be read the server sends vramSize as null (missing DCGM FB metrics, pod GPU lookup failure); when both FB values are 0
+    # it sends 0. Neither is the card size — n/a instead of '0 GB vram'. Goes through server JSON → SDK parsing.
     gpus = [{"gpuNumber": 0, "coreUsageRate": None, "vramUsageRate": None, "vramSize": None, "temp": 40.0},
             {"gpuNumber": 1, "coreUsageRate": None, "vramUsageRate": None, "vramSize": 0.0, "temp": 41.0}]
     monkeypatch.setattr(FakeClient, "get_machine_metrics", lambda self, machine_id: MachineMetrics.from_dict(
@@ -701,12 +701,12 @@ def test_gpu_line_shows_na_when_vram_size_is_unknown(monkeypatch, capsys):
 def test_gpus_output_and_passthrough(capsys):
     assert cli.main(["gpus"]) == 0
     out = capsys.readouterr().out
-    assert "NVIDIA H100" in out and "80 GB" in out and "$2.500" in out   # $/hr 은 3자리
+    assert "NVIDIA H100" in out and "80 GB" in out and "$2.500" in out   # $/hr has 3 decimals
     assert FakeClient.last_call == ("list_gpus", (), {"rental_type": "demand", "min_vram": None})
 
     assert cli.main(["gpus", "--rental", "spot", "--vram", "40", "--model", "h100"]) == 0
     out = capsys.readouterr().out
-    assert "NVIDIA H100" in out and "4090" not in out     # --model 은 클라이언트 필터
+    assert "NVIDIA H100" in out and "4090" not in out     # --model is a client-side filter
     assert FakeClient.last_call == ("list_gpus", (), {"rental_type": "spot", "min_vram": 40})
 
     assert cli.main(["gpus", "-o", "name"]) == 0
@@ -725,7 +725,9 @@ def test_api_keys_output_and_alias(capsys):
 def test_credit_output_and_name(capsys):
     assert cli.main(["credit"]) == 0
     out = capsys.readouterr().out
-    assert "$110.00" in out and "$100.00" in out and "$10.00" in out
+    assert "balance:         $110.00" in out
+    # Free credits retired (2026-10) — no paid/bonus split lines (the fields stay on the model for backward compatibility)
+    assert "paid:" not in out and "bonus" not in out
     assert "on (add $50.00 when below $10.00)" in out and "on file" in out
     assert cli.main(["credit", "-o", "name"]) == 0
     assert capsys.readouterr().out.strip() == "110.00"
@@ -792,7 +794,7 @@ def test_template_single_output(capsys):
     assert FakeClient.last_call == ("get_template", (99,), {"workspace": "ns"})
 
     with pytest.raises(SystemExit):
-        cli.main(["template", "twelve"])   # argparse: int 가 아니면 usage error
+        cli.main(["template", "twelve"])   # argparse: usage error if not an int
 
 
 def test_servings_output_and_filters(capsys):
@@ -809,7 +811,7 @@ def test_servings_output_and_filters(capsys):
     out = capsys.readouterr().out
     assert "sd-xl" in out and "Llama" not in out
 
-    assert cli.main(["servings", "ns", "--status", "stopped"]) == 2    # serving 에는 없는 상태
+    assert cli.main(["servings", "ns", "--status", "stopped"]) == 2    # a status servings don't have
     assert "unknown status" in capsys.readouterr().err
 
     assert cli.main(["servings", "ns", "-o", "name"]) == 0
@@ -858,7 +860,7 @@ def test_task_single_output(capsys):
     assert "exit code:   0" in out and "6 cores / 24 GiB" in out
     assert "outputs:     uploading, 1 of 4 files, 1.0 KiB of 4.0 KiB" in out
     assert "upload error: AccessDenied" in out
-    assert "weights" in out and "/inputs/w" in out          # 입력 자산 표
+    assert "weights" in out and "/inputs/w" in out          # input asset table
     assert cli.main(["task", "task_a", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["scriptContent"] == "print(1)"
 
@@ -869,19 +871,19 @@ def test_assets_output_filters_and_paging(capsys):
     assert cli.main(["assets", "ns"]) == 0
     out = capsys.readouterr().out
     assert "imagenet-mini" in out and "asset_data" in out and "style-lora" in out
-    assert "2.00 GiB" in out and "146.5 KiB" in out           # bytes → human (1024 기준·1024 기반 라벨)
+    assert "2.00 GiB" in out and "146.5 KiB" in out           # bytes → human (1024 basis, 1024-based labels)
     assert "managed" in out and "s3" in out                    # storage provider labels
-    assert "Page 1 of 3 (45 assets)" in out                    # 서버 total 기준 페이지 힌트
-    assert "VERSIONS" not in out                               # 자산에 버전이 없다
+    assert "Page 1 of 3 (45 assets)" in out                    # page hint based on the server's total
+    assert "VERSIONS" not in out                               # assets have no versions
     link = next(line for line in out.splitlines() if "hf-link" in line)
-    assert " 0 B" not in link and "-" in link                  # 모르는 크기는 0 이 아니라 '-'
+    assert " 0 B" not in link and "-" in link                  # an unknown size is '-', not 0
     assert FakeClient.last_call == ("list_assets", ("ns",),
                                     {"asset_type": None, "status": None, "page": 1, "page_size": 20})
 
     assert cli.main(["assets", "ns", "--type", "Dataset", "--status", "active",
                      "--page", "2", "--page-size", "50"]) == 0
     out = capsys.readouterr().out
-    assert "Page 2 is past the end: 45 assets on 1 page." in out   # 45 < 50 → 한 페이지뿐
+    assert "Page 2 is past the end: 45 assets on 1 page." in out   # 45 < 50 → only one page
     assert FakeClient.last_call == ("list_assets", ("ns",),
                                     {"asset_type": "dataset", "status": "active", "page": 2, "page_size": 50})
 
@@ -899,7 +901,7 @@ def test_assets_output_filters_and_paging(capsys):
 
 
 def test_assets_page_past_the_end_is_explained(capsys):
-    assert cli.main(["assets", "ns", "--page", "9", "--page-size", "20"]) == 0   # 45개 → 3페이지뿐
+    assert cli.main(["assets", "ns", "--page", "9", "--page-size", "20"]) == 0   # 45 assets → only 3 pages
     out = capsys.readouterr().out
     assert "Page 9 is past the end: 45 assets on 3 pages." in out
     assert "Use --page" not in out
@@ -919,7 +921,7 @@ def test_asset_single_output(capsys):
     assert "1.4 MiB in 2 files" in out
     assert "upload:     failed" in out and "source:     hf_import" in out
     assert "in use:     yes (pod trainer)" in out
-    assert "a.bin" in out and "976.6 KiB" in out and "b.bin" in out    # 파일 표
+    assert "a.bin" in out and "976.6 KiB" in out and "b.bin" in out    # file table
     assert "import failed: repo not found" in out
     assert "VERSION" not in out
     assert cli.main(["asset", "asset_data", "-o", "name"]) == 0
@@ -932,9 +934,10 @@ def test_asset_storage_output_and_name(capsys):
     assert cli.main(["asset-storage", "ns"]) == 0
     out = capsys.readouterr().out
     assert "managed:       2.00 GiB" in out
-    assert "$0.02 per GiB-month" in out and "$0.03" in out   # 자산 저장 과금은 GiB 당
+    assert "$0.02 per GiB-month" in out and "$0.03" in out   # asset storage is billed per GiB
     assert "grace (uploads block in" in out
-    assert "none (pods and tasks cannot start)" in out
+    assert "billing credit: none (pods and tasks cannot start)" in out
+    assert "paid balance:" not in out
     assert cli.main(["asset-storage", "ns", "-o", "name"]) == 0
     assert capsys.readouterr().out.strip() == "0.03"
 
@@ -942,18 +945,18 @@ def test_asset_storage_output_and_name(capsys):
 # --- transactions (in-flight pod operations) ----------------------------------
 
 def test_transactions_output_alias_and_name(capsys):
-    """진행 중 작업이 1건 이상일 때만 표를 그린다 — render_table 인자 오타(TypeError)는 여기서만 드러난다."""
+    """The table is drawn only when there is at least one in-progress operation — a typo in render_table's arguments (TypeError) only shows up here."""
     assert cli.main(["transactions", "ns"]) == 0
     out = capsys.readouterr().out
     assert FakeClient.last_call == ("list_transactions", ("ns",), {})
-    assert "trainer" in out and "9eb176aae9309fb8" in out    # 별칭이 없으면 statefulset 이름
+    assert "trainer" in out and "9eb176aae9309fb8" in out    # without an alias, the statefulset name
     assert "73213" in out and "pull_image" in out and "image pull stalled for 600s" in out
-    assert "42%" in out and "0%" not in out                  # 진행률 모름(None)은 '-' — 0% 로 찍지 않는다
-    assert "verifying" in out                                # 바이트가 멈춘 구간 이름
+    assert "42%" in out and "0%" not in out                  # unknown progress (None) is '-' — not printed as 0%
+    assert "verifying" in out                                # name of the phase where bytes stall
     assert "txn 73215 source-fetch log (before restart):" in out
-    assert "line 6" in out and "line 5\n" not in out          # 끝 10줄만
-    assert "HTTP 403" in out and "\x1b[31m" not in out         # 로그 줄의 제어문자는 걷어낸다
-    assert "\033[" not in out                                # tty 가 아니면 색 없음
+    assert "line 6" in out and "line 5\n" not in out          # only the last 10 lines
+    assert "HTTP 403" in out and "\x1b[31m" not in out         # control characters in log lines are stripped
+    assert "\033[" not in out                                # no color when not a tty
 
     assert cli.main(["txn", "ns", "-o", "name"]) == 0
     assert capsys.readouterr().out.splitlines() == ["73213", "73214", "73215"]
@@ -963,10 +966,10 @@ def test_transactions_output_alias_and_name(capsys):
 
 
 def test_transactions_table_paints_status_on_a_tty(monkeypatch, capsys):
-    """색은 render_table 의 `enabled=` 로 켠다 — 인자를 빼 버리면 표는 나와도 색이 조용히 꺼진다."""
+    """Color is turned on with render_table's `enabled=` — drop the argument and the table still prints but color silently turns off."""
     monkeypatch.setattr(cli.fmt, "color_enabled", lambda stream=None: True)
     assert cli.main(["transactions", "ns"]) == 0
-    assert "\033[31m● failed" in capsys.readouterr().out    # failed 상태 칸은 빨강
+    assert "\033[31m● failed" in capsys.readouterr().out    # the failed status cell is red
 
 
 def test_asset_download_saves_under_asset_id_by_default(tmp_path, monkeypatch, capsys):

@@ -37,28 +37,28 @@ from ..models import (
     WorkspaceDetail,
 )
 
-# K8sResourceLifecycleStatus (백엔드 enum). --status 검증용 — 서버가 필터를 안 받으므로
-# 클라이언트에서 오타를 잡아 "조용히 빈 결과" 대신 유효값을 알려준다. 스토리지(PV)도 같은 enum.
+# Pod lifecycle statuses (server enum). For --status validation — the server doesn't take this filter, so
+# typos are caught on the client and valid values are shown instead of a silent empty result. Storage (PV) uses the same enum.
 POD_STATUSES = (
     "pending", "creating", "running", "waiting", "stopping",
     "stopped", "error", "unreachable", "terminating", "terminated",
 )
-# TaskStatus (백엔드 enum). tasks --status 는 서버 필터로 넘어가지만 오타는 여기서 잡는다.
+# Task statuses (server enum). tasks --status goes to the server filter, but typos are caught here.
 TASK_STATUSES = (
     "queued", "scheduling", "pulling", "fetching", "running",
     "succeeded", "failed", "timed_out", "stopped",
 )
-# ModelDeploymentGroupStatus (백엔드 enum) — servings --status 클라이언트 필터 검증용.
-# terminated 는 서버가 목록에서 제외하므로 뺀다.
+# Serving statuses (server enum) — validation for the servings --status client-side filter.
+# terminated is left out because the server excludes it from the list.
 SERVING_STATUSES = ("provisioning", "active", "scaling", "draining", "error")
-# TemplateAppType (백엔드 enum) — templates --type 은 서버 필터(appType)로 넘어간다.
+# Template app types (server enum) — templates --type goes to the server filter (appType).
 TEMPLATE_TYPES = (
     "ide", "framework", "db", "mlops", "llmops", "inference",
     "generative", "science", "os", "custom",
 )
-# StorageType (백엔드 enum). 대소문자 무시 비교 (hostPath → hostpath).
+# Storage types (server enum). Compared case-insensitively (hostPath → hostpath).
 STORAGE_TYPES = ("nfs", "hostpath", "ephemeral", "emptydir")
-# AssetType / AssetStatus (백엔드 enum) — assets --type / --status 는 서버 필터로 넘어간다.
+# Asset types / statuses (server enums) — assets --type / --status go to the server filter.
 ASSET_TYPES = ("dataset", "model", "adapter", "checkpoint", "output", "config", "file")
 ASSET_STATUSES = ("active", "source_missing", "frozen", "deleted", "purged", "merged")
 
@@ -107,7 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
         version=f"%(prog)s {__version__}",
     )
 
-    # 모든 서브커맨드가 공유하는 전역 옵션.
+    # Global options shared by every subcommand.
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
         "--api-key", default=None,
@@ -119,7 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-o", "--output", choices=["table", "json", "name"], default=None,
         help="Output format: table (default), json (raw payload), name (IDs only, one per line).",
     )
-    # --json 은 -o json 의 별칭 (0.0.5 이전부터 쓰던 플래그 — 하위 호환 유지).
+    # --json is an alias of -o json (a flag used since before 0.0.5 — kept for backward compatibility).
     common.add_argument("--json", action="store_true", dest="as_json", help="Shorthand for -o json.")
     common.add_argument(
         "--timeout", type=float, default=30.0, metavar="SECONDS",
@@ -153,7 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Workspace ID (namespace name). Omit when using --all.")
     p_pods.add_argument("--all", action="store_true", dest="all_workspaces",
                         help="List pods across every workspace (adds a WORKSPACE column).")
-    # 클라이언트 측 필터 (서버는 필터 파라미터를 받지 않음).
+    # Client-side filter (the server takes no filter parameters).
     p_pods.add_argument(
         "--status", action="append", metavar="STATUS",
         help="Filter by status (repeatable or comma-separated), e.g. running,error. "
@@ -222,8 +222,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--type", choices=["gpu", "cpu", "storage"], default=None, dest="machine_type",
         help="Filter by machine type.",
     )
-    # 머신 status(state.name) enum 은 합성/확장적이라 클라이언트에서 검증하지 않는다 —
-    # 서버가 주는 값과 대소문자 무시 비교만 한다.
+    # The machine status (state.name) enum is synthesized and open-ended, so it isn't validated on the client —
+    # only compared case-insensitively with what the server returns.
     p_machines.add_argument(
         "--status", action="append", metavar="STATUS",
         help="Filter by status (repeatable or comma-separated), e.g. online,offline.",
@@ -357,11 +357,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # =============================================================================
-# 필터 / 검증 헬퍼
+# Filter / validation helpers
 # =============================================================================
 
 def _parse_status_filter(values: list[str] | None) -> set[str]:
-    """--status 값(반복/쉼표)을 소문자 set 으로. 빈 경우 빈 set."""
+    """--status values (repeated/comma-separated) as a lowercase set. Empty set if none."""
     result: set[str] = set()
     for value in values or []:
         result.update(s.strip().lower() for s in value.split(",") if s.strip())
@@ -369,7 +369,7 @@ def _parse_status_filter(values: list[str] | None) -> set[str]:
 
 
 def _reject_unknown_statuses(statuses: set[str], valid: tuple[str, ...]) -> int | None:
-    """알 수 없는 status 가 있으면 stderr 에 유효값을 안내하고 exit code 2 를 돌려준다."""
+    """If there is an unknown status, print the valid values to stderr and return exit code 2."""
     unknown = statuses - set(valid)
     if unknown:
         print(f"Error: unknown status: {', '.join(sorted(unknown))}. "
@@ -379,15 +379,15 @@ def _reject_unknown_statuses(statuses: set[str], valid: tuple[str, ...]) -> int 
 
 
 def _contains(haystack: str | None, needle: str | None) -> bool:
-    """--name 류 substring 필터 (대소문자 무시). needle 이 없으면 항상 True."""
+    """Substring filter for --name and the like (case-insensitive). Always True without a needle."""
     if not needle:
         return True
     return needle.lower() in (haystack or "").lower()
 
 
 def _gather_all_pods(client: Meshive) -> list[Pod]:
-    """모든 워크스페이스의 파드를 모아 반환. 한 워크스페이스 조회가 실패해도
-    전체를 죽이지 않고 경고만 내고 계속 (overview 성격)."""
+    """Collect pods from every workspace. If one workspace fails to load,
+    warn and keep going instead of failing the whole thing (it's an overview)."""
     pods: list[Pod] = []
     for ws in client.list_workspaces():
         try:
@@ -440,18 +440,18 @@ def _filter_servings(servings: list[Serving], statuses: set[str], name: str | No
 
 
 # =============================================================================
-# 사람용 출력 (table 포맷)
+# Human-readable output (table format)
 # =============================================================================
 
 def _pod_price(pod: Pod) -> str:
-    """웹 pod 페이지와 동일: compute 과금 중일 때만 가격, 아니면 '-'.
-    서버의 billing_active 가 기준이고, 그 값을 안 주는 옛 서버면 running 으로 판정한다."""
+    """Same as the web pod page: a price only while compute is billing, otherwise '-'.
+    Based on the server's billing_active; for older servers that don't send it, running counts as billing."""
     billed = pod.billing_active if pod.billing_active is not None else pod.status.lower() == "running"
     return fmt.money_hourly(pod.price_per_hour) if billed else "-"
 
 
 def _print_whoami(me: WhoAmI, color: bool) -> None:
-    # 서버 유래 문자열은 fmt.clean 으로 제어문자 제거 후 출력 (터미널 이스케이프 인젝션 방어).
+    # Server-provided strings go through fmt.clean to strip control characters (defense against terminal escape injection).
     print(f"email:    {fmt.clean(me.email)}")
     print(f"username: {fmt.clean(me.username or '-')}")
     print(f"role:     {fmt.clean(me.user_role)}")
@@ -461,7 +461,7 @@ def _print_workspaces(workspaces: list[Workspace], color: bool) -> None:
     if not workspaces:
         print("No workspaces.")
         return
-    # NAME = workspace_name(유저 라벨), ID = namespace_name(조회 키).
+    # NAME = workspace_name (user label), ID = namespace_name (lookup key).
     rows = [
         [ws.workspace_name or "-", ws.namespace_name, ws.member_role or "-", fmt.status_cell(ws.status),
          str(ws.resources.pod), fmt.money_hourly(ws.price_per_hour)]
@@ -478,8 +478,8 @@ def _print_workspaces(workspaces: list[Workspace], color: bool) -> None:
 
 
 def _print_workspace(ws: WorkspaceDetail, color: bool) -> None:
-    print(f"name:      {fmt.clean(ws.workspace_name or '-')}")  # 유저 라벨
-    print(f"id:        {fmt.clean(ws.namespace_name)}")         # 조회 키
+    print(f"name:      {fmt.clean(ws.workspace_name or '-')}")  # user label
+    print(f"id:        {fmt.clean(ws.namespace_name)}")         # lookup key
     print(f"price/hr:  {fmt.money_hourly(ws.price_per_hour)}")
     print(f"avg/day:   {fmt.money(ws.weekly_avg_daily_cost)}  (last 7 days)")
     print(f"gpus:      {ws.gpus}")
@@ -495,7 +495,7 @@ def _print_workspace(ws: WorkspaceDetail, color: bool) -> None:
         print()
         rows = [[fmt.date_str(c.date), fmt.money(c.pod), fmt.money(c.storage), fmt.money(c.serverless),
                  fmt.money(c.task), fmt.money(c.asset), fmt.money(c.total)]
-                for c in ws.costs[-7:]]  # 서버는 최근 30일(오래된 순)을 준다 — 마지막 7일만
+                for c in ws.costs[-7:]]  # the server sends the last 30 days (oldest first) — only the last 7
         fmt.render_table(["DATE", "POD", "STORAGE", "SERVERLESS", "TASK", "ASSET", "TOTAL"], rows,
                          aligns=["l", "r", "r", "r", "r", "r", "r"], enabled=color)
 
@@ -513,7 +513,7 @@ def _print_pods(pods: list[Pod], color: bool, show_workspace: bool = False) -> N
     if not pods:
         print("No pods.")
         return
-    # NAME = user_alias(유저 라벨), ID = pod_name(조회 키). --all 이면 WORKSPACE(namespace_name) 추가.
+    # NAME = user_alias (user label), ID = pod_name (lookup key). --all adds WORKSPACE (namespace_name).
     headers = ["NAME", "ID"]
     aligns = ["l", "l"]
     if show_workspace:
@@ -543,14 +543,14 @@ def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
     created = "-"
     if pod.created_at:
         created = f"{fmt.relative_time(pod.created_at)} ({pod.created_at.isoformat()})"
-    print(f"name:      {fmt.clean(pod.user_alias or '-')}")  # 유저 라벨
-    print(f"id:        {fmt.clean(pod.pod_name)}")           # 조회 키
+    print(f"name:      {fmt.clean(pod.user_alias or '-')}")  # user label
+    print(f"id:        {fmt.clean(pod.pod_name)}")           # lookup key
     print(f"workspace: {fmt.clean(pod.namespace_name)}")
     print(f"status:    {fmt.paint(fmt.clean(fmt.status_cell(pod.status)), fmt.status_color(pod.status), color)}")
     print(f"rental:    {fmt.clean(pod.rental_type)}")
     print(f"price/hr:  {_pod_price(pod)}")
     print(f"created:   {created}")
-    # 아래 줄들은 해당할 때만 찍는다 (boolean 나열 대신 의미 있을 때만).
+    # The lines below are printed only when they apply (only when meaningful, not a list of booleans).
     premiums = [n for n, on in (("cpu", pod.cpu_premium), ("uptime", pod.uptime_premium),
                                 ("internet", pod.internet_premium)) if on]
     if premiums:
@@ -587,8 +587,8 @@ def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
 
 def _print_gpu_usages(gpus, color: bool) -> None:
     for g in gpus:
-        # 총 VRAM 을 못 읽으면 서버는 None 을(DCGM FB 계열 누락·GPU 조회 실패), FB 두 값이 0 으로 오면 0 을
-        # 준다 — 어느 쪽도 카드 크기가 아니므로 '0 GB' 가 아니라 사용률처럼 n/a 로 찍는다.
+        # When total VRAM can't be read the server sends None (missing DCGM FB metrics, GPU lookup failure); when both FB values are 0 it sends 0
+        # — neither is the card size, so print n/a like utilization rather than '0 GB'.
         size = fmt.vram(g.vram_size) if g.vram_size else "n/a"
         print(f"gpu {g.gpu_number}:     {fmt.usage(g.core_usage_rate)} core, "
               f"{fmt.usage(g.vram_usage_rate)} of {size} vram, {fmt.temperature(g.temp)}")
@@ -606,8 +606,8 @@ def _print_machine_metrics(m: MachineMetrics, color: bool) -> None:
     print(f"machine:   {fmt.clean(m.machine_id)}")
     print(f"cpu:       {m.cpu_cores:g} cores, {fmt.usage(m.cpu_usage_rate)} used, "
           f"{m.cpu_allocated:g} allocated to pods")
-    # 머신 메트릭의 ram_size 만 바이트다(서버가 node_memory_MemTotal_bytes 를 그대로 준다). 할당 RAM·디스크·
-    # VRAM 은 MiB — 같은 식으로 읽으면 64 GiB 머신이 '65,648,036 GB' 로 찍힌다.
+    # Of the machine metrics only ram_size is in bytes (the server passes node_memory_MemTotal_bytes through). Allocated RAM, disk and
+    # VRAM are MiB — reading them the same way prints a 64 GiB machine as '65,648,036 GB'.
     print(f"ram:       {fmt.gib(m.ram_size / 1024 ** 2)}, {fmt.usage(m.ram_usage_rate)} used, "
           f"{fmt.gib(m.ram_allocated)} allocated to pods")
     _print_gpu_usages(m.gpus, color)
@@ -620,7 +620,7 @@ def _print_storages(storages: list[Storage], color: bool) -> None:
     if not storages:
         print("No storages.")
         return
-    # NAME = user_alias(유저 라벨), ID = pv_name(조회 키).
+    # NAME = user_alias (user label), ID = pv_name (lookup key).
     rows = []
     colors = []
     for s in storages:
@@ -643,8 +643,8 @@ def _print_storage(s: Storage, color: bool) -> None:
     created = "-"
     if s.created_at:
         created = f"{fmt.relative_time(s.created_at)} ({s.created_at.isoformat()})"
-    print(f"name:      {fmt.clean(s.user_alias or '-')}")  # 유저 라벨
-    print(f"id:        {fmt.clean(s.pv_name)}")            # 조회 키
+    print(f"name:      {fmt.clean(s.user_alias or '-')}")  # user label
+    print(f"id:        {fmt.clean(s.pv_name)}")            # lookup key
     print(f"workspace: {fmt.clean(s.namespace_name)}")
     print(f"type:      {fmt.clean(s.storage_type or '-')}")
     print(f"status:    {fmt.paint(fmt.clean(fmt.status_cell(s.status)), fmt.status_color(s.status), color)}")
@@ -658,7 +658,7 @@ def _print_storage(s: Storage, color: bool) -> None:
 
 
 def _gpu_cell(machine: Machine) -> str:
-    """'8x NVIDIA H100' 형태. GPU 없는(cpu/storage) 머신은 '-'."""
+    """'8x NVIDIA H100' form. Machines without GPUs (cpu/storage) get '-'."""
     if not machine.gpu_count:
         return "-"
     return f"{machine.gpu_count}x {machine.gpu_model}" if machine.gpu_model else str(machine.gpu_count)
@@ -668,7 +668,7 @@ def _print_machines(machines: list[Machine], color: bool) -> None:
     if not machines:
         print("No machines.")
         return
-    # NAME = name(유저 라벨), ID = machine_id(조회 키).
+    # NAME = name (user label), ID = machine_id (lookup key).
     rows = []
     colors = []
     for m in machines:
@@ -688,8 +688,8 @@ def _print_machines(machines: list[Machine], color: bool) -> None:
 
 
 def _print_machine(machine: Machine, color: bool) -> None:
-    print(f"name:      {fmt.clean(machine.name or '-')}")  # 유저 라벨
-    print(f"id:        {fmt.clean(machine.machine_id)}")   # 조회 키
+    print(f"name:      {fmt.clean(machine.name or '-')}")  # user label
+    print(f"id:        {fmt.clean(machine.machine_id)}")   # lookup key
     print(f"type:      {fmt.clean(machine.machine_type or '-')}")
     print(f"status:    {fmt.paint(fmt.clean(fmt.status_cell(machine.status)), fmt.status_color(machine.status), color)}")
     print(f"gpu:       {fmt.clean(_gpu_cell(machine))}")
@@ -702,7 +702,7 @@ def _print_earnings(e: Earnings, days: int, color: bool) -> None:
     print(f"current/hr:    {fmt.money(e.current_hourly)}")
     print(f"today:         {fmt.money(e.daily)}")
     print(f"until payout:  {fmt.money(e.accumulated_until_payout)}")
-    history = e.history[:days] if days > 0 else e.history  # 서버는 최신순
+    history = e.history[:days] if days > 0 else e.history  # the server sends newest first
     if history:
         print()
         rows = [[fmt.date_str(h.date), fmt.money(h.cpu), fmt.money(h.gpu), fmt.money(h.storage),
@@ -746,7 +746,7 @@ def _print_template(t: Template, color: bool) -> None:
     if t.framework and t.framework_version:
         framework += f" {t.framework_version}"
     print(f"name:        {fmt.clean(t.name)}")
-    print(f"id:          {t.template_id}")   # 조회 키
+    print(f"id:          {t.template_id}")   # lookup key
     print(f"source:      {_template_source(t)}")
     print(f"type:        {fmt.clean(app_type)}")
     print(f"deploy:      {fmt.clean(t.deploy_type or '-')}")
@@ -790,7 +790,7 @@ def _print_servings(servings: list[Serving], color: bool) -> None:
 def _print_serving(s: Serving, color: bool) -> None:
     healthy = "" if s.healthy_replicas is None else f", {s.healthy_replicas} healthy"
     print(f"name:      {fmt.clean(_serving_label(s))}")
-    print(f"id:        {s.serving_id}")   # 조회 키
+    print(f"id:        {s.serving_id}")   # lookup key
     print(f"workspace: {fmt.clean(s.namespace_name)}")
     print(f"model id:  {fmt.clean(s.api_model_id or '-')}")
     print(f"framework: {fmt.clean(s.framework or '-')}")
@@ -830,7 +830,7 @@ def _print_task(t: Task, color: bool) -> None:
         return f"{fmt.relative_time(dt)} ({dt.isoformat()})" if dt else "-"
 
     print(f"name:        {fmt.clean(t.name or '-')}")
-    print(f"id:          {fmt.clean(t.task_id)}")   # 조회 키
+    print(f"id:          {fmt.clean(t.task_id)}")   # lookup key
     print(f"workspace:   {fmt.clean(t.namespace_name)}")
     print(f"status:      {fmt.paint(fmt.clean(fmt.status_cell(t.status)), fmt.status_color(t.status), color)}")
     print(f"pod:         {fmt.clean(t.pod_name or '-')}")
@@ -868,7 +868,7 @@ _STORAGE_PROVIDER_LABELS = {"meshive_r2": "managed", "user_s3": "s3", "external"
 
 
 def _storage_label(provider: str | None) -> str:
-    """meshive_r2 → managed, user_s3 → s3, external → external. 그 외는 원문."""
+    """meshive_r2 → managed, user_s3 → s3, external → external. Anything else as-is."""
     if not provider:
         return "-"
     return _STORAGE_PROVIDER_LABELS.get(provider.lower(), provider)
@@ -906,7 +906,7 @@ def _print_asset(a: Asset, color: bool) -> None:
     if a.status_reason:
         status += f" ({a.status_reason})"
     print(f"name:       {fmt.clean(a.name or '-')}")
-    print(f"id:         {fmt.clean(a.asset_id)}")   # 조회 키
+    print(f"id:         {fmt.clean(a.asset_id)}")   # lookup key
     print(f"workspace:  {fmt.clean(a.namespace_name or '-')}")
     print(f"type:       {fmt.clean(a.asset_type or '-')}")
     print(f"status:     {fmt.paint(fmt.clean(status), fmt.status_color(a.status), color)}")
@@ -955,7 +955,7 @@ def _print_asset_storage(s: AssetStorage, color: bool) -> None:
         if s.purge_deadline_at:
             state += f" (managed assets are deleted {fmt.relative_time(s.purge_deadline_at)} unless credit is added)"
     print(f"credit:        {fmt.paint(fmt.clean(state), tone, color)}")
-    print(f"paid balance:  {'available' if s.paid_balance_available else 'none (pods and tasks cannot start)'}")
+    print(f"billing credit: {'available' if s.paid_balance_available else 'none (pods and tasks cannot start)'}")
 
 
 def _print_api_keys(keys: list[ApiKey], color: bool) -> None:
@@ -983,8 +983,6 @@ def _print_api_keys(keys: list[ApiKey], color: bool) -> None:
 
 def _print_credit(c: Credit, color: bool) -> None:
     print(f"balance:         {fmt.money(c.balance)}")
-    print(f"paid:            {fmt.money(c.paid_balance)}")
-    print(f"bonus:           {fmt.money(c.bonus_balance)}  (serverless inference only)")
     if c.auto_recharge:
         recharge = f"on (add {fmt.money(c.auto_recharge_amount)} when below {fmt.money(c.auto_recharge_threshold)})"
     else:
@@ -1005,11 +1003,11 @@ def _print_credit_history(entries: list[CreditHistoryEntry], color: bool) -> Non
 
 
 # =============================================================================
-# 커맨드 핸들러 — (client, args, output, color) -> exit code
+# Command handlers — (client, args, output, color) -> exit code
 # =============================================================================
 
 def _emit(output: str, raw: object, ids: list[str], show) -> None:
-    """선택된 포맷으로 출력. json=원본 payload, name=ID 만, table=사람용 렌더러(show)."""
+    """Print in the selected format. json = raw payload, name = IDs only, table = human renderer (show)."""
     if output == "json":
         print(json.dumps(raw, indent=2, ensure_ascii=False))
     elif output == "name":
@@ -1088,7 +1086,7 @@ def _cmd_pod_metrics(client: Meshive, args: argparse.Namespace, output: str, col
 
 def _print_transactions(transactions: list[Transaction], color: bool) -> None:
     if not transactions:
-        # 끝난 작업은 목록에서 빠진다 — 빈 목록은 "실패 없음" 이 아니라 "진행 중 없음" 이다.
+        # Finished operations drop out of the list — an empty list means "nothing in progress", not "no failures".
         print("No in-flight pod operations.")
         return
     rows = []
@@ -1105,7 +1103,7 @@ def _print_transactions(transactions: list[Transaction], color: bool) -> None:
     fmt.render_table(
         ["POD", "TXN", "ACTION", "STATUS", "STEP", "PROGRESS", "DETAIL", "UPDATED"],
         rows, colors=colors, enabled=color)
-    # 입력 자산 다운로드 실패면 그 컨테이너 로그 끝을 몇 줄 — 콘솔 실패 카드와 같은 발췌(서버가 정제).
+    # If an input asset download failed, a few lines from the end of that container's log — the same excerpt as the console's failure card (sanitized by the server).
     for t in transactions:
         for log in t.init_logs:
             if not log.lines:
@@ -1121,7 +1119,7 @@ _INIT_LOG_LINES = 10
 
 
 def _txn_progress(t: Transaction) -> str:
-    """진행률, 바이트가 멈춘 구간이면 그 이름(verifying · waiting for storage)을 붙인다."""
+    """Progress; if bytes have stalled, append the phase name (verifying · waiting for storage)."""
     cell = "-" if t.progress is None else f"{t.progress * 100:.0f}%"
     if t.phase:
         cell = t.phase.replace("_", " ") if cell == "-" else f"{cell} {t.phase.replace('_', ' ')}"
@@ -1177,7 +1175,7 @@ def _cmd_earnings(client: Meshive, args: argparse.Namespace, output: str, color:
         print("Error: --days must be 0 or greater.", file=sys.stderr)
         return 2
     earnings = client.get_earnings(start_date=args.since, end_date=args.until)
-    # 단일 값 리소스: -o name 은 정산 대기 누적액(호스트가 가장 자주 묻는 숫자) 하나만.
+    # Single-value resource: -o name prints only the pending-settlement total (the number hosts ask about most).
     _emit(output, earnings.raw, [f"{earnings.accumulated_until_payout:.2f}"],
           lambda: _print_earnings(earnings, args.days, color))
     return 0
@@ -1246,7 +1244,7 @@ def _cmd_assets(client: Meshive, args: argparse.Namespace, output: str, color: b
     page = client.list_assets(args.workspace, asset_type=args.asset_type, status=args.status,
                               page=args.page, page_size=args.page_size)
     assets = [a for a in page.items if _contains(a.name, args.name)] if args.name else page.items
-    # json 은 페이지 메타데이터를 유지하되 items 는 --name 필터 결과로 (table/name 과 같은 집합).
+    # json keeps the page metadata, but items are the --name filter result (the same set as table/name).
     raw = {**page.raw, "items": [a.raw for a in assets]}
     _emit(output, raw, [a.asset_id for a in assets], lambda: _print_assets(assets, page, color))
     return 0
@@ -1268,7 +1266,7 @@ def _print_saved(paths: list, color: bool) -> None:
 
 
 def _cmd_asset_download(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
-    # URL 은 download_asset 이 한 번만 받는다 — 무결제 계정의 일일 반출량은 발급마다 집계된다.
+    # download_asset fetches the URLs only once — for accounts without payment, daily egress is counted per issuance.
     paths = client.download_asset(args.asset_id, args.dir or args.asset_id, paths=args.path)
     _emit(output, [str(p) for p in paths], [str(p) for p in paths], lambda: _print_saved(paths, color))
     return 0
@@ -1296,7 +1294,7 @@ def _cmd_task_outputs(client: Meshive, args: argparse.Namespace, output: str, co
 
 def _cmd_asset_storage(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     storage = client.get_asset_storage(args.workspace)
-    # 단일 값 리소스: -o name 은 월 예상 비용 하나만.
+    # Single-value resource: -o name prints only the estimated monthly cost.
     _emit(output, storage.raw, [f"{storage.estimated_monthly_cost:.2f}"],
           lambda: _print_asset_storage(storage, color))
     return 0
@@ -1310,7 +1308,7 @@ def _cmd_api_keys(client: Meshive, args: argparse.Namespace, output: str, color:
 
 def _cmd_credit(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     credit = client.get_credit()
-    # 단일 값 리소스: -o name 은 잔액 숫자 하나만 (스크립트에서 바로 비교 가능).
+    # Single-value resource: -o name prints only the balance number (directly comparable in scripts).
     _emit(output, credit.raw, [f"{credit.balance:.2f}"], lambda: _print_credit(credit, color))
     return 0
 
@@ -1322,7 +1320,7 @@ def _cmd_credit_history(client: Meshive, args: argparse.Namespace, output: str, 
     return 0
 
 
-# 커맨드/별칭 → 핸들러. 별칭은 build_parser 의 aliases 와 같이 유지한다.
+# Command/alias → handler. Keep aliases in sync with build_parser's aliases.
 _HANDLERS: dict[str, Handler] = {
     "me": _cmd_me, "whoami": _cmd_me,
     "workspaces": _cmd_workspaces, "ws": _cmd_workspaces,
@@ -1362,19 +1360,19 @@ def _cmd_login(args: argparse.Namespace) -> int:
     if not api_key:
         print("Error: no API key provided.", file=sys.stderr)
         return 1
-    # base_url 은 credentials 파일을 *읽지 않고* 결정 — 기존 저장값이 새 로그인에 새지 않도록.
+    # base_url is decided *without reading* the credentials file — so a previously saved value doesn't leak into a new login.
     base_url = (args.base_url or os.getenv(_config.ENV_BASE_URL) or _config.DEFAULT_BASE_URL).rstrip("/")
 
     client = Meshive(api_key=api_key, base_url=base_url, timeout=args.timeout)
     try:
-        me = client.me()  # 저장 전에 키를 검증.
+        me = client.me()  # validate the key before saving.
     except (MeshiveError, httpx.HTTPError) as err:
         print(fmt.clean(f"Error: could not verify API key against {base_url}: {err}"), file=sys.stderr)
         return 1
     finally:
         client.close()
 
-    # prod 기본값이면 base_url 은 저장 안 함(암묵적으로 기본 사용). dev 등 비표준일 때만 기억.
+    # With the production default, base_url isn't saved (the default is implied). Only remembered for non-standard ones like dev.
     stored_base = base_url if base_url != _config.DEFAULT_BASE_URL else None
     path = _credentials.save(api_key, stored_base)
     print(fmt.clean(f"Logged in as {me.email} ({base_url})."))
@@ -1410,11 +1408,11 @@ def _run_command(args: argparse.Namespace) -> int:
     try:
         return handler(client, args, output, color)
     except ValueError as err:
-        # SDK 인자 검증 실패(날짜 형식, --limit 범위, 빈 ID 등) — 서버에 가기 전의 사용법 오류.
+        # SDK argument validation failed (date format, --limit range, empty ID, ...) — a usage error before reaching the server.
         print(fmt.clean(f"Error: {err}"), file=sys.stderr)
         return 2
     except MeshiveError as err:
-        # 서버 detail.message 가 포함되므로 제어문자 정제 후 출력.
+        # Includes the server's detail.message, so print it after stripping control characters.
         print(fmt.clean(f"Error: {err}"), file=sys.stderr)
         return 1
     finally:
@@ -1432,18 +1430,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return _run_command(args)
     except MeshiveError as err:
-        # 클라이언트 생성 단계(잘못된 base URL 등)는 _run_command 안쪽 try 밖에서 터진다.
+        # The client-construction step (bad base URL, ...) fails outside the inner try in _run_command.
         print(fmt.clean(f"Error: {err}"), file=sys.stderr)
         return 1
     except httpx.HTTPError as err:
-        # 서버까지 못 갔거나 연결이 끊긴 경우 (MeshiveError 가 아니라 트레이스백이 그대로 새던 자리).
+        # Never reached the server, or the connection dropped (where a traceback used to leak through instead of a MeshiveError).
         target = getattr(getattr(err, "request", None), "url", None)
         where = f" {target}" if target else ""
         print(fmt.clean(f"Error: could not reach the Meshive API{where}: {err}"), file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print(file=sys.stderr)
-        return 130  # 관례: 128 + SIGINT
+        return 130  # convention: 128 + SIGINT
 
 
 if __name__ == "__main__":

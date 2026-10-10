@@ -1,8 +1,8 @@
-"""SDK 응답 dataclass.
+"""SDK response dataclasses.
 
-서버 응답은 camelCase(JSON) 이므로 from_dict 에서 camelCase 키를 읽는다.
-깊게 중첩된 필드(파드의 machine/template/request 등)는 일일이 타입화하지 않고
-원본 dict 를 `.raw` 에 보존한다 → 백엔드가 필드를 추가해도 SDK 가 깨지지 않는다.
+Server responses are camelCase (JSON), so from_dict reads camelCase keys.
+Deeply nested fields (a pod's machine/template/request, ...) aren't typed one by one;
+the original dict is kept in `.raw` → the SDK doesn't break when the backend adds fields.
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from decimal import Decimal, InvalidOperation
 
 
 def _parse_dt(value: str | None) -> datetime | None:
-    """ISO8601 문자열 → datetime. 'Z' 접미사 허용. 파싱 실패 시 None."""
+    """ISO 8601 string → datetime. Accepts a 'Z' suffix. None if parsing fails."""
     if not value:
         return None
     try:
@@ -23,7 +23,7 @@ def _parse_dt(value: str | None) -> datetime | None:
 
 
 def _as_float(value: object) -> float:
-    """숫자/숫자문자열 → float. 변환 불가 시 0.0 (서버가 Numeric 을 문자열로 줘도 안전)."""
+    """Number/numeric string → float. 0.0 if it can't be converted (safe when the server sends Numeric as a string)."""
     try:
         return float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
@@ -32,7 +32,7 @@ def _as_float(value: object) -> float:
 
 @dataclass
 class WhoAmI:
-    """GET /v1/sdk/me 응답 — 현재 API Key 의 소유자."""
+    """GET /v1/sdk/me response — the owner of the current API key."""
 
     email: str
     username: str | None
@@ -51,7 +51,7 @@ class WhoAmI:
 
 @dataclass
 class WorkspaceResources:
-    """워크스페이스 내 리소스 개수 요약."""
+    """Resource count summary for a workspace."""
 
     pod: int = 0
     storage: int = 0
@@ -69,7 +69,7 @@ class WorkspaceResources:
 
 @dataclass
 class Workspace:
-    """GET /v1/sdk/workspaces 항목 (NamespaceMetaData)."""
+    """GET /v1/sdk/workspaces item."""
 
     namespace_name: str
     workspace_name: str
@@ -81,8 +81,8 @@ class Workspace:
     created_at: datetime | None = None
     updated_at: datetime | None = None
     raw: dict = field(default_factory=dict, repr=False)
-    # 키 주인의 이 워크스페이스 역할 — admin | billing | viewer. viewer 는 쓰기가 403 이다.
-    # 표시용이지 권한 판정이 아니다(서버가 쓰기마다 다시 본다). 서버가 모르면 None.
+    # The key owner's role in this workspace — admin | billing | viewer. Writes are 403 for viewer.
+    # For display, not authorization (the server checks again on every write). None if the server doesn't know.
     member_role: str | None = None
 
     @classmethod
@@ -104,15 +104,15 @@ class Workspace:
 
 @dataclass
 class PodEndpoint:
-    """Pod 의 열린 포트 하나 (template.endpoints[]) — 콘솔 Connect 탭의 URL 줄."""
+    """One open port of a Pod (template.endpoints[]) — a URL row in the console's Connect tab."""
 
-    name: str                  # userAlias (예: "ComfyUI", "Jupyter")
+    name: str                  # userAlias (e.g. "ComfyUI", "Jupyter")
     port: int                  # containerPort
     port_type: str             # connect | http | tcp | ...
     external_url: str | None
     internal_url: str | None
     is_external: bool
-    # 콘솔과 같은 판정: readinessState(preparing|ready|interrupted)가 있으면 그것, 없으면 isReady 로 ready|preparing.
+    # Same rule as the console: readinessState (preparing|ready|interrupted) if present, otherwise ready|preparing from isReady.
     readiness: str
 
     @classmethod
@@ -133,25 +133,25 @@ class PodEndpoint:
 
 @dataclass
 class ConnectCredential:
-    """접속에 필요한 값 하나 — 템플릿이 showOnConnect 로 표시한 env (예: ComfyUI 의 ACCESS_PASSWORD).
+    """One value needed to connect — an env the template marks showOnConnect (e.g. ComfyUI's ACCESS_PASSWORD).
 
-    `is_secret` 값은 API 키만 있으면 누구나 읽는 응답에 들어 있다. 화면·로그에 그대로 찍지 말 것 —
-    repr 에서 빠지고, CLI 는 `--show-secrets` 없이는 가린다.
+    `is_secret` values are in a response anyone with the API key can read. Don't print them to screens or logs as-is —
+    they're left out of repr, and the CLI hides them without `--show-secrets`.
     """
 
     key: str
     value: str = field(repr=False)
     is_secret: bool = False
-    is_auto_generated: bool = False   # 템플릿이 Pod 마다 만든 값(사용자가 정하지 않음)
+    is_auto_generated: bool = False   # a value the template generated per Pod (not chosen by the user)
 
 
 @dataclass
 class Pod:
-    """GET /v1/sdk/pods[/{name}] 항목 (PodMetaData).
+    """GET /v1/sdk/pods[/{name}] item.
 
-    자주 쓰는 top-level 스칼라와 접속 정보(endpoints·connect_credentials)를 타입화.
-    machine/template/request/linkedStorages 등 나머지 중첩 구조는 `.raw` 로 접근한다.
-    서버가 주지 않은 값은 None 이다(옛 서버) — False/0 으로 읽지 말 것.
+    Types the commonly used top-level scalars and connection info (endpoints, connect_credentials).
+    The remaining nested structures (machine/template/request/linkedStorages, ...) are in `.raw`.
+    Values the server didn't send are None (older servers) — don't read them as False/0.
     """
 
     pod_name: str
@@ -167,21 +167,23 @@ class Pod:
     storage_rate_per_hour: str = "0"
     endpoints: list[PodEndpoint] = field(default_factory=list)
     connect_credentials: list[ConnectCredential] = field(default_factory=list)
-    billing_active: bool | None = None          # compute 과금 중인가 (정지 Pod 의 storage 과금은 별개)
-    is_downloader: bool | None = None           # 시스템 자산 다운로드 Pod (무료, 사용자가 못 지운다)
+    billing_active: bool | None = None          # whether compute is billing (storage billing of a stopped Pod is separate)
+    is_downloader: bool | None = None           # system Pod that downloads assets (free, users can't delete it)
     cpu_premium: bool | None = None
     uptime_premium: bool | None = None
     internet_premium: bool | None = None
-    # 원래 노드에서 지금 시작할 수 없는 이유(stopped·waiting 에만): spec_mismatch | hardware_changed |
-    # node_unavailable | requirement_unmet | capacity. 시작할 수 있거나 판정할 수 없으면 None.
+    # Why it can't start on its original node right now (stopped/waiting only): spec_mismatch | hardware_changed |
+    # node_unavailable | requirement_unmet | capacity. None if it can start or this can't be determined.
     same_node_unavailable_reason: str | None = None
-    can_restart_on_same_node: bool | None = None   # stopped 에서만 계산된다
+    can_restart_on_same_node: bool | None = None   # computed only when stopped
     can_restart_on_any_node: bool | None = None
-    waiting_mode: str | None = None              # waiting 일 때 same_node | any_node
-    stop_reason_code: str | None = None          # None 또는 "user" = 사용자 정지, 그 외는 시스템 자동 정지
+    waiting_mode: str | None = None              # when waiting: same_node | any_node
+    stop_reason_code: str | None = None          # None or "user" = stopped by the user; anything else = stopped automatically by the system
     stop_reason_detail: str | None = None
     stop_reason_at: datetime | None = None
-    container_running_at: datetime | None = None  # connect Pod 의 컨테이너가 Running 이 된 시각
+    container_running_at: datetime | None = None  # when the connect Pod's container became Running
+    # Set when the pod is terminated because creating it failed (the platform cleans it up), not because it was deleted.
+    creation_failure_reason: str | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Pod":
@@ -198,7 +200,7 @@ class Pod:
             storage_rate_per_hour=str(d.get("storageRatePerHour", "0")),
             created_at=_parse_dt(d.get("createdAt")),
             endpoints=[PodEndpoint.from_dict(e) for e in template.get("endpoints") or [] if isinstance(e, dict)],
-            # 콘솔 CredentialLedger 와 같은 선택 — showOnConnect 인 env 만.
+            # Same selection as the console — only envs with showOnConnect.
             connect_credentials=[
                 ConnectCredential(key=str(e.get("key", "")), value=str(e.get("value") or ""),
                                   is_secret=bool(e.get("isSecret", False)),
@@ -218,34 +220,35 @@ class Pod:
             stop_reason_detail=d.get("stopReasonDetail"),
             stop_reason_at=_parse_dt(d.get("stopReasonAt")),
             container_running_at=_parse_dt(d.get("containerRunningAt")),
+            creation_failure_reason=(d.get("creationFailure") or {}).get("reason"),
             raw=d,
         )
 
 
 @dataclass
 class WatchedFolder:
-    """수확(Watched folders) 폴더 하나 — 새 파일이 자산으로 올라간다."""
+    """One watched folder — new files in it are uploaded as assets."""
 
     path: str
-    origin: str                    # template (템플릿이 정한 폴더) | user (사용자가 더한 폴더)
+    origin: str                    # template (folder defined by the template) | user (folder added by the user)
     enabled: bool
     role: str = ""
-    include: list[str] = field(default_factory=list)   # 템플릿 include
-    include_override: list[str] | None = None          # None = 템플릿 include, [] = 전부, [..] = 이것만
-    since: str | None = None       # 사용자 폴더: 이 시각 뒤에 생긴 파일만(None = 기존 파일도)
-    blocked_reason: str | None = None   # network_storage = NFS 위라 수확하지 않는다(켤 수 없다)
+    include: list[str] = field(default_factory=list)   # the template's include
+    include_override: list[str] | None = None          # None = template include, [] = everything, [..] = only these
+    since: str | None = None       # user folders: only files created after this time (None = existing files too)
+    blocked_reason: str | None = None   # network_storage = on NFS, so not harvested (can't be turned on)
 
 
 @dataclass
 class WatchedFolders:
-    """GET /v1/sdk/pods/{pod}/harvest — Pod 의 수확 폴더 전체와 편집 가능 여부."""
+    """GET /v1/sdk/pods/{pod}/harvest — all of a Pod's watched folders and whether they can be edited."""
 
-    version: str | None            # "3:ab12…" — 바꿀 때 revision(앞 숫자)을 expected_version 으로 보낸다
+    version: str | None            # "3:ab12…" — when changing, send the revision (leading number) as expected_version
     editable: bool
     editable_reason: str | None = None   # no_sidecar | busy | undecidable
-    applied: bool | None = None          # 사이드카가 이 버전을 받았는가(모르면 None)
-    restart_hint: bool = False           # 재시작해야 적용된다
-    folders: list[WatchedFolder] | None = None   # None = 판정할 수 없음
+    applied: bool | None = None          # whether the sidecar has received this version (None if unknown)
+    restart_hint: bool = False           # takes effect only after a restart
+    folders: list[WatchedFolder] | None = None   # None = can't be determined
     raw: dict = field(default_factory=dict, repr=False)
 
     @property
@@ -271,11 +274,11 @@ class WatchedFolders:
 
 @dataclass
 class SshAccess:
-    """POST /v1/sdk/pods/{pod}/ssh 응답 — 일회용 SSH 접속(몇 분 뒤 만료). 비밀번호는 repr 에서 빠진다."""
+    """POST /v1/sdk/pods/{pod}/ssh response — one-time SSH access (expires after a few minutes). The password is left out of repr."""
 
-    command: str                   # 예: "ssh -p 2222 gateway@<host>" (사용자 이름은 서버가 정한다)
+    command: str                   # e.g. "ssh -p 2222 gateway@<host>" (the server picks the user name)
     password: str = field(repr=False)
-    web_url: str = field(default="", repr=False)   # 브라우저 터미널 — 비밀번호가 URL 에 들어 있다
+    web_url: str = field(default="", repr=False)   # browser terminal — the password is in the URL
     expires_at: datetime | None = None
     raw: dict = field(default_factory=dict, repr=False)
 
@@ -290,19 +293,19 @@ class SshAccess:
 
 @dataclass
 class Machine:
-    """GET /v1/sdk/machines[/{machine_id}] 항목 — host 가 등록한 머신.
+    """GET /v1/sdk/machines[/{machine_id}] item — a machine registered by a host.
 
-    웹 콘솔의 MachineDataInterface 와 같은 스키마(camelCase)지만, SDK read 표면은
-    민감 필드(ssh/ipmi credentials, grafana, bootReport 등)를 제외한 trim DTO 를
-    받는다. 자주 쓰는 스칼라만 타입화하고 — status/gpu/earning 처럼 중첩에 있던
-    표시용 필드는 끌어올린다 — 나머지(specs/state 전체/podUses 등)는 `.raw` 로 접근.
+    Same schema (camelCase) as the web console's machine data, but the SDK read surface
+    gets a trimmed DTO without sensitive fields (ssh/ipmi credentials, grafana, bootReport, ...).
+    Only commonly used scalars are typed — display fields that were nested, such as
+    status/gpu/earning, are lifted up — and the rest (specs, the whole state, podUses, ...) is in `.raw`.
     """
 
-    machine_id: str       # id (조회 키)
-    name: str             # 유저 라벨
+    machine_id: str       # id (lookup key)
+    name: str             # user label
     machine_type: str     # "gpu" | "cpu" | "storage"
-    status: str           # state.name (ONLINE/OFFLINE/MAINTENANCE/...). stageState 는 .raw.
-    gpu_model: str         # specs.gpu (cpu/storage 머신은 빈 문자열)
+    status: str           # state.name (ONLINE/OFFLINE/MAINTENANCE/...). stageState is in .raw.
+    gpu_model: str         # specs.gpu (empty string for cpu/storage machines)
     gpu_count: int         # specs.gpuNumber
     earning_hourly: float  # earning.hourly
     uptime_rate: float     # uptimeRate (0.0~1.0)
@@ -329,11 +332,11 @@ class Machine:
 
 
 # =============================================================================
-# 0.0.7 확장 read 표면 — 워크스페이스 상세 / 스토리지 / 메트릭 / GPU / 계정 / 템플릿 / 서버리스
+# 0.0.7 read surface extension — workspace details / storage / metrics / GPUs / account / templates / serverless
 # =============================================================================
 
 def _parse_date(value: str | None) -> date | None:
-    """'YYYY-MM-DD' (또는 ISO datetime) → date. 파싱 실패 시 None."""
+    """'YYYY-MM-DD' (or ISO datetime) → date. None if parsing fails."""
     if not value:
         return None
     parsed = _parse_dt(value)
@@ -346,7 +349,7 @@ def _parse_date(value: str | None) -> date | None:
 
 
 def _as_int(value: object) -> int:
-    """숫자/숫자문자열 → int. None/변환 불가 시 0."""
+    """Number/numeric string → int. 0 for None or values that can't be converted."""
     try:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
@@ -354,7 +357,7 @@ def _as_int(value: object) -> int:
 
 
 def _as_optional_float(value: object) -> float | None:
-    """메트릭 usage rate 처럼 '측정 불가(None)' 와 0 을 구분해야 하는 값."""
+    """For values like metric usage rates where 'not measurable (None)' must be told apart from 0."""
     if value is None:
         return None
     try:
@@ -365,7 +368,7 @@ def _as_optional_float(value: object) -> float | None:
 
 @dataclass
 class ResourceCondition:
-    """워크스페이스 상세의 리소스 종류별 상태 카운트 (type: pod | storage | serverless)."""
+    """Status counts per resource type in workspace details (type: pod | storage | serverless)."""
 
     type: str
     active: int = 0
@@ -380,7 +383,7 @@ class ResourceCondition:
 
 @dataclass
 class DailyCost:
-    """워크스페이스 일별 비용 (USD). 항목별 합이 total."""
+    """Daily workspace cost (USD). The per-item amounts add up to total."""
 
     date: date | None
     pod: float = 0.0
@@ -402,22 +405,22 @@ class DailyCost:
 
 @dataclass
 class WorkspaceDetail:
-    """GET /v1/sdk/workspaces/{namespace} 응답 (NamespaceDetailData).
+    """GET /v1/sdk/workspaces/{namespace} response.
 
-    비용(현재 시간당/주간 일평균/일별 내역)과 리소스 요약을 타입화한다. 유지보수 일정
-    (maintenanceSchedule)과 호스트 메시지(messageFromHost)는 `.raw` 로 접근한다.
+    Types costs (current hourly / weekly daily average / daily breakdown) and the resource summary. The maintenance
+    schedule (maintenanceSchedule) and host message (messageFromHost) are in `.raw`.
     """
 
     namespace_name: str
     workspace_name: str
-    price_per_hour: str        # costData.currentUsage — 지금 과금 중인 시간당 합계 (USD)
-    weekly_avg_daily_cost: str  # costData.weeklyAvgUsage — 최근 7일 일평균 (USD)
+    price_per_hour: str        # costData.currentUsage — hourly total currently billing (USD)
+    weekly_avg_daily_cost: str  # costData.weeklyAvgUsage — daily average over the last 7 days (USD)
     gpus: int
     vcpus: int
     ram: int
     total_storage: float
     resources: list[ResourceCondition] = field(default_factory=list)
-    costs: list[DailyCost] = field(default_factory=list)   # 최근 일별 비용 (오래된 순)
+    costs: list[DailyCost] = field(default_factory=list)   # recent daily costs (oldest first)
     raw: dict = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -440,7 +443,7 @@ class WorkspaceDetail:
 
 
 def _step_order(step: dict) -> tuple:
-    """(updatedAt, 진행 중인가) — 시각이 없는 옛 데이터는 같은 값이라 호출부의 순번(뒤쪽)이 이긴다."""
+    """(updatedAt, in progress?) — old data without timestamps compares equal, so the caller's order (later wins) decides."""
     at = _parse_dt(step.get("updatedAt")) or datetime.min
     if at.tzinfo is None:
         at = at.replace(tzinfo=timezone.utc)
@@ -449,51 +452,51 @@ def _step_order(step: dict) -> tuple:
 
 @dataclass
 class InitLog:
-    """입력 자산 다운로드 컨테이너 로그 발췌 하나."""
+    """One log excerpt from an input asset download container."""
 
-    container: str      # source-fetch (외부 원본) | init-fetch (업로드 자산)
+    container: str      # source-fetch (external source) | init-fetch (uploaded asset)
     lines: list[str]
-    previous: bool      # 재시작 전(실패를 겪은) 인스턴스의 로그인가
+    previous: bool      # whether this is the log of the instance before the restart (the one that failed)
 
 
 @dataclass
 class Transaction:
-    """진행 중인 pod 작업 하나. `status: creating` 이 왜 길어지는지 알려주는 유일한 수단.
+    """One in-progress pod operation. The only way to see why `status: creating` is taking long.
 
-    `step` 이 현재 단계이고, 이미지 pull/자산 fetch 처럼 진행률이 있는 단계는 `progress`
-    (0.0~1.0) 가 채워진다. 진행률을 알 수 없는 단계는 None 이다 — **0.0 으로 읽지 말 것**.
-    실패 사유는 `detail`. 원문 진단(container status, k8s events, OOM 분류)은 `.raw`.
+    `step` is the current stage, and stages with progress such as image pull or asset fetch fill `progress`
+    (0.0–1.0). It is None for stages whose progress is unknown — **don't read it as 0.0**.
+    The failure reason is `detail`. Raw diagnostics (container status, k8s events, OOM classification) are in `.raw`.
     """
 
     transaction_id: int
-    resource_name: str          # statefulset 이름 (pod 이름의 `-0` 앞부분)
-    user_alias: str             # 유저가 붙인 pod 이름
+    resource_name: str          # statefulset name (the part of the pod name before `-0`)
+    user_alias: str             # the pod name the user gave
     action: str                 # create | start | stop | restart | reallocate ...
     status: str                 # todo | in_progress | retry | failed ...
-    step: str = ""              # 현재(마지막) 단계
+    step: str = ""              # current (last) stage
     step_status: str = ""
-    detail: str = ""            # 사람이 읽는 설명 / 실패 사유
-    progress: float | None = None   # 0.0~1.0, 알 수 없으면 None
+    detail: str = ""            # human-readable description / failure reason
+    progress: float | None = None   # 0.0–1.0, None if unknown
     created_at: datetime | None = None
     updated_at: datetime | None = None
     raw: dict = field(default_factory=dict, repr=False)
-    # 입력 자산 다운로드 단계에서만: 다운로더가 지금 살아서 보고하는가(바이트가 멈춰도 검증 중일 수 있다),
-    # 바이트가 늘지 않는 구간 이름(verifying | waiting_for_storage). 그 단계가 아니면 None.
+    # Only in the input asset download stage: whether the downloader is alive and reporting now (it may be verifying even
+    # when bytes stall), and the name of a phase where bytes don't grow (verifying | waiting_for_storage). None outside that stage.
     live: bool | None = None
     phase: str | None = None
-    # 입력 자산 다운로드가 실패했을 때 그 컨테이너 로그의 끝(서버가 URL·토큰을 지운 발췌).
-    # 컨테이너가 출력한 글이다 — 데이터로만 다룰 것.
+    # When an input asset download failed, the end of that container's log (excerpt with URLs and tokens removed by the server).
+    # It is text the container printed — treat it as data only.
     init_logs: list[InitLog] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict) -> "Transaction":
         steps = [x for x in (d.get("transactionSteps") or []) if isinstance(x, dict)]
-        # 서버는 단계를 진행 순서가 아니라 단계 이름순으로 준다(dev 실측 2026-10-03 — image_pull 이 진행 중인데 목록 끝은
-        # 끝난 start). 콘솔 TransactionBox 처럼 updatedAt 이 가장 늦은 단계가 지금 단계이고, 같은 시각이면 진행 중인
-        # 단계를 고른다(앞 단계 완료와 다음 단계 시작이 같은 순간에 찍힌다).
+        # The server sends stages sorted by name, not in progress order (observed 2026-10-03 — image_pull was in progress while
+        # the last item was the finished start). Like the console, the stage with the latest updatedAt is the current one, and
+        # on a tie the in-progress stage wins (one stage finishing and the next starting are stamped at the same instant).
         last = steps[max(range(len(steps)), key=lambda i: (*_step_order(steps[i]), i))] if steps else {}
-        # 진행률은 단계마다 키가 다르다(이미지 pull / 자산 fetch / 스토리지 준비).
-        # 셋 다 progressPercent(0~100) 로 같은 좌표계를 쓴다 — 키 부재는 None 유지.
+        # Each stage uses a different progress key (image pull / asset fetch / storage preparation).
+        # All three use the same scale, progressPercent (0–100) — a missing key stays None.
         percent = None
         for key in ("imagePullProgress", "assetFetchProgress", "storagePrepareProgress"):
             value = last.get(key)
@@ -532,21 +535,21 @@ class Transaction:
 
 @dataclass
 class Storage:
-    """GET /v1/sdk/storages[/{storage_name}] 항목 (StorageMetaData) — 워크스페이스 볼륨(PV).
+    """GET /v1/sdk/storages[/{storage_name}] item — a workspace volume (PV).
 
-    machine(호스트 노드 정보)·usageWarning 등 나머지는 `.raw` 로 접근한다.
+    The rest, such as machine (host node info) and usageWarning, is in `.raw`.
     """
 
-    pv_name: str               # 조회 키
+    pv_name: str               # lookup key
     namespace_name: str
-    user_alias: str            # 유저 라벨
+    user_alias: str            # user label
     storage_type: str          # nfs | hostPath | ...
     status: str
     total_size: float
     available_size: float
     usage_rate: float          # 0.0~1.0
     price_per_hour: str
-    linked_pods: list[str] = field(default_factory=list)   # 연결된 pod 이름
+    linked_pods: list[str] = field(default_factory=list)   # names of attached pods
     is_maintenance: bool = False
     encrypted: bool = False
     created_at: datetime | None = None
@@ -574,11 +577,11 @@ class Storage:
 
 @dataclass
 class GpuUsage:
-    """GPU 1장의 사용률. rate 는 0.0~1.0, vram_size 는 총 VRAM(MiB).
+    """Utilization of one GPU. rate is 0.0–1.0, vram_size is total VRAM (MiB).
 
-    gpu_number 외 필드는 각각 측정 불가면 None — dcgm-exporter 가 못 읽은 계열을 생략하면 서버는 그 필드를
-    null 로 주므로, 온도만 있고 메모리(FB) 값이 없는 GPU 가 정상적으로 온다. vram_size 도 이때 0.0 이 아니라
-    None 이다. 단 FB 두 값이 0 으로 보고되면 서버는 0.0 을 준다 — 이것도 카드 크기가 아니다(CLI 는 둘 다 n/a).
+    Each field other than gpu_number is None when not measurable — when dcgm-exporter omits a metric family it can't
+    read, the server sends that field as null, so a GPU with a temperature but no memory (FB) values is normal. vram_size
+    is then None too, not 0.0. But when both FB values are reported as 0 the server sends 0.0 — that isn't the card size either (the CLI shows n/a for both).
     """
 
     gpu_number: int
@@ -598,10 +601,10 @@ class GpuUsage:
 
 @dataclass
 class PodMetrics:
-    """GET /v1/sdk/pods/{pod_name}/metrics 응답 (ResourceUsage) — 파드 리소스 사용량.
+    """GET /v1/sdk/pods/{pod_name}/metrics response — pod resource usage.
 
-    usage rate 는 0.0~1.0, Prometheus 조회 실패 시 None (요청량 필드는 그대로 채워진다).
-    연결 스토리지 사용량은 `.raw["storage"]`. 크기(ram_size·ephemeral_storage_*·gpus[].vram_size)는 MiB.
+    Usage rates are 0.0–1.0, None if the Prometheus query failed (requested amounts are still filled in).
+    Attached storage usage is in `.raw["storage"]`. Sizes (ram_size, ephemeral_storage_*, gpus[].vram_size) are MiB.
     """
 
     pod_name: str
@@ -634,13 +637,13 @@ class PodMetrics:
 
 @dataclass
 class MachineMetrics:
-    """GET /v1/sdk/machines/{machine_id}/metrics 응답 — host 머신 실시간 메트릭.
+    """GET /v1/sdk/machines/{machine_id}/metrics response — live metrics of a host machine.
 
-    *_allocated 는 현재 파드들이 예약한 양. 디스크 온도(diskTemperatures)·네트워크
-    인터페이스명은 `.raw`.
+    *_allocated is what the current pods have reserved. Disk temperatures (diskTemperatures) and network
+    interface names are in `.raw`.
 
-    단위: ram_size 만 **바이트**다(노드 MemTotal — 서버가 Prometheus 값을 그대로 준다). ram_allocated·
-    root/pv_volume_size·gpus[].vram_size 는 MiB, network_receive/transmit 은 바이트/초.
+    Units: only ram_size is **bytes** (node MemTotal — the server passes the Prometheus value through). ram_allocated,
+    root/pv_volume_size and gpus[].vram_size are MiB; network_receive/transmit are bytes/sec.
     """
 
     machine_id: str
@@ -687,20 +690,20 @@ class MachineMetrics:
 
 @dataclass
 class GpuAvailability:
-    """GET /v1/sdk/gpus 항목 (GpuDistribution) — 지금 대여 가능한 GPU (model, VRAM) 티어.
+    """GET /v1/sdk/gpus item — a (model, VRAM) GPU tier that can be rented now.
 
-    combinations(머신별 최대 할당 가능량)는 available_gpus / max_gpus_per_pod 로 요약하고
-    원본은 `.raw["combinations"]`.
+    combinations (max allocatable per machine) is summarized as available_gpus / max_gpus_per_pod;
+    the original is in `.raw["combinations"]`.
     """
 
     gpu_model: str
     vram: int                  # GB
     rental_type: str           # demand | spot
-    price_per_hour: str        # GPU 1장 시간당 (USD)
+    price_per_hour: str        # per GPU per hour (USD)
     vcpu_recommended: int
     ram_recommended: int
-    available_gpus: int        # 전 머신 합계
-    max_gpus_per_pod: int      # 한 머신에서 한 파드에 줄 수 있는 최대 장수
+    available_gpus: int        # total across all machines
+    max_gpus_per_pod: int      # max number one pod can get on a single machine
     machine_count: int
     raw: dict = field(default_factory=dict, repr=False)
 
@@ -724,9 +727,9 @@ class GpuAvailability:
 
 @dataclass
 class ApiKey:
-    """GET /v1/sdk/api-keys 항목 — 내 Meshive API Key (활성 키만).
+    """GET /v1/sdk/api-keys item — one of my Meshive API keys (active keys only).
 
-    평문은 발급 시 한 번만 보이고 서버에는 해시만 남으므로 여기서는 표시용 prefix 만 온다.
+    The plaintext is shown only once at issuance and the server keeps only a hash, so only the display prefix comes back here.
     """
 
     key_id: int
@@ -756,10 +759,11 @@ class ApiKey:
 
 @dataclass
 class Credit:
-    """GET /v1/sdk/credit 응답 — 크레딧 잔액 (USD).
+    """GET /v1/sdk/credit response — credit balance (USD).
 
-    balance = paid_balance + bonus_balance. bonus 는 serverless 추론에만 쓸 수 있고,
-    GPU 파드/워크스페이스 실행에는 paid_balance 가 필요하다.
+    There is one kind of balance — pods, tasks and serverless all draw from it. paid_balance and bonus_balance are
+    leftovers of the paid/bonus split from before free credits were retired (2026-10); the server sends
+    paid_balance = balance and bonus_balance = 0 (the fields stay for backward compatibility).
     """
 
     balance: float
@@ -787,9 +791,9 @@ class Credit:
 
 @dataclass
 class CreditHistoryEntry:
-    """GET /v1/sdk/credit/history 항목 — 충전/환불 원장 1건 (환불은 음수).
+    """GET /v1/sdk/credit/history item — one top-up/refund ledger entry (refunds are negative).
 
-    Stripe 영수증/인보이스 링크는 SDK 표면에 실리지 않는다 (콘솔에서 확인).
+    Stripe receipt/invoice links aren't on the SDK surface (see the console).
     """
 
     entry_id: int
@@ -813,7 +817,7 @@ class CreditHistoryEntry:
 
 @dataclass
 class DailyEarning:
-    """host 일별 수익 (USD)."""
+    """Host daily earnings (USD)."""
 
     date: date | None
     cpu: float = 0.0
@@ -830,11 +834,11 @@ class DailyEarning:
 
 @dataclass
 class Earnings:
-    """GET /v1/sdk/earnings 응답 — host 수익 요약 (USD) + 일별 내역 (최신순)."""
+    """GET /v1/sdk/earnings response — host earnings summary (USD) + daily breakdown (newest first)."""
 
-    current_hourly: float          # 지금 과금 중인 파드/볼륨의 시간당 수익
-    daily: float                   # 오늘 누적
-    accumulated_until_payout: float  # 다음 정산까지 누적
+    current_hourly: float          # hourly earnings of pods/volumes currently billing
+    daily: float                   # accumulated today
+    accumulated_until_payout: float  # accumulated until the next payout
     history: list[DailyEarning] = field(default_factory=list)
     raw: dict = field(default_factory=dict, repr=False)
 
@@ -851,9 +855,9 @@ class Earnings:
 
 @dataclass
 class Member:
-    """GET /v1/sdk/members 항목 — 워크스페이스 멤버 (role: admin | billing | viewer)."""
+    """GET /v1/sdk/members item — a workspace member (role: admin | billing | viewer)."""
 
-    user: str                  # email (조회 키)
+    user: str                  # email (lookup key)
     role: str
     joined_at: datetime | None = None
     raw: dict = field(default_factory=dict, repr=False)
@@ -866,12 +870,12 @@ class Member:
 
 @dataclass
 class Template:
-    """GET /v1/sdk/templates[/{template_id}] 항목 (TemplateResponse).
+    """GET /v1/sdk/templates[/{template_id}] item.
 
-    envs/endpoints/volumeMounts/semanticPaths 등 배포 명세는 `.raw`.
+    The deployment spec (envs/endpoints/volumeMounts/semanticPaths, ...) is in `.raw`.
     """
 
-    template_id: int           # 조회 키
+    template_id: int           # lookup key
     name: str
     description: str
     is_official: bool
@@ -906,12 +910,12 @@ class Template:
 
 @dataclass
 class Serving:
-    """GET /v1/sdk/servings[/{serving_id}] 항목 (ServingGroupResponse) — serverless serving 배포.
+    """GET /v1/sdk/servings[/{serving_id}] item — a serverless serving deployment.
 
-    replicas(개별 replica 상태/GPU/과금)와 라이브 메트릭(throughput/latency 등)은 `.raw`.
+    replicas (per-replica status/GPU/billing) and live metrics (throughput/latency, ...) are in `.raw`.
     """
 
-    serving_id: int            # 조회 키 (group id)
+    serving_id: int            # lookup key (group id)
     namespace_name: str
     model_name: str | None
     api_model_id: str | None
@@ -923,16 +927,16 @@ class Serving:
     current_replicas: int
     healthy_replicas: int | None
     endpoint_url: str | None
-    price_per_hour: str        # 과금 중 replica 단가 합 (USD), 없으면 "0"
+    price_per_hour: str        # sum of billing replica prices (USD), "0" if none
     billing_active: bool
     autoscale: bool = False                 # auto_scale_enabled
-    price_cap_per_hour: str | None = None   # replica 당 시간당 상한 (USD), None = 무제한
+    price_cap_per_hour: str | None = None   # hourly cap per replica (USD), None = unlimited
     raw: dict = field(default_factory=dict, repr=False)
 
     def scale_raises_cost(self, *, min_replicas: int | None = None, max_replicas: int | None = None,
                           autoscale: bool | None = None, price_cap_per_hour: object = None) -> bool:
-        """scale_serving 인자가 시간당 비용을 **늘릴 수 있는지** — CLI/MCP 가 확인을 요구하는 기준.
-        replica 범위 확대, autoscale 켜기(꺼져 있던 경우), replica 당 상한 인상(무제한은 이미 최대)."""
+        """Whether scale_serving arguments **can raise** the hourly cost — the rule the CLI/MCP use to require confirmation.
+        A wider replica range, turning on autoscale (when it was off), a higher per-replica cap (unlimited is already the max)."""
         if min_replicas is not None and min_replicas > self.min_replicas:
             return True
         if max_replicas is not None and max_replicas > self.max_replicas:
@@ -943,7 +947,7 @@ class Serving:
             try:
                 return Decimal(str(price_cap_per_hour)) > Decimal(self.price_cap_per_hour)
             except (InvalidOperation, ValueError):
-                return True     # 해석 불가한 값은 안전하게 "확인 필요"
+                return True     # a value that can't be parsed safely counts as "needs confirmation"
         return False
 
     @classmethod
@@ -974,29 +978,29 @@ class Serving:
 
 @dataclass
 class TaskInputAsset:
-    """task 에 붙은 입력 자산 하나 (상세 응답의 inputAssets[])."""
+    """One input asset attached to a task (inputAssets[] of the detail response)."""
 
     asset_id: str
     name: str
     target_dir: str
-    reference_mode: str | None = None   # None = managed / "external" = 실행마다 원본에서 다시 받는다
+    reference_mode: str | None = None   # None = managed / "external" = fetched from the source again on every run
     ingest_source: str | None = None    # hf_import | civitai_import | web_upload | ...
 
 
 @dataclass
 class ModelDetection:
-    """POST /v1/sdk/models/detect 응답 — HF repo 를 서빙할 수 있는가(콘솔 등록 모달의 감지)."""
+    """POST /v1/sdk/models/detect response — whether an HF repo can be served (the detection in the console's registration dialog)."""
 
-    status: str                    # ok | unsupported | failed (failed = HF 를 못 읽었거나 판정 불가)
+    status: str                    # ok | unsupported | failed (failed = couldn't read HF or couldn't decide)
     output: str | None = None      # text | image | video
-    takes_image: bool = False      # 이미지 입력을 받는가 (VLM 등)
+    takes_image: bool = False      # whether it accepts image input (VLMs, ...)
     capability: str | None = None  # text_generation | embedding | text_to_image ...
     framework: str | None = None   # vllm | sglang
-    detail: str | None = None      # unsupported·failed 사유
+    detail: str | None = None      # reason for unsupported/failed
     architecture: str | None = None
     file_size_bytes: int | None = None
-    context_length: int | None = None   # 감지된 최대 context — 모르면 None
-    suggested_repo: str | None = None   # 지원 안 되는 GGUF 의 원본 후보
+    context_length: int | None = None   # detected max context — None if unknown
+    suggested_repo: str | None = None   # candidate original repo for an unsupported GGUF
     raw: dict = field(default_factory=dict, repr=False)
 
     @property
@@ -1013,12 +1017,12 @@ class ModelDetection:
 
 @dataclass
 class ServingModel:
-    """GET /v1/sdk/models 항목 — 워크스페이스가 등록한 서빙 모델. `registration_id` 를 deploy_serving 에 넘긴다."""
+    """GET /v1/sdk/models item — a serving model registered by the workspace. Pass `registration_id` to deploy_serving."""
 
     registration_id: int
     name: str
     huggingface_repo: str | None
-    api_model_id: str | None       # 추론 요청의 model 값
+    api_model_id: str | None       # the model value in inference requests
     framework: str
     model_type: str
     context_length: int | None = None
@@ -1038,7 +1042,7 @@ class ServingModel:
 
 @dataclass
 class HfToken:
-    """워크스페이스에 등록된 Hugging Face 토큰(또는 CivitAI 키) — id 와 이름만(값은 API 가 돌려주지 않는다)."""
+    """A Hugging Face token (or CivitAI key) saved in the workspace — id and name only (the API never returns the value)."""
 
     token_id: int
     label: str
@@ -1053,12 +1057,12 @@ class HfToken:
 
 @dataclass
 class Task:
-    """GET /v1/sdk/tasks[/{task_id}] 항목 (TaskResponse / TaskDetailResponse) — serverless task.
+    """GET /v1/sdk/tasks[/{task_id}] item — a serverless task.
 
-    단건 응답의 script/requirements/env(secret 값은 마스킹)/비용 분해는 `.raw`.
+    The single-item response's script/requirements/env (secret values masked)/cost breakdown are in `.raw`.
     """
 
-    task_id: str               # 조회 키 (externalId, "task_...")
+    task_id: str               # lookup key (externalId, "task_...")
     name: str
     namespace_name: str
     status: str                # queued | scheduling | pulling | fetching | running | succeeded | failed | timed_out | stopped
@@ -1077,19 +1081,19 @@ class Task:
     failure_reason: str | None = None
     exit_code: int | None = None
     raw: dict = field(default_factory=dict, repr=False)
-    # 입력 자산 다운로드에서 실패했으면 그 자산 id.
+    # The asset id, if the input asset download failed.
     failed_asset_id: str | None = None
-    # 입력 자산 — 상세(`get_task`)에만 온다. 목록에서는 빈 리스트.
+    # Input assets — only in the detail response (`get_task`). An empty list in listings.
     input_assets: list[TaskInputAsset] = field(default_factory=list)
-    # 출력 업로드는 task 상태와 별개 축이다: 끝난 task 도 출력은 아직 올라가는 중일 수 있다.
-    # state: pending | uploading | completed | failed | skipped | discarded. None = 옛 행(skipped 와 같게 읽는다).
+    # Output upload is a separate axis from task status: a finished task may still be uploading outputs.
+    # state: pending | uploading | completed | failed | skipped | discarded. None = old row (read it like skipped).
     output_upload_state: str | None = None
     output_files_declared: int | None = None
     output_files_completed: int | None = None
     output_bytes_declared: int | None = None
     output_bytes_completed: int | None = None
-    output_upload_last_error: str | None = None   # 마지막 업로드 실패 사유 (자격증명 오류 등)
-    outputs_purged_at: datetime | None = None      # 출력이 지워진 시각
+    output_upload_last_error: str | None = None   # reason of the last upload failure (credential error, ...)
+    outputs_purged_at: datetime | None = None      # when the outputs were deleted
 
     @classmethod
     def from_dict(cls, d: dict) -> "Task":
@@ -1138,10 +1142,10 @@ _READY = "ready"
 
 @dataclass
 class AssetVersion:
-    """[Deprecated — 0.2 에서 제거] 자산 버전 1건. 서버에 자산 버전은 더 이상 없다.
+    """[Deprecated — removed in 0.2] One asset version. Assets no longer have versions on the server.
 
-    서버가 옛 SDK 를 위해 자산 요약을 versionNumber=1 인 단일 버전처럼 되비춘 값이다.
-    `Asset` 의 자산 레벨 필드(size_bytes·file_count·upload_status·files …)를 쓸 것.
+    It is the asset summary the server echoes back as a single version with versionNumber=1, for older SDKs.
+    Use the asset-level fields of `Asset` (size_bytes, file_count, upload_status, files …).
     """
 
     version_number: int
@@ -1183,9 +1187,9 @@ def _warn_versions(name: str) -> None:
 
 @dataclass
 class AssetFile:
-    """자산의 파일 하나 (상세 응답의 files[])."""
+    """One file of an asset (files[] of the detail response)."""
 
-    path: str                  # relativePath — 자산 안의 상대 경로
+    path: str                  # relativePath — relative path inside the asset
     size_bytes: int
     status: str
     file_id: str | None = None  # fileExternalId
@@ -1201,7 +1205,7 @@ class AssetFile:
 
 @dataclass
 class AssetUsage:
-    """자산을 지금 쓰는 곳 하나 (상세 응답의 activeUsageContexts[]) — 삭제·변경을 막는 이유."""
+    """One place currently using the asset (activeUsageContexts[] of the detail response) — why it can't be deleted or changed."""
 
     kind: str                  # pod | task | serving ...
     identifier: str
@@ -1212,20 +1216,20 @@ class AssetUsage:
 
 @dataclass
 class Asset:
-    """GET /v1/sdk/assets 의 행(AssetListRow) 또는 /assets/{id} 의 상세(AssetDetailResponse).
+    """A row of GET /v1/sdk/assets or the detail of /assets/{id}.
 
-    자산에는 버전이 없다 — 크기·파일 수·업로드 상태는 자산 자체의 값이다. 파일 목록(files)과
-    사용 중인 곳(active_usage_contexts)은 상세에만 온다. pickle 뱃지 등 나머지는 `.raw`.
-    `version_count`·`latest_version`·`versions` 는 deprecated(0.2 에서 제거).
+    Assets have no versions — size, file count and upload status are values of the asset itself. The file list (files) and
+    where it's in use (active_usage_contexts) come only with the detail. The rest, such as the pickle badge, is in `.raw`.
+    `version_count`, `latest_version` and `versions` are deprecated (removed in 0.2).
     """
 
-    asset_id: str              # assetExternalId ("asset_…", 조회 키)
+    asset_id: str              # assetExternalId ("asset_…", lookup key)
     name: str
     asset_type: str            # dataset | model | adapter | checkpoint | output | config | file
     status: str                # active | source_missing | frozen | deleted | purged | merged
     status_reason: str | None
-    storage_provider: str      # meshive_r2 (managed) | user_s3 | external, 모르면 ""
-    # 외부 원본을 아직 재지 않은 링크 자산은 크기·파일 수를 모른다 → None (0 이 아니다).
+    storage_provider: str      # meshive_r2 (managed) | user_s3 | external, "" if unknown
+    # A link asset whose external source hasn't been measured yet has unknown size and file count → None (not 0).
     size_bytes: int | None
     file_count: int | None
     in_use: bool
@@ -1235,13 +1239,13 @@ class Asset:
     updated_at: datetime | None = None
     raw: dict = field(default_factory=dict, repr=False)
     upload_status: str = ""    # uploading | ready | failed
-    stale: bool = False        # uploading 인데 끝낼 Pod 이 이미 없다 (콘솔 "Interrupted")
+    stale: bool = False        # uploading, but the Pod that would finish it is gone (console "Interrupted")
     ingest_source: str = ""    # web_upload | hf_import | civitai_import | harvest | task_output | ...
     import_failure_reason: str | None = None
     kind: str | None = None
-    semantic_type: str | None = None   # 목록 행에만 온다
-    files: list[AssetFile] = field(default_factory=list)                   # 상세에만
-    active_usage_contexts: list[AssetUsage] = field(default_factory=list)  # 상세에만
+    semantic_type: str | None = None   # only in list rows
+    files: list[AssetFile] = field(default_factory=list)                   # detail only
+    active_usage_contexts: list[AssetUsage] = field(default_factory=list)  # detail only
 
     @classmethod
     def from_dict(cls, d: dict, *, namespace_name: str = "") -> "Asset":
@@ -1275,7 +1279,7 @@ class Asset:
             raw=d,
         )
 
-    # --- deprecated: 서버가 옛 SDK 용으로 되비추는 버전 필드(Phase C 에서 사라진다) -----------------
+    # --- deprecated: version fields the server echoes back for older SDKs (removed in 0.2) -----------------
 
     def _raw_versions(self) -> list[AssetVersion]:
         return [AssetVersion.from_dict(v) for v in self.raw.get("versions") or [] if isinstance(v, dict)]
@@ -1304,9 +1308,9 @@ class Asset:
 
 @dataclass
 class DownloadFile:
-    """다운로드할 파일 하나 — presigned URL 은 짧게 산다(`expires_in`). URL 에 Meshive 키를 붙이지 말 것."""
+    """One file to download — presigned URLs are short-lived (`expires_in`). Don't attach your Meshive key to the URL."""
 
-    path: str                  # 자산 안 상대 경로 / task 결과물 파일 이름
+    path: str                  # relative path inside the asset / task output file name
     url: str
     size_bytes: int | None = None
     content_hash: str | None = None
@@ -1314,13 +1318,13 @@ class DownloadFile:
 
 @dataclass
 class AssetDownload:
-    """GET /v1/sdk/assets/{id}/download-urls 응답 — 자산 파일별 presigned URL."""
+    """GET /v1/sdk/assets/{id}/download-urls response — presigned URLs per asset file."""
 
     asset_id: str
     name: str
     files: list[DownloadFile]
-    expires_in: int            # URL 유효 시간(초)
-    # 서버가 발급했어야 할 파일 수. files 가 이보다 적으면 일부 서명이 실패한 것이다(다시 요청).
+    expires_in: int            # URL lifetime (seconds)
+    # Number of files the server should have issued. If files has fewer, some signatures failed (request again).
     expected_file_count: int | None = None
     raw: dict = field(default_factory=dict, repr=False)
 
@@ -1347,11 +1351,11 @@ class AssetDownload:
 
 @dataclass
 class TaskOutputs:
-    """GET /v1/sdk/tasks/{id}/outputs 응답 — task 결과물 파일과 presigned URL(수 시간 유효)."""
+    """GET /v1/sdk/tasks/{id}/outputs response — task output files and presigned URLs (valid for a few hours)."""
 
     task_id: str
     files: list[DownloadFile]
-    expired: bool              # 결과물이 지워졌다(자산 삭제 등) — files 가 비어 있다
+    expired: bool              # outputs were deleted (asset deleted, ...) — files is empty
     storage_provider: str      # meshive_r2 (managed) | user_s3
     raw: dict = field(default_factory=dict, repr=False)
 
@@ -1360,7 +1364,7 @@ class TaskOutputs:
         destination = d.get("destination") or {}
         return cls(
             task_id=task_id,
-            # downloadUrl 은 첨부(attachment)로 서명된 것 — 없으면 미리보기 url 로도 받을 수 있다.
+            # downloadUrl is signed as an attachment — without it the preview url works for downloading too.
             files=[DownloadFile(path=str(f.get("filename", "")), url=str(f.get("downloadUrl") or f.get("url") or ""),
                                 size_bytes=f.get("sizeBytes"))
                    for f in d.get("files") or [] if isinstance(f, dict)],
@@ -1372,7 +1376,7 @@ class TaskOutputs:
 
 @dataclass
 class AssetImported:
-    """POST /v1/sdk/assets/import 응답 — 링크로 등록된 자산(바이트는 복사하지 않고 바로 ready)."""
+    """POST /v1/sdk/assets/import response — an asset registered by link (bytes aren't copied; ready immediately)."""
 
     asset_id: str
     name: str
@@ -1380,8 +1384,8 @@ class AssetImported:
     ingest_source: str            # hf_import | civitai_import | url_import
     file_count: int
     total_bytes: int
-    is_gated: bool = False        # 원본이 토큰·키 없이는 안 읽힌다 — 기동 때도 저장된 토큰이 필요하다
-    resolved_commit: str | None = None   # HF: 고정된 commit (등록 뒤 바뀌지 않는다)
+    is_gated: bool = False        # the source can't be read without a token/key — a saved token is needed at startup too
+    resolved_commit: str | None = None   # HF: the pinned commit (doesn't change after registration)
     raw: dict = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -1394,10 +1398,10 @@ class AssetImported:
 
 @dataclass
 class AssetPage:
-    """GET /v1/sdk/assets 응답 한 페이지. `for asset in page` 로 항목을 순회한다."""
+    """One page of the GET /v1/sdk/assets response. Iterate items with `for asset in page`."""
 
     items: list[Asset]
-    total: int                 # 필터 조건에 맞는 전체 자산 수
+    total: int                 # total number of assets matching the filters
     page: int
     page_size: int
     raw: dict = field(default_factory=dict, repr=False)
@@ -1410,7 +1414,7 @@ class AssetPage:
 
     @property
     def pages(self) -> int:
-        """전체 페이지 수 (최소 1)."""
+        """Total number of pages (at least 1)."""
         return max(1, -(-self.total // self.page_size)) if self.page_size > 0 else 1
 
     @classmethod
@@ -1428,10 +1432,10 @@ class AssetPage:
 
 @dataclass
 class AssetStorage:
-    """GET /v1/sdk/assets/storage-summary 응답 — managed 저장량/단가/월 예상 비용 + 크레딧 차단 상태.
+    """GET /v1/sdk/assets/storage-summary response — managed storage amount/unit price/estimated monthly cost + credit block state.
 
-    credit_state 가 grace 면 blocks_at 에 차단, blocked 면 purge_deadline_at 에 managed
-    저장분이 삭제된다. 유저 S3 자산은 Meshive 과금 대상이 아니라 managed_bytes 에 안 들어간다.
+    If credit_state is grace, it gets blocked at blocks_at; if blocked, the managed data is deleted at
+    purge_deadline_at. User S3 assets aren't billed by Meshive and aren't counted in managed_bytes.
     """
 
     managed_bytes: int
@@ -1462,14 +1466,14 @@ class AssetStorage:
 
 
 # =============================================================================
-# 쓰기 표면 (0.1.0) — 견적·수락 응답·로그
+# Write surface (0.1.0) — estimates, accepted responses, logs
 # =============================================================================
 
 @dataclass
 class PodEstimate:
-    """POST /v1/sdk/pods/estimate 응답 — 파드 시간당 견적(추정). 청구가는 착지 노드에서 확정된다."""
+    """POST /v1/sdk/pods/estimate response — hourly pod estimate. The billed price is fixed on the node it lands on."""
 
-    price_per_hour: str            # USD/h (문자열, 정규화)
+    price_per_hour: str            # USD/h (string, normalized)
     breakdown: dict                # {"gpu": "...", "cpu_extra": "...", "ram_extra": "...", ...}
     resources: dict                # gpu_model/vram_gb/gpu_count/vcpu/ram_gb/disk_gb/rental_type ...
     availability: dict             # available_gpus/max_gpus_per_pod/machine_count
@@ -1488,8 +1492,8 @@ class PodEstimate:
 
 @dataclass
 class PodCreated:
-    """POST /v1/sdk/pods 응답 (202). pod_name 은 K8sCS 가 확정하므로 생성 직후에는 None —
-    `list_pods()` 에서 user_alias == name 인 파드로 찾거나 `wait_for_pod_by_name()` 을 쓴다."""
+    """POST /v1/sdk/pods response (202). pod_name is assigned asynchronously, so it is None right after creation —
+    `wait_for_new_pod(name, workspace)` finds it by name once it shows up and waits until it is running."""
 
     name: str
     workspace: str
@@ -1508,14 +1512,14 @@ class PodCreated:
 
 @dataclass
 class ResourceAction:
-    """정지/시작/재시작/삭제/스케일 등 수락 응답. 상태 변화는 비동기 — 조회 메서드로 폴링한다."""
+    """Accepted response for stop/start/restart/delete/scale, etc. State changes are asynchronous — poll with the read methods."""
 
     resource: str                  # pod | storage | serving | task
     id: str                        # pod_name / pv_name / serving id / task id
     action: str
     workspace: str | None = None
     accepted: bool = True
-    result: object = None          # 위임된 웹 핸들러의 반환값(트랜잭션 id 등)
+    result: object = None          # return value of the underlying operation (transaction id, ...)
     raw: dict = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -1527,14 +1531,14 @@ class ResourceAction:
 
 @dataclass
 class StorageEstimate:
-    """POST /v1/sdk/storages/estimate 응답."""
+    """POST /v1/sdk/storages/estimate response."""
 
     price_per_hour: str
     price_per_gb_month: str
     size_gb: int
     storage_type: str
     max_size_gb: int
-    disk_type: str = "NVMe"        # 가격이 (storage_type, disk_type) 조합으로 정해진다
+    disk_type: str = "NVMe"        # the price is set by the (storage_type, disk_type) combination
     note: str = ""
     raw: dict = field(default_factory=dict, repr=False)
 
@@ -1548,7 +1552,7 @@ class StorageEstimate:
 
 @dataclass
 class StorageCreated:
-    """POST /v1/sdk/storages 응답 (202). pv_name 은 생성 후 `list_storages()` 에서 user_alias == name 으로 찾는다."""
+    """POST /v1/sdk/storages response (202). After creation, find pv_name in `list_storages()` by user_alias == name."""
 
     name: str
     workspace: str
@@ -1565,7 +1569,7 @@ class StorageCreated:
 
 @dataclass
 class TaskEstimate:
-    """POST /v1/sdk/tasks/estimate 응답. CPU 프리셋 태스크는 가격이 착지 노드에 따라 달라 None."""
+    """POST /v1/sdk/tasks/estimate response. None for CPU-preset tasks, whose price depends on the node they land on."""
 
     price_per_hour: str | None
     max_cost: str | None           # total bill ceiling, None when storage/fetch costs cannot be bounded
@@ -1585,7 +1589,7 @@ class TaskEstimate:
 
 @dataclass
 class TaskSubmitted:
-    """POST /v1/sdk/tasks 응답 (202) — 제출된 태스크 + 견적."""
+    """POST /v1/sdk/tasks response (202) — the submitted task + estimate."""
 
     task: Task
     estimate: TaskEstimate
@@ -1605,7 +1609,7 @@ class LogLine:
 
 @dataclass
 class Logs:
-    """GET /v1/sdk/pods/{pod}/logs · /tasks/{id}/logs 응답 — 마지막 N줄."""
+    """GET /v1/sdk/pods/{pod}/logs · /tasks/{id}/logs response — the last N lines."""
 
     pod_name: str
     workspace: str
@@ -1616,8 +1620,8 @@ class Logs:
     note: str | None = None
     container: str | None = None
     task_id: str | None = None
-    finished: bool | None = None   # 태스크 로그에서만
-    next_cursor: int | None = None # 외부 provider 태스크에서만 — get_task_logs(cursor=next_cursor) 로 그 뒤 증분 조회
+    finished: bool | None = None   # task logs only
+    next_cursor: int | None = None # external-provider tasks only — get_task_logs(cursor=next_cursor) fetches the increment after it
     raw: dict = field(default_factory=dict, repr=False)
 
     @property

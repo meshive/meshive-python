@@ -1,7 +1,7 @@
-"""쓰기 요청 빌더 — 동기/비동기 클라이언트가 공유하는 (path, params, body) 조립 + 인자 검증.
+"""Write request builders — (path, params, body) assembly + argument validation shared by the sync and async clients.
 
-서버(WebServerBackend routers/sdk/write.py, write_resources.py)는 camelCase JSON 을 받는다. 값 검증은 서버 왕복 전에
-여기서 끝내 ValueError 로 알린다(읽기 쪽 _*_params 와 같은 자세). 가격은 Decimal/float/str 어느 것이든 문자열로 보낸다.
+The server takes camelCase JSON. Values are validated here, before the round trip, and raise ValueError (the same
+stance as the read-side _*_params helpers). Prices are sent as strings whether given as Decimal, float or str.
 """
 from __future__ import annotations
 
@@ -62,7 +62,7 @@ def _env(env: Mapping[str, Any] | None, secret_keys: Iterable[str] | None) -> tu
 
 
 def _volumes(volumes: Iterable[Mapping[str, Any] | tuple[str, str]] | None) -> list[dict[str, str]]:
-    """[{"storage": pv_name, "mount_path": "/data"}] 또는 [("pv_name", "/data")]."""
+    """[{"storage": pv_name, "mount_path": "/data"}] or [("pv_name", "/data")]."""
     out: list[dict[str, str]] = []
     for item in volumes or []:
         if isinstance(item, tuple) and len(item) == 2:
@@ -80,7 +80,7 @@ def _volumes(volumes: Iterable[Mapping[str, Any] | tuple[str, str]] | None) -> l
 
 
 def _ports(ports: Iterable[int | Mapping[str, Any]] | None) -> list[dict[str, Any]]:
-    """[8888] 또는 [{"port": 8888, "name": "jupyter", "external": True}]."""
+    """[8888] or [{"port": 8888, "name": "jupyter", "external": True}]."""
     out: list[dict[str, Any]] = []
     for item in ports or []:
         if isinstance(item, bool):
@@ -104,7 +104,7 @@ def _drop_none(body: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in body.items() if v is not None}
 
 
-# --- 파드 --------------------------------------------------------------------
+# --- Pods ---------------------------------------------------------------------
 
 def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: int, gpu_vram_gb: int | None,
              rental_type: str, vcpu: int | None, ram_gb: int | None,
@@ -126,7 +126,7 @@ def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: i
         "rentalType": _rental(rental_type),
         "vcpu": _optional_int(vcpu, "vcpu"),
         "ramGb": _optional_int(ram_gb, "ram_gb"),
-        # 시스템 디스크는 서버 공식으로 고정된다(견적 resources.disk_gb) — 보내지 않는다.
+        # The system disk is fixed by a server-side formula (quote resources.disk_gb) — not sent.
         "volumes": _volumes(volumes),
         "env": env_out,
         "secretKeys": secrets,
@@ -144,7 +144,7 @@ def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: i
 
 
 def _pod_input_assets(items: Any) -> list[dict[str, Any]]:
-    """Pod 입력 자산 — "asset_id" 또는 {"asset", "target_dir", "role", "paths"} (paths = 자산 안 일부 파일·폴더)."""
+    """Pod input asset — "asset_id" or {"asset", "target_dir", "role", "paths"} (paths = some files/folders inside the asset)."""
     out = []
     for item in items or []:
         if isinstance(item, str):
@@ -162,7 +162,7 @@ def _pod_input_assets(items: Any) -> list[dict[str, Any]]:
 
 
 def _watched_folders(items: Any) -> list[dict[str, Any]]:
-    """수확 폴더 — "path" 또는 {"path", "include", "include_existing", "enabled"}. include_existing=True 면 지금 있는 파일도 올린다."""
+    """Watched folder — "path" or {"path", "include", "include_existing", "enabled"}. include_existing=True also uploads files already there."""
     out = []
     for item in items or []:
         if isinstance(item, str):
@@ -173,7 +173,7 @@ def _watched_folders(items: Any) -> list[dict[str, Any]]:
                 "path": _require_str(item.get("path"), "watched_folders[].path"),
                 "include": ([include] if isinstance(include, str) else list(include)) if include else None,
                 "includeExisting": bool(item.get("include_existing", False)),
-                # 끈 채로 두는 폴더(set_watched_folders 가 읽은 값을 돌려보낼 때). 없으면 서버 기본 = 켜짐.
+                # A folder kept turned off (when set_watched_folders sends back what it read). Omitted = server default = on.
                 "enabled": None if item.get("enabled") is None else bool(item["enabled"]),
             }))
         else:
@@ -182,7 +182,7 @@ def _watched_folders(items: Any) -> list[dict[str, Any]]:
 
 
 def _harvest_destination(value: Any) -> dict[str, Any] | None:
-    """수확 파일이 갈 곳 — None/"managed"(기본) 또는 {"mode": "user_s3", "credential_id": N}."""
+    """Where harvested files go — None/"managed" (default) or {"mode": "user_s3", "credential_id": N}."""
     if value is None or value == "managed":
         return None
     if isinstance(value, Mapping):
@@ -196,7 +196,7 @@ def _harvest_destination(value: Any) -> dict[str, Any] | None:
 
 def watched_folders_body(expected_version: int, template: Mapping[str, Any] | None,
                          user: Any) -> dict[str, Any]:
-    """PUT …/harvest 본문 — 전체 교체. template = {경로: {"enabled", "include"}}, user = 폴더 목록."""
+    """PUT …/harvest body — full replacement. template = {path: {"enabled", "include"}}, user = list of folders."""
     if isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < 0:
         raise ValueError("expected_version must be a non-negative integer (WatchedFolders.revision)")
     toggles = {}
@@ -223,7 +223,7 @@ def delete_pod_params(workspace: str, delete_local_storages: Iterable[str] | Non
     return params
 
 
-# --- 스토리지 -------------------------------------------------------------------
+# --- Storage ------------------------------------------------------------------
 
 def storage_body(name: str, size_gb: int, *, storage_type: str, disk_type: str, encrypted: bool,
                  region: str | None, max_price_per_hour: Any) -> dict[str, Any]:
@@ -235,7 +235,7 @@ def storage_body(name: str, size_gb: int, *, storage_type: str, disk_type: str, 
     disk = next((t for t in DISK_TYPES if t.lower() == (disk_type or "").strip().lower()), None)
     if disk is None:
         raise ValueError(f"disk_type must be one of {', '.join(DISK_TYPES)}")
-    # at-rest 암호화는 네트워크(nfs) 스토리지만 — 서버(WSB write_resources)가 hostPath+encrypted 를 422 로 거절한다.
+    # Encryption at rest is for network (nfs) storage only — the server rejects hostPath + encrypted with 422.
     if encrypted and kind != "nfs":
         raise ValueError("encrypted is only available for nfs (network) storage; hostPath volumes cannot be encrypted")
     return _drop_none({
@@ -245,11 +245,11 @@ def storage_body(name: str, size_gb: int, *, storage_type: str, disk_type: str, 
     })
 
 
-# --- 서빙 ---------------------------------------------------------------------
+# --- Serving ------------------------------------------------------------------
 
 def model_body(huggingface_repo: str, *, hf_token_id: int | None = None, name: str | None = None,
                framework: str | None = None, context_length: int | None = None) -> dict[str, Any]:
-    """서빙 모델 감지·등록 본문. HF 토큰은 워크스페이스에 등록된 것의 id 로만 받는다(값은 보내지 않는다)."""
+    """Body for detecting/registering a serving model. HF tokens are accepted only as the id of one saved in the workspace (the value is never sent)."""
     if framework is not None and framework not in ("vllm", "sglang"):
         raise ValueError("framework must be 'vllm' or 'sglang'")
     return _drop_none({
@@ -262,8 +262,8 @@ def model_body(huggingface_repo: str, *, hf_token_id: int | None = None, name: s
 def asset_import_body(target: str, *, name: str | None = None, asset_type: str | None = None,
                       revision: str | None = None, paths: Iterable[str] | None = None,
                       hf_token_id: int | None = None, civitai_key_id: int | None = None) -> dict[str, Any]:
-    """`target` 하나로 source 를 고른다 — `owner/name` 또는 huggingface.co URL = huggingface, civitai.com URL =
-    civitai, 그 밖의 http(s) URL = 직링크 1파일(url). 토큰·키는 워크스페이스에 등록된 것의 id 로만."""
+    """Pick the source from `target` alone — `owner/name` or a huggingface.co URL = huggingface, a civitai.com URL =
+    civitai, any other http(s) URL = a single direct-link file (url). Tokens and keys only as the id of one saved in the workspace."""
     target = _require_str(target, "target").strip()
     parsed = urlparse(target)
     body: dict[str, Any] = {}
@@ -323,7 +323,7 @@ def serving_scale_body(*, min_replicas: int | None, max_replicas: int | None, au
     return body
 
 
-# --- 태스크 --------------------------------------------------------------------
+# --- Tasks --------------------------------------------------------------------
 
 def task_body(name: str, script: str, *, image: str | None, template_id: int | None, requirements: str | None,
               env: Mapping[str, Any] | None, secret_keys: Iterable[str] | None, args: Iterable[str] | None,
@@ -349,7 +349,7 @@ def task_body(name: str, script: str, *, image: str | None, template_id: int | N
             asset = _require_str(item.get("asset") or item.get("asset_id"), "input_assets[].asset")
             entry: dict[str, Any] = {"asset": asset}
             if item.get("version") is not None:
-                # 자산에 버전이 없다 — 서버도 무시하던 값이라 보내지 않는다. 0.2 에서 받는 것 자체를 없앤다.
+                # Assets have no versions — the server already ignored this value, so it isn't sent. 0.2 stops accepting it at all.
                 warnings.warn("input_assets[].version is ignored: assets no longer have versions",
                               DeprecationWarning, stacklevel=3)
             if item.get("target_dir"):
@@ -368,11 +368,11 @@ def task_body(name: str, script: str, *, image: str | None, template_id: int | N
     })
 
 
-# --- 로그 --------------------------------------------------------------------
+# --- Logs ---------------------------------------------------------------------
 
 def logs_params(*, tail: int, wait: float | None, container: str | None = None,
                 cursor: int | None = None) -> dict[str, Any]:
-    """cursor 는 외부 provider 태스크 전용: None/0 = 마지막 tail 줄, 이전 응답의 next_cursor = 그 뒤 증분."""
+    """cursor is for external-provider tasks only: None/0 = last tail lines, a previous response's next_cursor = the increment after it."""
     if isinstance(tail, bool) or not isinstance(tail, int) or not 1 <= tail <= 1000:
         raise ValueError("tail must be an integer between 1 and 1000")
     params: dict[str, Any] = {"tail": tail}

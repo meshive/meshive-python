@@ -1,23 +1,22 @@
-"""CLI 쓰기 커맨드 (0.1.0): pod-create/stop/start/restart/delete, storage-create/delete,
+"""CLI write commands (0.1.0): pod-create/stop/start/restart/delete, storage-create/delete,
 serving-deploy/scale/pause/resume/delete, task-submit/stop, logs, task-logs.
-0.1.3: models, hf-tokens, model-detect, model-register, model-delete (서빙용 모델 등록), asset-import, civitai-keys.
+0.1.3: models, hf-tokens, model-detect, model-register, model-delete (model registration for serving), asset-import, civitai-keys.
 
-규칙: 돈이 들거나 되돌릴 수 없는 커맨드(create/start/deploy/submit/delete, 그리고 비용이 늘 수 있는
-serving-scale·serving-resume)는 먼저 견적·요약을 보여주고 `--yes` 가 없으면 확인을 묻는다(TTY 가 아니면 exit 2).
-`--estimate` 는 견적만 보고 끝낸다. `pod-create --wait` 가 시간 안에 파드를 못 찾으면 exit 1 (수락된 transaction 은 출력).
+Rule: commands that cost money or can't be undone (create/start/deploy/submit/delete, plus serving-scale and
+serving-resume, which can raise cost) first show an estimate or summary and ask for confirmation without `--yes` (exit 2 if not a TTY).
+`--estimate` shows the estimate and stops. `pod-create --wait` exits 1 if it can't find the pod in time (the accepted transaction is printed).
 """
 from __future__ import annotations
 
 import argparse
 import json
 import sys
-import time
 from pathlib import Path
 from typing import Any, Callable
 
 from . import _format as fmt
 from .._client import Meshive
-from ..exceptions import MeshiveError
+from ..exceptions import MeshiveError, WaitTimeoutError
 from ..models import Logs, PodEstimate, ResourceAction, StorageEstimate, TaskEstimate
 
 Handler = Callable[[Meshive, argparse.Namespace, str, bool], int]
@@ -34,8 +33,8 @@ def _emit(output: str, raw: object, ids: list[str], show: Callable[[], None]) ->
 
 
 def _emit_estimate(output: str, estimate: PodEstimate | StorageEstimate | TaskEstimate, show: Callable[[], None]) -> None:
-    """`--estimate` 출력. json 은 서버 payload 만, table 은 견적 표, name 은 credit·asset-storage 처럼 헤드라인 숫자
-    하나 — 시간당 견적을 표와 같은 반올림(3자리)으로 `$`·천 단위 쉼표 없이. 단가를 모르면(CPU 프리셋 태스크) 안 찍는다."""
+    """`--estimate` output. json is the server payload only, table is the estimate table, name is one headline number
+    like credit and asset-storage — the hourly estimate with the table's rounding (3 decimals), without `$` or thousands separators. Not printed when the unit price is unknown (CPU-preset tasks)."""
     ids: list[str] = []
     if output == "name":
         price = fmt.money_hourly(estimate.price_per_hour)
@@ -45,16 +44,16 @@ def _emit_estimate(output: str, estimate: PodEstimate | StorageEstimate | TaskEs
 
 
 def _confirm(args: argparse.Namespace, question: str) -> bool:
-    """--yes 면 통과. 아니면 TTY 에서 묻고, 비대화형이면 안내 후 거절."""
+    """Passes with --yes. Otherwise asks on a TTY; non-interactive runs print a hint and decline."""
     if getattr(args, "yes", False):
         return True
     if not sys.stdin.isatty():
         print("Error: this command spends credit or deletes resources. Re-run with --yes to confirm.",
               file=sys.stderr)
         return False
-    # 질문은 stderr 로 — input() 은 stdout 이 터미널이 아니면 질문을 stdout 에 써서, `-o json > out.json`·`| jq`·
-    # `id=$(… -o name)` 에서 결과에 질문이 섞이고 정작 사람은 질문을 못 본다. 묻기 전에 stdout 은 input() 처럼 비운다 —
-    # 파이프면 블록 버퍼라 앞서 찍은 견적 표가 질문 뒤로 밀린다(비우기 오류도 input() 처럼 무시). 답 없이 EOF 면 거절.
+    # Ask on stderr — when stdout isn't a terminal, input() writes the prompt to stdout, so with `-o json > out.json`, `| jq`
+    # or `id=$(… -o name)` the prompt ends up in the result and the person never sees it. Flush stdout before asking, as input() does —
+    # in a pipe it's block-buffered and the estimate table printed earlier would land after the prompt (flush errors are ignored like input() does). EOF without an answer declines.
     try:
         sys.stdout.flush()
     except OSError:
@@ -110,14 +109,14 @@ def _parse_input_assets(values: list[str] | None) -> list[dict[str, Any]]:
     for item in values or []:
         asset, sep, _ = item.partition(":")
         if sep:
-            # 0.1.2 까지 받던 ASSET_ID:VERSION — 자산에 버전이 없어 서버도 무시했다. 스크립트가 깨지지 않게 경고만.
+            # ASSET_ID:VERSION, accepted up to 0.1.2 — assets have no versions and the server ignored it. Only warn so scripts don't break.
             print(f"Warning: {item!r}: assets no longer have versions; using {asset.strip()!r}.", file=sys.stderr)
         out.append({"asset": asset.strip()})
     return out
 
 
 # =============================================================================
-# 출력
+# Output
 # =============================================================================
 
 def _print_pod_estimate(est: PodEstimate, color: bool) -> None:
@@ -158,7 +157,7 @@ def _print_logs(logs: Logs, color: bool) -> None:
 
 
 # =============================================================================
-# 파드
+# Pods
 # =============================================================================
 
 def _pod_kwargs(args: argparse.Namespace) -> dict[str, Any]:
@@ -175,13 +174,13 @@ def _pod_kwargs(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _pod_input_asset(value: str) -> Any:
-    """ASSET_ID 또는 ASSET_ID=/target/dir."""
+    """ASSET_ID or ASSET_ID=/target/dir."""
     asset, sep, target = value.partition("=")
     return {"asset": asset.strip(), "target_dir": target.strip()} if sep and target.strip() else asset.strip()
 
 
 def cmd_ssh(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
-    """접속 명령과 일회용 비밀번호만 출력한다 — ssh 를 대신 실행하지 않는다."""
+    """Prints only the connect command and one-time password — does not run ssh for you."""
     access = client.ssh_access(args.pod_name, args.workspace)
 
     def show() -> None:
@@ -196,7 +195,7 @@ def cmd_ssh(client: Meshive, args: argparse.Namespace, output: str, color: bool)
 
 
 def cmd_pod_watch(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
-    """수확 폴더 보기·바꾸기 — 지금 설정을 읽어 고친 뒤 그 버전으로 전체 교체(다른 곳에서 바뀌었으면 409)."""
+    """Show or change watched folders — read the current settings, edit them, then replace everything at that version (409 if changed elsewhere)."""
     current = client.get_watched_folders(args.pod_name, args.workspace)
     changing = args.add or args.remove or args.on or args.off
     if changing:
@@ -253,40 +252,32 @@ def _toggle(template: dict[str, Any], user: list[dict[str, Any]], path: str, ena
     raise ValueError(f"{path} is not a watched folder of this pod (use --add for a new one)")
 
 
-def _wait_for_new_pod(client: Meshive, workspace: str, name: str, until: str, timeout: float) -> str | None:
-    """생성 직후에는 pod_name 이 없다 — 목록에서 user_alias == name 을 찾은 뒤 wait_for_pod 로 넘긴다."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        for pod in client.list_pods(workspace):
-            if pod.user_alias == name:
-                client.wait_for_pod(pod.pod_name, workspace, until=until, timeout=max(1.0, deadline - time.monotonic()))
-                return pod.pod_name
-        time.sleep(5)
-    return None
-
-
 def cmd_pod_create(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     kwargs = _pod_kwargs(args)
     estimate = client.estimate_pod(args.name, args.template, workspace=args.workspace, **kwargs)
     if args.estimate:
         _emit_estimate(output, estimate, lambda: _print_pod_estimate(estimate, color))
         return 0
-    if output == "table":      # 확인을 묻기 전에 견적을 보여 준다 — json/name 출력에는 섞지 않는다
+    if output == "table":      # show the estimate before asking — not mixed into json/name output
         _print_pod_estimate(estimate, color)
     if not _confirm(args, f"Create pod '{args.name}' at {fmt.money_hourly(estimate.price_per_hour)}/hr?"):
         return 2
     created = client.create_pod(args.name, args.template, workspace=args.workspace, **kwargs)
-    pod_name = None
+    pod_name, timed_out = None, None
     if args.wait:
-        pod_name = _wait_for_new_pod(client, args.workspace, args.name, args.wait, args.wait_timeout)
+        try:
+            pod_name = client.wait_for_new_pod(args.name, args.workspace, until=args.wait,
+                                               timeout=args.wait_timeout).pod_name
+        except WaitTimeoutError as exc:
+            timed_out = exc
     _emit(output, created.raw, [pod_name or str(created.transaction_id)], lambda: _kv([
         ("accepted", fmt.yes_no(created.accepted)), ("name", created.name),
         ("pod", pod_name or "(assigned shortly — see `meshive pods`)"),
         ("transaction", str(created.transaction_id))]))
-    if args.wait and pod_name is None:
-        # 수락은 됐지만 파드가 시간 안에 안 나타났다 — 자동화가 `--wait running` 성공으로 오인하면 안 된다.
-        print(fmt.clean(f"Error: pod '{args.name}' did not appear within {args.wait_timeout:g}s. The create was accepted "
-                        f"(transaction {created.transaction_id}); check `meshive pods {args.workspace}`."), file=sys.stderr)
+    if timed_out:
+        # Accepted, but the pod didn't show up or get ready in time — automation must not mistake this for `--wait running` success.
+        print(fmt.clean(f"Error: {timed_out} The create was accepted (transaction {created.transaction_id}); "
+                        f"check `meshive pods {args.workspace}`."), file=sys.stderr)
         return 1
     return 0
 
@@ -323,7 +314,7 @@ def _pod_action(method: str, needs_confirm: bool, question: str):
 
 
 # =============================================================================
-# 스토리지 / 서빙 / 태스크
+# Storage / serving / tasks
 # =============================================================================
 
 def _print_storage_estimate(est: StorageEstimate, color: bool) -> None:
@@ -379,7 +370,7 @@ def cmd_serving_scale(client: Meshive, args: argparse.Namespace, output: str, co
         autoscale = True
     elif args.no_autoscale:
         autoscale = False
-    # 비용이 늘 수 있는 변경(범위 확대·autoscale 켜기·상한 인상)만 확인 — 줄이는 변경은 바로 적용.
+    # Confirm only changes that can raise cost (wider range, turning on autoscale, higher cap) — reductions apply immediately.
     current = client.get_serving(args.serving_id)
     if current.scale_raises_cost(min_replicas=args.min_replicas, max_replicas=args.max_replicas, autoscale=autoscale,
                                  price_cap_per_hour=args.price_cap):
@@ -458,7 +449,7 @@ def cmd_model_detect(client: Meshive, args: argparse.Namespace, output: str, col
 
 
 def cmd_model_register(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
-    # 비용 없음(DB 등록만, 다운로드는 배포 때) → 확인을 묻지 않는다.
+    # No cost (just a registration; the download happens at deploy) → no confirmation.
     action = client.register_model(args.repo, workspace=args.workspace, name=args.name, framework=args.framework,
                                    hf_token_id=args.hf_token, context_length=args.context)
     result = action.result if isinstance(action.result, dict) else {}
@@ -490,7 +481,7 @@ def _read_text(path: str | None, label: str) -> str | None:
 
 
 def cmd_asset_import(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
-    # 링크 등록이라 비용이 없다(저장 요금 0, 바이트는 쓸 때 원본에서) → 확인을 묻지 않는다.
+    # Registering a link costs nothing (no storage charge; bytes come from the source when used) → no confirmation.
     a = client.import_asset(args.target, workspace=args.workspace, name=args.name, asset_type=args.type,
                             revision=args.revision, paths=args.path, hf_token_id=args.hf_token,
                             civitai_key_id=args.civitai_key)
@@ -574,7 +565,7 @@ def cmd_task_logs(client: Meshive, args: argparse.Namespace, output: str, color:
 
 
 # =============================================================================
-# 파서
+# Parser
 # =============================================================================
 
 def _yes(parser: argparse.ArgumentParser) -> None:
@@ -597,7 +588,7 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--env", action="append", metavar="KEY=VALUE", help="Environment variable (repeatable).")
     p.add_argument("--secret", action="append", metavar="KEY", help="Mark an --env key as secret (repeatable).")
     p.add_argument("--port", action="append", metavar="PORT[:NAME[:internal]]", help="Expose a port (repeatable).")
-    # dest 를 바꾸지 않으면 서브커맨드 이름을 담는 args.command 를 덮어써 커맨드가 사라진다.
+    # Without changing dest it overwrites args.command, which holds the subcommand name, and the command disappears.
     p.add_argument("--command", dest="overwrite_command", default=None, help="Override the template command.")
     p.add_argument("--region", default=None, metavar="CODE", help="Target location, e.g. KR.")
     p.add_argument("--internet-premium", action="store_true")

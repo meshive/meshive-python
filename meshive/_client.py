@@ -38,6 +38,7 @@ from .exceptions import (
     MeshiveError,
     NotFoundError,
     PermissionDeniedError,
+    PodCreationFailedError,
     RateLimitError,
     WaitTimeoutError,
 )
@@ -380,6 +381,8 @@ def _wait_reached(pod: Pod, targets: set[str], terminal: set[str], label: str) -
     if status in targets:
         return True
     if status in terminal:
+        if pod.creation_failure_reason:
+            raise PodCreationFailedError(label, pod.creation_failure_reason)
         raise MeshiveError(
             f"Pod {label} reached terminal status {pod.status!r} "
             f"while waiting for {'/'.join(sorted(targets))}."
@@ -522,7 +525,8 @@ class Meshive(_BaseClient):
 
             pod = client.wait_for_pod("pod-1", "my-workspace", until="running")
 
-        On error/terminated it raises MeshiveError without waiting out the timeout.
+        On error/terminated it raises MeshiveError without waiting out the timeout (PodCreationFailedError,
+        with the reason, when the pod was cleaned up because creating it failed).
         A timeout raises WaitTimeoutError (both a MeshiveError and a built-in TimeoutError).
         """
         targets, terminal = _wait_targets(until)

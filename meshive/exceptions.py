@@ -22,6 +22,15 @@ class WaitTimeoutError(MeshiveError, TimeoutError):
     """
 
 
+class PodCreationFailedError(MeshiveError):
+    """wait_for_pod saw the pod end because creating it failed. `reason` is the server's explanation."""
+
+    def __init__(self, pod_name: str, reason: str):
+        super().__init__(f"Pod {pod_name} failed to start and was cleaned up: {reason}")
+        self.pod_name = pod_name
+        self.reason = reason
+
+
 class MeshiveAPIError(MeshiveError):
     """The server returned a 4xx/5xx.
 

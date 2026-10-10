@@ -10,6 +10,7 @@ from .exceptions import (
     MeshiveError,
     NotFoundError,
     PermissionDeniedError,
+    PodCreationFailedError,
     RateLimitError,
     WaitTimeoutError,
 )
@@ -144,4 +145,5 @@ __all__ = [
     "ConflictError",
     "RateLimitError",
     "WaitTimeoutError",
+    "PodCreationFailedError",
 ]

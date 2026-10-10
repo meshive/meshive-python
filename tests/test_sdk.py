@@ -21,6 +21,7 @@ from meshive import (
     NotFoundError,
     PermissionDeniedError,
     RateLimitError,
+    PodCreationFailedError,
     WaitTimeoutError,
 )
 from meshive import _client, _config
@@ -512,6 +513,15 @@ def test_wait_for_pod_gives_up_on_terminal_status():
     with pytest.raises(MeshiveError, match="terminal status"):
         sync_client(handler).wait_for_pod("pod-1", "team-ns")
     assert calls["n"] == 1  # doesn't wait out the timeout
+
+
+def test_wait_for_pod_reports_why_creation_failed():
+    failed = httpx.Response(200, json={**POD, "status": "terminated",
+                                       "creationFailure": {"reason": "CrashLoopBackOff", "failedAt": None}})
+    handler, _ = _counting_handler([failed])
+    with pytest.raises(PodCreationFailedError, match="CrashLoopBackOff") as exc:
+        sync_client(handler).wait_for_pod("pod-1", "team-ns")
+    assert exc.value.reason == "CrashLoopBackOff" and isinstance(exc.value, MeshiveError)
 
 
 def test_wait_for_pod_can_target_a_terminal_status():

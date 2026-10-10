@@ -182,6 +182,8 @@ class Pod:
     stop_reason_detail: str | None = None
     stop_reason_at: datetime | None = None
     container_running_at: datetime | None = None  # when the connect Pod's container became Running
+    # Set when the pod is terminated because creating it failed (the platform cleans it up), not because it was deleted.
+    creation_failure_reason: str | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Pod":
@@ -218,6 +220,7 @@ class Pod:
             stop_reason_detail=d.get("stopReasonDetail"),
             stop_reason_at=_parse_dt(d.get("stopReasonAt")),
             container_running_at=_parse_dt(d.get("containerRunningAt")),
+            creation_failure_reason=(d.get("creationFailure") or {}).get("reason"),
             raw=d,
         )
 

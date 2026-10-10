@@ -12,6 +12,35 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## v0.1.4
+
+A pod whose creation failed now says why instead of ending as a plain `terminated`, and SDK users can wait for a
+pod they just created by name. Free bonus credit is gone, so the paid/bonus split is no longer shown.
+
+### SDK
+
+- `wait_for_new_pod(name, workspace, until=)` (sync and async) waits for a pod that `create_pod` just accepted: it
+  finds the pod by name, then waits like `wait_for_pod`. `create_pod` returns before the pod has an ID, so you no
+  longer have to poll `list_pods` yourself. It raises `WaitTimeoutError` if the pod doesn't appear or reach `until`
+  in time, and refuses an empty name.
+- `Pod.creation_failure_reason` is the server's reason when the platform cleaned a pod up because creating it
+  failed (`None` otherwise, and on a server that predates it).
+- `wait_for_pod` raises `PodCreationFailedError` (with `pod_name` and `reason`) for such a pod instead of a generic
+  `MeshiveError`. It is still a `MeshiveError`, so existing `except` blocks keep working.
+- `Credit.paid_balance` and `bonus_balance` stay for compatibility; the server now sends the whole balance as paid
+  and `0` as bonus.
+
+### CLI
+
+- `meshive pod-create --wait` uses `wait_for_new_pod` and, on either kind of timeout, prints the accepted transaction
+  and what to run next.
+- `meshive credit` drops the paid/bonus lines, and `meshive asset-storage` says `billing credit:` instead of
+  `paid balance:`.
+
+### Docs
+
+- The README is rewritten for users; contributor notes moved to `DEVELOPMENT.md`.
+
 ## v0.1.3
 
 The SDK, CLI and MCP now cover what the console added on the server: register Hugging Face models for serving, link

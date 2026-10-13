@@ -12,9 +12,7 @@ Upgrade with:
 pip install -U meshive
 ```
 
-## v1.0.0rc2
-
-Second release candidate for 1.0.0. `pip install meshive` keeps installing the current stable release; try this one with `pip install "meshive==1.0.0rc2"`. It requires httpx below 1.0: installing 1.0.0rc1 with `pip install --pre` picked up an httpx 1.0 development release, which the SDK does not support. Its contents are what 1.0.0 will be:
+## v1.0.0
 
 The first stable release of the Meshive Python SDK and the `meshive` command. Everything you can do in the
 Meshive console can be scripted: find GPUs, launch and manage pods, run serverless tasks, serve models and move
@@ -61,6 +59,10 @@ version fails; change the pin to `meshive>=1,<2`.
 - `Asset.versions`, `Asset.latest_version` and `Asset.version_count` warn with a `DeprecationWarning` and will be
   removed in 2.0. Assets no longer have versions; use `Asset.size_bytes`, `file_count`, `upload_status` and
   `files`.
+
+## v1.0.0rc2
+
+Second release candidate for 1.0.0. Requires httpx below 1.0. Same code as 1.0.0.
 
 ## v1.0.0rc1
 

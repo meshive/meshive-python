@@ -1,0 +1,67 @@
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Check tag matches package version
+        # Read _version.py as a file — importing the package goes through __init__, which needs
+        # dependencies such as httpx and breaks on a runner without them installed.
+        run: |
+          pkg="v$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' meshive/_version.py)"
+          if [ -z "${pkg#v}" ] || [ "$pkg" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME != package version $pkg"
+            exit 1
+          fi
+      - run: python -m pip install build
+      - run: python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Create GitHub Release
+        # Release notes come from this version's section in CHANGELOG.md (English, written for users).
+        # Fails if the section is missing — so raw commit/tag messages never become the public notes.
+        # Pre-releases (vX.Y.ZaN, bN, rcN) are marked as such, so they never show as the latest release.
+        run: |
+          scripts/release-notes.sh "$GITHUB_REF_NAME" > notes.md
+          flags=""
+          if printf '%s' "$GITHUB_REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(a|b|rc)[0-9]+$'; then flags="--prerelease"; fi
+          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md $flags
+        env:
+          GH_TOKEN: ${{ github.token }}

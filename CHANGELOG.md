@@ -57,9 +57,9 @@ a model set, all as in the web console. Code written for 1.0 and 1.1 keeps worki
 - In `input_assets`, a `paths` entry that matches no file of the asset is now refused instead of skipped while the
   other entries are attached, and a Korean or other accented name typed in a different Unicode form (NFC or NFD)
   than the stored file name now attaches that file instead of leaving it out.
-- Reading a pod with a read-only API key now returns `***` for secret values such as `ACCESS_PASSWORD`, as reading a
-  task already did. Keys with write scope still get the values, so `meshive pod --show-secrets` needs one; with a
-  read-only key it says so.
+- Reading a pod now returns `***` for secret variables, as reading a task already did. Keys with write scope still
+  get the logins shown on Connect, such as `ACCESS_PASSWORD`, so `meshive pod --show-secrets` needs one; with a
+  read-only key the CLI says so.
 
 ## v1.1.0
 

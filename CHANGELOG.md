@@ -15,8 +15,8 @@ pip install -U meshive
 ## v1.1.0
 
 Pods can now get local storage of their own, CPU pods can choose their CPU line, and a pod that fails to come up
-tells you why as soon as it happens. Pod creation now follows the same rules as the web console. Code written for
-1.0 keeps working.
+tells you why as soon as it happens. Creating and starting pods now follows the same rules as the web console. Code
+written for 1.0 keeps working.
 
 ### What's new
 
@@ -33,6 +33,13 @@ tells you why as soon as it happens. Pod creation now follows the same rules as 
 - **Failed creations reported right away.** Pass `transaction_id=created.transaction_id` to `wait_for_new_pod` and a
   creation that fails ends the wait at once with the reason, such as an image that can't be pulled, instead of
   running into the timeout. `meshive pod-create --wait` does this for you.
+- **Template ports can be changed.** `create_pod(template_ports=[{"port": 8080, "name": "ide"}])` or
+  `meshive pod-create --template-port 8080:ide` renames a port the template opens; `new_port` (`8080::8443`) gives it
+  another number and `external` (`8080:::internal`) exposes or hides it, as on the console's deploy screen. Template
+  ports can't be removed. `estimate_pod` takes the same argument.
+- **Storage usage warnings.** `create_storage(usage_warning=True, usage_warning_threshold=0.8)` or
+  `meshive storage-create --usage-warning 80` emails you when the storage is more than 80% full (90% if you leave
+  out the threshold), like the console's usage warning.
 - **One operation by ID.** `get_transaction(transaction_id, workspace)` and `meshive transaction ID --workspace WS`
   show a pod operation's status, steps and failure reason, even after it has dropped out of `transactions`.
 
@@ -42,6 +49,13 @@ tells you why as soon as it happens. Pod creation now follows the same rules as 
   template already opens or a port listed twice is refused, required environment variables of the template need a
   value, and a command can be at most 4096 characters. The error says what is allowed. CPU pods now default to
   8 vCPU and 32 GiB of RAM (or the nearest the line offers), as in the console, instead of 2 vCPU and 4 GiB.
+- **Storage is at least 10 GiB**, as in the console. A smaller size is refused with an error.
+- **Starting without a placement picks what the console would.** `start_pod` without `placement` and
+  `meshive pod-start` without `--placement` used to mean `same_node`. Now the server chooses: `same_node`, or
+  `wait_same_node` when the pod's machine has no room right now; `any_node` or `wait_any_node` when that machine can
+  no longer run the pod's configuration. The result's `placement` and the CLI output say which one was used. A choice
+  that moves the pod still needs data-loss consent: without it the start is refused, and the CLI tells you which
+  `--placement` to rerun with. Pass `placement="same_node"` (`--placement same_node`) to keep the old behavior.
 - **Local storage is created only together with a pod.** Creating local (`hostPath`) storage on its own is refused,
   and a new pod's `volumes` can attach existing network storage only. Use network storage, or `local_volumes`.
 - The SDK and CLI no longer check placements, storage types, disk types or the GPU count themselves. The server

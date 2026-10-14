@@ -95,13 +95,54 @@ def _ports(ports: Iterable[int | Mapping[str, Any]] | None) -> list[dict[str, An
             port, name, external = item.get("port"), item.get("name"), item.get("external", True)
         else:
             raise ValueError("ports items must be port numbers or mappings")
-        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
-            raise ValueError("ports[].port must be an integer between 1 and 65535")
-        entry: dict[str, Any] = {"port": port, "external": bool(external)}
+        entry: dict[str, Any] = {"port": _port_number(port, "ports[].port"), "external": bool(external)}
         if name:
             entry["name"] = str(name)
         out.append(entry)
     return out
+
+
+def _template_ports(items: Any) -> list[dict[str, Any]]:
+    """Changes to the ports the template opens — [{"port", "name", "new_port", "external"}], where port is the
+    template's port (its current number) and the rest is what to change: rename it, give it another number, expose or
+    hide it. Only the keys given are sent. Whether the port is the template's and whether the result clashes with
+    another port is the server's check."""
+    out: list[dict[str, Any]] = []
+    for item in items or []:
+        if not isinstance(item, Mapping):
+            raise ValueError("template_ports items must be mappings like {'port': 8080, 'name': 'ide'}")
+
+        def pick(snake: str, camel: str) -> Any:
+            return item.get(snake) if item.get(snake) is not None else item.get(camel)
+
+        entry: dict[str, Any] = {"port": _port_number(item.get("port"), "template_ports[].port")}
+        if item.get("name") is not None:
+            entry["name"] = _require_str(item.get("name"), "template_ports[].name")
+        new_port = pick("new_port", "newPort")
+        if new_port is not None:
+            entry["newPort"] = _port_number(new_port, "template_ports[].new_port")
+        if item.get("external") is not None:
+            entry["external"] = bool(item.get("external"))
+        out.append(entry)
+    return out
+
+
+def _port_number(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
+        raise ValueError(f"{name} must be an integer between 1 and 65535")
+    return value
+
+
+def _usage_threshold(value: Any, name: str) -> float | None:
+    """A usage warning threshold as a float (the server checks the range)."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number") from None
 
 
 def _local_volumes(items: Any) -> list[dict[str, Any]]:
@@ -121,14 +162,8 @@ def _local_volumes(items: Any) -> list[dict[str, Any]]:
         size = pick("size_gb", "sizeGb")
         if isinstance(size, bool) or not isinstance(size, int) or size < 1:
             raise ValueError("local_volumes[].size_gb must be a positive integer (GiB)")
-        threshold = pick("usage_warning_threshold", "usageWarningThreshold")
-        if threshold is not None:
-            if isinstance(threshold, bool):
-                raise ValueError("local_volumes[].usage_warning_threshold must be a number")
-            try:
-                threshold = float(threshold)
-            except (TypeError, ValueError):
-                raise ValueError("local_volumes[].usage_warning_threshold must be a number") from None
+        threshold = _usage_threshold(pick("usage_warning_threshold", "usageWarningThreshold"),
+                                     "local_volumes[].usage_warning_threshold")
         warning, encrypted = pick("usage_warning", "usageWarning"), item.get("encrypted")
         out.append(_drop_none({
             "name": _require_str(item.get("name"), "local_volumes[].name"), "mountPath": mount, "sizeGb": size,
@@ -154,7 +189,8 @@ def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: i
              volumes: Any, env: Mapping[str, Any] | None, secret_keys: Iterable[str] | None, ports: Any,
              command: str | None, internet_premium: bool, uptime_premium: bool, cpu_premium: bool,
              region: str | None, max_price_per_hour: Any, input_assets: Any = None, watched_folders: Any = None,
-             harvest_destination: Any = None, local_volumes: Any = None, cpu_line: str | None = None) -> dict[str, Any]:
+             harvest_destination: Any = None, local_volumes: Any = None, cpu_line: str | None = None,
+             template_ports: Any = None) -> dict[str, Any]:
     if isinstance(template_id, bool) or not isinstance(template_id, int) or template_id < 0:
         raise ValueError("template_id must be a non-negative integer")
     # How many GPUs one pod may take is the server's rule; only the type is checked here.
@@ -183,6 +219,7 @@ def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: i
         "env": env_out,
         "secretKeys": secrets,
         "ports": _ports(ports),
+        "templatePorts": _template_ports(template_ports) or None,
         "command": command if command else None,
         "internetPremium": bool(internet_premium),
         "uptimePremium": bool(uptime_premium),
@@ -259,12 +296,28 @@ def watched_folders_body(expected_version: int, template: Mapping[str, Any] | No
     return {"expectedVersion": expected_version, "template": toggles, "user": _watched_folders(user)}
 
 
-def placement(value: str) -> str:
-    """start_pod placement, normalized (" Any_Node " → "any_node"). Which placements exist is the server's call
-    (an unknown one comes back as a 422), so only an empty value is refused here."""
+def placement(value: str | None) -> str | None:
+    """start_pod placement, normalized (" Any_Node " → "any_node"). None stays None: the server then picks what the
+    console would. Which placements exist is the server's call (an unknown one comes back as a 422), so only an empty
+    value is refused here."""
+    if value is None:
+        return None
     if not isinstance(value, str) or not value.strip():
         raise ValueError("placement must be a non-empty string, e.g. same_node or wait_any_node")
     return value.strip().lower()
+
+
+def start_pod_params(workspace: str, placement_value: str | None, allow_data_loss: bool) -> dict[str, Any]:
+    """Query of POST /pods/{pod}/start. Without a placement the parameter is left out (not sent empty), so the server
+    applies the console's choice."""
+    if not isinstance(allow_data_loss, bool):
+        raise ValueError("allow_data_loss must be an explicit boolean")
+    params: dict[str, Any] = {"workspace": workspace}
+    chosen = placement(placement_value)
+    if chosen is not None:
+        params["placement"] = chosen
+    params["allow_data_loss"] = allow_data_loss
+    return params
 
 
 def delete_pod_params(workspace: str, delete_local_storages: Iterable[str] | None) -> dict[str, str]:
@@ -278,10 +331,12 @@ def delete_pod_params(workspace: str, delete_local_storages: Iterable[str] | Non
 # --- Storage ------------------------------------------------------------------
 
 def storage_body(name: str, size_gb: int, *, storage_type: str, disk_type: str, encrypted: bool,
-                 region: str | None, max_price_per_hour: Any) -> dict[str, Any]:
+                 region: str | None, max_price_per_hour: Any, usage_warning: bool | None = None,
+                 usage_warning_threshold: Any = None) -> dict[str, Any]:
     """Standalone storage. Which types the server creates this way is its rule (today network storage only — local
-    storage is created with a pod, see create_pod(local_volumes=...)), so storage_type is passed through. The server
-    ignores disk_type (always NVMe) and region, so neither is sent."""
+    storage is created with a pod, see create_pod(local_volumes=...)), so storage_type is passed through, and so is
+    the minimum size. The server ignores disk_type (always NVMe) and region, so neither is sent. The usage warning
+    settings are sent only when given (the server's default threshold is 0.9)."""
     if isinstance(size_gb, bool) or not isinstance(size_gb, int) or size_gb < 1:
         raise ValueError("size_gb must be a positive integer")
     kind = _require_str(storage_type, "storage_type")
@@ -294,6 +349,8 @@ def storage_body(name: str, size_gb: int, *, storage_type: str, disk_type: str, 
     return _drop_none({
         "name": _require_str(name, "name"), "sizeGb": size_gb, "storageType": kind, "encrypted": bool(encrypted),
         "maxPricePerHourUsd": _price(max_price_per_hour, "max_price_per_hour"),
+        "usageWarning": None if usage_warning is None else bool(usage_warning),
+        "usageWarningThreshold": _usage_threshold(usage_warning_threshold, "usage_warning_threshold"),
     })
 
 

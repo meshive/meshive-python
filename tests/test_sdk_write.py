@@ -792,3 +792,128 @@ def test_async_wait_for_new_pod_follows_the_transaction(slept):
 
     assert asyncio.run(run()).status == "running"
     assert server.paths == ["/pods", "/transactions/99"] and fallback.paths == ["/pods", "/transactions/99", "/pods/p-0"]
+
+
+# --- 1.1.0: server-chosen start placement, template ports, storage usage warnings ------------------------
+
+def test_start_pod_without_placement_lets_the_server_choose():
+    """No placement → the query parameter is left out (not sent empty), and the server's choice comes back."""
+    rec = Recorder((202, {"podName": "p-0", "workspace": "ws", "action": "start", "accepted": True,
+                          "placement": "wait_same_node"}))
+    c = sync_client(rec)
+    action = c.start_pod("p-0", "ws")
+    assert dict(rec.last.url.params) == {"workspace": "ws", "allow_data_loss": "false"}
+    assert "placement=" not in str(rec.last.url)
+    assert isinstance(action, ResourceAction) and action.placement == "wait_same_node"
+    c.start_pod("p-0", "ws", placement=None, allow_data_loss=True)
+    assert dict(rec.last.url.params) == {"workspace": "ws", "allow_data_loss": "true"}
+    c.start_pod("p-0", "ws", placement="Same_Node")
+    assert rec.last.url.params["placement"] == "same_node"      # an explicit placement is still sent
+
+
+def test_resource_action_placement_is_none_when_not_reported():
+    rec = Recorder((202, {"podName": "p-0", "action": "stop"}))
+    assert sync_client(rec).stop_pod("p-0", "ws").placement is None
+    assert sync_client(Recorder((202, {"podName": "p-0", "action": "start"}))).start_pod("p-0", "ws").placement is None
+    # Added after raw, so 1.0 code that builds one positionally keeps working.
+    action = ResourceAction("pod", "p-0", "start", "ws", True, 7, {"podName": "p-0"})
+    assert action.raw == {"podName": "p-0"} and action.placement is None
+
+
+def test_start_pod_consent_refusal_names_the_servers_placement():
+    rec = Recorder((409, {"detail": {"title": "Data Loss Consent Required", "message": "consent required",
+                                     "placement": "any_node"}}))
+    with pytest.raises(ConflictError) as err:
+        sync_client(rec).start_pod("p-0", "ws")
+    assert err.value.title == "Data Loss Consent Required" and err.value.raw["detail"]["placement"] == "any_node"
+    assert "placement" not in rec.last.url.params and rec.last.url.params["allow_data_loss"] == "false"
+
+
+def test_create_and_estimate_pod_send_template_ports():
+    rec = Recorder((202, {"name": "p", "workspace": "ws", "transactionId": 8, "estimate": ESTIMATE}))
+    c = sync_client(rec)
+    ports = [{"port": 8080, "name": " ide "}, {"port": 8888, "newPort": 9999}, {"port": 22, "external": False},
+             {"port": 7860, "name": "ui", "new_port": 7861, "external": 1}, {"port": 3000}]
+    expected = [{"port": 8080, "name": "ide"}, {"port": 8888, "newPort": 9999}, {"port": 22, "external": False},
+                {"port": 7860, "name": "ui", "newPort": 7861, "external": True}, {"port": 3000}]
+    c.create_pod("p", 457, workspace="ws", template_ports=ports, ports=[9000])
+    assert rec.body()["templatePorts"] == expected and rec.body()["ports"] == [{"port": 9000, "external": True}]
+    c.estimate_pod("p", 457, workspace="ws", template_ports=ports)
+    assert rec.last.url.path == "/v1/sdk/pods/estimate" and rec.body()["templatePorts"] == expected
+    c.create_pod("p", 457, workspace="ws", template_ports=[])
+    assert "templatePorts" not in rec.body()
+    c.create_pod("p", 457, workspace="ws")
+    assert "templatePorts" not in rec.body()
+
+
+@pytest.mark.parametrize("template_ports", [
+    [8080], [("8080", "ide")], [{"name": "ide"}], [{"port": 0}], [{"port": True}], [{"port": "8080"}],
+    [{"port": 8080, "new_port": 70000}], [{"port": 8080, "newPort": "8443"}], [{"port": 8080, "name": " "}],
+])
+def test_template_ports_shape_errors(template_ports):
+    rec = Recorder((200, ESTIMATE))
+    with pytest.raises(ValueError, match="template_ports"):
+        sync_client(rec).estimate_pod("p", 457, workspace="ws", template_ports=template_ports)
+    assert rec.requests == []
+
+
+def test_template_port_rules_are_the_servers():
+    """Whether the port is the template's, or clashes with another, is the server's check — its 400 comes back."""
+    rec = Recorder((400, {"detail": {"title": "Port Not In Template", "message": "8081 is not a port of this template",
+                                     "templatePorts": [8081]}}))
+    with pytest.raises(MeshiveAPIError) as err:
+        sync_client(rec).create_pod("p", 457, workspace="ws", template_ports=[{"port": 8081, "name": "x"}])
+    assert err.value.status_code == 400 and err.value.title == "Port Not In Template"
+    assert err.value.raw["detail"]["templatePorts"] == [8081]
+
+
+def test_storage_usage_warning_is_sent_only_when_given():
+    rec = Recorder((202, {"name": "vol", "workspace": "ws", "transactionId": 5, "estimate": {}}))
+    c = sync_client(rec)
+    c.create_storage("vol", 10, workspace="ws", usage_warning=True, usage_warning_threshold=0.8)
+    assert rec.body() == {"name": "vol", "sizeGb": 10, "storageType": "nfs", "encrypted": False,
+                          "usageWarning": True, "usageWarningThreshold": 0.8}
+    c.estimate_storage("vol", 10, workspace="ws", usage_warning=False)
+    assert rec.body()["usageWarning"] is False and "usageWarningThreshold" not in rec.body()
+    c.estimate_storage("vol", 10, workspace="ws", usage_warning_threshold="0.75")
+    assert rec.body()["usageWarningThreshold"] == 0.75 and "usageWarning" not in rec.body()
+    c.create_storage("vol", 10, workspace="ws")
+    assert not {"usageWarning", "usageWarningThreshold"} & rec.body().keys()
+    for bad in ("most", True):
+        with pytest.raises(ValueError, match="usage_warning_threshold"):
+            c.create_storage("vol", 10, workspace="ws", usage_warning=True, usage_warning_threshold=bad)
+
+
+def test_storage_minimum_size_and_threshold_range_are_the_servers():
+    rec = Recorder((422, {"detail": [{"loc": ["body", "sizeGb"], "msg": "Input should be greater than or equal to 10"}]}))
+    c = sync_client(rec)
+    with pytest.raises(MeshiveAPIError) as err:
+        c.create_storage("vol", 5, workspace="ws")
+    assert err.value.status_code == 422 and rec.body()["sizeGb"] == 5
+    with pytest.raises(MeshiveAPIError):
+        c.estimate_storage("vol", 10, workspace="ws", usage_warning=True, usage_warning_threshold=1.5)
+    assert rec.body()["usageWarningThreshold"] == 1.5
+
+
+def test_async_client_takes_the_new_start_port_and_storage_arguments():
+    start = Recorder((202, {"podName": "p-0", "action": "start", "placement": "any_node"}))
+    pod = Recorder((202, {"name": "p", "workspace": "ws", "transactionId": 3, "estimate": ESTIMATE}))
+    storage = Recorder((202, {"name": "vol", "workspace": "ws", "transactionId": 5, "estimate": {}}))
+
+    async def run():
+        async with async_client(start) as c:
+            action = await c.start_pod("p-0", "ws", allow_data_loss=True)
+        async with async_client(pod) as c:
+            await c.estimate_pod("p", 457, workspace="ws", template_ports=[{"port": 8080, "external": True}])
+            await c.create_pod("p", 457, workspace="ws", template_ports=[{"port": 8080, "new_port": 8443}])
+        async with async_client(storage) as c:
+            await c.estimate_storage("vol", 20, workspace="ws", usage_warning=True)
+            await c.create_storage("vol", 20, workspace="ws", usage_warning=True, usage_warning_threshold=0.5)
+        return action
+
+    action = asyncio.run(run())
+    assert action.placement == "any_node" and "placement" not in start.last.url.params
+    assert pod.body(0)["templatePorts"] == [{"port": 8080, "external": True}]
+    assert pod.body(1)["templatePorts"] == [{"port": 8080, "newPort": 8443}]
+    assert storage.body(0)["usageWarning"] is True and "usageWarningThreshold" not in storage.body(0)
+    assert storage.body(1)["usageWarningThreshold"] == 0.5

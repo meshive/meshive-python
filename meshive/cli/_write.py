@@ -17,7 +17,7 @@ from typing import Any, Callable
 
 from . import _format as fmt
 from .._client import Meshive
-from ..exceptions import MeshiveError, PodCreationFailedError, WaitTimeoutError
+from ..exceptions import ConflictError, MeshiveError, PodCreationFailedError, WaitTimeoutError
 from ..models import Logs, PodEstimate, ResourceAction, StorageEstimate, TaskEstimate
 
 Handler = Callable[[Meshive, argparse.Namespace, str, bool], int]
@@ -131,6 +131,60 @@ def _parse_ports(values: list[str] | None) -> list[dict[str, Any]]:
     return out
 
 
+_TEMPLATE_PORT_USAGE = ("--template-port expects PORT[:NAME][:NEW_PORT][:internal|external], "
+                        "e.g. 8080:ide, 8080::8443 or 8080:::internal")
+
+
+def _parse_template_ports(values: list[str] | None) -> list[dict[str, Any]]:
+    """PORT[:NAME][:NEW_PORT][:internal|external] — change a port the template opens. The fields are positional and an
+    empty one keeps what the template has: 8080:ide renames, 8080::8443 renumbers, 8080:::internal hides,
+    8080:ide:8443:external does all three. A NAME of only digits, or internal/external, is refused: it would read as
+    another field, so the error shows where that field goes."""
+    out = []
+    for item in values or []:
+        parts = [part.strip() for part in item.split(":")]
+        if len(parts) > 4:
+            raise ValueError(f"{_TEMPLATE_PORT_USAGE}; got {item!r}")
+        port_text, name, new_port_text, visibility = parts + [""] * (4 - len(parts))
+        try:
+            entry: dict[str, Any] = {"port": int(port_text)}
+            new_port = int(new_port_text) if new_port_text else None
+        except ValueError:
+            raise ValueError(f"{_TEMPLATE_PORT_USAGE}; got {item!r}") from None
+        if name.isdigit():
+            raise ValueError(f"--template-port {item!r} would rename the port to {name!r}; "
+                             f"to give it the number {name}, write {port_text}::{name}")
+        if name.lower() in ("internal", "external"):
+            raise ValueError(f"--template-port {item!r} would rename the port to {name!r}; "
+                             f"to make it {name.lower()}, write {port_text}:::{name.lower()}")
+        if visibility.lower() not in ("", "internal", "external"):
+            raise ValueError(f"{_TEMPLATE_PORT_USAGE}; got {item!r}")
+        if name:
+            entry["name"] = name
+        if new_port is not None:
+            entry["new_port"] = new_port
+        if visibility:
+            entry["external"] = visibility.lower() == "external"
+        out.append(entry)
+    return out
+
+
+def _usage_warning(value: str | bool | None) -> dict[str, Any]:
+    """storage-create --usage-warning [PERCENT] → create_storage arguments. The bare flag (True) turns the warning on
+    at the server's default threshold (90%); PERCENT (1-100, as the console shows it) becomes the 0-1 threshold."""
+    if value is None:
+        return {}
+    if value is True:
+        return {"usage_warning": True}
+    try:
+        percent = int(value.strip().rstrip("%"))
+    except ValueError:
+        percent = 0
+    if not 1 <= percent <= 100:
+        raise ValueError(f"--usage-warning expects a whole percentage from 1 to 100 (e.g. 90), got {value!r}")
+    return {"usage_warning": True, "usage_warning_threshold": percent / 100}
+
+
 def _parse_input_assets(values: list[str] | None) -> list[dict[str, Any]]:
     out = []
     for item in values or []:
@@ -172,9 +226,13 @@ def _volume_cell(volume: dict[str, Any]) -> str:
 
 
 def _print_action(action: ResourceAction, color: bool) -> None:
-    _kv([(action.resource, action.id), ("action", action.action),
-         ("accepted", fmt.yes_no(action.accepted)),
-         ("result", json.dumps(action.result) if action.result not in (None, "") else "-")])
+    pairs = [(action.resource, action.id), ("action", action.action)]
+    if action.placement:       # pod-start: the placement used, which the server picks when none was given
+        pairs.append(("placement", action.placement))
+    _kv(pairs + [("accepted", fmt.yes_no(action.accepted)),
+                 ("result", json.dumps(action.result) if action.result not in (None, "") else "-")])
+    if action.placement and action.placement.lower().startswith("wait_"):
+        print(fmt.paint("The pod waits until a node has room for it, then starts.", "dim", color))
 
 
 def _print_logs(logs: Logs, color: bool) -> None:
@@ -202,7 +260,8 @@ def _pod_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         rental_type="spot" if args.spot else "demand", vcpu=args.vcpu, ram_gb=args.ram, cpu_line=args.cpu_line,
         volumes=_parse_volumes(args.volume), local_volumes=_parse_local_volumes(args.local_volume) or None,
         env=_parse_env(args.env), secret_keys=args.secret or [],
-        ports=_parse_ports(args.port), command=args.overwrite_command, internet_premium=args.internet_premium,
+        ports=_parse_ports(args.port), template_ports=_parse_template_ports(args.template_port) or None,
+        command=args.overwrite_command, internet_premium=args.internet_premium,
         uptime_premium=args.uptime_premium, cpu_premium=args.cpu_premium,
         max_price_per_hour=args.max_price,
         input_assets=[_pod_input_asset(v) for v in args.pod_input_asset or []] or None,
@@ -332,15 +391,34 @@ def cmd_pod_create(client: Meshive, args: argparse.Namespace, output: str, color
 
 # Placements that may start the pod on another node, which deletes its unpreserved workspace files.
 _MOVING_PLACEMENTS = ("any_node", "wait_any_node")
+_MOVE_WARNING = ("Moving this pod to another node permanently deletes unpreserved workspace files. "
+                 "Attached local hostPath storage stays on the old node.")
+_CONSENT_REQUIRED = "Data Loss Consent Required"    # the server's 409 title for a move without consent
 
 
 def _start_placement(args: argparse.Namespace) -> str | None:
-    """--placement as given (the server decides which exist), or any_node for --any-node. None after a usage error."""
+    """--placement as given (the server decides which exist), any_node for --any-node, or "" when neither is given
+    (the server then picks what the console would). None after a usage error."""
     placement = (args.placement or "").strip()
     if args.any_node and placement and placement.lower() != "any_node":
         print("Error: --any-node is short for --placement any_node; pass one or the other.", file=sys.stderr)
         return None
-    return placement or ("any_node" if args.any_node else "same_node")
+    return placement or ("any_node" if args.any_node else "")
+
+
+def _start_refused_for_consent(err: ConflictError, given: str) -> int:
+    """The server refused a start that may move the pod because it has unpreserved workspace files. Without
+    --placement the CLI couldn't know in advance, so name the placement the server chose and how to consent to it."""
+    detail = err.raw.get("detail") if isinstance(err.raw, dict) else None
+    chosen = str((detail.get("placement") if isinstance(detail, dict) else None) or given or "PLACEMENT")
+    print(_MOVE_WARNING, file=sys.stderr)
+    if given:
+        print("Error: separate data-loss consent is required: --allow-data-loss (in addition to --yes).", file=sys.stderr)
+    else:
+        print(fmt.clean(f"Error: the server would start this pod with placement {chosen}, which may move it to another "
+                        f"node. To consent, re-run with --placement {chosen} --allow-data-loss (in addition to --yes)."),
+              file=sys.stderr)
+    return 2
 
 
 def _pod_action(method: str, needs_confirm: bool, question: str):
@@ -352,14 +430,13 @@ def _pod_action(method: str, needs_confirm: bool, question: str):
             return 2
         extra: dict[str, Any] = {}
         if method == "start_pod":
-            extra["placement"] = placement
+            if placement:          # otherwise no placement is sent and the server picks what the console would
+                extra["placement"] = placement
             extra["allow_data_loss"] = bool(getattr(args, "allow_data_loss", False))
             if placement.lower() in _MOVING_PLACEMENTS:
                 current = client.get_pod(args.pod_name, args.workspace)
                 if current.has_unpreserved_workspace is not False:
-                    warning = ("Moving this pod to another node permanently deletes unpreserved workspace files. "
-                               "Attached local hostPath storage stays on the old node.")
-                    print(warning, file=sys.stderr)
+                    print(_MOVE_WARNING, file=sys.stderr)
                     if not extra["allow_data_loss"]:
                         if not sys.stdin.isatty():
                             print("Error: separate data-loss consent is required: --allow-data-loss (in addition to --yes).",
@@ -371,7 +448,12 @@ def _pod_action(method: str, needs_confirm: bool, question: str):
                         extra["allow_data_loss"] = True
         if method == "delete_pod":
             extra["delete_local_storages"] = args.delete_local_storage or []
-        action: ResourceAction = getattr(client, method)(args.pod_name, args.workspace, **extra)
+        try:
+            action: ResourceAction = getattr(client, method)(args.pod_name, args.workspace, **extra)
+        except ConflictError as err:
+            if method != "start_pod" or err.title != _CONSENT_REQUIRED:
+                raise
+            return _start_refused_for_consent(err, placement)
         _emit(output, action.raw, [action.id], lambda: _print_action(action, color))
         return 0
     return handler
@@ -392,7 +474,8 @@ def cmd_storage_create(client: Meshive, args: argparse.Namespace, output: str, c
     # --disk and --region are accepted but not passed on: the server ignores both (storage is always NVMe).
     _deprecated_flag("--disk", args.disk, "storage is always NVMe")
     _deprecated_flag("--region", args.region, "storage is created without a region")
-    kwargs = dict(storage_type=args.type, encrypted=args.encrypted, max_price_per_hour=args.max_price)
+    kwargs = dict(storage_type=args.type, encrypted=args.encrypted, max_price_per_hour=args.max_price,
+                  **_usage_warning(args.usage_warning))
     estimate = client.estimate_storage(args.name, args.size, workspace=args.workspace, **kwargs)
     if args.estimate:
         _emit_estimate(output, estimate, lambda: _print_storage_estimate(estimate, color))
@@ -661,7 +744,13 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
                         "not available for spot pods.")
     p.add_argument("--env", action="append", metavar="KEY=VALUE", help="Environment variable (repeatable).")
     p.add_argument("--secret", action="append", metavar="KEY", help="Mark an --env key as secret (repeatable).")
-    p.add_argument("--port", action="append", metavar="PORT[:NAME[:internal]]", help="Expose a port (repeatable).")
+    p.add_argument("--port", action="append", metavar="PORT[:NAME[:internal]]",
+                   help="Open a port the template doesn't (repeatable). To change one it opens, use --template-port.")
+    p.add_argument("--template-port", action="append", metavar="PORT[:NAME][:NEW_PORT][:internal|external]",
+                   help="Change a port the template opens (repeatable), as the console's deploy screen does. PORT is "
+                        "its current number; the other fields are positional and an empty one keeps the template's "
+                        "value: 8080:ide renames it, 8080::8443 gives it the number 8443, 8080:::internal hides it, "
+                        "8080:ide:8443:external does all three. Template ports can't be removed.")
     # Without changing dest it overwrites args.command, which holds the subcommand name, and the command disappears.
     p.add_argument("--command", dest="overwrite_command", default=None, help="Override the template command.")
     p.add_argument("--region", default=None, metavar="CODE", help="Deprecated and ignored; pods are placed without a region.")
@@ -689,9 +778,11 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
         p.add_argument("pod_name", help="Pod ID (pod name).")
         if name == "pod-start":
             p.add_argument("--placement", default=None, metavar="PLACEMENT",
-                           help="same_node (default), any_node, wait_same_node or wait_any_node. wait_* keeps the pod "
-                                "waiting until capacity frees up; any_node and wait_any_node may move it to another "
-                                "node, which permanently deletes unpreserved workspace files.")
+                           help="same_node, any_node, wait_same_node or wait_any_node. wait_* keeps the pod waiting "
+                                "until capacity frees up; any_node and wait_any_node may move it to another node, which "
+                                "permanently deletes unpreserved workspace files. Without it the server picks what the "
+                                "console would (same_node, or wait_same_node when its node has no room now; any_node or "
+                                "wait_any_node when its node can no longer run it) and the output shows which.")
             p.add_argument("--any-node", action="store_true", help="Short for --placement any_node.")
             p.add_argument("--allow-data-loss", action="store_true",
                            help="Separately consent to permanent loss of unpreserved workspace files for this pod's migration.")
@@ -716,12 +807,15 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     _yes(p)
     p = sub.add_parser("storage-create", parents=[common], help="Create a storage volume (shows the estimate first).")
     p.add_argument("workspace"); p.add_argument("name", help="Storage name (label).")
-    p.add_argument("--size", type=int, required=True, metavar="GiB")
+    p.add_argument("--size", type=int, required=True, metavar="GiB", help="Size in GiB (at least 10).")
     p.add_argument("--type", default="nfs", metavar="TYPE",
                    help="Storage type (default: nfs, network storage). Local storage is created together with a pod: "
                         "`meshive pod-create --local-volume`.")
     p.add_argument("--disk", default=None, metavar="TYPE", help="Deprecated and ignored; storage is always NVMe.")
     p.add_argument("--encrypted", action="store_true", help="At-rest encryption.")
+    p.add_argument("--usage-warning", nargs="?", const=True, default=None, metavar="PERCENT",
+                   help="Email a warning when the storage is more than PERCENT full (1-100; default 90), like the "
+                        "console's usage warning. E.g. --usage-warning, or --usage-warning 80.")
     p.add_argument("--region", default=None, metavar="CODE", help="Deprecated and ignored.")
     p.add_argument("--max-price", default=None, metavar="USD", help="Cap this volume's final initial USD/hour rate.")
     p.add_argument("--estimate", action="store_true", help="Only show the estimate; create nothing.")

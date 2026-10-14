@@ -817,7 +817,7 @@ class Meshive(_BaseClient):
                      uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
                      max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
                      harvest_destination: Any = None, local_volumes: Any = None,
-                     cpu_line: str | None = None) -> PodEstimate:
+                     cpu_line: str | None = None, template_ports: Any = None) -> PodEstimate:
         """Pod estimate — creates nothing (read scope is enough). Same arguments as create_pod; the price includes any
         new local_volumes (breakdown "local_storage")."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
@@ -827,7 +827,7 @@ class Meshive(_BaseClient):
                                cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour,
                                input_assets=input_assets, watched_folders=watched_folders,
                                harvest_destination=harvest_destination, local_volumes=local_volumes,
-                               cpu_line=cpu_line)
+                               cpu_line=cpu_line, template_ports=template_ports)
         return PodEstimate.from_dict(self._send("POST", "/pods/estimate",
                                                  params={"workspace": _query_value(workspace, "workspace")}, json=body))
 
@@ -839,7 +839,7 @@ class Meshive(_BaseClient):
                    uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
                    max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
                    harvest_destination: Any = None, idempotency_key: str | None = None, local_volumes: Any = None,
-                   cpu_line: str | None = None) -> PodCreated:
+                   cpu_line: str | None = None, template_ports: Any = None) -> PodCreated:
         """Create a pod (202 accepted). It is billed hourly — check the price with estimate_pod first;
         max_price_per_hour caps the final hourly compute price. Placement above it can fail asynchronously.
         Storage (including the automatic PV) and asset storage charges are separate and not covered by the cap.
@@ -847,6 +847,11 @@ class Meshive(_BaseClient):
         creates new local storage on the pod's machine together with the pod ({"name", "mount_path", "size_gb", and
         optionally "usage_warning", "usage_warning_threshold", "encrypted"}). cpu_line puts a CPU pod on a line from
         list_cpus (default: the cheapest line that fits). region is deprecated and ignored.
+        ports opens new ports; template_ports changes the ports the template already opens, as the console's deploy
+        screen does: [{"port": 8080, "name": "ide", "new_port": 8443, "external": False}] — port is the template's
+        port, and each other key, when given, renames it, renumbers it or exposes/hides it (template ports can't be
+        removed). A port the template doesn't open is refused ('Port Not In Template'), and so is a clash with
+        another port or name ('Port In Use', 'Port Name In Use').
         input_assets attaches Asset Hub assets ("asset_id" or {"asset", "target_dir", "role", "paths"}),
         watched_folders are folders whose new files are uploaded as assets ("path" or {"path", "include", "include_existing"}).
         Pass the result's transaction_id to wait_for_new_pod to learn right away if the creation fails."""
@@ -857,7 +862,7 @@ class Meshive(_BaseClient):
                                cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour,
                                input_assets=input_assets, watched_folders=watched_folders,
                                harvest_destination=harvest_destination, local_volumes=local_volumes,
-                               cpu_line=cpu_line)
+                               cpu_line=cpu_line, template_ports=template_ports)
         return PodCreated.from_dict(self._send("POST", "/pods", params={"workspace": _query_value(workspace, "workspace")},
                                                 json=body, idempotency_key=idempotency_key))
 
@@ -867,18 +872,19 @@ class Meshive(_BaseClient):
                              params={"workspace": _query_value(workspace, "workspace")}, idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="pod")
 
-    def start_pod(self, pod_name: str, workspace: str, *, placement: str = "same_node",
+    def start_pod(self, pod_name: str, workspace: str, *, placement: str | None = None,
                   allow_data_loss: bool = False, idempotency_key: str | None = None) -> ResourceAction:
-        """Start a stopped pod. placement: same_node (its original node, the default) | any_node (any node with
-        capacity) | wait_same_node / wait_any_node (the pod waits until capacity frees up, then starts). The server
-        decides which placements exist and refuses an unknown one. Moving to another node (any_node, wait_any_node)
-        permanently deletes work files that aren't preserved; allow_data_loss=True is a separate data-loss consent for
-        this pod/move request (ConflictError 'Data Loss Consent Required' without it)."""
-        if not isinstance(allow_data_loss, bool):
-            raise ValueError("allow_data_loss must be an explicit boolean")
+        """Start a stopped pod. placement: same_node (its original node) | any_node (any node with capacity) |
+        wait_same_node / wait_any_node (the pod waits until capacity frees up, then starts). The server decides which
+        placements exist and refuses an unknown one. Without a placement (the default) the server picks what the web
+        console would: wait_any_node for a pod already waiting for any node; any_node, or wait_any_node if no node has
+        room now, when its original node can no longer run its configuration; otherwise same_node, or wait_same_node
+        if that node has no room now. The result's `placement` says which one was used.
+        Moving to another node (any_node, wait_any_node) permanently deletes work files that aren't preserved;
+        allow_data_loss=True is a separate data-loss consent for this pod/move request. Without it such a start is
+        refused with ConflictError 'Data Loss Consent Required', whose raw["detail"]["placement"] names the placement."""
         data = self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/start",
-                             params={"workspace": _query_value(workspace, "workspace"), "placement": _write.placement(placement),
-                                     "allow_data_loss": bool(allow_data_loss)},
+                             params=_write.start_pod_params(_query_value(workspace, "workspace"), placement, allow_data_loss),
                              idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="pod")
 
@@ -899,21 +905,28 @@ class Meshive(_BaseClient):
 
     def estimate_storage(self, name: str, size_gb: int, *, workspace: str, storage_type: str = "nfs",
                          disk_type: str = "NVMe", encrypted: bool = False, region: str | None = None,
-                         max_price_per_hour: Any = None) -> StorageEstimate:
+                         max_price_per_hour: Any = None, usage_warning: bool | None = None,
+                         usage_warning_threshold: float | None = None) -> StorageEstimate:
         """Storage estimate — creates nothing. Same arguments as create_storage."""
         body = _write.storage_body(name, size_gb, storage_type=storage_type, disk_type=disk_type, encrypted=encrypted,
-                                   region=region, max_price_per_hour=max_price_per_hour)
+                                   region=region, max_price_per_hour=max_price_per_hour, usage_warning=usage_warning,
+                                   usage_warning_threshold=usage_warning_threshold)
         return StorageEstimate.from_dict(self._send("POST", "/storages/estimate",
                                                      params={"workspace": _query_value(workspace, "workspace")}, json=body))
 
     def create_storage(self, name: str, size_gb: int, *, workspace: str, storage_type: str = "nfs",
                        disk_type: str = "NVMe", encrypted: bool = False, region: str | None = None,
-                       max_price_per_hour: Any = None, idempotency_key: str | None = None) -> StorageCreated:
-        """Create network storage (PV) (202). Billed hourly by capacity while it exists. Local storage can't be created
-        on its own (the server refuses storage_type "hostPath"); create it with a pod: create_pod(local_volumes=...).
-        disk_type and region are deprecated and ignored (storage is always NVMe)."""
+                       max_price_per_hour: Any = None, idempotency_key: str | None = None,
+                       usage_warning: bool | None = None,
+                       usage_warning_threshold: float | None = None) -> StorageCreated:
+        """Create network storage (PV) (202). Billed hourly by capacity while it exists; the server's minimum size is
+        10 GiB. Local storage can't be created on its own (the server refuses storage_type "hostPath"); create it with
+        a pod: create_pod(local_volumes=...). usage_warning=True emails you when the storage fills past
+        usage_warning_threshold (a fraction in (0, 1], default 0.9), as the console's usage warning does; both are
+        sent only when given. disk_type and region are deprecated and ignored (storage is always NVMe)."""
         body = _write.storage_body(name, size_gb, storage_type=storage_type, disk_type=disk_type, encrypted=encrypted,
-                                   region=region, max_price_per_hour=max_price_per_hour)
+                                   region=region, max_price_per_hour=max_price_per_hour, usage_warning=usage_warning,
+                                   usage_warning_threshold=usage_warning_threshold)
         return StorageCreated.from_dict(self._send("POST", "/storages", params={"workspace": _query_value(workspace, "workspace")},
                                                     json=body, idempotency_key=idempotency_key))
 
@@ -1483,7 +1496,7 @@ class AsyncMeshive(_BaseClient):
                      uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
                      max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
                      harvest_destination: Any = None, local_volumes: Any = None,
-                     cpu_line: str | None = None) -> PodEstimate:
+                     cpu_line: str | None = None, template_ports: Any = None) -> PodEstimate:
         """Pod estimate — creates nothing (read scope is enough). Same arguments as create_pod; the price includes any
         new local_volumes (breakdown "local_storage")."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
@@ -1493,7 +1506,7 @@ class AsyncMeshive(_BaseClient):
                                cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour,
                                input_assets=input_assets, watched_folders=watched_folders,
                                harvest_destination=harvest_destination, local_volumes=local_volumes,
-                               cpu_line=cpu_line)
+                               cpu_line=cpu_line, template_ports=template_ports)
         return PodEstimate.from_dict(await self._send("POST", "/pods/estimate",
                                                  params={"workspace": _query_value(workspace, "workspace")}, json=body))
 
@@ -1505,7 +1518,7 @@ class AsyncMeshive(_BaseClient):
                    uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
                    max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
                    harvest_destination: Any = None, idempotency_key: str | None = None, local_volumes: Any = None,
-                   cpu_line: str | None = None) -> PodCreated:
+                   cpu_line: str | None = None, template_ports: Any = None) -> PodCreated:
         """Create a pod (202 accepted). It is billed hourly — check the price with estimate_pod first;
         max_price_per_hour caps the final hourly compute price. Placement above it can fail asynchronously.
         Storage (including the automatic PV) and asset storage charges are separate and not covered by the cap.
@@ -1513,6 +1526,11 @@ class AsyncMeshive(_BaseClient):
         creates new local storage on the pod's machine together with the pod ({"name", "mount_path", "size_gb", and
         optionally "usage_warning", "usage_warning_threshold", "encrypted"}). cpu_line puts a CPU pod on a line from
         list_cpus (default: the cheapest line that fits). region is deprecated and ignored.
+        ports opens new ports; template_ports changes the ports the template already opens, as the console's deploy
+        screen does: [{"port": 8080, "name": "ide", "new_port": 8443, "external": False}] — port is the template's
+        port, and each other key, when given, renames it, renumbers it or exposes/hides it (template ports can't be
+        removed). A port the template doesn't open is refused ('Port Not In Template'), and so is a clash with
+        another port or name ('Port In Use', 'Port Name In Use').
         input_assets attaches Asset Hub assets ("asset_id" or {"asset", "target_dir", "role", "paths"}),
         watched_folders are folders whose new files are uploaded as assets ("path" or {"path", "include", "include_existing"}).
         Pass the result's transaction_id to wait_for_new_pod to learn right away if the creation fails."""
@@ -1523,7 +1541,7 @@ class AsyncMeshive(_BaseClient):
                                cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour,
                                input_assets=input_assets, watched_folders=watched_folders,
                                harvest_destination=harvest_destination, local_volumes=local_volumes,
-                               cpu_line=cpu_line)
+                               cpu_line=cpu_line, template_ports=template_ports)
         return PodCreated.from_dict(await self._send("POST", "/pods", params={"workspace": _query_value(workspace, "workspace")},
                                                 json=body, idempotency_key=idempotency_key))
 
@@ -1533,18 +1551,19 @@ class AsyncMeshive(_BaseClient):
                              params={"workspace": _query_value(workspace, "workspace")}, idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="pod")
 
-    async def start_pod(self, pod_name: str, workspace: str, *, placement: str = "same_node",
+    async def start_pod(self, pod_name: str, workspace: str, *, placement: str | None = None,
                   allow_data_loss: bool = False, idempotency_key: str | None = None) -> ResourceAction:
-        """Start a stopped pod. placement: same_node (its original node, the default) | any_node (any node with
-        capacity) | wait_same_node / wait_any_node (the pod waits until capacity frees up, then starts). The server
-        decides which placements exist and refuses an unknown one. Moving to another node (any_node, wait_any_node)
-        permanently deletes work files that aren't preserved; allow_data_loss=True is a separate data-loss consent for
-        this pod/move request (ConflictError 'Data Loss Consent Required' without it)."""
-        if not isinstance(allow_data_loss, bool):
-            raise ValueError("allow_data_loss must be an explicit boolean")
+        """Start a stopped pod. placement: same_node (its original node) | any_node (any node with capacity) |
+        wait_same_node / wait_any_node (the pod waits until capacity frees up, then starts). The server decides which
+        placements exist and refuses an unknown one. Without a placement (the default) the server picks what the web
+        console would: wait_any_node for a pod already waiting for any node; any_node, or wait_any_node if no node has
+        room now, when its original node can no longer run its configuration; otherwise same_node, or wait_same_node
+        if that node has no room now. The result's `placement` says which one was used.
+        Moving to another node (any_node, wait_any_node) permanently deletes work files that aren't preserved;
+        allow_data_loss=True is a separate data-loss consent for this pod/move request. Without it such a start is
+        refused with ConflictError 'Data Loss Consent Required', whose raw["detail"]["placement"] names the placement."""
         data = await self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/start",
-                             params={"workspace": _query_value(workspace, "workspace"), "placement": _write.placement(placement),
-                                     "allow_data_loss": bool(allow_data_loss)},
+                             params=_write.start_pod_params(_query_value(workspace, "workspace"), placement, allow_data_loss),
                              idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="pod")
 
@@ -1565,21 +1584,28 @@ class AsyncMeshive(_BaseClient):
 
     async def estimate_storage(self, name: str, size_gb: int, *, workspace: str, storage_type: str = "nfs",
                          disk_type: str = "NVMe", encrypted: bool = False, region: str | None = None,
-                         max_price_per_hour: Any = None) -> StorageEstimate:
+                         max_price_per_hour: Any = None, usage_warning: bool | None = None,
+                         usage_warning_threshold: float | None = None) -> StorageEstimate:
         """Storage estimate — creates nothing. Same arguments as create_storage."""
         body = _write.storage_body(name, size_gb, storage_type=storage_type, disk_type=disk_type, encrypted=encrypted,
-                                   region=region, max_price_per_hour=max_price_per_hour)
+                                   region=region, max_price_per_hour=max_price_per_hour, usage_warning=usage_warning,
+                                   usage_warning_threshold=usage_warning_threshold)
         return StorageEstimate.from_dict(await self._send("POST", "/storages/estimate",
                                                      params={"workspace": _query_value(workspace, "workspace")}, json=body))
 
     async def create_storage(self, name: str, size_gb: int, *, workspace: str, storage_type: str = "nfs",
                        disk_type: str = "NVMe", encrypted: bool = False, region: str | None = None,
-                       max_price_per_hour: Any = None, idempotency_key: str | None = None) -> StorageCreated:
-        """Create network storage (PV) (202). Billed hourly by capacity while it exists. Local storage can't be created
-        on its own (the server refuses storage_type "hostPath"); create it with a pod: create_pod(local_volumes=...).
-        disk_type and region are deprecated and ignored (storage is always NVMe)."""
+                       max_price_per_hour: Any = None, idempotency_key: str | None = None,
+                       usage_warning: bool | None = None,
+                       usage_warning_threshold: float | None = None) -> StorageCreated:
+        """Create network storage (PV) (202). Billed hourly by capacity while it exists; the server's minimum size is
+        10 GiB. Local storage can't be created on its own (the server refuses storage_type "hostPath"); create it with
+        a pod: create_pod(local_volumes=...). usage_warning=True emails you when the storage fills past
+        usage_warning_threshold (a fraction in (0, 1], default 0.9), as the console's usage warning does; both are
+        sent only when given. disk_type and region are deprecated and ignored (storage is always NVMe)."""
         body = _write.storage_body(name, size_gb, storage_type=storage_type, disk_type=disk_type, encrypted=encrypted,
-                                   region=region, max_price_per_hour=max_price_per_hour)
+                                   region=region, max_price_per_hour=max_price_per_hour, usage_warning=usage_warning,
+                                   usage_warning_threshold=usage_warning_threshold)
         return StorageCreated.from_dict(await self._send("POST", "/storages", params={"workspace": _query_value(workspace, "workspace")},
                                                     json=body, idempotency_key=idempotency_key))
 

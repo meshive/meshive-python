@@ -606,3 +606,122 @@ def test_pod_start_wait_any_node_asks_twice_on_a_terminal(capsys, monkeypatch):
     assert cli.main(["pod-start", "ws", "p-0", "--placement", "wait_any_node", "-o", "json"]) == 0
     assert capsys.readouterr().err.count("[y/N]") == 2
     assert _last("pod_action")[2] == {"placement": "wait_any_node", "allow_data_loss": True}
+
+
+# --- 1.1.0: server-chosen start placement, template ports, storage usage warnings ------------------------
+
+def _start_returns(monkeypatch, payload=None, error=None):
+    def start_pod(self, *a, **kw):
+        self._rec("pod_action", *a, **kw)
+        if error:
+            raise error
+        return ResourceAction.from_dict({"podName": a[0], "action": "start", **(payload or {})}, resource="pod")
+    monkeypatch.setattr(FakeClient, "start_pod", start_pod)
+
+
+def test_pod_start_without_placement_lets_the_server_choose(capsys, non_tty, monkeypatch):
+    _start_returns(monkeypatch, {"placement": "wait_same_node"})
+    assert cli.main(["pod-start", "ws", "p-0", "--yes"]) == 0
+    assert _last("pod_action")[2] == {"allow_data_loss": False}               # no placement sent
+    assert all(c[0] != "get_pod" for c in FakeClient.instances[-1].calls)     # nothing to check in advance
+    out = capsys.readouterr().out
+    assert "placement:" in out and "wait_same_node" in out and "waits until a node has room" in out
+    assert cli.main(["pod-start", "ws", "p-0", "--yes", "-o", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["placement"] == "wait_same_node"
+    assert cli.main(["pod-start", "ws", "p-0", "--allow-data-loss", "--yes"]) == 0
+    assert _last("pod_action")[2] == {"allow_data_loss": True}                # consent for whatever the server picks
+
+
+def test_pod_start_output_without_a_reported_placement(capsys, non_tty):
+    assert cli.main(["pod-start", "ws", "p-0", "--placement", "same_node", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "placement" not in out and "waits until" not in out
+
+
+def test_pod_start_server_asks_for_data_loss_consent(capsys, non_tty, monkeypatch):
+    """Without --placement the CLI can't know in advance that the pod may move — the server's 409 says which placement
+    it chose, and the error tells how to consent to it."""
+    from meshive.exceptions import ConflictError
+    error = ConflictError(409, "consent required", title="Data Loss Consent Required",
+                          raw={"detail": {"title": "Data Loss Consent Required", "message": "consent required",
+                                          "placement": "wait_any_node"}})
+    _start_returns(monkeypatch, error=error)
+    assert cli.main(["pod-start", "ws", "p-0", "--yes", "-o", "json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == "" and "permanently deletes unpreserved workspace files" in captured.err
+    assert "the server would start this pod with placement wait_any_node" in captured.err
+    assert "re-run with --placement wait_any_node --allow-data-loss" in captured.err
+
+
+def test_pod_start_consent_refusal_after_an_explicit_placement(capsys, non_tty, monkeypatch):
+    """The pod gained unpreserved files after the CLI looked — same message as the CLI's own check."""
+    from meshive.exceptions import ConflictError
+    monkeypatch.setattr(FakeClient, "get_pod", lambda self, *a, **kw: Pod.from_dict(
+        {"podName": a[0], "namespaceName": a[1], "hasUnpreservedWorkspace": False}))
+    _start_returns(monkeypatch, error=ConflictError(409, "consent required", title="Data Loss Consent Required",
+                                                    raw={"detail": {"placement": "any_node"}}))
+    assert cli.main(["pod-start", "ws", "p-0", "--any-node", "--yes"]) == 2
+    err = capsys.readouterr().err
+    assert "separate data-loss consent is required: --allow-data-loss" in err
+
+
+def test_pod_start_other_conflicts_stay_errors(capsys, non_tty, monkeypatch):
+    from meshive.exceptions import ConflictError
+    _start_returns(monkeypatch, error=ConflictError(409, "no room", title="No Capacity", raw={}))
+    assert cli.main(["pod-start", "ws", "p-0", "--yes"]) == 1
+    assert "[409] No Capacity: no room" in capsys.readouterr().err
+
+
+def test_pod_create_template_ports(capsys):
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--port", "9000",
+                     "--template-port", "8080:ide", "--template-port", "8888::9999",
+                     "--template-port", "22:::internal", "--template-port", "7860:ui:7861:External",
+                     "--template-port", "3000:", "--yes"]) == 0
+    expected = [{"port": 8080, "name": "ide"}, {"port": 8888, "new_port": 9999}, {"port": 22, "external": False},
+                {"port": 7860, "name": "ui", "new_port": 7861, "external": True}, {"port": 3000}]
+    assert _last("estimate_pod")[2]["template_ports"] == expected
+    assert _last("create_pod")[2]["template_ports"] == expected
+    assert _last("create_pod")[2]["ports"] == [{"port": 9000, "external": True}]
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--estimate"]) == 0
+    assert _last("estimate_pod")[2]["template_ports"] is None
+
+
+@pytest.mark.parametrize("value, message", [
+    ("ide", "PORT[:NAME][:NEW_PORT][:internal|external]"),
+    ("8080:ide:fast", "PORT[:NAME][:NEW_PORT][:internal|external]"),
+    ("8080:ide:8443:public", "PORT[:NAME][:NEW_PORT][:internal|external]"),
+    ("8080:ide:8443:external:x", "PORT[:NAME][:NEW_PORT][:internal|external]"),
+    ("8080:8443", "write 8080::8443"),
+    ("8080:internal", "write 8080:::internal"),
+    ("8080:External", "write 8080:::external"),
+])
+def test_pod_create_bad_template_port_is_usage_error(capsys, value, message):
+    assert cli.main(["pod-create", "ws", "p", "--template", "1", "--template-port", value, "--yes"]) == 2
+    assert message in capsys.readouterr().err
+    assert not any(c[0] in ("estimate_pod", "create_pod") for c in FakeClient.instances[-1].calls)
+
+
+@pytest.mark.parametrize("flags, expected", [
+    ([], {}),
+    (["--usage-warning"], {"usage_warning": True}),
+    (["--usage-warning", "80"], {"usage_warning": True, "usage_warning_threshold": 0.8}),
+    (["--usage-warning=85%"], {"usage_warning": True, "usage_warning_threshold": 0.85}),
+    (["--usage-warning", "100"], {"usage_warning": True, "usage_warning_threshold": 1.0}),
+])
+def test_storage_create_usage_warning(capsys, flags, expected):
+    assert cli.main(["storage-create", "ws", "vol", "--size", "10", *flags, "--yes"]) == 0
+    for method in ("estimate_storage", "create_storage"):
+        kw = _last(method)[2]
+        assert {k: v for k, v in kw.items() if k.startswith("usage_warning")} == expected
+
+
+@pytest.mark.parametrize("value", ["0.9", "0", "101", "lots", ""])
+def test_storage_create_bad_usage_warning_is_usage_error(capsys, value):
+    assert cli.main(["storage-create", "ws", "vol", "--size", "10", f"--usage-warning={value}", "--yes"]) == 2
+    assert "--usage-warning expects a whole percentage from 1 to 100" in capsys.readouterr().err
+    assert not any(c[0] in ("estimate_storage", "create_storage") for c in FakeClient.instances[-1].calls)
+
+
+def test_storage_create_small_size_is_left_to_the_server(capsys):
+    assert cli.main(["storage-create", "ws", "vol", "--size", "5", "--estimate"]) == 0
+    assert _last("estimate_storage")[1] == ("vol", 5)

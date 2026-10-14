@@ -1597,12 +1597,16 @@ class ResourceAction:
     accepted: bool = True
     result: object = None          # return value of the underlying operation (transaction id, ...)
     raw: dict = field(default_factory=dict, repr=False)
+    # start_pod only: the placement the server used (same_node | any_node | wait_same_node | wait_any_node), which it
+    # picks itself when none was given. None for other actions and from servers that don't report it.
+    placement: str | None = None
 
     @classmethod
     def from_dict(cls, d: dict, *, resource: str | None = None) -> "ResourceAction":
+        placement = d.get("placement")
         return cls(resource=d.get("resource") or resource or "", id=str(d.get("id") or d.get("podName") or ""),
                    action=d.get("action", ""), workspace=d.get("workspace"), accepted=bool(d.get("accepted", True)),
-                   result=d.get("result"), raw=d)
+                   result=d.get("result"), raw=d, placement=str(placement) if placement else None)
 
 
 @dataclass

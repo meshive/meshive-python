@@ -27,6 +27,7 @@ from ..models import (
     Machine,
     MachineMetrics,
     Member,
+    ModelSetList,
     Pod,
     PodMetrics,
     Serving,
@@ -92,9 +93,13 @@ def build_parser() -> argparse.ArgumentParser:
             "  meshive earnings               Show your earnings (as a host)\n"
             "\n"
             "Write commands (need a key with the write scope; they ask for confirmation unless --yes):\n"
-            "  meshive pod-create <ws> <name> --template ID --gpu MODEL [--estimate]\n"
+            "  meshive pod-create <ws> <name> --template ID --gpu MODEL [--model-set SLUG] [--estimate]\n"
+            "  meshive model-sets <ws> --template ID  (the SLUGs a template offers)\n"
+            "  meshive pod-update <ws> <pod> --gpu MODEL [--estimate]\n"
             "  meshive pod-stop|pod-start|pod-restart|pod-delete <ws> <pod>\n"
             "  meshive storage-create <ws> <name> --size GiB  meshive storage-delete <ws> <pv>\n"
+            "  meshive storage-update <ws> <pv> --size GiB\n"
+            "  meshive storage-connect <ws> <pv>  (SSH and SFTP access to a storage)\n"
             "  meshive task-submit <ws> <name> --script FILE --image IMG --cpu-preset micro-2c8g\n"
             "  meshive logs <ws> <pod>          meshive task-logs <task>\n"
             "\n"
@@ -199,9 +204,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_txn_one = sub.add_parser("transaction", parents=[common],
                                help="Show one pod operation by ID: status, steps and why it failed (no time limit).")
+    p_txn_one.add_argument("workspace", help="Workspace ID (namespace name).")
     p_txn_one.add_argument("transaction_id", type=int,
                            help="Transaction ID, as printed by `pod-create` or `meshive transactions`.")
-    p_txn_one.add_argument("--workspace", required=True, metavar="ID", help="Workspace ID (namespace name).")
 
     # --- storages -------------------------------------------------------------
     p_storages = sub.add_parser("storages", parents=[common],
@@ -286,6 +291,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_template.add_argument("template_id", type=int, help="Template ID. See ID column of `meshive templates`.")
     p_template.add_argument("--workspace", default=None, metavar="ID",
                             help="Required for a custom template: the workspace that owns it.")
+
+    p_model_sets = sub.add_parser("model-sets", parents=[common],
+                                  help="List the model sets a template can start with "
+                                       "(SLUG goes to `pod-create --model-set`).")
+    p_model_sets.add_argument("workspace", help="Workspace ID (namespace name).")
+    p_model_sets.add_argument("--template", type=int, required=True, metavar="ID", dest="template_id",
+                              help="Template ID. See ID column of `meshive templates`.")
 
     # --- serverless -----------------------------------------------------------
     p_servings = sub.add_parser("servings", parents=[common],
@@ -794,6 +806,34 @@ def _print_template(t: Template, color: bool) -> None:
     print(f"description: {fmt.clean(t.description or '-')}")
 
 
+def _model_set_vram(value: float | None, estimated: bool | None) -> str:
+    return "-" if value is None else f"{'~' if estimated else ''}{value:g} GB"
+
+
+def _model_set_licenses(names: list[str], unknown: int) -> str:
+    cell = ", ".join(dict.fromkeys(n for n in names if n))     # each license once, in order
+    if unknown:
+        cell += f"{' + ' if cell else ''}{unknown} unknown"
+    return cell or "-"
+
+
+def _print_model_sets(sets: ModelSetList, color: bool) -> None:
+    if not sets.selectable:
+        reason = f": {sets.reason}" if sets.reason else "."
+        print(fmt.clean(f"This template doesn't take a model set{reason}"))
+        return
+    if not sets.model_sets:
+        print("No model sets for this template.")
+        return
+    rows = [[m.slug, m.name or "-", m.task or "-", str(len(m.items)), fmt.bytes_human(m.total_size_bytes),
+             _model_set_vram(m.min_vram_gb, m.min_vram_estimated),
+             _model_set_licenses([x.license for x in m.licenses], m.license_unknown_count)] for m in sets.model_sets]
+    fmt.render_table(["SLUG", "NAME", "TASK", "FILES", "SIZE", "MIN VRAM", "LICENSE"], rows,
+                     aligns=["l", "l", "l", "r", "r", "r", "l"], enabled=color)
+    print(fmt.paint("Pass SLUG to `meshive pod-create --model-set` (one set per pod). -o json lists each set's files "
+                    "and workflows.", "dim", color))
+
+
 def _serving_label(s: Serving) -> str:
     return s.model_name or s.api_model_id or "-"
 
@@ -1289,6 +1329,12 @@ def _cmd_template(client: Meshive, args: argparse.Namespace, output: str, color:
     return 0
 
 
+def _cmd_model_sets(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    sets = client.list_model_sets(args.workspace, args.template_id)
+    _emit(output, sets.raw, [m.slug for m in sets], lambda: _print_model_sets(sets, color))
+    return 0
+
+
 def _cmd_servings(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     statuses = _parse_status_filter(args.status)
     code = _reject_unknown_statuses(statuses, SERVING_STATUSES)
@@ -1426,6 +1472,7 @@ _HANDLERS: dict[str, Handler] = {
     "cpus": _cmd_cpus,
     "templates": _cmd_templates,
     "template": _cmd_template,
+    "model-sets": _cmd_model_sets,
     "servings": _cmd_servings,
     "serving": _cmd_serving,
     "tasks": _cmd_tasks,

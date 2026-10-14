@@ -21,6 +21,7 @@ from meshive import (
     ResourceAction,
     StorageCreated,
     TaskSubmitted,
+    WaitTimeoutError,
 )
 from tests.test_sdk import async_client, isolate_config_dir, slept, sync_client  # noqa: F401  (autouse fixtures)
 
@@ -917,3 +918,514 @@ def test_async_client_takes_the_new_start_port_and_storage_arguments():
     assert pod.body(1)["templatePorts"] == [{"port": 8080, "newPort": 8443}]
     assert storage.body(0)["usageWarning"] is True and "usageWarningThreshold" not in storage.body(0)
     assert storage.body(1)["usageWarningThreshold"] == 0.5
+
+
+# --- 1.2.0: storage edit -------------------------------------------------------------------------------------
+
+STORAGE_UPDATE_ESTIMATE = {"pvName": "pv-1", "name": "data", "sizeGb": 200, "currentSizeGb": 100,
+                           "pricePerHourUsd": "0.0194", "currentPricePerHourUsd": "0.0097", "usageWarning": True,
+                           "usageWarningThreshold": 0.8, "note": "Billed at the new size."}
+
+
+def test_update_storage_sends_only_what_is_given():
+    from meshive import StorageUpdated
+
+    rec = Recorder((202, {"pvName": "pv-1", "workspace": "ws", "accepted": True, "transactionId": 77,
+                          "estimate": STORAGE_UPDATE_ESTIMATE}))
+    c = sync_client(rec)
+    updated = c.update_storage("pv-1", "ws", size_gb=200, idempotency_key="grow-0001")
+    assert rec.last.method == "PATCH" and rec.last.url.path == "/v1/sdk/storages/pv-1"
+    assert dict(rec.last.url.params) == {"workspace": "ws"} and rec.last.headers["Idempotency-Key"] == "grow-0001"
+    assert rec.body() == {"sizeGb": 200}
+    assert isinstance(updated, StorageUpdated) and updated.transaction_id == 77 and updated.accepted
+    assert (updated.estimate.size_gb, updated.estimate.current_size_gb) == (200, 100)
+    assert updated.estimate.price_per_hour == "0.0194" and updated.estimate.current_price_per_hour == "0.0097"
+    c.update_storage("pv-1", "ws", name=" archive ", usage_warning=False)
+    assert rec.body() == {"name": "archive", "usageWarning": False}
+    c.update_storage("pv-1", "ws", usage_warning=True, usage_warning_threshold="0.75")
+    assert rec.body() == {"usageWarning": True, "usageWarningThreshold": 0.75}
+
+
+def test_update_storage_without_a_transaction():
+    """A rename or a warning change alone is applied at once — no transaction (or an earlier one)."""
+    rec = Recorder((202, {"pvName": "pv-1", "workspace": "ws", "accepted": True, "transactionId": None,
+                          "estimate": {"pvName": "pv-1", "name": "archive", "sizeGb": 100}}))
+    updated = sync_client(rec).update_storage("pv-1", "ws", name="archive")
+    assert updated.transaction_id is None and updated.estimate.current_price_per_hour is None
+    assert updated.estimate.usage_warning is None and updated.estimate.usage_warning_threshold is None
+
+
+def test_estimate_storage_update():
+    rec = Recorder((200, STORAGE_UPDATE_ESTIMATE))
+    est = sync_client(rec).estimate_storage_update("pv-1", "ws", size_gb=200, usage_warning=True,
+                                                   usage_warning_threshold=0.8)
+    assert rec.last.method == "POST" and rec.last.url.path == "/v1/sdk/storages/pv-1/estimate"
+    assert rec.body() == {"sizeGb": 200, "usageWarning": True, "usageWarningThreshold": 0.8}
+    assert (est.pv_name, est.name, est.usage_warning, est.usage_warning_threshold) == ("pv-1", "data", True, 0.8)
+    assert est.note == "Billed at the new size." and est.raw["currentSizeGb"] == 100
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(), dict(size_gb=0), dict(size_gb="200"), dict(size_gb=True), dict(name=" "), dict(name=5),
+    dict(usage_warning_threshold="most"), dict(usage_warning_threshold=True),
+])
+def test_storage_update_shape_errors(kwargs):
+    rec = Recorder((202, {}))
+    c = sync_client(rec)
+    with pytest.raises(ValueError):
+        c.update_storage("pv-1", "ws", **kwargs)
+    with pytest.raises(ValueError):
+        c.estimate_storage_update("pv-1", "ws", **kwargs)
+    assert rec.requests == []
+
+
+def test_storage_update_rules_are_the_servers():
+    """The minimum size and "can only grow" are the server's checks: the request goes out and its error comes back."""
+    rec = Recorder((400, {"detail": {"title": "Storage Cannot Shrink", "message": "Storage can only grow.",
+                                     "currentSizeGb": 100}}))
+    with pytest.raises(MeshiveAPIError) as err:
+        sync_client(rec).update_storage("pv-1", "ws", size_gb=50)
+    assert err.value.title == "Storage Cannot Shrink" and err.value.raw["detail"]["currentSizeGb"] == 100
+    assert rec.body() == {"sizeGb": 50}
+    rec = Recorder((422, {"detail": [{"loc": ["body", "sizeGb"], "msg": "Input should be greater than or equal to 10"}]}))
+    with pytest.raises(MeshiveAPIError):
+        sync_client(rec).estimate_storage_update("pv-1", "ws", size_gb=5)
+    assert rec.body() == {"sizeGb": 5}
+
+
+def test_storage_update_not_found_and_older_servers():
+    with pytest.raises(NotFoundError) as err:
+        sync_client(Recorder((404, {"detail": {"title": "Storage Not Found", "message": "No storage pv-9"}}))) \
+            .update_storage("pv-9", "ws", name="x")
+    assert err.value.title == "Storage Not Found"
+    # PATCH /storages/{pv} collides with GET/DELETE of the same path on an older server → 405
+    with pytest.raises(NotFoundError, match="does not support storage editing"):
+        sync_client(Recorder((405, {"detail": "Method Not Allowed"}))).update_storage("pv-1", "ws", name="x")
+    with pytest.raises(NotFoundError, match="does not support storage editing"):
+        sync_client(Recorder((404, {"detail": "Not Found"}))).estimate_storage_update("pv-1", "ws", size_gb=20)
+
+
+# --- 1.2.0: storage connect ----------------------------------------------------------------------------------
+
+SSH = {"password": "pw-123", "sshUrl": "ssh -p 2222 gateway@m.example", "sshWebUrl": "https://m.example/?p=x",
+       "expiredAt": 1_900_000_000}
+
+
+def _conn(phase, **extra):
+    return {"pvName": "pv-1", "workspace": "ws", "encrypted": True, "phase": phase, **extra}
+
+
+class ConnectServer:
+    """POST/GET /storages/pv-1/connect answer from a list that advances per call; POST /pods/{pod}/ssh answers SSH."""
+
+    def __init__(self, *phases):
+        self.phases = list(phases)
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path.removeprefix("/v1/sdk")
+        self.calls.append((request.method, path))
+        if path.endswith("/ssh"):
+            return httpx.Response(200, json=SSH)
+        status, body = self.phases.pop(0) if len(self.phases) > 1 else self.phases[0]
+        return httpx.Response(status, json=body)
+
+
+def test_connect_storage_waits_until_ready_and_gets_ssh(slept):
+    from meshive import SshAccess, StorageConnection
+
+    ready = _conn("ready", podName="pv-1-access-0", transactionId=31, autoLockMinutes=30, remainingSeconds=1790)
+    server = ConnectServer((200, _conn("preparing", transactionId=31)), (200, _conn("preparing")), (200, ready))
+    conn = sync_client(server).connect_storage("pv-1", "ws", interval=2)
+    assert server.calls == [("POST", "/storages/pv-1/connect"), ("GET", "/storages/pv-1/connect"),
+                            ("GET", "/storages/pv-1/connect"), ("POST", "/pods/pv-1-access-0/ssh")]
+    assert slept == [2, 2]
+    assert isinstance(conn, StorageConnection) and conn.ready and conn.phase == "ready" and conn.encrypted is True
+    assert (conn.pod_name, conn.transaction_id, conn.auto_lock_minutes, conn.remaining_seconds) == \
+        ("pv-1-access-0", 31, 30, 1790)
+    assert isinstance(conn.ssh, SshAccess) and conn.ssh.command.startswith("ssh -p 2222")
+    assert conn.ssh.password == "pw-123" and "pw-123" not in repr(conn)
+
+
+def test_connect_storage_ready_at_once_and_plain_storage(slept):
+    server = ConnectServer((200, {**_conn("ready", podName="acc-0"), "encrypted": False}))
+    conn = sync_client(server).connect_storage("pv-1", "ws")
+    assert server.calls == [("POST", "/storages/pv-1/connect"), ("POST", "/pods/acc-0/ssh")] and slept == []
+    assert conn.encrypted is False and conn.auto_lock_minutes is None and conn.ssh.password == "pw-123"
+
+
+def test_connect_storage_without_waiting(slept):
+    server = ConnectServer((200, _conn("preparing")))
+    conn = sync_client(server).connect_storage("pv-1", "ws", wait=False, idempotency_key="connect-0001")
+    assert server.calls == [("POST", "/storages/pv-1/connect")] and conn.ssh is None and not conn.ready
+    server = ConnectServer((200, _conn("ready", podName="acc-0")))
+    assert sync_client(server).connect_storage("pv-1", "ws", wait=False).ssh is not None
+
+
+def test_connect_storage_error_phase(slept):
+    from meshive import StorageConnectionError
+
+    server = ConnectServer((200, _conn("preparing")), (200, _conn("error")))
+    with pytest.raises(StorageConnectionError, match="could not be opened for SSH access") as err:
+        sync_client(server).connect_storage("pv-1", "ws")
+    assert err.value.pv_name == "pv-1" and err.value.connection.phase == "error"
+    assert not any(path.endswith("/ssh") for _, path in server.calls)
+    with pytest.raises(StorageConnectionError):
+        sync_client(ConnectServer((200, _conn("error")))).connect_storage("pv-1", "ws", wait=False)
+
+
+def test_connect_storage_times_out(slept):
+    server = ConnectServer((200, _conn("preparing")))
+    with pytest.raises(WaitTimeoutError, match="not ready for SSH access within 0s .last phase: preparing") as err:
+        sync_client(server).connect_storage("pv-1", "ws", timeout=0)
+    assert isinstance(err.value, TimeoutError) and server.calls == [("POST", "/storages/pv-1/connect")]
+
+
+def test_connect_storage_keeps_waiting_through_unknown_phases(slept):
+    server = ConnectServer((200, _conn("unlocking")), (200, _conn("ready", podName="acc-0")))
+    assert sync_client(server).connect_storage("pv-1", "ws").ready
+
+
+def test_get_storage_connection_and_older_servers():
+    rec = Recorder((200, _conn("preparing", podName=None)))
+    conn = sync_client(rec).get_storage_connection("pv-1", "ws")
+    assert rec.last.method == "GET" and rec.last.url.path == "/v1/sdk/storages/pv-1/connect"
+    assert dict(rec.last.url.params) == {"workspace": "ws"} and conn.pod_name is None and conn.ssh is None
+    for call in (lambda c: c.get_storage_connection("pv-1", "ws"), lambda c: c.connect_storage("pv-1", "ws")):
+        with pytest.raises(NotFoundError, match="does not support storage SSH access"):
+            call(sync_client(Recorder((404, {"detail": "Not Found"}))))
+    with pytest.raises(NotFoundError) as err:
+        sync_client(Recorder((404, {"detail": {"title": "Storage Not Found", "message": "x"}}))) \
+            .connect_storage("pv-9", "ws")
+    assert err.value.title == "Storage Not Found"
+
+
+def test_async_connect_storage(slept):
+    from meshive import StorageConnectionError
+
+    server = ConnectServer((200, _conn("preparing")), (200, _conn("ready", podName="acc-0")))
+    failing = ConnectServer((200, _conn("preparing")), (200, _conn("error")))
+
+    async def run():
+        async with async_client(server) as c:
+            conn = await c.connect_storage("pv-1", "ws", interval=1)
+            status = await c.get_storage_connection("pv-1", "ws")
+        async with async_client(failing) as c:
+            with pytest.raises(StorageConnectionError):
+                await c.connect_storage("pv-1", "ws")
+        async with async_client(ConnectServer((200, _conn("preparing")))) as c:
+            with pytest.raises(WaitTimeoutError):
+                await c.connect_storage("pv-1", "ws", timeout=0)
+        return conn, status
+
+    conn, status = asyncio.run(run())
+    assert conn.ssh.password == "pw-123" and status.ready and slept == [1, 3]
+    assert server.calls[:3] == [("POST", "/storages/pv-1/connect"), ("GET", "/storages/pv-1/connect"),
+                                ("POST", "/pods/acc-0/ssh")]
+
+
+# --- 1.2.0: model sets ---------------------------------------------------------------------------------------
+
+MODEL_SETS = {"templateId": 457, "selectable": True, "modelSets": [{
+    "slug": "sdxl-basics", "name": "SDXL basics", "description": "SDXL with a VAE", "family": "sdxl",
+    "modality": "image", "task": "text-to-image", "totalSizeBytes": 7_000_000_000, "minVramGb": 12,
+    "minVramEstimated": True, "bestResolution": "1024x1024",
+    "licenses": [{"license": "openrail++", "licenseUrl": "https://example.com/l"}], "licenseUnknownCount": 1,
+    "workflows": [{"slug": "t2i", "name": "Text to image", "task": "text-to-image"}],
+    "items": [{"entrySlug": "sdxl-base", "name": "sd_xl_base_1.0.safetensors", "category": "checkpoints",
+               "sizeBytes": 6_900_000_000, "defaultRole": "checkpoint", "license": "openrail++",
+               "licenseUrl": "https://example.com/l", "alreadyInWorkspace": True},
+              {"entrySlug": "sdxl-vae", "name": "sdxl_vae.safetensors", "category": "vae", "sizeBytes": None}]}]}
+
+
+def test_list_model_sets_parses():
+    from meshive import ModelSet, ModelSetItem, ModelSetList
+
+    rec = Recorder((200, MODEL_SETS))
+    sets = sync_client(rec).list_model_sets("ws", 457)
+    assert rec.last.method == "GET" and rec.last.url.path == "/v1/sdk/model-sets"
+    assert dict(rec.last.url.params) == {"workspace": "ws", "templateId": "457"}
+    assert isinstance(sets, ModelSetList) and sets.selectable and sets.reason is None and len(sets) == 1
+    s, = sets
+    assert isinstance(s, ModelSet) and (s.slug, s.name, s.task, s.total_size_bytes) == \
+        ("sdxl-basics", "SDXL basics", "text-to-image", 7_000_000_000)
+    assert (s.min_vram_gb, s.min_vram_estimated, s.best_resolution, s.license_unknown_count) == (12.0, True, "1024x1024", 1)
+    assert s.licenses[0].license == "openrail++" and s.workflows[0].slug == "t2i"
+    base, vae = s.items
+    assert isinstance(base, ModelSetItem) and base.already_in_workspace is True and base.size_bytes == 6_900_000_000
+    assert vae.size_bytes is None and vae.already_in_workspace is None and vae.license is None
+    sync_client(rec).list_model_sets("ws", "457")
+    assert rec.last.url.params["templateId"] == "457"
+    for bad in (None, "abc", -1, True):
+        with pytest.raises(ValueError):
+            sync_client(rec).list_model_sets("ws", bad)
+
+
+def test_list_model_sets_not_selectable_and_older_servers():
+    rec = Recorder((200, {"templateId": 12, "selectable": False, "reason": "This template adds its own model set.",
+                          "modelSets": []}))
+    sets = sync_client(rec).list_model_sets("ws", 12)
+    assert not sets.selectable and sets.reason == "This template adds its own model set." and list(sets) == []
+    with pytest.raises(NotFoundError, match="does not support model sets"):
+        sync_client(Recorder((404, {"detail": "Not Found"}))).list_model_sets("ws", 12)
+
+
+MODEL_SET_ESTIMATE = {**ESTIMATE, "modelSet": {"slug": "sdxl-basics", "name": "SDXL basics", "file_count": 2,
+                                               "total_size_bytes": 7_000_000_000, "min_vram_gb": 12,
+                                               "min_vram_estimated": True}}
+
+
+def test_estimate_pod_with_a_model_set():
+    rec = Recorder((200, MODEL_SET_ESTIMATE))
+    est = sync_client(rec).estimate_pod("p", 457, workspace="ws", gpu_model="RTX 4090", model_set=" sdxl-basics ")
+    assert rec.body()["modelSet"] == "sdxl-basics" and est.model_set["file_count"] == 2
+    assert rec.last.extensions["timeout"]["read"] < 900          # only the create waits long
+    est = sync_client(Recorder((200, ESTIMATE))).estimate_pod("p", 457, workspace="ws", model_set=" ")
+    assert est.model_set is None
+    with pytest.raises(ValueError, match="model_set"):
+        sync_client(rec).estimate_pod("p", 457, workspace="ws", model_set=3)
+
+
+def test_create_pod_with_a_model_set_waits_long():
+    rec = Recorder((202, {"name": "p", "workspace": "ws", "transactionId": 5, "estimate": MODEL_SET_ESTIMATE}))
+    created = sync_client(rec).create_pod("p", 457, workspace="ws", model_set="sdxl-basics")
+    assert rec.body()["modelSet"] == "sdxl-basics" and created.estimate.model_set["slug"] == "sdxl-basics"
+    assert rec.last.extensions["timeout"] == {"connect": 30.0, "read": 900.0, "write": 30.0, "pool": 30.0}
+    sync_client(rec, timeout=1200.0).create_pod("p", 457, workspace="ws", model_set="sdxl-basics")
+    assert rec.last.extensions["timeout"]["read"] == 1200.0     # a longer client timeout is kept
+    sync_client(rec).create_pod("p", 457, workspace="ws")
+    assert "modelSet" not in rec.body() and rec.last.extensions["timeout"]["read"] < 900
+
+
+def test_create_pod_with_a_model_set_is_not_resent_after_a_timeout(slept):
+    seen = []
+
+    def timeout(request):
+        seen.append(request.headers["Idempotency-Key"])
+        raise httpx.ReadTimeout("no answer", request=request)
+
+    with pytest.raises(httpx.ReadTimeout) as err:
+        sync_client(timeout).create_pod("p", 457, workspace="ws", model_set="sdxl-basics")
+    assert len(seen) == 1 and slept == []
+    assert err.value.idempotency_key == seen[0] and err.value.operation_path == "/pods"
+    seen.clear()
+    with pytest.raises(httpx.ReadTimeout):
+        sync_client(timeout).create_pod("p", 457, workspace="ws")       # without a model set: retried as before
+    assert len(seen) == 3 and len(set(seen)) == 1
+
+
+@pytest.mark.parametrize("first, resent", [
+    ((504, {"detail": "Gateway Timeout"}), False),       # the first request may still be running
+    ((502, {"detail": "Bad Gateway"}), False),
+    ((500, {"detail": "Internal Server Error"}), False),
+    ((503, {"detail": {"title": "Scheduling Busy", "message": "busy"}}), True),   # refused before it started
+    ((429, {"detail": {"title": "Too Many Requests", "message": "slow down"}}), True),
+])
+def test_create_pod_with_a_model_set_is_resent_only_when_it_never_started(slept, first, resent):
+    rec = Recorder(first, (202, {"name": "p", "workspace": "ws", "transactionId": 5, "estimate": ESTIMATE}))
+    c = sync_client(rec)
+    if resent:
+        assert c.create_pod("p", 457, workspace="ws", model_set="sdxl-basics").transaction_id == 5
+        assert len(rec.requests) == 2
+        assert rec.requests[0].headers["Idempotency-Key"] == rec.requests[1].headers["Idempotency-Key"]
+    else:
+        with pytest.raises(MeshiveAPIError):
+            c.create_pod("p", 457, workspace="ws", model_set="sdxl-basics")
+        assert len(rec.requests) == 1
+
+
+def test_create_pod_with_a_model_set_is_resent_when_the_connection_failed(slept):
+    attempts = []
+
+    def flaky(request):
+        attempts.append(request)
+        if len(attempts) == 1:
+            raise httpx.ConnectError("refused", request=request)
+        return httpx.Response(202, json={"name": "p", "workspace": "ws", "transactionId": 6, "estimate": ESTIMATE})
+
+    assert sync_client(flaky).create_pod("p", 457, workspace="ws", model_set="s").transaction_id == 6
+    assert len(attempts) == 2 and slept == [0.5]
+
+
+def test_model_set_errors_come_back_as_they_are():
+    rec = Recorder((400, {"detail": {"title": "Model Set Unavailable", "message": "1 file could not be fetched.",
+                                     "modelSet": "sdxl-basics",
+                                     "failed": [{"slug": "sdxl-vae", "name": "sdxl_vae", "error": "403 from source"}]}}))
+    with pytest.raises(MeshiveAPIError) as err:
+        sync_client(rec).create_pod("p", 457, workspace="ws", model_set="sdxl-basics")
+    assert err.value.title == "Model Set Unavailable" and err.value.raw["detail"]["failed"][0]["slug"] == "sdxl-vae"
+    rec = Recorder((409, {"detail": {"title": "Operation Outcome Unknown",
+                                     "message": "A request with this key is still running."}}))
+    with pytest.raises(ConflictError) as err:
+        sync_client(rec).create_pod("p", 457, workspace="ws", model_set="sdxl-basics", idempotency_key="k-1")
+    assert err.value.title == "Operation Outcome Unknown" and len(rec.requests) == 1
+
+
+def test_async_model_sets(slept):
+    sets = Recorder((200, MODEL_SETS))
+    pod = Recorder((200, MODEL_SET_ESTIMATE),
+                   (202, {"name": "p", "workspace": "ws", "transactionId": 5, "estimate": MODEL_SET_ESTIMATE}))
+    seen = []
+
+    def timeout(request):
+        seen.append(request)
+        raise httpx.ReadTimeout("no answer", request=request)
+
+    async def run():
+        async with async_client(sets) as c:
+            listed = await c.list_model_sets("ws", 457)
+        async with async_client(pod) as c:
+            est = await c.estimate_pod("p", 457, workspace="ws", model_set="sdxl-basics")
+            await c.create_pod("p", 457, workspace="ws", model_set="sdxl-basics")
+        async with async_client(timeout) as c:
+            with pytest.raises(httpx.ReadTimeout):
+                await c.create_pod("p", 457, workspace="ws", model_set="sdxl-basics")
+        return listed, est
+
+    listed, est = asyncio.run(run())
+    assert listed.model_sets[0].slug == "sdxl-basics" and est.model_set["name"] == "SDXL basics"
+    assert pod.last.extensions["timeout"]["read"] == 900.0 and len(seen) == 1
+
+
+# --- 1.2.0: pod edit -----------------------------------------------------------------------------------------
+
+POD_UPDATE_ESTIMATE = {"podName": "p-0", "name": "agent-pod", "changes": ["GPU: 1x RTX 3060 -> 1x RTX 4090",
+                                                                          "Environment: adds HF_HOME"],
+                       "restarts": True, "pricePerHourUsd": "0.31", "currentPricePerHourUsd": "0.068",
+                       "breakdown": {"gpu": "0.31"}, "resources": {"gpu_model": "RTX 4090"}, "volumes": [],
+                       "note": "The running pod restarts."}
+
+
+def test_update_pod_sends_every_change_in_the_servers_shape():
+    from meshive import PodUpdated
+
+    rec = Recorder((202, {"podName": "p-0", "workspace": "ws", "accepted": True, "transactionId": 900,
+                          "renamedOnly": False, "estimate": POD_UPDATE_ESTIMATE}))
+    updated = sync_client(rec).update_pod(
+        "p-0", "ws", name=" agent-pod ", template_id=458, rental_type="Spot", gpu_model=" RTX 4090 ", gpu_vram_gb=24,
+        gpu_count=2, vcpu=16, ram_gb=64, cpu_line="amd-epyc-4-ddr5", env={"HF_HOME": "/data/hf", "TOKEN": "x"},
+        secret_keys=["TOKEN"], remove_env="OLD", ports=[9000, {"port": 7000, "name": "api", "external": False}],
+        template_ports=[{"port": 8080, "new_port": 8443}], remove_ports=[6006], command="",
+        volumes=[("pv-net", "/data")], local_volumes=[{"name": "scratch", "mount_path": "/scratch", "size_gb": 50}],
+        detach_storages=["pv-old"], allow_node_migration=True, allow_data_loss=False,
+        drop_watched_folders="/workspace/out", max_price_per_hour=0.5, idempotency_key="edit-0001")
+    req = rec.last
+    assert req.method == "PATCH" and req.url.path == "/v1/sdk/pods/p-0" and dict(req.url.params) == {"workspace": "ws"}
+    assert req.headers["Idempotency-Key"] == "edit-0001"
+    assert rec.body() == {
+        "name": "agent-pod", "templateId": 458, "rentalType": "spot", "gpuModel": "RTX 4090", "gpuVramGb": 24,
+        "gpuCount": 2, "vcpu": 16, "ramGb": 64, "cpuLine": "amd-epyc-4-ddr5",
+        "env": {"HF_HOME": "/data/hf", "TOKEN": "x"}, "secretKeys": ["TOKEN"], "removeEnv": ["OLD"],
+        "ports": [{"port": 9000, "external": True}, {"port": 7000, "external": False, "name": "api"}],
+        "templatePorts": [{"port": 8080, "newPort": 8443}], "removePorts": [6006], "command": "",
+        "volumes": [{"storage": "pv-net", "mountPath": "/data"}],
+        "localVolumes": [{"name": "scratch", "mountPath": "/scratch", "sizeGb": 50}], "detachStorages": ["pv-old"],
+        "allowNodeMigration": True, "allowDataLoss": False, "dropWatchedFolders": ["/workspace/out"],
+        "maxPricePerHourUsd": "0.5",
+    }
+    assert isinstance(updated, PodUpdated) and updated.transaction_id == 900 and updated.renamed_only is False
+    assert updated.estimate.changes[0].startswith("GPU") and updated.estimate.restarts is True
+
+
+@pytest.mark.parametrize("kwargs, body", [
+    (dict(name="renamed"), {"name": "renamed"}),
+    (dict(command=""), {"command": ""}),                              # "" = back to the template's command
+    (dict(command="sleep infinity"), {"command": "sleep infinity"}),
+    (dict(env={"A": 1}), {"env": {"A": "1"}}),
+    (dict(remove_ports=8888), {"removePorts": [8888]}),
+    (dict(detach_storages="pv-a", max_price_per_hour="0.2"), {"detachStorages": ["pv-a"], "maxPricePerHourUsd": "0.2"}),
+    (dict(gpu_count=3, env={}, ports=[], volumes=None, remove_env=[]), {"gpuCount": 3}),   # empty means nothing
+])
+def test_update_pod_sends_only_what_is_given(kwargs, body):
+    rec = Recorder((202, {"podName": "p-0", "workspace": "ws", "accepted": True, "transactionId": None,
+                          "renamedOnly": True, "estimate": {}}))
+    updated = sync_client(rec).update_pod("p-0", "ws", **kwargs)
+    assert rec.body() == body
+    assert updated.renamed_only is True and updated.transaction_id is None
+
+
+def test_estimate_pod_update():
+    from meshive import PodUpdateEstimate
+
+    rec = Recorder((200, POD_UPDATE_ESTIMATE))
+    est = sync_client(rec).estimate_pod_update("p-0", "ws", gpu_model="RTX 4090", env={"HF_HOME": "/data/hf"})
+    assert rec.last.method == "POST" and rec.last.url.path == "/v1/sdk/pods/p-0/estimate"
+    assert rec.body() == {"gpuModel": "RTX 4090", "env": {"HF_HOME": "/data/hf"}}
+    assert isinstance(est, PodUpdateEstimate) and est.pod_name == "p-0" and est.name == "agent-pod"
+    assert est.price_per_hour == "0.31" and est.current_price_per_hour == "0.068" and est.restarts is True
+    assert len(est.changes) == 2 and est.breakdown == {"gpu": "0.31"} and est.note == "The running pod restarts."
+    bare = PodUpdateEstimate.from_dict({"podName": "p-0"})          # an older or partial answer
+    assert bare.restarts is None and bare.current_price_per_hour is None and bare.changes == []
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(), dict(allow_node_migration=True, allow_data_loss=True), dict(drop_watched_folders=["/x"]),
+    dict(max_price_per_hour=1), dict(name="p", allow_data_loss="false"), dict(name="p", allow_node_migration=1),
+    dict(name=" "), dict(gpu_model=""), dict(cpu_line=" "), dict(template_id=True), dict(template_id=-1),
+    dict(gpu_count=0), dict(vcpu="8"), dict(rental_type="hourly"), dict(env={"A": "1"}, secret_keys=["B"]),
+    dict(secret_keys=["A"]), dict(remove_env=[""]), dict(remove_ports=[70000]), dict(remove_ports=["80"]),
+    dict(ports=[True]), dict(template_ports=[8080]), dict(volumes=[("pv", "data")]), dict(command=5),
+    dict(local_volumes=[{"name": "s", "mount_path": "/s"}]), dict(detach_storages=[None]),
+    dict(name="p", max_price_per_hour="free"),
+])
+def test_pod_update_shape_errors(kwargs):
+    rec = Recorder((202, {}))
+    c = sync_client(rec)
+    with pytest.raises(ValueError):
+        c.update_pod("p-0", "ws", **kwargs)
+    with pytest.raises(ValueError):
+        c.estimate_pod_update("p-0", "ws", **kwargs)
+    assert rec.requests == []
+
+
+@pytest.mark.parametrize("status, detail, exc", [
+    (409, {"title": "Node Migration Required", "message": "The pod's machine can't fit this change."}, ConflictError),
+    (409, {"title": "Data Loss Consent Required", "message": "consent required"}, ConflictError),
+    (409, {"title": "Resource values need confirmation", "message": "pass ramGb"}, ConflictError),
+    (400, {"title": "Watched folders would be removed", "message": "…", "code": "harvest_roots_orphaned",
+           "paths": ["/workspace/out"]}, MeshiveAPIError),
+    (400, {"title": "Nothing To Change", "message": "The pod already has these settings."}, MeshiveAPIError),
+    (402, {"title": "Insufficient Credit", "message": "top up"}, InsufficientCreditError),
+])
+def test_pod_update_refusals_come_back_as_they_are(status, detail, exc):
+    rec = Recorder((status, {"detail": detail}))
+    with pytest.raises(exc) as err:
+        sync_client(rec).update_pod("p-0", "ws", gpu_model="RTX 4090")
+    assert err.value.title == detail["title"] and err.value.raw["detail"] == detail and len(rec.requests) == 1
+
+
+def test_pod_update_on_older_servers():
+    with pytest.raises(NotFoundError, match="does not support pod editing"):
+        sync_client(Recorder((405, {"detail": "Method Not Allowed"}))).update_pod("p-0", "ws", name="x")
+    with pytest.raises(NotFoundError, match="does not support pod editing"):
+        sync_client(Recorder((404, {"detail": "Not Found"}))).estimate_pod_update("p-0", "ws", name="x")
+    with pytest.raises(NotFoundError) as err:      # a missing pod keeps the server's titled 404
+        sync_client(Recorder((404, {"detail": {"title": "Pod Not Found", "message": "x"}}))).update_pod(
+            "p-9", "ws", name="x")
+    assert err.value.title == "Pod Not Found"
+
+
+def test_async_pod_and_storage_edit():
+    pod = Recorder((200, POD_UPDATE_ESTIMATE),
+                   (202, {"podName": "p-0", "workspace": "ws", "accepted": True, "transactionId": 900,
+                          "estimate": POD_UPDATE_ESTIMATE}))
+    storage = Recorder((200, STORAGE_UPDATE_ESTIMATE),
+                       (202, {"pvName": "pv-1", "workspace": "ws", "transactionId": 77, "estimate": STORAGE_UPDATE_ESTIMATE}))
+
+    async def run():
+        async with async_client(pod) as c:
+            est = await c.estimate_pod_update("p-0", "ws", gpu_model="RTX 4090")
+            updated = await c.update_pod("p-0", "ws", gpu_model="RTX 4090", allow_node_migration=True,
+                                         idempotency_key="edit-0002")
+        async with async_client(storage) as c:
+            s_est = await c.estimate_storage_update("pv-1", "ws", size_gb=200)
+            s_upd = await c.update_storage("pv-1", "ws", size_gb=200)
+        with pytest.raises(ValueError):
+            await async_client(pod).update_pod("p-0", "ws")
+        return est, updated, s_est, s_upd
+
+    est, updated, s_est, s_upd = asyncio.run(run())
+    assert est.restarts and updated.transaction_id == 900
+    assert pod.requests[1].method == "PATCH" and pod.body(1) == {"gpuModel": "RTX 4090", "allowNodeMigration": True}
+    assert pod.requests[1].headers["Idempotency-Key"] == "edit-0002"
+    assert s_est.size_gb == 200 and s_upd.transaction_id == 77 and storage.requests[1].method == "PATCH"

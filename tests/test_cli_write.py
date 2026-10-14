@@ -8,7 +8,7 @@ import pytest
 
 
 cli = importlib.import_module("meshive.cli.main")  # cli.__init__ exposes the main function, which shadows the submodule
-from meshive import Meshive
+from meshive import Meshive, WaitTimeoutError
 from meshive.models import (Pod, Logs, PodCreated, PodEstimate, ResourceAction, Serving, StorageCreated, StorageEstimate,
                             TaskEstimate, TaskSubmitted, ModelDetection, ServingModel, AssetImported, WatchedFolders, SshAccess,
                             Transaction)
@@ -573,7 +573,7 @@ def test_pod_create_wait_passes_the_transaction_and_reports_a_failed_creation(ca
     assert _last("get_transaction")[1] == (99, "ws")
     assert "(not created)" in captured.out and "99" in captured.out
     assert "failed to start and was cleaned up: creation failed at step image_pull: manifest unknown:" in captured.err
-    assert "\x1b" not in captured.err and "meshive transaction 99 --workspace ws" in captured.err   # server text is cleaned
+    assert "\x1b" not in captured.err and "meshive transaction ws 99" in captured.err   # server text is cleaned
     assert cli.main(argv + ["-o", "name"]) == 1
     assert capsys.readouterr().out.strip() == "99"
 
@@ -725,3 +725,364 @@ def test_storage_create_bad_usage_warning_is_usage_error(capsys, value):
 def test_storage_create_small_size_is_left_to_the_server(capsys):
     assert cli.main(["storage-create", "ws", "vol", "--size", "5", "--estimate"]) == 0
     assert _last("estimate_storage")[1] == ("vol", 5)
+
+
+# --- 1.2.0: pod and storage edit, storage connect, model sets ----------------------------------------------
+
+from meshive.models import (ModelSetList, PodUpdated, PodUpdateEstimate, StorageConnection,  # noqa: E402
+                            StorageUpdated, StorageUpdateEstimate)
+
+POD_UPDATE_ESTIMATE = {"podName": "p-0", "name": "agent-pod", "restarts": True,
+                       "changes": ["GPU: 1x RTX 3060 -> 1x RTX 4090", "Environment: adds \x1b[31mHF_HOME"],
+                       "pricePerHourUsd": "0.31", "currentPricePerHourUsd": "0.068423", "breakdown": {"gpu": "0.31"},
+                       "resources": {}, "volumes": [{"storage": "pv-a", "mount_path": "/data"}], "note": "Restarts."}
+STORAGE_UPDATE_ESTIMATE = {"pvName": "pv-1", "name": "data", "sizeGb": 200, "currentSizeGb": 100,
+                           "pricePerHourUsd": "0.0194", "currentPricePerHourUsd": "0.0097", "usageWarning": True,
+                           "usageWarningThreshold": 0.8, "note": "Billed at the new size."}
+MODEL_SETS = {"templateId": 457, "selectable": True, "modelSets": [
+    {"slug": "sdxl-basics", "name": "SDXL basics", "task": "text-to-image", "totalSizeBytes": 7 * 1024 ** 3,
+     "minVramGb": 12, "minVramEstimated": True,
+     "licenses": [{"license": "openrail++"}, {"license": "openrail++"}, {"license": "mit"}], "licenseUnknownCount": 1,
+     "items": [{"entrySlug": "a", "name": "a"}, {"entrySlug": "b", "name": "b"}]},
+    {"slug": "flux-dev", "name": "FLUX dev", "task": "text-to-image", "totalSizeBytes": None, "minVramGb": None,
+     "licenses": [], "items": []}]}
+
+
+def _fake(name, value):
+    """A FakeClient method that records its call and returns value (or raises it, when it is an exception)."""
+    def method(self, *a, **kw):
+        self.calls.append((name, a, kw))
+        if isinstance(value, BaseException):
+            raise value
+        return value() if callable(value) else value
+    return method
+
+
+@pytest.fixture
+def edit_client(monkeypatch):
+    monkeypatch.setattr(FakeClient, "estimate_pod_update", _fake(
+        "estimate_pod_update", lambda: PodUpdateEstimate.from_dict(copy.deepcopy(POD_UPDATE_ESTIMATE))), raising=False)
+    monkeypatch.setattr(FakeClient, "update_pod", _fake("update_pod", lambda: PodUpdated.from_dict(
+        {"podName": "p-0", "workspace": "ws", "accepted": True, "transactionId": 900, "renamedOnly": False,
+         "estimate": POD_UPDATE_ESTIMATE})), raising=False)
+    monkeypatch.setattr(FakeClient, "estimate_storage_update", _fake(
+        "estimate_storage_update", lambda: StorageUpdateEstimate.from_dict(dict(STORAGE_UPDATE_ESTIMATE))),
+        raising=False)
+    monkeypatch.setattr(FakeClient, "update_storage", _fake("update_storage", lambda: StorageUpdated.from_dict(
+        {"pvName": "pv-1", "workspace": "ws", "accepted": True, "transactionId": 77,
+         "estimate": STORAGE_UPDATE_ESTIMATE})), raising=False)
+    monkeypatch.setattr(FakeClient, "list_model_sets", _fake(
+        "list_model_sets", lambda: ModelSetList.from_dict(copy.deepcopy(MODEL_SETS))), raising=False)
+
+
+def _connection(phase="ready", encrypted=True, ssh=True, **extra):
+    conn = StorageConnection.from_dict({"pvName": "pv-1", "workspace": "ws", "phase": phase, "encrypted": encrypted,
+                                        "podName": "pv-1-access-0" if phase == "ready" else None, **extra})
+    if ssh:
+        conn.ssh = SshAccess.from_dict({"password": "pw-123", "sshUrl": "ssh -p 2222 gateway@m.example",
+                                        "expiredAt": 4_000_000_000})
+    return conn
+
+
+# storage-update
+
+def test_storage_update_needs_something_to_change(capsys, edit_client):
+    assert cli.main(["storage-update", "ws", "pv-1", "--yes"]) == 2
+    assert "nothing to change" in capsys.readouterr().err
+    assert FakeClient.instances[-1].calls == []
+
+
+def test_storage_update_estimate(capsys, edit_client):
+    assert cli.main(["storage-update", "ws", "pv-1", "--size", "200", "--estimate"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("estimate:") and "$0.019/hr (now $0.010/hr)" in out
+    assert "200 GiB (now 100 GiB)" in out and "on, above 80%" in out and "data (pv-1)" in out
+    assert _last("estimate_storage_update")[1:] == (("pv-1", "ws"), {"size_gb": 200})
+    assert all(c[0] != "update_storage" for c in FakeClient.instances[-1].calls)
+    assert cli.main(["storage-update", "ws", "pv-1", "--size", "200", "--estimate", "-o", "name"]) == 0
+    assert capsys.readouterr().out == "0.019\n"
+
+
+def test_storage_update_confirms_and_sends_only_the_flags_given(capsys, edit_client, non_tty):
+    assert cli.main(["storage-update", "ws", "pv-1", "--size", "200"]) == 2
+    assert "--yes" in capsys.readouterr().err
+    assert all(c[0] != "update_storage" for c in FakeClient.instances[-1].calls)
+    assert cli.main(["storage-update", "ws", "pv-1", "--size", "200", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "accepted:" in out and "77" in out
+    assert _last("update_storage")[1:] == (("pv-1", "ws"), {"size_gb": 200})
+    assert cli.main(["storage-update", "ws", "pv-1", "--name", "archive", "--yes", "-o", "name"]) == 0
+    assert capsys.readouterr().out == "pv-1\n" and _last("update_storage")[2] == {"name": "archive"}
+
+
+@pytest.mark.parametrize("flags, expected", [
+    (["--usage-warning"], {"usage_warning": True}),
+    (["--usage-warning", "80"], {"usage_warning": True, "usage_warning_threshold": 0.8}),
+    (["--no-usage-warning"], {"usage_warning": False}),
+    (["--name", "x", "--size", "20", "--no-usage-warning"], {"name": "x", "size_gb": 20, "usage_warning": False}),
+])
+def test_storage_update_usage_warning_flags(capsys, edit_client, flags, expected):
+    assert cli.main(["storage-update", "ws", "pv-1", *flags, "--yes", "-o", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["transactionId"] == 77
+    assert _last("estimate_storage_update")[2] == expected and _last("update_storage")[2] == expected
+
+
+def test_storage_update_flag_errors(capsys, edit_client):
+    with pytest.raises(SystemExit) as exit_:
+        cli.main(["storage-update", "ws", "pv-1", "--usage-warning", "--no-usage-warning"])
+    assert exit_.value.code == 2
+    with pytest.raises(SystemExit):
+        cli.main(["storage-update", "pv-1", "--size", "20"])              # both the workspace and the storage
+    capsys.readouterr()
+    assert cli.main(["storage-update", "ws", "pv-1", "--usage-warning=150", "--yes"]) == 2
+    assert "whole percentage" in capsys.readouterr().err
+
+
+# storage-connect
+
+def test_storage_connect_prints_the_ssh_command(capsys, monkeypatch):
+    monkeypatch.setattr(FakeClient, "connect_storage", _fake("connect_storage", lambda: _connection(
+        remainingSeconds=1790, autoLockMinutes=30)), raising=False)
+    assert cli.main(["storage-connect", "ws", "pv-1"]) == 0
+    out = capsys.readouterr().out
+    assert "ssh -p 2222 gateway@m.example" in out and "pw-123" in out and "pv-1-access-0" in out
+    assert "locks again automatically in about 30 min" in out
+    assert _last("connect_storage")[1:] == (("pv-1", "ws"), {"wait": True, "timeout": 300.0})
+    assert cli.main(["storage-connect", "ws", "pv-1", "-o", "name"]) == 0
+    assert capsys.readouterr().out == "ssh -p 2222 gateway@m.example\n"
+    assert cli.main(["storage-connect", "ws", "pv-1", "-o", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["phase"] == "ready" and payload["ssh"]["password"] == "pw-123"
+
+
+def test_storage_connect_plain_storage_has_no_lock_note(capsys, monkeypatch):
+    monkeypatch.setattr(FakeClient, "connect_storage", _fake("connect_storage", lambda: _connection(encrypted=False)),
+                        raising=False)
+    assert cli.main(["storage-connect", "ws", "pv-1"]) == 0
+    assert "locks again" not in capsys.readouterr().out
+
+
+def test_storage_connect_without_waiting(capsys, monkeypatch):
+    monkeypatch.setattr(FakeClient, "connect_storage", _fake("connect_storage", lambda: _connection(
+        "preparing", ssh=False, autoLockMinutes=30)), raising=False)
+    assert cli.main(["storage-connect", "ws", "pv-1", "--no-wait", "--wait-timeout", "60"]) == 0
+    out = capsys.readouterr().out
+    assert "preparing" in out and "Not ready yet" in out and "storage-connect ws pv-1" in out
+    assert "after 30 min" in out and "password" not in out
+    assert _last("connect_storage")[2] == {"wait": False, "timeout": 60.0}
+    assert cli.main(["storage-connect", "ws", "pv-1", "--no-wait", "-o", "name"]) == 0
+    assert capsys.readouterr().out == "preparing\n"
+
+
+@pytest.mark.parametrize("error, message", [
+    (WaitTimeoutError("Storage pv-1 was not ready for SSH access within 300s (last phase: preparing)."), "within 300s"),
+    ("connection-error", "could not be opened for SSH access"),
+])
+def test_storage_connect_failures_exit_1(capsys, monkeypatch, error, message):
+    from meshive.exceptions import StorageConnectionError
+    if error == "connection-error":
+        error = StorageConnectionError("pv-1")
+    monkeypatch.setattr(FakeClient, "connect_storage", _fake("connect_storage", error), raising=False)
+    assert cli.main(["storage-connect", "ws", "pv-1"]) == 1
+    assert message in capsys.readouterr().err
+
+
+# model-sets
+
+def test_model_sets_table(capsys, edit_client):
+    assert cli.main(["model-sets", "ws", "--template", "457"]) == 0
+    out = capsys.readouterr().out
+    assert "sdxl-basics" in out and "SDXL basics" in out and "7.00 GiB" in out and "~12 GB" in out
+    assert "openrail++, mit + 1 unknown" in out and "pod-create --model-set" in out
+    assert _last("list_model_sets")[1] == ("ws", 457)
+    assert cli.main(["model-sets", "ws", "--template", "457", "-o", "name"]) == 0
+    assert capsys.readouterr().out == "sdxl-basics\nflux-dev\n"
+    assert cli.main(["model-sets", "ws", "--template", "457", "-o", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["modelSets"][0]["slug"] == "sdxl-basics"
+
+
+def test_model_sets_not_selectable(capsys, monkeypatch):
+    monkeypatch.setattr(FakeClient, "list_model_sets", _fake("list_model_sets", lambda: ModelSetList.from_dict(
+        {"templateId": 12, "selectable": False, "reason": "This template adds its own model set."})), raising=False)
+    assert cli.main(["model-sets", "ws", "--template", "12"]) == 0
+    assert "doesn't take a model set: This template adds its own model set." in capsys.readouterr().out
+
+
+# pod-create --model-set
+
+def test_pod_create_with_a_model_set(capsys, monkeypatch):
+    payload = {**ESTIMATE, "modelSet": {"slug": "sdxl-basics", "name": "SDXL basics", "file_count": 2,
+                                        "total_size_bytes": 7 * 1024 ** 3, "min_vram_gb": 12,
+                                        "min_vram_estimated": True}}
+    monkeypatch.setattr(FakeClient, "estimate_pod", _fake("estimate_pod", lambda: PodEstimate.from_dict(payload)))
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--model-set", "sdxl-basics", "--yes"]) == 0
+    captured = capsys.readouterr()
+    assert "model set: SDXL basics (sdxl-basics): 2 files, 7.00 GiB, min VRAM ~12 GB" in captured.out
+    assert "can take several minutes" in captured.err
+    assert _last("estimate_pod")[2]["model_set"] == "sdxl-basics" and _last("create_pod")[2]["model_set"] == "sdxl-basics"
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--estimate"]) == 0
+    captured = capsys.readouterr()
+    assert _last("estimate_pod")[2]["model_set"] is None and "can take several minutes" not in captured.err
+
+
+def test_pod_create_model_set_timeout(capsys, monkeypatch):
+    import httpx
+    request = httpx.Request("POST", "https://api.test/v1/sdk/pods")
+    monkeypatch.setattr(FakeClient, "create_pod", _fake("create_pod", httpx.ReadTimeout("no answer", request=request)))
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--model-set", "sdxl-basics", "--yes"]) == 1
+    err = capsys.readouterr().err
+    assert "no answer within 900s" in err and "may still be created" in err and "meshive pods ws" in err
+    # Without a model set a timeout is still the general "could not reach" error.
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--yes"]) == 1
+    assert "could not reach the Meshive API" in capsys.readouterr().err
+
+
+def test_pod_create_model_set_refusals(capsys, monkeypatch):
+    from meshive.exceptions import MeshiveAPIError
+    unavailable = MeshiveAPIError(400, "1 file could not be fetched.", title="Model Set Unavailable", raw={"detail": {
+        "title": "Model Set Unavailable", "modelSet": "sdxl-basics",
+        "failed": [{"slug": "sdxl-vae", "name": "sdxl_vae", "error": "403 from \x1b[31msource"}]}})
+    monkeypatch.setattr(FakeClient, "create_pod", _fake("create_pod", unavailable))
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--model-set", "sdxl-basics", "--yes"]) == 1
+    err = capsys.readouterr().err
+    assert "[400] Model Set Unavailable" in err and "sdxl_vae: 403 from" in err and "\x1b" not in err
+    assert "reused next time" in err
+
+    wrong = MeshiveAPIError(400, "not for this template", title="Model Set Not For Template",
+                            raw={"detail": {"available": ["sdxl-basics", {"slug": "flux-dev"}]}})
+    monkeypatch.setattr(FakeClient, "estimate_pod", _fake("estimate_pod", wrong))
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--model-set", "nope", "--estimate"]) == 1
+    err = capsys.readouterr().err
+    assert "model sets: sdxl-basics, flux-dev" in err and "meshive model-sets ws --template 457" in err
+
+    other = MeshiveAPIError(400, "bad", title="Invalid Pod Settings", raw={})
+    monkeypatch.setattr(FakeClient, "estimate_pod", _fake("estimate_pod", other))
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--estimate"]) == 1
+    assert "[400] Invalid Pod Settings: bad" in capsys.readouterr().err
+
+
+# pod-update
+
+def test_pod_update_needs_something_to_change(capsys, edit_client):
+    for extra in ([], ["--allow-node-migration", "--allow-data-loss", "--max-price", "1",
+                       "--drop-watched-folder", "/x"]):
+        assert cli.main(["pod-update", "ws", "p-0", "--yes", *extra]) == 2
+        assert "nothing to change" in capsys.readouterr().err
+        assert FakeClient.instances[-1].calls == []
+
+
+def test_pod_update_maps_every_flag(capsys, edit_client):
+    argv = ["pod-update", "ws", "p-0", "--name", "agent-pod", "--template", "458", "--rental", "spot",
+            "--gpu", "RTX 4090", "--gpu-count", "2", "--vram", "24", "--vcpu", "16", "--ram", "64",
+            "--cpu-line", "amd-epyc-4-ddr5", "--env", "HF_HOME=/data/hf", "--env", "TOKEN=x", "--secret", "TOKEN",
+            "--remove-env", "OLD", "--port", "9000:api", "--template-port", "8080::8443", "--remove-port", "6006",
+            "--command", "", "--volume", "pv-net:/data", "--local-volume", "scratch:/scratch:50", "--detach", "pv-old",
+            "--allow-node-migration", "--allow-data-loss", "--drop-watched-folder", "/workspace/out",
+            "--max-price", "0.5", "--yes"]
+    assert cli.main(argv) == 0
+    expected = {
+        "name": "agent-pod", "template_id": 458, "rental_type": "spot", "gpu_model": "RTX 4090", "gpu_count": 2,
+        "gpu_vram_gb": 24, "vcpu": 16, "ram_gb": 64, "cpu_line": "amd-epyc-4-ddr5",
+        "env": {"HF_HOME": "/data/hf", "TOKEN": "x"}, "secret_keys": ["TOKEN"], "remove_env": ["OLD"],
+        "ports": [{"port": 9000, "external": True, "name": "api"}], "template_ports": [{"port": 8080, "new_port": 8443}],
+        "remove_ports": [6006], "command": "", "volumes": [("pv-net", "/data")],
+        "local_volumes": [{"name": "scratch", "mount_path": "/scratch", "size_gb": 50}], "detach_storages": ["pv-old"],
+        "max_price_per_hour": "0.5", "allow_node_migration": True, "allow_data_loss": True,
+        "drop_watched_folders": ["/workspace/out"],
+    }
+    assert _last("estimate_pod_update")[1:] == (("p-0", "ws"), expected)
+    assert _last("update_pod")[1:] == (("p-0", "ws"), expected)
+    out = capsys.readouterr().out
+    assert "transaction" in out and "900" in out and "meshive transaction ws 900" in out
+
+
+def test_pod_update_sends_only_the_flags_given(capsys, edit_client):
+    assert cli.main(["pod-update", "ws", "p-0", "--gpu", "RTX 4090", "--yes"]) == 0
+    assert _last("update_pod")[2] == {"gpu_model": "RTX 4090"}
+
+
+def test_pod_update_estimate(capsys, edit_client):
+    assert cli.main(["pod-update", "ws", "p-0", "--gpu", "RTX 4090", "--estimate"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("estimate:") and "$0.310/hr (now $0.068/hr)" in out
+    assert "agent-pod (p-0)" in out and "yes, the running pod restarts" in out
+    assert "  - GPU: 1x RTX 3060 -> 1x RTX 4090" in out and "Environment: adds" in out and "\x1b" not in out
+    assert "pv-a→/data" in out and "gpu=$0.310" in out
+    assert all(c[0] != "update_pod" for c in FakeClient.instances[-1].calls)
+    assert cli.main(["pod-update", "ws", "p-0", "--gpu", "RTX 4090", "--estimate", "-o", "name"]) == 0
+    assert capsys.readouterr().out == "0.310\n"
+    assert cli.main(["pod-update", "ws", "p-0", "--gpu", "RTX 4090", "--estimate", "-o", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["changes"][0].startswith("GPU")
+
+
+def test_pod_update_confirms_first(capsys, edit_client, non_tty, monkeypatch):
+    assert cli.main(["pod-update", "ws", "p-0", "--gpu", "RTX 4090"]) == 2
+    assert "--yes" in capsys.readouterr().err
+    assert all(c[0] != "update_pod" for c in FakeClient.instances[-1].calls)
+    monkeypatch.setattr("sys.stdin", _Tty("y\n"))
+    assert cli.main(["pod-update", "ws", "p-0", "--gpu", "RTX 4090", "-o", "name"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "p-0\n" and "Update pod p-0 (then $0.310/hr)? It restarts" in captured.err
+
+
+def test_pod_update_rename_only_output(capsys, edit_client, monkeypatch):
+    monkeypatch.setattr(FakeClient, "update_pod", _fake("update_pod", lambda: PodUpdated.from_dict(
+        {"podName": "p-0", "workspace": "ws", "accepted": True, "transactionId": None, "renamedOnly": True,
+         "estimate": {}})))
+    assert cli.main(["pod-update", "ws", "p-0", "--name", "new-name", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "Renamed in place" in out and "meshive transaction" not in out
+
+
+def _refusal(status, title, **detail):
+    from meshive.exceptions import ConflictError, MeshiveAPIError
+    cls = ConflictError if status == 409 else MeshiveAPIError
+    return cls(status, f"{title} message", title=title, raw={"detail": {"title": title, **detail}})
+
+
+@pytest.mark.parametrize("step", ["estimate_pod_update", "update_pod"])
+@pytest.mark.parametrize("error, expected", [
+    (_refusal(409, "Node Migration Required"), ["Node Migration Required message", "permanently deletes",
+                                               "re-run with --allow-node-migration"]),
+    (_refusal(409, "Data Loss Consent Required"), ["permanently deletes", "re-run with --allow-data-loss"]),
+    (_refusal(400, "Watched folders would be removed", code="harvest_roots_orphaned",
+              paths=["/workspace/out", "/workspace/my logs"]),
+     ["removes watched folders of the pod: /workspace/out, /workspace/my logs",
+      "--drop-watched-folder /workspace/out --drop-watched-folder '/workspace/my logs'"]),
+    (_refusal(409, "Resource values need confirmation"), ["Re-run with --ram GiB"]),
+])
+def test_pod_update_consent_refusals_say_what_to_rerun_with(capsys, edit_client, monkeypatch, step, error, expected):
+    monkeypatch.setattr(FakeClient, step, _fake(step, error))
+    assert cli.main(["pod-update", "ws", "p-0", "--gpu", "RTX 4090", "--yes", "-o", "json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == "" and all(text in captured.err for text in expected), captured.err
+
+
+def test_pod_update_other_errors_exit_1(capsys, edit_client, monkeypatch):
+    monkeypatch.setattr(FakeClient, "update_pod", _fake("update_pod", _refusal(400, "Pod Type Locked")))
+    assert cli.main(["pod-update", "ws", "p-0", "--gpu", "RTX 4090", "--yes"]) == 1
+    assert "[400] Pod Type Locked: Pod Type Locked message" in capsys.readouterr().err
+
+
+def test_pod_update_flag_errors(capsys, edit_client):
+    assert cli.main(["pod-update", "ws", "p-0", "--env", "NOEQUALS", "--yes"]) == 2
+    assert "KEY=VALUE" in capsys.readouterr().err
+    assert cli.main(["pod-update", "ws", "p-0", "--template-port", "8080:8443", "--yes"]) == 2
+    assert "write 8080::8443" in capsys.readouterr().err
+    for argv in (["--remove-port", "http"], ["--rental", "hourly"]):
+        with pytest.raises(SystemExit) as exit_:
+            cli.main(["pod-update", "ws", "p-0", *argv])
+        assert exit_.value.code == 2
+    assert FakeClient.instances == [] or all(not i.calls for i in FakeClient.instances)
+
+
+def test_new_commands_in_help(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["pod-update", "--help"])
+    out = capsys.readouterr().out
+    assert all(flag in out for flag in ("--allow-node-migration", "--drop-watched-folder", "--remove-env",
+                                        "--remove-port", "--detach", "--template-port", "--estimate"))
+    with pytest.raises(SystemExit):
+        cli.main(["--help"])
+    out = capsys.readouterr().out
+    assert "pod-update" in out and "storage-update" in out and "storage-connect" in out and "--model-set" in out

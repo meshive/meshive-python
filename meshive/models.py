@@ -1556,13 +1556,17 @@ class PodEstimate:
     volumes: list = field(default_factory=list)
     note: str = ""
     raw: dict = field(default_factory=dict, repr=False)
+    # The model set the pod starts with: {"slug", "name", "file_count", "total_size_bytes", "min_vram_gb",
+    # "min_vram_estimated"}. None without one, and from servers that don't report it.
+    model_set: dict | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "PodEstimate":
+        model_set = d.get("modelSet")
         return cls(price_per_hour=str(d.get("pricePerHourUsd", "0")), breakdown=d.get("breakdown") or {},
                    resources=d.get("resources") or {}, availability=d.get("availability") or {},
                    template=d.get("template") or {}, volumes=list(d.get("volumes") or []),
-                   note=d.get("note") or "", raw=d)
+                   note=d.get("note") or "", raw=d, model_set=model_set if isinstance(model_set, dict) else None)
 
 
 @dataclass
@@ -1645,6 +1649,246 @@ class StorageCreated:
     def from_dict(cls, d: dict) -> "StorageCreated":
         return cls(name=d.get("name", ""), workspace=d.get("workspace", ""), transaction_id=d.get("transactionId"),
                    estimate=StorageEstimate.from_dict(d.get("estimate") or {}), pv_name=d.get("pvName"), raw=d)
+
+
+def _optional_bool(value: object) -> bool | None:
+    return None if value is None else bool(value)
+
+
+def _optional_str(value: object) -> str | None:
+    return None if value is None else str(value)
+
+
+@dataclass
+class StorageUpdateEstimate:
+    """POST /v1/sdk/storages/{pv}/estimate response — what a storage would look like and cost after update_storage.
+    Changes nothing. Sizes are GiB."""
+
+    pv_name: str
+    name: str
+    size_gb: int | None
+    current_size_gb: int | None
+    price_per_hour: str                    # USD/h after the change
+    current_price_per_hour: str | None     # USD/h now
+    usage_warning: bool | None = None
+    usage_warning_threshold: float | None = None
+    note: str = ""
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "StorageUpdateEstimate":
+        return cls(pv_name=str(d.get("pvName", "") or ""), name=str(d.get("name", "") or ""),
+                   size_gb=_optional_int(d.get("sizeGb")), current_size_gb=_optional_int(d.get("currentSizeGb")),
+                   price_per_hour=str(d.get("pricePerHourUsd", "0")),
+                   current_price_per_hour=_optional_str(d.get("currentPricePerHourUsd")),
+                   usage_warning=_optional_bool(d.get("usageWarning")),
+                   usage_warning_threshold=_as_optional_float(d.get("usageWarningThreshold")),
+                   note=d.get("note") or "", raw=d)
+
+
+@dataclass
+class StorageUpdated:
+    """PATCH /v1/sdk/storages/{pv} response (202). Growing a storage runs as a transaction; a rename or a usage
+    warning change alone is applied at once, and then transaction_id is None (or the id of an earlier operation)."""
+
+    pv_name: str
+    workspace: str
+    accepted: bool
+    transaction_id: int | str | None
+    estimate: StorageUpdateEstimate
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "StorageUpdated":
+        return cls(pv_name=str(d.get("pvName", "") or ""), workspace=str(d.get("workspace", "") or ""),
+                   accepted=bool(d.get("accepted", True)), transaction_id=d.get("transactionId"),
+                   estimate=StorageUpdateEstimate.from_dict(d.get("estimate") or {}), raw=d)
+
+
+@dataclass
+class StorageConnection:
+    """POST/GET /v1/sdk/storages/{pv}/connect response — SSH and SFTP access to a storage, as the console's Connect.
+
+    The storage is reached through an access pod (`pod_name`). Plain storage has one running all the time; encrypted
+    storage is unlocked and gets one on demand, and it locks again automatically after `auto_lock_minutes`
+    (`remaining_seconds` left when this was read). `phase` is preparing | ready | error. `ssh` is filled by
+    connect_storage once the storage is ready: the one-time command and password (see ssh_access)."""
+
+    pv_name: str
+    workspace: str
+    phase: str
+    encrypted: bool | None = None
+    pod_name: str | None = None
+    transaction_id: int | str | None = None
+    auto_lock_minutes: int | None = None
+    remaining_seconds: int | None = None
+    ssh: SshAccess | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def ready(self) -> bool:
+        return self.phase.lower() == "ready"
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "StorageConnection":
+        return cls(pv_name=str(d.get("pvName", "") or ""), workspace=str(d.get("workspace", "") or ""),
+                   phase=str(d.get("phase", "") or ""), encrypted=_optional_bool(d.get("encrypted")),
+                   pod_name=d.get("podName") or None, transaction_id=d.get("transactionId"),
+                   auto_lock_minutes=_optional_int(d.get("autoLockMinutes")),
+                   remaining_seconds=_optional_int(d.get("remainingSeconds")), raw=d)
+
+
+@dataclass
+class ModelSetItem:
+    """One file of a model set (a model, LoRA, VAE, ...)."""
+
+    entry_slug: str
+    name: str
+    category: str                  # where it goes, such as checkpoints or loras
+    size_bytes: int | None = None
+    default_role: str | None = None
+    license: str | None = None
+    license_url: str | None = None
+    already_in_workspace: bool | None = None   # fetched before; the pod reuses it instead of downloading again
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ModelSetItem":
+        return cls(entry_slug=str(d.get("entrySlug", "") or ""), name=str(d.get("name", "") or ""),
+                   category=str(d.get("category", "") or ""), size_bytes=_optional_int(d.get("sizeBytes")),
+                   default_role=d.get("defaultRole"), license=d.get("license"), license_url=d.get("licenseUrl"),
+                   already_in_workspace=_optional_bool(d.get("alreadyInWorkspace")))
+
+
+@dataclass
+class ModelSetLicense:
+    license: str
+    license_url: str | None = None
+
+
+@dataclass
+class ModelSetWorkflow:
+    """A ready-made workflow that comes with a model set."""
+
+    slug: str
+    name: str
+    task: str | None = None
+
+
+@dataclass
+class ModelSet:
+    """One model set — the console's model-set tile: files that are fetched into the pod when it is created.
+    Pass `slug` to create_pod(model_set=...)."""
+
+    slug: str
+    name: str
+    description: str = ""
+    family: str | None = None
+    modality: str | None = None
+    task: str | None = None
+    total_size_bytes: int | None = None
+    min_vram_gb: float | None = None
+    min_vram_estimated: bool | None = None     # min_vram_gb is an estimate, not a measurement
+    best_resolution: object = None             # as the server sends it
+    licenses: list[ModelSetLicense] = field(default_factory=list)
+    license_unknown_count: int = 0             # files whose license isn't known
+    workflows: list[ModelSetWorkflow] = field(default_factory=list)
+    items: list[ModelSetItem] = field(default_factory=list)
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ModelSet":
+        return cls(
+            slug=str(d.get("slug", "") or ""), name=str(d.get("name", "") or ""),
+            description=str(d.get("description", "") or ""), family=d.get("family"), modality=d.get("modality"),
+            task=d.get("task"), total_size_bytes=_optional_int(d.get("totalSizeBytes")),
+            min_vram_gb=_as_optional_float(d.get("minVramGb")),
+            min_vram_estimated=_optional_bool(d.get("minVramEstimated")), best_resolution=d.get("bestResolution"),
+            licenses=[ModelSetLicense(license=str(x.get("license", "") or ""), license_url=x.get("licenseUrl"))
+                      for x in d.get("licenses") or [] if isinstance(x, dict)],
+            license_unknown_count=_as_int(d.get("licenseUnknownCount")),
+            workflows=[ModelSetWorkflow(slug=str(w.get("slug", "") or ""), name=str(w.get("name", "") or ""),
+                                        task=w.get("task"))
+                       for w in d.get("workflows") or [] if isinstance(w, dict)],
+            items=[ModelSetItem.from_dict(i) for i in d.get("items") or [] if isinstance(i, dict)],
+            raw=d,
+        )
+
+
+@dataclass
+class ModelSetList:
+    """GET /v1/sdk/model-sets response — the model sets a template can start with. Iterate with `for s in sets`.
+
+    `selectable` is False (with `reason`) when the template adds its own set automatically or has no model folders;
+    then no model_set can be passed to create_pod for it."""
+
+    template_id: int | None
+    selectable: bool
+    reason: str | None = None
+    model_sets: list[ModelSet] = field(default_factory=list)
+    raw: dict = field(default_factory=dict, repr=False)
+
+    def __iter__(self):
+        return iter(self.model_sets)
+
+    def __len__(self) -> int:
+        return len(self.model_sets)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ModelSetList":
+        return cls(template_id=_optional_int(d.get("templateId")), selectable=bool(d.get("selectable", False)),
+                   reason=d.get("reason") or None,
+                   model_sets=[ModelSet.from_dict(s) for s in d.get("modelSets") or [] if isinstance(s, dict)],
+                   raw=d)
+
+
+@dataclass
+class PodUpdateEstimate:
+    """POST /v1/sdk/pods/{pod}/estimate response — what update_pod would change and cost. Changes nothing.
+
+    `changes` describes each change in words. `restarts` says whether a running pod restarts to apply them (a rename
+    alone doesn't). breakdown/resources/volumes have the same shape as in PodEstimate."""
+
+    pod_name: str
+    name: str
+    changes: list[str]
+    restarts: bool | None
+    price_per_hour: str                    # USD/h after the change
+    current_price_per_hour: str | None     # USD/h now
+    breakdown: dict = field(default_factory=dict)
+    resources: dict = field(default_factory=dict)
+    volumes: list = field(default_factory=list)
+    note: str = ""
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PodUpdateEstimate":
+        return cls(pod_name=str(d.get("podName", "") or ""), name=str(d.get("name", "") or ""),
+                   changes=[str(c) for c in d.get("changes") or []], restarts=_optional_bool(d.get("restarts")),
+                   price_per_hour=str(d.get("pricePerHourUsd", "0")),
+                   current_price_per_hour=_optional_str(d.get("currentPricePerHourUsd")),
+                   breakdown=d.get("breakdown") or {}, resources=d.get("resources") or {},
+                   volumes=list(d.get("volumes") or []), note=d.get("note") or "", raw=d)
+
+
+@dataclass
+class PodUpdated:
+    """PATCH /v1/sdk/pods/{pod} response (202). Follow the change with get_transaction(transaction_id) (action
+    "update"). A rename alone is applied in place without a restart: renamed_only is True and transaction_id None."""
+
+    pod_name: str
+    workspace: str
+    accepted: bool
+    transaction_id: int | str | None
+    renamed_only: bool | None
+    estimate: PodUpdateEstimate
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PodUpdated":
+        return cls(pod_name=str(d.get("podName", "") or ""), workspace=str(d.get("workspace", "") or ""),
+                   accepted=bool(d.get("accepted", True)), transaction_id=d.get("transactionId"),
+                   renamed_only=_optional_bool(d.get("renamedOnly")),
+                   estimate=PodUpdateEstimate.from_dict(d.get("estimate") or {}), raw=d)
 
 
 @dataclass

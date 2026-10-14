@@ -190,7 +190,7 @@ def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: i
              command: str | None, internet_premium: bool, uptime_premium: bool, cpu_premium: bool,
              region: str | None, max_price_per_hour: Any, input_assets: Any = None, watched_folders: Any = None,
              harvest_destination: Any = None, local_volumes: Any = None, cpu_line: str | None = None,
-             template_ports: Any = None) -> dict[str, Any]:
+             template_ports: Any = None, model_set: str | None = None) -> dict[str, Any]:
     if isinstance(template_id, bool) or not isinstance(template_id, int) or template_id < 0:
         raise ValueError("template_id must be a non-negative integer")
     # How many GPUs one pod may take is the server's rule; only the type is checked here.
@@ -198,6 +198,8 @@ def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: i
         raise ValueError("gpu_count must be a positive integer")
     if cpu_line is not None and not isinstance(cpu_line, str):
         raise ValueError("cpu_line must be a string (a cpu_line from list_cpus)")
+    if model_set is not None and not isinstance(model_set, str):
+        raise ValueError("model_set must be a string (a slug from list_model_sets)")
     if region:
         # The server places pods without a region (as the console does) and ignores the value, so it isn't sent.
         _deprecated("region is ignored by the server; the argument will be removed in meshive 2.0")
@@ -228,7 +230,81 @@ def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: i
         "inputAssets": _pod_input_assets(input_assets) or None,
         "watchedFolders": _watched_folders(watched_folders) or None,
         "harvestDestination": _harvest_destination(harvest_destination),
+        # One model set per pod (list_model_sets → slug). Omitted = none.
+        "modelSet": model_set.strip() if isinstance(model_set, str) and model_set.strip() else None,
     })
+
+
+def _strings(values: str | Iterable[str] | None, name: str) -> list[str] | None:
+    """A list of non-empty strings (a single string counts as one item). None or empty → None (not sent)."""
+    if values is None:
+        return None
+    items = [values] if isinstance(values, str) else list(values)
+    return [_require_str(v, f"{name}[]") for v in items] or None
+
+
+def _flag(value: Any, name: str) -> bool | None:
+    """A consent flag: None (not sent) or an explicit bool, so a string such as "false" can't turn into consent."""
+    if value is None or isinstance(value, bool):
+        return value
+    raise ValueError(f"{name} must be an explicit boolean")
+
+
+# Pod edit fields that are a change. The rest of the body (consents, the price cap) only qualifies a change.
+_POD_UPDATE_CHANGES = ("name", "templateId", "rentalType", "gpuModel", "gpuVramGb", "gpuCount", "vcpu", "ramGb",
+                       "cpuLine", "env", "secretKeys", "removeEnv", "ports", "templatePorts", "removePorts", "command",
+                       "volumes", "localVolumes", "detachStorages")
+
+
+def pod_update_body(*, name: str | None = None, template_id: int | None = None, rental_type: str | None = None,
+                    gpu_model: str | None = None, gpu_vram_gb: int | None = None, gpu_count: int | None = None,
+                    vcpu: int | None = None, ram_gb: int | None = None, cpu_line: str | None = None,
+                    env: Mapping[str, Any] | None = None, secret_keys: Iterable[str] | None = None,
+                    remove_env: str | Iterable[str] | None = None, ports: Any = None, template_ports: Any = None,
+                    remove_ports: Iterable[int] | None = None, command: str | None = None, volumes: Any = None,
+                    local_volumes: Any = None, detach_storages: str | Iterable[str] | None = None,
+                    allow_node_migration: bool | None = None, allow_data_loss: bool | None = None,
+                    drop_watched_folders: str | Iterable[str] | None = None,
+                    max_price_per_hour: Any = None) -> dict[str, Any]:
+    """PATCH /pods/{pod} (and its estimate) body — only what is given is sent, so the rest of the pod stays as it is.
+    command="" is sent (it means "back to the template's command"). Which changes the pod allows is the server's call."""
+    if template_id is not None and (isinstance(template_id, bool) or not isinstance(template_id, int) or template_id < 0):
+        raise ValueError("template_id must be a non-negative integer")
+    if command is not None and not isinstance(command, str):
+        raise ValueError("command must be a string ('' goes back to the template's command)")
+    env_out, secrets = _env(env, secret_keys)
+    removed_ports = None
+    if remove_ports is not None:
+        items = [remove_ports] if isinstance(remove_ports, int) else list(remove_ports)
+        removed_ports = [_port_number(p, "remove_ports[]") for p in items] or None
+    body = _drop_none({
+        "name": None if name is None else _require_str(name, "name"),
+        "templateId": template_id,
+        "rentalType": None if rental_type is None else _rental(rental_type),
+        "gpuModel": None if gpu_model is None else _require_str(gpu_model, "gpu_model"),
+        "gpuVramGb": _optional_int(gpu_vram_gb, "gpu_vram_gb"),
+        "gpuCount": _optional_int(gpu_count, "gpu_count"),
+        "vcpu": _optional_int(vcpu, "vcpu"),
+        "ramGb": _optional_int(ram_gb, "ram_gb"),
+        "cpuLine": None if cpu_line is None else _require_str(cpu_line, "cpu_line"),
+        "env": env_out or None,
+        "secretKeys": secrets or None,
+        "removeEnv": _strings(remove_env, "remove_env"),
+        "ports": _ports(ports) or None,
+        "templatePorts": _template_ports(template_ports) or None,
+        "removePorts": removed_ports,
+        "command": command,
+        "volumes": _volumes(volumes) or None,
+        "localVolumes": _local_volumes(local_volumes) or None,
+        "detachStorages": _strings(detach_storages, "detach_storages"),
+        "allowNodeMigration": _flag(allow_node_migration, "allow_node_migration"),
+        "allowDataLoss": _flag(allow_data_loss, "allow_data_loss"),
+        "dropWatchedFolders": _strings(drop_watched_folders, "drop_watched_folders"),
+        "maxPricePerHourUsd": _price(max_price_per_hour, "max_price_per_hour"),
+    })
+    if not any(key in body for key in _POD_UPDATE_CHANGES):
+        raise ValueError("pass at least one change, such as name, gpu_model, env, ports or volumes")
+    return body
 
 
 def _pod_input_assets(items: Any) -> list[dict[str, Any]]:
@@ -352,6 +428,23 @@ def storage_body(name: str, size_gb: int, *, storage_type: str, disk_type: str, 
         "usageWarning": None if usage_warning is None else bool(usage_warning),
         "usageWarningThreshold": _usage_threshold(usage_warning_threshold, "usage_warning_threshold"),
     })
+
+
+def storage_update_body(*, name: str | None = None, size_gb: int | None = None, usage_warning: bool | None = None,
+                        usage_warning_threshold: Any = None) -> dict[str, Any]:
+    """PATCH /storages/{pv} (and its estimate) body — only what is given is sent; the rest keeps its current value.
+    The minimum size and that storage can only grow are the server's rules."""
+    if size_gb is not None and (isinstance(size_gb, bool) or not isinstance(size_gb, int) or size_gb < 1):
+        raise ValueError("size_gb must be a positive integer (GiB)")
+    body = _drop_none({
+        "name": None if name is None else _require_str(name, "name"),
+        "sizeGb": size_gb,
+        "usageWarning": None if usage_warning is None else bool(usage_warning),
+        "usageWarningThreshold": _usage_threshold(usage_warning_threshold, "usage_warning_threshold"),
+    })
+    if not body:
+        raise ValueError("pass at least one of name, size_gb, usage_warning, usage_warning_threshold")
+    return body
 
 
 # --- Serving ------------------------------------------------------------------

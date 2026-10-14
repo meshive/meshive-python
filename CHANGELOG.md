@@ -12,6 +12,34 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## v1.2.0
+
+Pods and storage can now be changed after they are created, storage can be opened over SSH, and pods can start with
+a model set, all as in the web console. Code written for 1.0 and 1.1 keeps working.
+
+### What's new
+
+- **Edit pods.** `update_pod(pod_name, workspace, ...)` and `meshive pod-update WORKSPACE POD` change a pod's
+  name, template, GPU, vCPU and RAM, CPU line, rental type, environment variables, ports, command and storage, like
+  the console's edit screen. Only what you pass changes. `estimate_pod_update` (`--estimate`) lists the changes, the
+  new hourly price and whether the running pod restarts; a rename alone applies without a restart. If the pod's
+  machine can't fit the change, the update is refused until you allow a move with `allow_node_migration`
+  (`--allow-node-migration`), plus `allow_data_loss` (`--allow-data-loss`) when the pod has unpreserved files. A
+  change that removes watched folders needs `drop_watched_folders` (`--drop-watched-folder`). The CLI says what to
+  rerun with.
+- **Edit storage.** `update_storage(pv_name, workspace, ...)` and `meshive storage-update WORKSPACE STORAGE` rename a
+  storage, grow it (`size_gb`, `--size`; storage can't shrink) and turn its usage warning on or off
+  (`--usage-warning [PERCENT]`, `--no-usage-warning`). `estimate_storage_update` shows the new price first.
+- **SSH into storage.** `connect_storage(pv_name, workspace)` and `meshive storage-connect WORKSPACE STORAGE` open a
+  storage for SSH and SFTP, like the console's Connect button: they wait until it is ready and return a one-time SSH
+  command and password. Encrypted storage is unlocked for this and locks again automatically after a while.
+  `get_storage_connection` (`--no-wait`) only reads the status.
+- **Model sets.** `list_model_sets(workspace, template_id)` and `meshive model-sets WORKSPACE --template ID`
+  list the model sets a template can start with: their files, size, minimum VRAM, licenses and workflows. Pass a
+  set's slug to `create_pod(model_set=...)` or `meshive pod-create --model-set SLUG`, and the estimate shows it. The
+  server fetches the set's files before it answers, which can take minutes, so this create waits up to 15 minutes
+  and is not resent automatically after a timeout (the pod may still be created; check before trying again).
+
 ## v1.1.0
 
 Pods can now get local storage of their own, CPU pods can choose their CPU line, and a pod that fails to come up
@@ -40,7 +68,7 @@ written for 1.0 keeps working.
 - **Storage usage warnings.** `create_storage(usage_warning=True, usage_warning_threshold=0.8)` or
   `meshive storage-create --usage-warning 80` emails you when the storage is more than 80% full (90% if you leave
   out the threshold), like the console's usage warning.
-- **One operation by ID.** `get_transaction(transaction_id, workspace)` and `meshive transaction ID --workspace WS`
+- **One operation by ID.** `get_transaction(transaction_id, workspace)` and `meshive transaction WORKSPACE ID`
   show a pod operation's status, steps and failure reason, even after it has dropped out of `transactions`.
 
 ### Changed

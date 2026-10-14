@@ -1004,7 +1004,7 @@ def test_transactions_output_alias_and_name(capsys):
 
 
 def test_transaction_shows_steps_in_order_and_the_reason(capsys):
-    assert cli.main(["transaction", "73216", "--workspace", "ns"]) == 0
+    assert cli.main(["transaction", "ns", "73216"]) == 0
     out = capsys.readouterr().out
     assert FakeClient.last_call == ("get_transaction", (73216, "ns"), {})
     assert "trainer (5f0e1d2c3b4a6978)" in out and "73216" in out and "failed" in out
@@ -1012,14 +1012,15 @@ def test_transaction_shows_steps_in_order_and_the_reason(capsys):
     # Steps in the order they happened, not the server's alphabetical order.
     assert out.index("Starting Pod creation process") < out.index("create_statefulset") < out.index("fetch_assets  ")
     assert "txn 73216 source-fetch log:" in out and "  403" in out
-    assert cli.main(["transaction", "73216", "--workspace", "ns", "-o", "name"]) == 0
+    assert cli.main(["transaction", "ns", "73216", "-o", "name"]) == 0
     assert capsys.readouterr().out.strip() == "73216"
-    assert cli.main(["transaction", "73216", "--workspace", "ns", "-o", "json"]) == 0
+    assert cli.main(["transaction", "ns", "73216", "-o", "json"]) == 0
     assert json.loads(capsys.readouterr().out)["transactionId"] == 73216
 
 
 def test_transaction_needs_a_workspace_and_a_numeric_id(capsys):
-    for argv in (["transaction", "73216"], ["transaction", "abc", "--workspace", "ns"]):
+    for argv in (["transaction", "73216"], ["transaction", "ns", "abc"],
+                 ["transaction", "73216", "--workspace", "ns"]):      # the workspace is positional, as in `pod-start`
         with pytest.raises(SystemExit) as exit_:
             cli.main(argv)
         assert exit_.value.code == 2

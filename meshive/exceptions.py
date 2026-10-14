@@ -32,6 +32,17 @@ class PodCreationFailedError(MeshiveError):
         self.reason = reason
 
 
+class StorageConnectionError(MeshiveError):
+    """connect_storage: the server reported phase "error" — the storage's access pod could not be prepared.
+    `connection` is the StorageConnection as last read."""
+
+    def __init__(self, pv_name: str, connection: object = None):
+        super().__init__(f"Storage {pv_name} could not be opened for SSH access (phase: error). "
+                         "Try connecting again in a moment.")
+        self.pv_name = pv_name
+        self.connection = connection
+
+
 class MeshiveAPIError(MeshiveError):
     """The server returned a 4xx/5xx.
 

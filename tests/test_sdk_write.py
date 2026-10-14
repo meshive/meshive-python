@@ -479,6 +479,27 @@ def test_pod_assets_and_watched_folders():
     sync_client(rec).estimate_pod("p", 457, workspace="ws")
     assert not {"inputAssets", "watchedFolders", "harvestDestination"} & rec.body().keys()   # not sent when unused
 
+    # The console's create screen: Keep structure, a folder added turned off, and the template's own folders.
+    rec = Recorder((202, {"name": "p", "workspace": "ws", "transactionId": 2, "estimate": {"pricePerHourUsd": "1"}}))
+    sync_client(rec).create_pod("p", 457, workspace="ws",
+                                input_assets=[{"asset": "asset_b", "paths": ["unet/"], "strip_prefix": ""}],
+                                watched_folders=[{"path": "/workspace/later", "enabled": False}],
+                                watched_template_folders={"/outputs": {"enabled": False},
+                                                          "/workspace/config": {"include": ["*.yaml"]}})
+    body = rec.body()
+    assert body["inputAssets"] == [{"asset": "asset_b", "includePaths": ["unet/"], "stripPrefix": ""}]
+    assert body["watchedFolders"] == [{"path": "/workspace/later", "includeExisting": False, "enabled": False}]
+    assert body["watchedTemplateFolders"] == {"/outputs": {"enabled": False},
+                                              "/workspace/config": {"enabled": True, "include": ["*.yaml"]}}
+    for bad in (dict(input_assets=[{"asset": "asset_b", "include_paths": ["unet/"]}]),
+                dict(input_assets=[{"asset": "asset_b", "strip_prefix": True}]),
+                dict(watched_template_folders=["/outputs"]),
+                dict(watched_template_folders={"/outputs": False})):
+        with pytest.raises(ValueError):
+            sync_client(Recorder()).create_pod("p", 457, workspace="ws", **bad)
+    with pytest.raises(ValueError, match="unknown key.*include_paths.*paths"):
+        sync_client(Recorder()).estimate_pod("p", 457, workspace="ws", input_assets=[{"asset": "a", "include_paths": "x"}])
+
     config = {"version": "3:ab", "editable": True, "applied": True, "roots": [
         {"role": "output", "path": "/workspace/outputs", "origin": "template", "enabled": True, "include": ["*.png"],
          "includeOverride": None},

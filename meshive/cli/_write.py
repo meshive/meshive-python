@@ -297,6 +297,7 @@ def _pod_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         max_price_per_hour=args.max_price,
         input_assets=[_pod_input_asset(v) for v in args.pod_input_asset or []] or None,
         watched_folders=args.watch or None, model_set=args.model_set,
+        watched_template_folders={path: {"enabled": False} for path in args.watch_off or []} or None,
     )
 
 
@@ -1055,6 +1056,9 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
                    help="Attach an Asset Hub asset (repeatable); default place /inputs/<name> or the template's path.")
     p.add_argument("--watch", action="append", metavar="PATH",
                    help="Upload new files in this folder as assets (repeatable); see `meshive pod-watch`.")
+    p.add_argument("--watch-off", action="append", metavar="PATH",
+                   help="Turn off one of the template's watched folders from the start (repeatable), as the console's "
+                        "create screen does; `meshive pod-watch --on` turns it back on.")
     p.add_argument("--model-set", default=None, metavar="SLUG",
                    help="Start the pod with this model set (see `meshive model-sets`). Its files are fetched before "
                         "the pod is created, which can take several minutes.")

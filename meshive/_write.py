@@ -190,7 +190,8 @@ def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: i
              command: str | None, internet_premium: bool, uptime_premium: bool, cpu_premium: bool,
              region: str | None, max_price_per_hour: Any, input_assets: Any = None, watched_folders: Any = None,
              harvest_destination: Any = None, local_volumes: Any = None, cpu_line: str | None = None,
-             template_ports: Any = None, model_set: str | None = None) -> dict[str, Any]:
+             template_ports: Any = None, model_set: str | None = None,
+             watched_template_folders: Mapping[str, Any] | None = None) -> dict[str, Any]:
     if isinstance(template_id, bool) or not isinstance(template_id, int) or template_id < 0:
         raise ValueError("template_id must be a non-negative integer")
     # How many GPUs one pod may take is the server's rule; only the type is checked here.
@@ -229,6 +230,8 @@ def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: i
         "maxPricePerHourUsd": _price(max_price_per_hour, "max_price_per_hour"),
         "inputAssets": _pod_input_assets(input_assets) or None,
         "watchedFolders": _watched_folders(watched_folders) or None,
+        # The template's own watched folders, as the console's create screen sets them: {path: {"enabled", "include"}}.
+        "watchedTemplateFolders": _template_folders(watched_template_folders, "watched_template_folders") or None,
         "harvestDestination": _harvest_destination(harvest_destination),
         # One model set per pod (list_model_sets → slug). Omitted = none.
         "modelSet": model_set.strip() if isinstance(model_set, str) and model_set.strip() else None,
@@ -307,18 +310,31 @@ def pod_update_body(*, name: str | None = None, template_id: int | None = None, 
     return body
 
 
+_POD_INPUT_ASSET_KEYS = ("asset", "asset_id", "target_dir", "role", "paths", "strip_prefix")
+
+
 def _pod_input_assets(items: Any) -> list[dict[str, Any]]:
-    """Pod input asset — "asset_id" or {"asset", "target_dir", "role", "paths"} (paths = some files/folders inside the asset)."""
+    """Pod input asset — "asset_id" or {"asset", "target_dir", "role", "paths", "strip_prefix"} (paths = some
+    files/folders inside the asset; strip_prefix "" keeps their folder structure, a prefix strips that prefix, and
+    leaving it out strips the folder they have in common, as the console's Flatten/Keep structure toggle)."""
     out = []
     for item in items or []:
         if isinstance(item, str):
             out.append({"asset": _require_str(item, "input_assets[]")})
         elif isinstance(item, Mapping):
-            paths = item.get("paths")
+            unknown = sorted(str(key) for key in item if key not in _POD_INPUT_ASSET_KEYS)
+            if unknown:
+                # A misspelled key (say include_paths) would otherwise be dropped and the whole asset attached.
+                raise ValueError(f"input_assets[] has unknown key(s) {', '.join(unknown)}; "
+                                 f"use {', '.join(k for k in _POD_INPUT_ASSET_KEYS if k != 'asset_id')}")
+            paths, strip = item.get("paths"), item.get("strip_prefix")
+            if strip is not None and not isinstance(strip, str):
+                raise ValueError("input_assets[].strip_prefix must be a string ('' keeps the folder structure)")
             out.append(_drop_none({
                 "asset": _require_str(item.get("asset") or item.get("asset_id"), "input_assets[].asset"),
                 "targetDir": item.get("target_dir") or None, "role": item.get("role") or None,
                 "includePaths": ([paths] if isinstance(paths, str) else list(paths)) if paths else None,
+                "stripPrefix": strip,
             }))
         else:
             raise ValueError("input_assets items must be asset ids or mappings")
@@ -326,7 +342,8 @@ def _pod_input_assets(items: Any) -> list[dict[str, Any]]:
 
 
 def _watched_folders(items: Any) -> list[dict[str, Any]]:
-    """Watched folder — "path" or {"path", "include", "include_existing", "enabled"}. include_existing=True also uploads files already there."""
+    """Watched folder — "path" or {"path", "include", "include_existing", "enabled"}. include_existing=True also uploads
+    files already there; enabled=False adds it turned off."""
     out = []
     for item in items or []:
         if isinstance(item, str):
@@ -363,13 +380,26 @@ def watched_folders_body(expected_version: int, template: Mapping[str, Any] | No
     """PUT …/harvest body — full replacement. template = {path: {"enabled", "include"}}, user = list of folders."""
     if isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < 0:
         raise ValueError("expected_version must be a non-negative integer (WatchedFolders.revision)")
+    return {"expectedVersion": expected_version, "template": _template_folders(template, "template"),
+            "user": _watched_folders(user)}
+
+
+def _template_folders(template: Mapping[str, Any] | None, name: str) -> dict[str, Any]:
+    """The template's watched folders by path — {path: {"enabled": bool, "include": [globs] or None}}. include None
+    keeps the template's patterns."""
+    if template is None:
+        return {}
+    if not isinstance(template, Mapping):
+        raise ValueError(f"{name} must be a mapping of folder path to {{'enabled', 'include'}}")
     toggles = {}
-    for path, toggle in (template or {}).items():
-        toggle = toggle or {}
-        toggles[_require_str(path, "template path")] = _drop_none({
+    for path, toggle in template.items():
+        toggle = {} if toggle is None else toggle
+        if not isinstance(toggle, Mapping):     # {path: False} would otherwise read as "on"
+            raise ValueError(f"{name}[{path!r}] must be a mapping like {{'enabled': False}}")
+        toggles[_require_str(path, f"{name} path")] = _drop_none({
             "enabled": bool(toggle.get("enabled", True)),
             "include": list(toggle["include"]) if toggle.get("include") is not None else None})
-    return {"expectedVersion": expected_version, "template": toggles, "user": _watched_folders(user)}
+    return toggles
 
 
 def placement(value: str | None) -> str | None:

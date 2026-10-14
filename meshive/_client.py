@@ -883,7 +883,7 @@ class Meshive(_BaseClient):
                      max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
                      harvest_destination: Any = None, local_volumes: Any = None,
                      cpu_line: str | None = None, template_ports: Any = None,
-                     model_set: str | None = None) -> PodEstimate:
+                     model_set: str | None = None, watched_template_folders: Any = None) -> PodEstimate:
         """Pod estimate — creates nothing (read scope is enough). Same arguments as create_pod; the price includes any
         new local_volumes (breakdown "local_storage"), and `model_set` describes the model set when one is given."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
@@ -893,7 +893,8 @@ class Meshive(_BaseClient):
                                cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour,
                                input_assets=input_assets, watched_folders=watched_folders,
                                harvest_destination=harvest_destination, local_volumes=local_volumes,
-                               cpu_line=cpu_line, template_ports=template_ports, model_set=model_set)
+                               cpu_line=cpu_line, template_ports=template_ports, model_set=model_set,
+                               watched_template_folders=watched_template_folders)
         return PodEstimate.from_dict(self._send("POST", "/pods/estimate",
                                                  params={"workspace": _query_value(workspace, "workspace")}, json=body))
 
@@ -906,7 +907,7 @@ class Meshive(_BaseClient):
                    max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
                    harvest_destination: Any = None, idempotency_key: str | None = None, local_volumes: Any = None,
                    cpu_line: str | None = None, template_ports: Any = None,
-                   model_set: str | None = None) -> PodCreated:
+                   model_set: str | None = None, watched_template_folders: Any = None) -> PodCreated:
         """Create a pod (202 accepted). It is billed hourly — check the price with estimate_pod first;
         max_price_per_hour caps the final hourly compute price. Placement above it can fail asynchronously.
         Storage (including the automatic PV) and asset storage charges are separate and not covered by the cap.
@@ -919,8 +920,12 @@ class Meshive(_BaseClient):
         port, and each other key, when given, renames it, renumbers it or exposes/hides it (template ports can't be
         removed). A port the template doesn't open is refused ('Port Not In Template'), and so is a clash with
         another port or name ('Port In Use', 'Port Name In Use').
-        input_assets attaches Asset Hub assets ("asset_id" or {"asset", "target_dir", "role", "paths"}),
-        watched_folders are folders whose new files are uploaded as assets ("path" or {"path", "include", "include_existing"}).
+        input_assets attaches Asset Hub assets ("asset_id" or {"asset", "target_dir", "role", "paths", "strip_prefix"};
+        with paths, strip_prefix "" keeps their folder structure — the console's Keep structure — and leaving it out
+        strips the folder they share). watched_folders are folders whose new files are uploaded as assets ("path" or
+        {"path", "include", "include_existing", "enabled"}); watched_template_folders sets the template's own watched
+        folders from the start, as the console's create screen does: {"/outputs": {"enabled": False}} turns one off and
+        {"/outputs": {"include": ["*.png"]}} changes its patterns (get_watched_folders lists them on a running pod).
         Pass the result's transaction_id to wait_for_new_pod to learn right away if the creation fails.
         model_set starts the pod with one of the template's model sets (a slug from list_model_sets; one per pod). The
         server fetches the set's files before it answers, which can take minutes, so this request waits up to
@@ -937,7 +942,8 @@ class Meshive(_BaseClient):
                                cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour,
                                input_assets=input_assets, watched_folders=watched_folders,
                                harvest_destination=harvest_destination, local_volumes=local_volumes,
-                               cpu_line=cpu_line, template_ports=template_ports, model_set=model_set)
+                               cpu_line=cpu_line, template_ports=template_ports, model_set=model_set,
+                               watched_template_folders=watched_template_folders)
         return PodCreated.from_dict(self._send("POST", "/pods", params={"workspace": _query_value(workspace, "workspace")},
                                                 json=body, idempotency_key=idempotency_key,
                                                 long_running="modelSet" in body))
@@ -1731,7 +1737,7 @@ class AsyncMeshive(_BaseClient):
                      max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
                      harvest_destination: Any = None, local_volumes: Any = None,
                      cpu_line: str | None = None, template_ports: Any = None,
-                     model_set: str | None = None) -> PodEstimate:
+                     model_set: str | None = None, watched_template_folders: Any = None) -> PodEstimate:
         """Pod estimate — creates nothing (read scope is enough). Same arguments as create_pod; the price includes any
         new local_volumes (breakdown "local_storage"), and `model_set` describes the model set when one is given."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
@@ -1741,7 +1747,8 @@ class AsyncMeshive(_BaseClient):
                                cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour,
                                input_assets=input_assets, watched_folders=watched_folders,
                                harvest_destination=harvest_destination, local_volumes=local_volumes,
-                               cpu_line=cpu_line, template_ports=template_ports, model_set=model_set)
+                               cpu_line=cpu_line, template_ports=template_ports, model_set=model_set,
+                               watched_template_folders=watched_template_folders)
         return PodEstimate.from_dict(await self._send("POST", "/pods/estimate",
                                                  params={"workspace": _query_value(workspace, "workspace")}, json=body))
 
@@ -1754,7 +1761,7 @@ class AsyncMeshive(_BaseClient):
                    max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
                    harvest_destination: Any = None, idempotency_key: str | None = None, local_volumes: Any = None,
                    cpu_line: str | None = None, template_ports: Any = None,
-                   model_set: str | None = None) -> PodCreated:
+                   model_set: str | None = None, watched_template_folders: Any = None) -> PodCreated:
         """Create a pod (202 accepted). It is billed hourly — check the price with estimate_pod first;
         max_price_per_hour caps the final hourly compute price. Placement above it can fail asynchronously.
         Storage (including the automatic PV) and asset storage charges are separate and not covered by the cap.
@@ -1767,8 +1774,12 @@ class AsyncMeshive(_BaseClient):
         port, and each other key, when given, renames it, renumbers it or exposes/hides it (template ports can't be
         removed). A port the template doesn't open is refused ('Port Not In Template'), and so is a clash with
         another port or name ('Port In Use', 'Port Name In Use').
-        input_assets attaches Asset Hub assets ("asset_id" or {"asset", "target_dir", "role", "paths"}),
-        watched_folders are folders whose new files are uploaded as assets ("path" or {"path", "include", "include_existing"}).
+        input_assets attaches Asset Hub assets ("asset_id" or {"asset", "target_dir", "role", "paths", "strip_prefix"};
+        with paths, strip_prefix "" keeps their folder structure — the console's Keep structure — and leaving it out
+        strips the folder they share). watched_folders are folders whose new files are uploaded as assets ("path" or
+        {"path", "include", "include_existing", "enabled"}); watched_template_folders sets the template's own watched
+        folders from the start, as the console's create screen does: {"/outputs": {"enabled": False}} turns one off and
+        {"/outputs": {"include": ["*.png"]}} changes its patterns (get_watched_folders lists them on a running pod).
         Pass the result's transaction_id to wait_for_new_pod to learn right away if the creation fails.
         model_set starts the pod with one of the template's model sets (a slug from list_model_sets; one per pod). The
         server fetches the set's files before it answers, which can take minutes, so this request waits up to
@@ -1785,7 +1796,8 @@ class AsyncMeshive(_BaseClient):
                                cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour,
                                input_assets=input_assets, watched_folders=watched_folders,
                                harvest_destination=harvest_destination, local_volumes=local_volumes,
-                               cpu_line=cpu_line, template_ports=template_ports, model_set=model_set)
+                               cpu_line=cpu_line, template_ports=template_ports, model_set=model_set,
+                               watched_template_folders=watched_template_folders)
         return PodCreated.from_dict(await self._send("POST", "/pods", params={"workspace": _query_value(workspace, "workspace")},
                                                 json=body, idempotency_key=idempotency_key,
                                                 long_running="modelSet" in body))

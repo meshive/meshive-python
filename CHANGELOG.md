@@ -39,6 +39,20 @@ a model set, all as in the web console. Code written for 1.0 and 1.1 keeps worki
   set's slug to `create_pod(model_set=...)` or `meshive pod-create --model-set SLUG`, and the estimate shows it. The
   server fetches the set's files before it answers, which can take minutes, so this create waits up to 15 minutes
   and is not resent automatically after a timeout (the pod may still be created; check before trying again).
+- **Watched folders and input assets as on the console's create screen.** `create_pod` and `estimate_pod` take
+  `watched_template_folders` to turn off the template's own watched folders or change their patterns from the start
+  (`{"/outputs": {"enabled": False}}`; `meshive pod-create --watch-off PATH`). A folder in `watched_folders` can be
+  added turned off with `"enabled": False`, and an input asset with `paths` takes `strip_prefix`: `""` keeps the
+  folder structure of the chosen files, like the console's Keep structure.
+
+### Changes
+
+- An `input_assets` item with a key the SDK doesn't know, such as `include_paths` instead of `paths`, now raises
+  `ValueError` instead of being ignored, which attached the whole asset.
+- A pod created from a template that declares no output folders now keeps the default `/outputs` rule it was created
+  with, as console-created pods do, so a later change to the template doesn't change it when the pod is edited.
+- Changing a pod's template with `update_pod(template_id=...)` starts it from the new template's variables, ports and
+  command; the estimate's `changes` now lists what you added that doesn't carry over.
 
 ## v1.1.0
 

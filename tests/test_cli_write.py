@@ -500,6 +500,11 @@ def test_pod_create_input_assets_and_watch(capsys):
     assert kw["watched_folders"] == ["/workspace/out"]
 
 
+def test_pod_create_watch_off_turns_template_folders_off():
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--estimate", "--watch-off", "/outputs"]) == 0
+    assert _last("estimate_pod")[2]["watched_template_folders"] == {"/outputs": {"enabled": False}}
+
+
 def test_pod_watch_shows_and_rewrites_with_the_version(capsys, non_tty):
     assert cli.main(["pod-watch", "ws", "p-0"]) == 0
     out = capsys.readouterr().out

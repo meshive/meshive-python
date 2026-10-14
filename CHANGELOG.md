@@ -28,7 +28,8 @@ a model set, all as in the web console. Code written for 1.0 and 1.1 keeps worki
   change that removes watched folders needs `drop_watched_folders` (`--drop-watched-folder`). The CLI says what to
   rerun with.
 - **Edit storage.** `update_storage(pv_name, workspace, ...)` and `meshive storage-update WORKSPACE STORAGE` rename a
-  storage, grow it (`size_gb`, `--size`; storage can't shrink) and turn its usage warning on or off
+  storage (a name another volume in the workspace uses is refused, as in the console), grow it (`size_gb`,
+  `--size`; storage can't shrink) and turn its usage warning on or off
   (`--usage-warning [PERCENT]`, `--no-usage-warning`). `estimate_storage_update` shows the new price first.
 - **SSH into storage.** `connect_storage(pv_name, workspace)` and `meshive storage-connect WORKSPACE STORAGE` open a
   storage for SSH and SFTP, like the console's Connect button: they wait until it is ready and return a one-time SSH

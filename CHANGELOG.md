@@ -21,9 +21,9 @@ don't break your code.
 
 If you used a pre-1.0 release, change your pin to `meshive>=1,<2` and reinstall. No code changes are needed.
 
-**Pre-1.0 releases on PyPI.** 0.1.4 stays available. 0.0.1 to 0.1.1 are removed on November 12, 2026, and 0.1.2 and 0.1.3
-on January 11, 2027. Environments that already have one installed keep working, but a fresh install pinned to a removed
-version fails; change the pin to `meshive>=1,<2`.
+**Pre-1.0 releases on PyPI.** 0.1.4 stays available. 0.0.1 to 0.1.0 were removed on October 13, 2026; 0.1.1 is removed
+on November 12, 2026, and 0.1.2 and 0.1.3 on January 11, 2027. Environments that already have one installed keep
+working, but a fresh install pinned to a removed version fails; change the pin to `meshive>=1,<2`.
 
 ### What's included
 

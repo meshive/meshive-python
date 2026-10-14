@@ -12,6 +12,50 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## v1.1.0
+
+Pods can now get local storage of their own, CPU pods can choose their CPU line, and a pod that fails to come up
+tells you why as soon as it happens. Pod creation now follows the same rules as the web console. Code written for
+1.0 keeps working.
+
+### What's new
+
+- **Local storage with a pod.** You can now create local storage on a pod's machine together with the pod:
+  `create_pod(local_volumes=[{"name": "scratch", "mount_path": "/scratch", "size_gb": 50}])`, or
+  `meshive pod-create --local-volume scratch:/scratch:50` (add `:encrypted` to encrypt it). The estimate includes
+  its price. Not available for spot pods.
+- **CPU lines.** `list_cpus()` and `meshive cpus` list the CPU lines you can rent, with prices per vCPU and per GiB
+  of RAM. Pass one to `create_pod(cpu_line=...)` or `pod-create --cpu-line` to choose where a CPU pod runs; without
+  it, the cheapest line that fits is used.
+- **Starts that wait for room.** `start_pod` and `meshive pod-start --placement` now take `wait_same_node` and
+  `wait_any_node`: the pod waits until a machine has room, then starts. `wait_any_node` needs the same data-loss
+  consent as `any_node`.
+- **Failed creations reported right away.** Pass `transaction_id=created.transaction_id` to `wait_for_new_pod` and a
+  creation that fails ends the wait at once with the reason, such as an image that can't be pulled, instead of
+  running into the timeout. `meshive pod-create --wait` does this for you.
+- **One operation by ID.** `get_transaction(transaction_id, workspace)` and `meshive transaction ID --workspace WS`
+  show a pod operation's status, steps and failure reason, even after it has dropped out of `transactions`.
+
+### Changed
+
+- **Pod creation follows the console's rules.** vCPU and RAM must be values the console offers, a port the
+  template already opens or a port listed twice is refused, required environment variables of the template need a
+  value, and a command can be at most 4096 characters. The error says what is allowed. CPU pods now default to
+  8 vCPU and 32 GiB of RAM (or the nearest the line offers), as in the console, instead of 2 vCPU and 4 GiB.
+- **Local storage is created only together with a pod.** Creating local (`hostPath`) storage on its own is refused,
+  and a new pod's `volumes` can attach existing network storage only. Use network storage, or `local_volumes`.
+- The SDK and CLI no longer check placements, storage types, disk types or the GPU count themselves. The server
+  decides, so new values work without upgrading.
+
+### Deprecated
+
+These are still accepted but ignored by the server. They warn with a `DeprecationWarning` (the CLI prints a note)
+and will be removed in 2.0.
+
+- `region` on `create_pod`, `estimate_pod`, `create_storage` and `estimate_storage`, and `--region` on `pod-create`
+  and `storage-create`. Pods and storage are placed without a region.
+- `disk_type` on `create_storage` and `estimate_storage`, and `--disk` on `storage-create`. Storage is always NVMe.
+
 ## v1.0.0
 
 The first stable release of the Meshive Python SDK and the `meshive` command. Everything you can do in the

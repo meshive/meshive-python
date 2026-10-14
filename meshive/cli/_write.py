@@ -4,7 +4,8 @@ Also models, hf-tokens, model-detect, model-register, model-delete (model regist
 
 Rule: commands that cost money or can't be undone (create/start/deploy/submit/delete, plus serving-scale and
 serving-resume, which can raise cost) first show an estimate or summary and ask for confirmation without `--yes` (exit 2 if not a TTY).
-`--estimate` shows the estimate and stops. `pod-create --wait` exits 1 if it can't find the pod in time (the accepted transaction is printed).
+`--estimate` shows the estimate and stops. `pod-create --wait` exits 1 if the pod isn't ready in time or its creation fails
+(the accepted transaction is printed, and a failure's reason).
 """
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ from typing import Any, Callable
 
 from . import _format as fmt
 from .._client import Meshive
-from ..exceptions import MeshiveError, WaitTimeoutError
+from ..exceptions import MeshiveError, PodCreationFailedError, WaitTimeoutError
 from ..models import Logs, PodEstimate, ResourceAction, StorageEstimate, TaskEstimate
 
 Handler = Callable[[Meshive, argparse.Namespace, str, bool], int]
@@ -88,6 +89,32 @@ def _parse_volumes(values: list[str] | None) -> list[tuple[str, str]]:
     return out
 
 
+def _parse_local_volumes(values: list[str] | None) -> list[dict[str, Any]]:
+    """NAME:/PATH:SIZE_GB[:encrypted] — new local storage created with the pod. Limits (such as the minimum size) are the server's."""
+    out = []
+    for item in values or []:
+        parts = item.split(":")
+        flag = parts[3].strip().lower() if len(parts) == 4 else ""
+        valid = len(parts) in (3, 4) and parts[0].strip() and parts[1].startswith("/") and flag in ("", "encrypted")
+        try:
+            size = int(parts[2]) if valid else None
+        except ValueError:
+            size = None
+        if size is None:
+            raise ValueError(f"--local-volume expects NAME:/PATH:SIZE_GB[:encrypted], got {item!r}")
+        entry: dict[str, Any] = {"name": parts[0].strip(), "mount_path": parts[1], "size_gb": size}
+        if flag:
+            entry["encrypted"] = True
+        out.append(entry)
+    return out
+
+
+def _deprecated_flag(flag: str, value: Any, why: str) -> None:
+    """A flag that is still accepted but no longer does anything — say so instead of silently dropping it."""
+    if value:
+        print(f"Warning: {flag} is deprecated and ignored ({why}); it will be removed in 2.0.", file=sys.stderr)
+
+
 def _parse_ports(values: list[str] | None) -> list[dict[str, Any]]:
     """8888 | 8888:jupyter | 8888:jupyter:internal"""
     out = []
@@ -132,8 +159,16 @@ def _print_pod_estimate(est: PodEstimate, color: bool) -> None:
          ("breakdown", ", ".join(f"{k}={fmt.money_hourly(v)}" for k, v in est.breakdown.items()) or "-"),
          ("available", str(est.availability.get("available_gpus", est.availability.get("machine_count", "-"))))])
     if est.volumes:
-        print("volumes:   " + ", ".join(f"{v.get('storage')}→{v.get('mount_path')}" for v in est.volumes))
+        print(fmt.clean("volumes:   " + ", ".join(_volume_cell(v) for v in est.volumes if isinstance(v, dict))))
     print(fmt.paint(est.note, "dim", color))
+
+
+def _volume_cell(volume: dict[str, Any]) -> str:
+    """An attached storage as 'pv→/mount'; a local volume created with the pod as 'name (new local, 20 GiB)→/mount'."""
+    if volume.get("new"):
+        extra = ", encrypted" if volume.get("encrypted") else ""
+        return f"{volume.get('name')} (new local, {volume.get('size_gb')} GiB{extra})→{volume.get('mount_path')}"
+    return f"{volume.get('storage')}→{volume.get('mount_path')}"
 
 
 def _print_action(action: ResourceAction, color: bool) -> None:
@@ -161,12 +196,14 @@ def _print_logs(logs: Logs, color: bool) -> None:
 # =============================================================================
 
 def _pod_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    # --region is accepted but not passed on: the server ignores it (cmd_pod_create prints the deprecation note).
     return dict(
         gpu_model=args.gpu, gpu_count=args.gpu_count, gpu_vram_gb=args.vram,
-        rental_type="spot" if args.spot else "demand", vcpu=args.vcpu, ram_gb=args.ram,
-        volumes=_parse_volumes(args.volume), env=_parse_env(args.env), secret_keys=args.secret or [],
+        rental_type="spot" if args.spot else "demand", vcpu=args.vcpu, ram_gb=args.ram, cpu_line=args.cpu_line,
+        volumes=_parse_volumes(args.volume), local_volumes=_parse_local_volumes(args.local_volume) or None,
+        env=_parse_env(args.env), secret_keys=args.secret or [],
         ports=_parse_ports(args.port), command=args.overwrite_command, internet_premium=args.internet_premium,
-        uptime_premium=args.uptime_premium, cpu_premium=args.cpu_premium, region=args.region,
+        uptime_premium=args.uptime_premium, cpu_premium=args.cpu_premium,
         max_price_per_hour=args.max_price,
         input_assets=[_pod_input_asset(v) for v in args.pod_input_asset or []] or None,
         watched_folders=args.watch or None,
@@ -254,6 +291,7 @@ def _toggle(template: dict[str, Any], user: list[dict[str, Any]], path: str, ena
 
 def cmd_pod_create(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     kwargs = _pod_kwargs(args)
+    _deprecated_flag("--region", args.region, "pods are placed without a region")
     estimate = client.estimate_pod(args.name, args.template, workspace=args.workspace, **kwargs)
     if args.estimate:
         _emit_estimate(output, estimate, lambda: _print_pod_estimate(estimate, color))
@@ -263,17 +301,27 @@ def cmd_pod_create(client: Meshive, args: argparse.Namespace, output: str, color
     if not _confirm(args, f"Create pod '{args.name}' at {fmt.money_hourly(estimate.price_per_hour)}/hr?"):
         return 2
     created = client.create_pod(args.name, args.template, workspace=args.workspace, **kwargs)
-    pod_name, timed_out = None, None
+    pod_name, timed_out, failed = None, None, None
     if args.wait:
         try:
-            pod_name = client.wait_for_new_pod(args.name, args.workspace, until=args.wait,
-                                               timeout=args.wait_timeout).pod_name
+            # With the transaction id a failed creation ends the wait at once, with the server's reason. An id that
+            # isn't a number can't be looked up, so the wait then watches the pod only (rather than failing after the create).
+            txn = created.transaction_id if str(created.transaction_id).isdigit() else None
+            pod_name = client.wait_for_new_pod(args.name, args.workspace, until=args.wait, timeout=args.wait_timeout,
+                                               transaction_id=txn).pod_name
         except WaitTimeoutError as exc:
             timed_out = exc
+        except PodCreationFailedError as exc:
+            failed = exc
     _emit(output, created.raw, [pod_name or str(created.transaction_id)], lambda: _kv([
         ("accepted", fmt.yes_no(created.accepted)), ("name", created.name),
-        ("pod", pod_name or "(assigned shortly — see `meshive pods`)"),
+        ("pod", pod_name or ("(not created)" if failed else "(assigned shortly — see `meshive pods`)")),
         ("transaction", str(created.transaction_id))]))
+    if failed:
+        print(fmt.clean(f"Error: {str(failed).rstrip('.')}. "
+                        f"See `meshive transaction {created.transaction_id} --workspace {args.workspace}`."),
+              file=sys.stderr)
+        return 1
     if timed_out:
         # Accepted, but the pod didn't show up or get ready in time — automation must not mistake this for `--wait running` success.
         print(fmt.clean(f"Error: {timed_out} The create was accepted (transaction {created.transaction_id}); "
@@ -282,15 +330,31 @@ def cmd_pod_create(client: Meshive, args: argparse.Namespace, output: str, color
     return 0
 
 
+# Placements that may start the pod on another node, which deletes its unpreserved workspace files.
+_MOVING_PLACEMENTS = ("any_node", "wait_any_node")
+
+
+def _start_placement(args: argparse.Namespace) -> str | None:
+    """--placement as given (the server decides which exist), or any_node for --any-node. None after a usage error."""
+    placement = (args.placement or "").strip()
+    if args.any_node and placement and placement.lower() != "any_node":
+        print("Error: --any-node is short for --placement any_node; pass one or the other.", file=sys.stderr)
+        return None
+    return placement or ("any_node" if args.any_node else "same_node")
+
+
 def _pod_action(method: str, needs_confirm: bool, question: str):
     def handler(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+        placement = _start_placement(args) if method == "start_pod" else ""
+        if placement is None:
+            return 2
         if needs_confirm and not _confirm(args, question.format(pod=args.pod_name)):
             return 2
         extra: dict[str, Any] = {}
         if method == "start_pod":
-            extra["placement"] = "any_node" if args.any_node else "same_node"
+            extra["placement"] = placement
             extra["allow_data_loss"] = bool(getattr(args, "allow_data_loss", False))
-            if args.any_node:
+            if placement.lower() in _MOVING_PLACEMENTS:
                 current = client.get_pod(args.pod_name, args.workspace)
                 if current.has_unpreserved_workspace is not False:
                     warning = ("Moving this pod to another node permanently deletes unpreserved workspace files. "
@@ -325,8 +389,10 @@ def _print_storage_estimate(est: StorageEstimate, color: bool) -> None:
 
 
 def cmd_storage_create(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
-    kwargs = dict(storage_type=args.type, disk_type=args.disk, encrypted=args.encrypted, region=args.region,
-                  max_price_per_hour=args.max_price)
+    # --disk and --region are accepted but not passed on: the server ignores both (storage is always NVMe).
+    _deprecated_flag("--disk", args.disk, "storage is always NVMe")
+    _deprecated_flag("--region", args.region, "storage is created without a region")
+    kwargs = dict(storage_type=args.type, encrypted=args.encrypted, max_price_per_hour=args.max_price)
     estimate = client.estimate_storage(args.name, args.size, workspace=args.workspace, **kwargs)
     if args.estimate:
         _emit_estimate(output, estimate, lambda: _print_storage_estimate(estimate, color))
@@ -582,15 +648,23 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--gpu-count", type=int, default=1, metavar="N")
     p.add_argument("--vram", type=int, default=None, metavar="GB", help="VRAM tier when a model comes in several.")
     p.add_argument("--spot", action="store_true", help="Spot (preemptible) rental instead of on-demand.")
-    p.add_argument("--vcpu", type=int, default=None, metavar="N", help="vCPU (default: recommended for the GPU).")
-    p.add_argument("--ram", type=int, default=None, metavar="GiB", help="RAM in GiB (default: recommended).")
-    p.add_argument("--volume", action="append", metavar="PV:/mount", help="Attach an existing storage (repeatable).")
+    p.add_argument("--vcpu", type=int, default=None, metavar="N",
+                   help="vCPU (default: recommended for the GPU; 8 for a CPU pod). Values the console offers.")
+    p.add_argument("--ram", type=int, default=None, metavar="GiB",
+                   help="RAM in GiB (default: recommended; 4 GiB per vCPU for a CPU pod). Values the console offers.")
+    p.add_argument("--cpu-line", default=None, metavar="LINE",
+                   help="CPU pods only: the CPU line to run on, from `meshive cpus` (default: the cheapest that fits).")
+    p.add_argument("--volume", action="append", metavar="PV:/mount",
+                   help="Attach an existing network storage (repeatable).")
+    p.add_argument("--local-volume", action="append", metavar="NAME:/PATH:SIZE_GB[:encrypted]",
+                   help="Create local storage on the pod's machine together with the pod (repeatable); "
+                        "not available for spot pods.")
     p.add_argument("--env", action="append", metavar="KEY=VALUE", help="Environment variable (repeatable).")
     p.add_argument("--secret", action="append", metavar="KEY", help="Mark an --env key as secret (repeatable).")
     p.add_argument("--port", action="append", metavar="PORT[:NAME[:internal]]", help="Expose a port (repeatable).")
     # Without changing dest it overwrites args.command, which holds the subcommand name, and the command disappears.
     p.add_argument("--command", dest="overwrite_command", default=None, help="Override the template command.")
-    p.add_argument("--region", default=None, metavar="CODE", help="Target location, e.g. KR.")
+    p.add_argument("--region", default=None, metavar="CODE", help="Deprecated and ignored; pods are placed without a region.")
     p.add_argument("--internet-premium", action="store_true")
     p.add_argument("--uptime-premium", action="store_true")
     p.add_argument("--cpu-premium", action="store_true")
@@ -600,7 +674,9 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--watch", action="append", metavar="PATH",
                    help="Upload new files in this folder as assets (repeatable); see `meshive pod-watch`.")
     p.add_argument("--estimate", action="store_true", help="Only show the estimate; create nothing.")
-    p.add_argument("--wait", default=None, metavar="STATUS", help="After creating, wait until the pod reaches STATUS (e.g. running).")
+    p.add_argument("--wait", default=None, metavar="STATUS",
+                   help="After creating, wait until the pod reaches STATUS (e.g. running); a failed creation ends the "
+                        "wait with the reason.")
     p.add_argument("--wait-timeout", type=float, default=600.0, metavar="SECONDS")
     _yes(p)
 
@@ -612,8 +688,11 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
         p.add_argument("workspace", help="Workspace ID (namespace name).")
         p.add_argument("pod_name", help="Pod ID (pod name).")
         if name == "pod-start":
-            p.add_argument("--any-node", action="store_true",
-                           help="Start on any available node; unpreserved workspace files are permanently deleted on migration.")
+            p.add_argument("--placement", default=None, metavar="PLACEMENT",
+                           help="same_node (default), any_node, wait_same_node or wait_any_node. wait_* keeps the pod "
+                                "waiting until capacity frees up; any_node and wait_any_node may move it to another "
+                                "node, which permanently deletes unpreserved workspace files.")
+            p.add_argument("--any-node", action="store_true", help="Short for --placement any_node.")
             p.add_argument("--allow-data-loss", action="store_true",
                            help="Separately consent to permanent loss of unpreserved workspace files for this pod's migration.")
             _yes(p)
@@ -638,10 +717,12 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p = sub.add_parser("storage-create", parents=[common], help="Create a storage volume (shows the estimate first).")
     p.add_argument("workspace"); p.add_argument("name", help="Storage name (label).")
     p.add_argument("--size", type=int, required=True, metavar="GiB")
-    p.add_argument("--type", default="nfs", choices=["nfs", "hostPath"], help="nfs (network, default) or hostPath (local).")
-    p.add_argument("--disk", default="NVMe", choices=["NVMe", "SSD", "HDD"])
-    p.add_argument("--encrypted", action="store_true", help="At-rest encryption (network storage, --type nfs, only).")
-    p.add_argument("--region", default=None, metavar="CODE")
+    p.add_argument("--type", default="nfs", metavar="TYPE",
+                   help="Storage type (default: nfs, network storage). Local storage is created together with a pod: "
+                        "`meshive pod-create --local-volume`.")
+    p.add_argument("--disk", default=None, metavar="TYPE", help="Deprecated and ignored; storage is always NVMe.")
+    p.add_argument("--encrypted", action="store_true", help="At-rest encryption.")
+    p.add_argument("--region", default=None, metavar="CODE", help="Deprecated and ignored.")
     p.add_argument("--max-price", default=None, metavar="USD", help="Cap this volume's final initial USD/hour rate.")
     p.add_argument("--estimate", action="store_true", help="Only show the estimate; create nothing.")
     _yes(p)

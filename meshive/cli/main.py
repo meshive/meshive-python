@@ -4,6 +4,7 @@ import json
 import os
 import sys
 from collections.abc import Callable
+from datetime import datetime, timezone
 
 import httpx
 
@@ -18,6 +19,7 @@ from ..models import (
     Asset,
     AssetPage,
     AssetStorage,
+    CpuLine,
     Credit,
     CreditHistoryEntry,
     Earnings,
@@ -35,6 +37,7 @@ from ..models import (
     WhoAmI,
     Workspace,
     WorkspaceDetail,
+    _parse_dt,
 )
 
 # Pod lifecycle statuses (server enum). For --status validation — the server doesn't take this filter, so
@@ -77,6 +80,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  meshive pod <workspace> <pod>  Show a single pod\n"
             "  meshive storages <workspace>   List storages (volumes) in a workspace\n"
             "  meshive gpus                   List GPUs available to rent, with prices\n"
+            "  meshive cpus                   List CPU lines for CPU pods, with prices\n"
             "  meshive templates              List templates\n"
             "  meshive assets <workspace>     List assets (datasets, models, outputs, ...)\n"
             "  meshive tasks <workspace>      List serverless tasks\n"
@@ -193,6 +197,12 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Show in-flight pod operations (why a pod is still creating).")
     p_txn.add_argument("workspace", help="Workspace ID (namespace name).")
 
+    p_txn_one = sub.add_parser("transaction", parents=[common],
+                               help="Show one pod operation by ID: status, steps and why it failed (no time limit).")
+    p_txn_one.add_argument("transaction_id", type=int,
+                           help="Transaction ID, as printed by `pod-create` or `meshive transactions`.")
+    p_txn_one.add_argument("--workspace", required=True, metavar="ID", help="Workspace ID (namespace name).")
+
     # --- storages -------------------------------------------------------------
     p_storages = sub.add_parser("storages", parents=[common],
                                 help="List storages (volumes) in a workspace.")
@@ -257,6 +267,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Only GPUs with at least this much VRAM.")
     p_gpus.add_argument("--model", default=None, metavar="SUBSTR",
                         help="Filter by GPU model substring (client-side), e.g. h100.")
+
+    p_cpus = sub.add_parser("cpus", parents=[common],
+                            help="List CPU lines for CPU pods, with prices (LINE goes to `pod-create --cpu-line`).")
+    p_cpus.add_argument("--rental", choices=["demand", "spot"], default="demand",
+                        help="Rental type to price for (default: demand).")
 
     p_templates = sub.add_parser("templates", parents=[common],
                                  help="List templates (official, plus a workspace's custom ones).")
@@ -725,6 +740,28 @@ def _print_gpus(gpus: list[GpuAvailability], color: bool) -> None:
     )
 
 
+def _cpu_cell(line: CpuLine) -> str:
+    """'AMD EPYC gen 4' — vendor, product line and generation as one label."""
+    label = " ".join(part for part in (line.vendor, line.product_line) if part) or "-"
+    return f"{label} gen {line.generation}" if line.generation else label
+
+
+def _print_cpus(lines: list[CpuLine], color: bool) -> None:
+    if not lines:
+        print("No CPU lines available.")
+        return
+    rows = [[c.cpu_line, _cpu_cell(c), f"DDR{c.ddr_type}" if c.ddr_type else "-", c.rental_type or "-",
+             fmt.money_hourly(c.price_per_core), fmt.money_hourly(c.ram_price_per_gb), str(c.max_vcpus_per_pod),
+             fmt.gib(c.max_ram_per_pod), str(c.machine_count)] for c in lines]
+    fmt.render_table(
+        ["LINE", "CPU", "RAM", "RENTAL", "PER vCPU/HR", "PER GiB/HR", "MAX vCPU", "MAX RAM", "MACHINES"],
+        rows,
+        aligns=["l", "l", "l", "l", "r", "r", "r", "r", "r"],
+        enabled=color,
+    )
+    print(fmt.paint("Pass LINE to `meshive pod-create --cpu-line` to pick the line of a CPU pod.", "dim", color))
+
+
 def _template_source(t: Template) -> str:
     return "official" if t.is_official else "custom"
 
@@ -1103,19 +1140,55 @@ def _print_transactions(transactions: list[Transaction], color: bool) -> None:
     fmt.render_table(
         ["POD", "TXN", "ACTION", "STATUS", "STEP", "PROGRESS", "DETAIL", "UPDATED"],
         rows, colors=colors, enabled=color)
-    # If an input asset download failed, a few lines from the end of that container's log — the same excerpt as the console's failure card (sanitized by the server).
     for t in transactions:
-        for log in t.init_logs:
-            if not log.lines:
-                continue
-            print()
-            print(fmt.paint(f"txn {t.transaction_id} {log.container} log"
-                            f"{' (before restart)' if log.previous else ''}:", "dim", color))
-            for line in log.lines[-_INIT_LOG_LINES:]:
-                print(f"  {fmt.clean(line)}")
+        _print_init_logs(t, color)
+
+
+def _print_init_logs(t: Transaction, color: bool) -> None:
+    """If an input asset download failed, a few lines from the end of that container's log — the same excerpt as the console's failure card (sanitized by the server)."""
+    for log in t.init_logs:
+        if not log.lines:
+            continue
+        print()
+        print(fmt.paint(f"txn {t.transaction_id} {log.container} log"
+                        f"{' (before restart)' if log.previous else ''}:", "dim", color))
+        for line in log.lines[-_INIT_LOG_LINES:]:
+            print(f"  {fmt.clean(line)}")
 
 
 _INIT_LOG_LINES = 10
+
+
+def _print_transaction(t: Transaction, color: bool) -> None:
+    print(f"pod:         {fmt.clean(t.user_alias or '-')} ({fmt.clean(t.resource_name or '-')})")
+    print(f"transaction: {t.transaction_id}")
+    print(f"action:      {fmt.clean(t.action or '-')}")
+    print(f"status:      {fmt.paint(fmt.clean(fmt.status_cell(t.status)), fmt.status_color(t.status), color)}")
+    step = t.step or "-"
+    if t.step_status:
+        step += f" ({t.step_status})"
+    progress = _txn_progress(t)
+    if progress != "-":
+        step += f", {progress}"
+    print(f"step:        {fmt.clean(step)}")
+    print(f"updated:     {fmt.relative_time(t.updated_at)}")
+    if t.failure_reason:
+        print(fmt.paint(fmt.clean(f"reason:      {t.failure_reason}"), "red", color))
+    steps = sorted((s for s in t.raw.get("transactionSteps") or [] if isinstance(s, dict)), key=_step_sort_key)
+    if steps:
+        print()
+        rows = [[str(s.get("step") or "-"), fmt.status_cell(str(s.get("status") or "")),
+                 fmt.clean(str(s.get("detail") or "-")), fmt.relative_time(_parse_dt(s.get("updatedAt")))]
+                for s in steps]
+        colors = [[None, fmt.status_color(str(s.get("status") or "")), None, "dim"] for s in steps]
+        fmt.render_table(["STEP", "STATUS", "DETAIL", "UPDATED"], rows, colors=colors, enabled=color)
+    _print_init_logs(t, color)
+
+
+def _step_sort_key(step: dict) -> datetime:
+    """Steps in the order they happened (the server sends them sorted by name). Steps without a time keep their place."""
+    at = _parse_dt(step.get("updatedAt")) or datetime.min
+    return at if at.tzinfo else at.replace(tzinfo=timezone.utc)
 
 
 def _txn_progress(t: Transaction) -> str:
@@ -1130,6 +1203,12 @@ def _cmd_transactions(client: Meshive, args: argparse.Namespace, output: str, co
     transactions = client.list_transactions(args.workspace)
     _emit(output, [t.raw for t in transactions], [str(t.transaction_id) for t in transactions],
           lambda: _print_transactions(transactions, color))
+    return 0
+
+
+def _cmd_transaction(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    t = client.get_transaction(args.transaction_id, args.workspace)
+    _emit(output, t.raw, [str(t.transaction_id)], lambda: _print_transaction(t, color))
     return 0
 
 
@@ -1186,6 +1265,12 @@ def _cmd_gpus(client: Meshive, args: argparse.Namespace, output: str, color: boo
     if args.model:
         gpus = [g for g in gpus if _contains(g.gpu_model, args.model)]
     _emit(output, [g.raw for g in gpus], [g.gpu_model for g in gpus], lambda: _print_gpus(gpus, color))
+    return 0
+
+
+def _cmd_cpus(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    lines = client.list_cpus(rental_type=args.rental)
+    _emit(output, [c.raw for c in lines], [c.cpu_line for c in lines], lambda: _print_cpus(lines, color))
     return 0
 
 
@@ -1330,6 +1415,7 @@ _HANDLERS: dict[str, Handler] = {
     "pod": _cmd_pod,
     "pod-metrics": _cmd_pod_metrics,
     "transactions": _cmd_transactions, "txn": _cmd_transactions,
+    "transaction": _cmd_transaction,
     "storages": _cmd_storages,
     "storage": _cmd_storage,
     "machines": _cmd_machines, "m": _cmd_machines,
@@ -1337,6 +1423,7 @@ _HANDLERS: dict[str, Handler] = {
     "machine-metrics": _cmd_machine_metrics,
     "earnings": _cmd_earnings,
     "gpus": _cmd_gpus,
+    "cpus": _cmd_cpus,
     "templates": _cmd_templates,
     "template": _cmd_template,
     "servings": _cmd_servings,

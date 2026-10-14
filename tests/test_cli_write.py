@@ -10,7 +10,8 @@ import pytest
 cli = importlib.import_module("meshive.cli.main")  # cli.__init__ exposes the main function, which shadows the submodule
 from meshive import Meshive
 from meshive.models import (Pod, Logs, PodCreated, PodEstimate, ResourceAction, Serving, StorageCreated, StorageEstimate,
-                            TaskEstimate, TaskSubmitted, ModelDetection, ServingModel, AssetImported, WatchedFolders, SshAccess)
+                            TaskEstimate, TaskSubmitted, ModelDetection, ServingModel, AssetImported, WatchedFolders, SshAccess,
+                            Transaction)
 
 ESTIMATE = {"pricePerHourUsd": "0.068423", "breakdown": {"gpu": "0.068423"},
             "resources": {"gpu_model": "RTX 3060", "vram_gb": 12, "gpu_count": 1, "vcpu": 4, "ram_gb": 12, "disk_gb": 25,
@@ -40,6 +41,11 @@ class FakeClient:
         self._rec("list_pods", *a, **kw); return []          # right after creation the pod doesn't exist yet
 
     wait_for_new_pod = Meshive.wait_for_new_pod   # the real SDK method, on top of the fake list_pods
+    _check_creation = Meshive._check_creation
+    TRANSACTION = {"transactionId": 99, "status": "in_progress", "transactionSteps": []}
+
+    def get_transaction(self, *a, **kw):
+        self._rec("get_transaction", *a, **kw); return Transaction.from_dict(self.TRANSACTION)
 
     def get_serving(self, *a, **kw):
         self._rec("get_serving", *a, **kw)
@@ -174,14 +180,17 @@ def test_pod_create_with_yes_passes_all_options(capsys):
             "--secret", "TOKEN", "--port", "8888:jupyter", "--port", "6006::internal", "--command", "sleep 1", "--region", "KR",
             "--uptime-premium", "--max-price", "0.5", "--yes", "-o", "name"]
     assert cli.main(argv) == 0
-    assert capsys.readouterr().out.strip() == "99"
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "99"
+    assert "--region is deprecated and ignored" in captured.err        # still accepted, no longer sent
     name, args, kw = _last("create_pod")
     assert args == ("agent-pod", 457) and kw["workspace"] == "ws"
     assert kw["gpu_model"] == "RTX 3060" and kw["gpu_count"] == 2 and kw["gpu_vram_gb"] == 12 and kw["rental_type"] == "spot"
     assert kw["vcpu"] == 8 and kw["ram_gb"] == 24 and "disk_gb" not in kw and kw["volumes"] == [("pv-a", "/data")]
     assert kw["env"] == {"A": "1", "TOKEN": "x"} and kw["secret_keys"] == ["TOKEN"]
     assert kw["ports"] == [{"port": 8888, "external": True, "name": "jupyter"}, {"port": 6006, "external": False}]
-    assert kw["command"] == "sleep 1" and kw["region"] == "KR" and kw["uptime_premium"] is True and kw["max_price_per_hour"] == "0.5"
+    assert kw["command"] == "sleep 1" and kw["uptime_premium"] is True and kw["max_price_per_hour"] == "0.5"
+    assert "region" not in kw and kw["cpu_line"] is None and kw["local_volumes"] is None
 
 
 def test_pod_create_bad_env_is_usage_error(capsys):
@@ -207,9 +216,10 @@ def test_storage_create_and_estimate(capsys, non_tty):
     assert "$0.000/hr" in storage_out and "per GiB·month: $0.07" in storage_out
     assert "10 GiB" in storage_out and "305 GiB" in storage_out     # size = capacity × 1024 MiB
     assert cli.main(["storage-create", "ws", "vol", "--size", "10", "--yes", "-o", "name"]) == 0
-    assert capsys.readouterr().out.strip() == "5"
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "5" and captured.err == ""
     name, args, kw = _last("create_storage")
-    assert args == ("vol", 10) and kw["storage_type"] == "nfs" and kw["disk_type"] == "NVMe"
+    assert args == ("vol", 10) and kw["storage_type"] == "nfs" and "disk_type" not in kw and "region" not in kw
 
 
 def test_task_submit_from_file(tmp_path, capsys):
@@ -296,10 +306,21 @@ def test_serving_scale_and_resume_confirm_only_when_cost_can_rise(capsys, non_tt
     assert cli.main(["serving-pause", "42"]) == 0 and _last("pause_serving")[2]["paused"] is True
 
 
-def test_storage_estimate_shows_disk_type(capsys):
-    assert cli.main(["storage-create", "ws", "vol", "--size", "10", "--disk", "SSD", "--estimate"]) == 0
-    assert "nfs / NVMe" in capsys.readouterr().out       # the FakeClient response has no diskType, so the default NVMe
-    assert _last("estimate_storage")[2]["disk_type"] == "SSD"
+def test_storage_disk_and_region_are_deprecated_and_not_sent(capsys):
+    assert cli.main(["storage-create", "ws", "vol", "--size", "10", "--disk", "SSD", "--region", "KR", "--estimate"]) == 0
+    captured = capsys.readouterr()
+    assert "nfs / NVMe" in captured.out       # the FakeClient response has no diskType, so the default NVMe
+    assert "--disk is deprecated and ignored" in captured.err and "--region is deprecated and ignored" in captured.err
+    assert not {"disk_type", "region"} & _last("estimate_storage")[2].keys()
+
+
+def test_storage_type_is_left_to_the_server(capsys):
+    """No argparse choices: the server decides which types it creates (it refuses hostPath with a pointer to pod-create)."""
+    assert cli.main(["storage-create", "ws", "vol", "--size", "10", "--type", "hostPath", "--estimate"]) == 0
+    assert _last("estimate_storage")[2]["storage_type"] == "hostPath"
+    with pytest.raises(SystemExit):
+        cli.main(["storage-create", "--help"])
+    assert "--local-volume" in capsys.readouterr().out
 
 
 # --estimate is shared by pod-create, storage-create and task-submit — each output format's behavior is checked on all three.
@@ -508,3 +529,80 @@ def test_ssh_prints_the_command_and_password_only(capsys):
     assert _last("ssh_access")[1] == ("p-0", "ws")
     assert cli.main(["ssh", "ws", "p-0", "-o", "name"]) == 0
     assert capsys.readouterr().out.strip() == "ssh -p 2222 root@m.example"
+
+
+# --- 1.1.0 ------------------------------------------------------------------------------------------------
+
+def test_pod_create_local_volumes_and_cpu_line(capsys):
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--cpu-line", "amd-epyc-4-ddr5",
+                     "--local-volume", "scratch:/scratch:50", "--local-volume", "keys:/keys:10:encrypted", "--estimate"]) == 0
+    kw = _last("estimate_pod")[2]
+    assert kw["cpu_line"] == "amd-epyc-4-ddr5"
+    assert kw["local_volumes"] == [{"name": "scratch", "mount_path": "/scratch", "size_gb": 50},
+                                   {"name": "keys", "mount_path": "/keys", "size_gb": 10, "encrypted": True}]
+
+
+@pytest.mark.parametrize("value", ["scratch:/scratch", "scratch:scratch:50", ":/scratch:50", "scratch:/scratch:big",
+                                   "scratch:/scratch:50:fast", "a:/b:1:encrypted:x"])
+def test_pod_create_bad_local_volume_is_usage_error(capsys, value):
+    assert cli.main(["pod-create", "ws", "p", "--template", "1", "--local-volume", value, "--yes"]) == 2
+    assert "NAME:/PATH:SIZE_GB[:encrypted]" in capsys.readouterr().err
+    assert not any(c[0] in ("estimate_pod", "create_pod") for c in FakeClient.instances[-1].calls)
+
+
+def test_pod_estimate_lists_new_local_volumes(capsys, monkeypatch):
+    payload = {**ESTIMATE, "breakdown": {"gpu": "0.068423", "local_storage": "0.0026"},
+               "volumes": [{"storage": "pv-a", "mount_path": "/data"},
+                           {"storage": None, "name": "scratch", "mount_path": "/scratch", "storage_type": "hostPath",
+                            "size_gb": 50, "encrypted": True, "new": True}]}
+    monkeypatch.setattr(FakeClient, "estimate_pod", lambda self, *a, **kw: PodEstimate.from_dict(payload))
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--estimate"]) == 0
+    out = capsys.readouterr().out
+    assert "pv-a→/data" in out and "scratch (new local, 50 GiB, encrypted)→/scratch" in out and "None" not in out
+    assert "local_storage=$0.003" in out
+
+
+def test_pod_create_wait_passes_the_transaction_and_reports_a_failed_creation(capsys, monkeypatch):
+    monkeypatch.setattr(FakeClient, "TRANSACTION", {
+        "transactionId": 99, "status": "failed", "transactionSteps": [
+            {"step": "image_pull", "status": "failed", "detail": "",
+             "failureDiagnostic": {"failureReason": "manifest unknown: \x1b[31mno such tag"}}]})
+    argv = ["pod-create", "ws", "bad-image", "--template", "457", "--yes", "--wait", "running", "--wait-timeout", "600"]
+    assert cli.main(argv) == 1
+    captured = capsys.readouterr()
+    assert _last("get_transaction")[1] == (99, "ws")
+    assert "(not created)" in captured.out and "99" in captured.out
+    assert "failed to start and was cleaned up: creation failed at step image_pull: manifest unknown:" in captured.err
+    assert "\x1b" not in captured.err and "meshive transaction 99 --workspace ws" in captured.err   # server text is cleaned
+    assert cli.main(argv + ["-o", "name"]) == 1
+    assert capsys.readouterr().out.strip() == "99"
+
+
+@pytest.mark.parametrize("placement", ["same_node", "wait_same_node", "Next_Week"])
+def test_pod_start_placement_is_passed_through(capsys, non_tty, placement):
+    """--placement is free text — the server knows which placements exist (and answers 422 for an unknown one)."""
+    assert cli.main(["pod-start", "ws", "p-0", "--placement", placement, "--yes"]) == 0
+    assert _last("pod_action")[2] == {"placement": placement, "allow_data_loss": False}
+
+
+def test_pod_start_wait_any_node_needs_data_loss_consent(capsys, non_tty):
+    assert cli.main(["pod-start", "ws", "p-0", "--placement", "wait_any_node", "--yes"]) == 2
+    assert "permanently deletes" in capsys.readouterr().err
+    assert all(c[0] != "pod_action" for c in FakeClient.instances[-1].calls)
+    assert cli.main(["pod-start", "ws", "p-0", "--placement", "wait_any_node", "--allow-data-loss", "--yes"]) == 0
+    assert _last("pod_action")[2] == {"placement": "wait_any_node", "allow_data_loss": True}
+
+
+def test_pod_start_any_node_shorthand(capsys, non_tty):
+    assert cli.main(["pod-start", "ws", "p-0", "--any-node", "--placement", "any_node", "--allow-data-loss", "-y"]) == 0
+    assert _last("pod_action")[2]["placement"] == "any_node"
+    assert cli.main(["pod-start", "ws", "p-0", "--any-node", "--placement", "wait_same_node", "-y"]) == 2
+    assert "--any-node is short for --placement any_node" in capsys.readouterr().err
+    assert all(c[0] != "pod_action" for c in FakeClient.instances[-1].calls)
+
+
+def test_pod_start_wait_any_node_asks_twice_on_a_terminal(capsys, monkeypatch):
+    monkeypatch.setattr("sys.stdin", _Tty("y\ny\n"))
+    assert cli.main(["pod-start", "ws", "p-0", "--placement", "wait_any_node", "-o", "json"]) == 0
+    assert capsys.readouterr().err.count("[y/N]") == 2
+    assert _last("pod_action")[2] == {"placement": "wait_any_node", "allow_data_loss": True}

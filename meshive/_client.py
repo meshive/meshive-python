@@ -6,8 +6,9 @@ only the transport differs (httpx.Client vs httpx.AsyncClient).
 Authentication: Meshive API key, `Authorization: Bearer meshive_...`. Reads, estimates, logs and downloads need the
 read scope; creating, changing or deleting pods, storage, servings, tasks, model registrations and asset imports, and
 SSH access, need the write scope.
-Read surface: account (me/api-keys/credit/earnings), workspaces (list/detail/members), pods (list/single/metrics),
-storage, machines (list/single/metrics), GPU availability, templates, serverless (servings/tasks), assets (Asset Hub).
+Read surface: account (me/api-keys/credit/earnings), workspaces (list/detail/members), pods (list/single/metrics,
+transactions), storage, machines (list/single/metrics), GPU and CPU availability, templates, serverless
+(servings/tasks), assets (Asset Hub).
 Retries are safe for both: GETs are idempotent, and writes resend the same Idempotency-Key, so the
 server replays the first response instead of creating twice.
 """
@@ -49,6 +50,7 @@ from .models import (
     AssetImported,
     AssetPage,
     AssetStorage,
+    CpuLine,
     DownloadFile,
     TaskOutputs,
     Credit,
@@ -191,6 +193,13 @@ def _gpus_params(rental_type: str, min_vram: int | None) -> dict[str, Any]:
             raise ValueError("min_vram must be a non-negative integer (GB)")
         params["vram"] = min_vram
     return params
+
+
+def _cpus_params(rental_type: str) -> dict[str, Any]:
+    rental = (rental_type or "").strip().lower()
+    if rental not in _RENTAL_TYPES:
+        raise ValueError(f"rental_type must be one of {', '.join(_RENTAL_TYPES)}")
+    return {"rentalType": rental}
 
 
 def _templates_params(workspace: str | None, app_type: str | None) -> dict[str, Any]:
@@ -404,6 +413,32 @@ def _new_pod_expired(deadline: float, name: str, timeout: float) -> None:
         raise WaitTimeoutError(f"Pod {name!r} did not appear within {timeout:g}s.")
 
 
+class _CreationWatch:
+    """wait_for_new_pod(transaction_id=...) — follows the pod's creation transaction alongside the pod itself, so a
+    creation that failed (or was cancelled by deleting the pod) ends the wait at once with the server's reason.
+
+    It stops following when the transaction is done (the pod's own status takes over), when the transaction can't be
+    read (404: an older server or an id outside the workspace — the wait falls back to watching the pod only), and when
+    `until` names a terminal status (then a failed creation is what was waited for, not an error)."""
+
+    def __init__(self, name: str, transaction_id: int | str | None, targets: set[str]) -> None:
+        self.name = name
+        self.transaction_id = None if transaction_id is None else int(_int_segment(transaction_id, "transaction_id"))
+        self.active = self.transaction_id is not None and not targets & _POD_TERMINAL_STATUSES
+
+    def unreadable(self) -> None:
+        self.active = False
+
+    def check(self, txn: Transaction) -> None:
+        status = txn.status.lower()
+        if status == "failed":
+            raise PodCreationFailedError(self.name, f"creation {txn.failure_reason}")
+        if status == "superseded":
+            raise PodCreationFailedError(self.name, "the creation was cancelled because the pod was deleted")
+        if status == "done":
+            self.active = False
+
+
 class Meshive(_BaseClient):
     """Synchronous Meshive SDK client.
 
@@ -529,16 +564,31 @@ class Meshive(_BaseClient):
         with the reason, when the pod was cleaned up because creating it failed).
         A timeout raises WaitTimeoutError (both a MeshiveError and a built-in TimeoutError).
         """
+        return self._wait_for_pod(pod_name, workspace, until=until, timeout=timeout, interval=interval)
+
+    def _wait_for_pod(self, pod_name: str, workspace: str, *, until: str | Iterable[str], timeout: float,
+                      interval: float, watch: _CreationWatch | None = None) -> Pod:
         targets, terminal = _wait_targets(until)
         deadline = time.monotonic() + timeout
         last = ""
         while True:
+            self._check_creation(watch, workspace)
             pod = self.get_pod(pod_name, workspace)
             if _wait_reached(pod, targets, terminal, pod_name):
                 return pod
             last = pod.status
             _wait_expired(deadline, pod_name, targets, last)
             time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+
+    def _check_creation(self, watch: _CreationWatch | None, workspace: str) -> None:
+        if watch is None or not watch.active:
+            return
+        try:
+            txn = self.get_transaction(watch.transaction_id, workspace)
+        except NotFoundError:
+            watch.unreadable()
+            return
+        watch.check(txn)
 
     def wait_for_new_pod(
         self,
@@ -548,23 +598,31 @@ class Meshive(_BaseClient):
         until: str | Iterable[str] = "running",
         timeout: float = 600.0,
         interval: float = 5.0,
+        transaction_id: int | str | None = None,
     ) -> Pod:
         """Wait for a pod just created with `create_pod(name, ...)` to appear and reach `until`, and return it.
 
-            client.create_pod("my-pod", template_id, workspace="my-workspace", gpu_model="RTX 3060")
-            pod = client.wait_for_new_pod("my-pod", "my-workspace", until="running")
+            created = client.create_pod("my-pod", template_id, workspace="my-workspace", gpu_model="RTX 3060")
+            pod = client.wait_for_new_pod("my-pod", "my-workspace", transaction_id=created.transaction_id)
 
         create_pod returns before the pod has an ID, so this finds it by name (user_alias), then waits like
-        wait_for_pod. Raises WaitTimeoutError if it doesn't appear or reach `until` within `timeout` seconds.
+        wait_for_pod. With `transaction_id` (create_pod's `transaction_id`) it also follows the creation on every
+        poll: if the server records it as failed, or as cancelled because the pod was deleted, PodCreationFailedError
+        is raised right away with the reason instead of waiting for the pod. Without it, or on a server that can't
+        look the transaction up, only the pod is watched. Raises WaitTimeoutError if the pod doesn't appear or reach
+        `until` within `timeout` seconds.
         """
         if not name:
             raise ValueError("name is required")  # an empty name would match system pods, which have no label
+        watch = _CreationWatch(name, transaction_id, _wait_targets(until)[0])
         deadline = time.monotonic() + timeout
         while True:
             pod = next((p for p in self.list_pods(workspace) if p.user_alias == name), None)
             if pod is not None:
-                return self.wait_for_pod(pod.pod_name, workspace, until=until,
-                                         timeout=max(deadline - time.monotonic(), 0.0), interval=interval)
+                return self._wait_for_pod(pod.pod_name, workspace, until=until,
+                                          timeout=max(deadline - time.monotonic(), 0.0), interval=interval,
+                                          watch=watch)
+            self._check_creation(watch, workspace)
             _new_pod_expired(deadline, name, timeout)
             time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
 
@@ -594,6 +652,17 @@ class Meshive(_BaseClient):
         return [Transaction.from_dict(d)
                 for d in self._get("/transactions", params={"workspace": workspace})]
 
+    def get_transaction(self, transaction_id: int | str, workspace: str) -> Transaction:
+        """One pod operation by id (GET /transactions/{transaction_id}?workspace=), such as create_pod's
+        `transaction_id`. Unlike list_transactions there is no time window, so a finished or failed operation can be
+        read later; `failure_reason` says why a failed one failed. NotFoundError for an id outside the workspace."""
+        segment = _int_segment(transaction_id, "transaction_id")
+        try:
+            data = self._get(f"/transactions/{segment}", params={"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "transaction lookup") from None
+        return Transaction.from_dict(data)
+
     def get_storage(self, storage_name: str, workspace: str) -> Storage:
         """A single storage (GET /storages/{storage_name}?workspace=). Same argument order as get_pod."""
         segment = _path_segment(storage_name, "storage_name")
@@ -615,6 +684,15 @@ class Meshive(_BaseClient):
         """GPU tiers available to rent now, with prices (GET /gpus?rentalType=&vram=)."""
         return [GpuAvailability.from_dict(d)
                 for d in self._get("/gpus", params=_gpus_params(rental_type, min_vram))]
+
+    def list_cpus(self, *, rental_type: str = "demand") -> list[CpuLine]:
+        """CPU lines available to rent now, with prices (GET /cpus?rentalType=). Pass a line's `cpu_line` to
+        create_pod / estimate_pod to put a CPU pod on it."""
+        try:
+            data = self._get("/cpus", params=_cpus_params(rental_type))
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "CPU lines") from None
+        return [CpuLine.from_dict(d) for d in data]
 
     def list_api_keys(self) -> list[ApiKey]:
         """My active API keys — prefixes only, no plaintext (GET /api-keys)."""
@@ -738,15 +816,18 @@ class Meshive(_BaseClient):
                      ports: Any = None, command: str | None = None, internet_premium: bool = False,
                      uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
                      max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
-                     harvest_destination: Any = None) -> PodEstimate:
-        """Pod estimate — creates nothing (read scope is enough). Same arguments as create_pod."""
+                     harvest_destination: Any = None, local_volumes: Any = None,
+                     cpu_line: str | None = None) -> PodEstimate:
+        """Pod estimate — creates nothing (read scope is enough). Same arguments as create_pod; the price includes any
+        new local_volumes (breakdown "local_storage")."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
                                internet_premium=internet_premium, uptime_premium=uptime_premium,
                                cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour,
                                input_assets=input_assets, watched_folders=watched_folders,
-                               harvest_destination=harvest_destination)
+                               harvest_destination=harvest_destination, local_volumes=local_volumes,
+                               cpu_line=cpu_line)
         return PodEstimate.from_dict(self._send("POST", "/pods/estimate",
                                                  params={"workspace": _query_value(workspace, "workspace")}, json=body))
 
@@ -757,19 +838,26 @@ class Meshive(_BaseClient):
                    ports: Any = None, command: str | None = None, internet_premium: bool = False,
                    uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
                    max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
-                   harvest_destination: Any = None, idempotency_key: str | None = None) -> PodCreated:
+                   harvest_destination: Any = None, idempotency_key: str | None = None, local_volumes: Any = None,
+                   cpu_line: str | None = None) -> PodCreated:
         """Create a pod (202 accepted). It is billed hourly — check the price with estimate_pod first;
         max_price_per_hour caps the final hourly compute price. Placement above it can fail asynchronously.
         Storage (including the automatic PV) and asset storage charges are separate and not covered by the cap.
+        volumes attaches existing network storage ((pv_name, mount_path) or {"storage", "mount_path"}); local_volumes
+        creates new local storage on the pod's machine together with the pod ({"name", "mount_path", "size_gb", and
+        optionally "usage_warning", "usage_warning_threshold", "encrypted"}). cpu_line puts a CPU pod on a line from
+        list_cpus (default: the cheapest line that fits). region is deprecated and ignored.
         input_assets attaches Asset Hub assets ("asset_id" or {"asset", "target_dir", "role", "paths"}),
-        watched_folders are folders whose new files are uploaded as assets ("path" or {"path", "include", "include_existing"})."""
+        watched_folders are folders whose new files are uploaded as assets ("path" or {"path", "include", "include_existing"}).
+        Pass the result's transaction_id to wait_for_new_pod to learn right away if the creation fails."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
                                internet_premium=internet_premium, uptime_premium=uptime_premium,
                                cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour,
                                input_assets=input_assets, watched_folders=watched_folders,
-                               harvest_destination=harvest_destination)
+                               harvest_destination=harvest_destination, local_volumes=local_volumes,
+                               cpu_line=cpu_line)
         return PodCreated.from_dict(self._send("POST", "/pods", params={"workspace": _query_value(workspace, "workspace")},
                                                 json=body, idempotency_key=idempotency_key))
 
@@ -781,8 +869,11 @@ class Meshive(_BaseClient):
 
     def start_pod(self, pod_name: str, workspace: str, *, placement: str = "same_node",
                   allow_data_loss: bool = False, idempotency_key: str | None = None) -> ResourceAction:
-        """Start a stopped pod. placement: same_node (original node) | any_node (moving nodes permanently deletes work files that aren't preserved).
-        allow_data_loss=True is a separate data-loss consent for this pod/move request."""
+        """Start a stopped pod. placement: same_node (its original node, the default) | any_node (any node with
+        capacity) | wait_same_node / wait_any_node (the pod waits until capacity frees up, then starts). The server
+        decides which placements exist and refuses an unknown one. Moving to another node (any_node, wait_any_node)
+        permanently deletes work files that aren't preserved; allow_data_loss=True is a separate data-loss consent for
+        this pod/move request (ConflictError 'Data Loss Consent Required' without it)."""
         if not isinstance(allow_data_loss, bool):
             raise ValueError("allow_data_loss must be an explicit boolean")
         data = self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/start",
@@ -809,6 +900,7 @@ class Meshive(_BaseClient):
     def estimate_storage(self, name: str, size_gb: int, *, workspace: str, storage_type: str = "nfs",
                          disk_type: str = "NVMe", encrypted: bool = False, region: str | None = None,
                          max_price_per_hour: Any = None) -> StorageEstimate:
+        """Storage estimate — creates nothing. Same arguments as create_storage."""
         body = _write.storage_body(name, size_gb, storage_type=storage_type, disk_type=disk_type, encrypted=encrypted,
                                    region=region, max_price_per_hour=max_price_per_hour)
         return StorageEstimate.from_dict(self._send("POST", "/storages/estimate",
@@ -817,7 +909,9 @@ class Meshive(_BaseClient):
     def create_storage(self, name: str, size_gb: int, *, workspace: str, storage_type: str = "nfs",
                        disk_type: str = "NVMe", encrypted: bool = False, region: str | None = None,
                        max_price_per_hour: Any = None, idempotency_key: str | None = None) -> StorageCreated:
-        """Create storage (PV) (202). Billed hourly by capacity while it exists."""
+        """Create network storage (PV) (202). Billed hourly by capacity while it exists. Local storage can't be created
+        on its own (the server refuses storage_type "hostPath"); create it with a pod: create_pod(local_volumes=...).
+        disk_type and region are deprecated and ignored (storage is always NVMe)."""
         body = _write.storage_body(name, size_gb, storage_type=storage_type, disk_type=disk_type, encrypted=encrypted,
                                    region=region, max_price_per_hour=max_price_per_hour)
         return StorageCreated.from_dict(self._send("POST", "/storages", params={"workspace": _query_value(workspace, "workspace")},
@@ -1147,16 +1241,31 @@ class AsyncMeshive(_BaseClient):
         interval: float = 5.0,
     ) -> Pod:
         """Poll until the pod reaches the `until` state (same rules as the sync wait_for_pod)."""
+        return await self._wait_for_pod(pod_name, workspace, until=until, timeout=timeout, interval=interval)
+
+    async def _wait_for_pod(self, pod_name: str, workspace: str, *, until: str | Iterable[str], timeout: float,
+                            interval: float, watch: _CreationWatch | None = None) -> Pod:
         targets, terminal = _wait_targets(until)
         deadline = time.monotonic() + timeout
         last = ""
         while True:
+            await self._check_creation(watch, workspace)
             pod = await self.get_pod(pod_name, workspace)
             if _wait_reached(pod, targets, terminal, pod_name):
                 return pod
             last = pod.status
             _wait_expired(deadline, pod_name, targets, last)
             await asyncio.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+
+    async def _check_creation(self, watch: _CreationWatch | None, workspace: str) -> None:
+        if watch is None or not watch.active:
+            return
+        try:
+            txn = await self.get_transaction(watch.transaction_id, workspace)
+        except NotFoundError:
+            watch.unreadable()
+            return
+        watch.check(txn)
 
     async def wait_for_new_pod(
         self,
@@ -1166,17 +1275,21 @@ class AsyncMeshive(_BaseClient):
         until: str | Iterable[str] = "running",
         timeout: float = 600.0,
         interval: float = 5.0,
+        transaction_id: int | str | None = None,
     ) -> Pod:
         """Wait for a pod just created with `create_pod(name, ...)` to appear and reach `until` (same rules as the
-        sync wait_for_new_pod)."""
+        sync wait_for_new_pod, including `transaction_id` to report a failed creation right away)."""
         if not name:
             raise ValueError("name is required")  # an empty name would match system pods, which have no label
+        watch = _CreationWatch(name, transaction_id, _wait_targets(until)[0])
         deadline = time.monotonic() + timeout
         while True:
             pod = next((p for p in await self.list_pods(workspace) if p.user_alias == name), None)
             if pod is not None:
-                return await self.wait_for_pod(pod.pod_name, workspace, until=until,
-                                               timeout=max(deadline - time.monotonic(), 0.0), interval=interval)
+                return await self._wait_for_pod(pod.pod_name, workspace, until=until,
+                                                timeout=max(deadline - time.monotonic(), 0.0), interval=interval,
+                                                watch=watch)
+            await self._check_creation(watch, workspace)
             _new_pod_expired(deadline, name, timeout)
             await asyncio.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
 
@@ -1202,6 +1315,16 @@ class AsyncMeshive(_BaseClient):
         data = await self._get("/transactions", params={"workspace": workspace})
         return [Transaction.from_dict(d) for d in data]
 
+    async def get_transaction(self, transaction_id: int | str, workspace: str) -> Transaction:
+        """One pod operation by id (GET /transactions/{transaction_id}?workspace=). Same contract as the sync client."""
+        segment = _int_segment(transaction_id, "transaction_id")
+        try:
+            data = await self._get(f"/transactions/{segment}",
+                                   params={"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "transaction lookup") from None
+        return Transaction.from_dict(data)
+
     async def get_storage(self, storage_name: str, workspace: str) -> Storage:
         """A single storage (GET /storages/{storage_name}?workspace=)."""
         segment = _path_segment(storage_name, "storage_name")
@@ -1224,6 +1347,14 @@ class AsyncMeshive(_BaseClient):
         """GPU tiers available to rent now, with prices (GET /gpus?rentalType=&vram=)."""
         data = await self._get("/gpus", params=_gpus_params(rental_type, min_vram))
         return [GpuAvailability.from_dict(d) for d in data]
+
+    async def list_cpus(self, *, rental_type: str = "demand") -> list[CpuLine]:
+        """CPU lines available to rent now, with prices (GET /cpus?rentalType=). Pass a line's `cpu_line` to create_pod."""
+        try:
+            data = await self._get("/cpus", params=_cpus_params(rental_type))
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "CPU lines") from None
+        return [CpuLine.from_dict(d) for d in data]
 
     async def list_api_keys(self) -> list[ApiKey]:
         """My active API keys — prefixes only, no plaintext (GET /api-keys)."""
@@ -1351,15 +1482,18 @@ class AsyncMeshive(_BaseClient):
                      ports: Any = None, command: str | None = None, internet_premium: bool = False,
                      uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
                      max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
-                     harvest_destination: Any = None) -> PodEstimate:
-        """Pod estimate — creates nothing (read scope is enough). Same arguments as create_pod."""
+                     harvest_destination: Any = None, local_volumes: Any = None,
+                     cpu_line: str | None = None) -> PodEstimate:
+        """Pod estimate — creates nothing (read scope is enough). Same arguments as create_pod; the price includes any
+        new local_volumes (breakdown "local_storage")."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
                                internet_premium=internet_premium, uptime_premium=uptime_premium,
                                cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour,
                                input_assets=input_assets, watched_folders=watched_folders,
-                               harvest_destination=harvest_destination)
+                               harvest_destination=harvest_destination, local_volumes=local_volumes,
+                               cpu_line=cpu_line)
         return PodEstimate.from_dict(await self._send("POST", "/pods/estimate",
                                                  params={"workspace": _query_value(workspace, "workspace")}, json=body))
 
@@ -1370,19 +1504,26 @@ class AsyncMeshive(_BaseClient):
                    ports: Any = None, command: str | None = None, internet_premium: bool = False,
                    uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
                    max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
-                   harvest_destination: Any = None, idempotency_key: str | None = None) -> PodCreated:
+                   harvest_destination: Any = None, idempotency_key: str | None = None, local_volumes: Any = None,
+                   cpu_line: str | None = None) -> PodCreated:
         """Create a pod (202 accepted). It is billed hourly — check the price with estimate_pod first;
         max_price_per_hour caps the final hourly compute price. Placement above it can fail asynchronously.
         Storage (including the automatic PV) and asset storage charges are separate and not covered by the cap.
+        volumes attaches existing network storage ((pv_name, mount_path) or {"storage", "mount_path"}); local_volumes
+        creates new local storage on the pod's machine together with the pod ({"name", "mount_path", "size_gb", and
+        optionally "usage_warning", "usage_warning_threshold", "encrypted"}). cpu_line puts a CPU pod on a line from
+        list_cpus (default: the cheapest line that fits). region is deprecated and ignored.
         input_assets attaches Asset Hub assets ("asset_id" or {"asset", "target_dir", "role", "paths"}),
-        watched_folders are folders whose new files are uploaded as assets ("path" or {"path", "include", "include_existing"})."""
+        watched_folders are folders whose new files are uploaded as assets ("path" or {"path", "include", "include_existing"}).
+        Pass the result's transaction_id to wait_for_new_pod to learn right away if the creation fails."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
                                internet_premium=internet_premium, uptime_premium=uptime_premium,
                                cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour,
                                input_assets=input_assets, watched_folders=watched_folders,
-                               harvest_destination=harvest_destination)
+                               harvest_destination=harvest_destination, local_volumes=local_volumes,
+                               cpu_line=cpu_line)
         return PodCreated.from_dict(await self._send("POST", "/pods", params={"workspace": _query_value(workspace, "workspace")},
                                                 json=body, idempotency_key=idempotency_key))
 
@@ -1394,8 +1535,11 @@ class AsyncMeshive(_BaseClient):
 
     async def start_pod(self, pod_name: str, workspace: str, *, placement: str = "same_node",
                   allow_data_loss: bool = False, idempotency_key: str | None = None) -> ResourceAction:
-        """Start a stopped pod. placement: same_node (original node) | any_node (moving nodes permanently deletes work files that aren't preserved).
-        allow_data_loss=True is a separate data-loss consent for this pod/move request."""
+        """Start a stopped pod. placement: same_node (its original node, the default) | any_node (any node with
+        capacity) | wait_same_node / wait_any_node (the pod waits until capacity frees up, then starts). The server
+        decides which placements exist and refuses an unknown one. Moving to another node (any_node, wait_any_node)
+        permanently deletes work files that aren't preserved; allow_data_loss=True is a separate data-loss consent for
+        this pod/move request (ConflictError 'Data Loss Consent Required' without it)."""
         if not isinstance(allow_data_loss, bool):
             raise ValueError("allow_data_loss must be an explicit boolean")
         data = await self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/start",
@@ -1422,6 +1566,7 @@ class AsyncMeshive(_BaseClient):
     async def estimate_storage(self, name: str, size_gb: int, *, workspace: str, storage_type: str = "nfs",
                          disk_type: str = "NVMe", encrypted: bool = False, region: str | None = None,
                          max_price_per_hour: Any = None) -> StorageEstimate:
+        """Storage estimate — creates nothing. Same arguments as create_storage."""
         body = _write.storage_body(name, size_gb, storage_type=storage_type, disk_type=disk_type, encrypted=encrypted,
                                    region=region, max_price_per_hour=max_price_per_hour)
         return StorageEstimate.from_dict(await self._send("POST", "/storages/estimate",
@@ -1430,7 +1575,9 @@ class AsyncMeshive(_BaseClient):
     async def create_storage(self, name: str, size_gb: int, *, workspace: str, storage_type: str = "nfs",
                        disk_type: str = "NVMe", encrypted: bool = False, region: str | None = None,
                        max_price_per_hour: Any = None, idempotency_key: str | None = None) -> StorageCreated:
-        """Create storage (PV) (202). Billed hourly by capacity while it exists."""
+        """Create network storage (PV) (202). Billed hourly by capacity while it exists. Local storage can't be created
+        on its own (the server refuses storage_type "hostPath"); create it with a pod: create_pod(local_volumes=...).
+        disk_type and region are deprecated and ignored (storage is always NVMe)."""
         body = _write.storage_body(name, size_gb, storage_type=storage_type, disk_type=disk_type, encrypted=encrypted,
                                    region=region, max_price_per_hour=max_price_per_hour)
         return StorageCreated.from_dict(await self._send("POST", "/storages", params={"workspace": _query_value(workspace, "workspace")},

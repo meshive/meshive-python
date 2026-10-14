@@ -461,7 +461,8 @@ class InitLog:
 
 @dataclass
 class Transaction:
-    """One in-progress pod operation. The only way to see why `status: creating` is taking long.
+    """One pod operation (list_transactions: those in progress; get_transaction: any one by id). The only way to see
+    why `status: creating` is taking long, or why a creation failed.
 
     `step` is the current stage, and stages with progress such as image pull or asset fetch fill `progress`
     (0.0–1.0). It is None for stages whose progress is unknown — **don't read it as 0.0**.
@@ -472,7 +473,7 @@ class Transaction:
     resource_name: str          # statefulset name (the part of the pod name before `-0`)
     user_alias: str             # the pod name the user gave
     action: str                 # create | start | stop | restart | reallocate ...
-    status: str                 # todo | in_progress | retry | failed ...
+    status: str                 # todo | in_progress | retry | done | failed | superseded
     step: str = ""              # current (last) stage
     step_status: str = ""
     detail: str = ""            # human-readable description / failure reason
@@ -531,6 +532,32 @@ class Transaction:
             updated_at=_parse_dt(d.get("updatedAt")),
             raw=d,
         )
+
+    @property
+    def failure_reason(self) -> str | None:
+        """Why the operation failed, as one sentence ("failed at step pull_image: image pull stalled for 600s").
+        None unless `status` is failed. Built from the failed step's diagnostics: the failure reason, the OOM reason,
+        else the first event message, else the step's detail."""
+        if self.status.lower() != "failed":
+            return None
+        steps = [x for x in (self.raw.get("transactionSteps") or []) if isinstance(x, dict)]
+        failed = [i for i, x in enumerate(steps) if str(x.get("status", "")).lower() == "failed"]
+        step = steps[max(failed, key=lambda i: (*_step_order(steps[i]), i))] if failed else {}
+        name = str(step.get("step", "") or "") or self.step
+        diagnostic = step.get("failureDiagnostic") if isinstance(step.get("failureDiagnostic"), dict) else {}
+        reasons = [str(diagnostic[key]).strip() for key in ("failureReason", "oomReason") if diagnostic.get(key)]
+        if not reasons:
+            events = [e for e in diagnostic.get("events") or []
+                      if isinstance(e, dict) and (e.get("message") or e.get("reason"))]
+            # The first Warning event says what went wrong; Normal ones only narrate.
+            event = next((e for e in events if str(e.get("type", "")).lower() == "warning"), events[0] if events else None)
+            if event:
+                reasons = [str(event.get("message") or event.get("reason")).strip()]
+        if not reasons:
+            detail = str(step.get("detail", "") or "") if step else self.detail
+            reasons = [detail.strip()] if detail.strip() else []
+        where = f"failed at step {name}" if name else "failed"
+        return f"{where}: {'; '.join(reasons)}" if reasons else where
 
 
 @dataclass
@@ -720,6 +747,53 @@ class GpuAvailability:
             ram_recommended=_as_int(d.get("ramRecommended")),
             available_gpus=sum(per_machine),
             max_gpus_per_pod=max(per_machine, default=0),
+            machine_count=len(combos),
+            raw=d,
+        )
+
+
+def _optional_int(value: object) -> int | None:
+    return None if value is None else _as_int(value)
+
+
+@dataclass
+class CpuLine:
+    """GET /v1/sdk/cpus item — a CPU line that can be rented now (vendor, product line, generation and the RAM's
+    DDR generation), the choice the console offers for CPU pods.
+
+    Pass `cpu_line` to `create_pod(cpu_line=...)` (CLI: `pod-create --cpu-line`) to put a CPU pod on this line.
+    combinations (max allocatable per machine) is summarized as max_vcpus_per_pod / max_ram_per_pod / machine_count;
+    the original and the disk sizing (baseEphemeralStorage, ephemeralStoragePerCore, scratchDiskInitialGb) are in `.raw`.
+    """
+
+    cpu_line: str                  # cpuModel — the line key (not a CPU model name)
+    vendor: str
+    product_line: str
+    generation: int | None
+    ddr_type: int | None           # DDR generation of the line's RAM (0 = unknown)
+    rental_type: str               # demand | spot
+    price_per_core: str | None     # per vCPU per hour (USD)
+    ram_price_per_gb: str | None   # per GiB of RAM per hour (USD)
+    max_vcpus_per_pod: int         # the most one pod can get on a single machine
+    max_ram_per_pod: int           # MiB, same scope
+    machine_count: int
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CpuLine":
+        combos = [c for c in d.get("combinations") or [] if isinstance(c, dict)]
+        core_price, ram_price = d.get("cpuPricePerCore"), d.get("ramPricePerGb")
+        return cls(
+            cpu_line=str(d.get("cpuModel", "") or ""),
+            vendor=str(d.get("cpuVendor", "") or ""),
+            product_line=str(d.get("cpuProductLine", "") or ""),
+            generation=_optional_int(d.get("cpuGeneration")),
+            ddr_type=_optional_int(d.get("ddrType")),
+            rental_type=str(d.get("rentalType", "") or ""),
+            price_per_core=None if core_price is None else str(core_price),
+            ram_price_per_gb=None if ram_price is None else str(ram_price),
+            max_vcpus_per_pod=max((_as_int(c.get("maxCpu")) for c in combos), default=0),
+            max_ram_per_pod=max((_as_int(c.get("maxRam")) for c in combos), default=0),
             machine_count=len(combos),
             raw=d,
         )
@@ -1474,10 +1548,11 @@ class PodEstimate:
     """POST /v1/sdk/pods/estimate response — hourly pod estimate. The billed price is fixed on the node it lands on."""
 
     price_per_hour: str            # USD/h (string, normalized)
-    breakdown: dict                # {"gpu": "...", "cpu_extra": "...", "ram_extra": "...", ...}
-    resources: dict                # gpu_model/vram_gb/gpu_count/vcpu/ram_gb/disk_gb/rental_type ...
+    breakdown: dict                # {"gpu": "...", "cpu_extra": "...", "ram_extra": "...", "local_storage": "...", ...}
+    resources: dict                # gpu_model/vram_gb/gpu_count/vcpu/ram_gb/disk_gb/rental_type, cpu_model for CPU pods ...
     availability: dict             # available_gpus/max_gpus_per_pod/machine_count
     template: dict                 # id/name/image/hardware_type
+    # Attached storage: {"storage", "mount_path", ...}; new local volumes have "storage": None, "name", "size_gb" and "new": True.
     volumes: list = field(default_factory=list)
     note: str = ""
     raw: dict = field(default_factory=dict, repr=False)
@@ -1493,7 +1568,8 @@ class PodEstimate:
 @dataclass
 class PodCreated:
     """POST /v1/sdk/pods response (202). pod_name is assigned asynchronously, so it is None right after creation —
-    `wait_for_new_pod(name, workspace)` finds it by name once it shows up and waits until it is running."""
+    `wait_for_new_pod(name, workspace, transaction_id=created.transaction_id)` finds it by name once it shows up,
+    waits until it is running, and reports a failed creation as soon as the server records it."""
 
     name: str
     workspace: str

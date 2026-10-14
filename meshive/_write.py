@@ -1,7 +1,10 @@
 """Write request builders — (path, params, body) assembly + argument validation shared by the sync and async clients.
 
-The server takes camelCase JSON. Values are validated here, before the round trip, and raise ValueError (the same
-stance as the read-side _*_params helpers). Prices are sent as strings whether given as Decimal, float or str.
+The server takes camelCase JSON. The shape of the input (required values, types, absolute paths) is checked here,
+before the round trip, and raises ValueError (the same stance as the read-side _*_params helpers). Which values are
+allowed — GPU counts, sizes, placements, storage types — is the server's rule, so it is not repeated here and a value
+the server accepts is never refused first; the few fixed limits kept here (task duration, script size, log tail) are
+the server's own. Prices are sent as strings whether given as Decimal, float or str.
 """
 from __future__ import annotations
 
@@ -12,9 +15,10 @@ from typing import Any
 from urllib.parse import urlparse
 
 RENTAL_TYPES = ("demand", "spot")
-PLACEMENTS = ("same_node", "any_node")
+# The placements the server knows today, for reference only — start_pod sends any value and the server decides.
+PLACEMENTS = ("same_node", "any_node", "wait_same_node", "wait_any_node")
+# Known storage types, used only to send them in the server's spelling ("hostpath" → "hostPath").
 STORAGE_TYPES = ("nfs", "hostPath")
-DISK_TYPES = ("HDD", "SSD", "NVMe")
 MAX_SCRIPT_BYTES = 256 * 1024
 TASK_DURATION_RANGE = (3600, 86400)
 
@@ -100,6 +104,45 @@ def _ports(ports: Iterable[int | Mapping[str, Any]] | None) -> list[dict[str, An
     return out
 
 
+def _local_volumes(items: Any) -> list[dict[str, Any]]:
+    """New local storage created with the pod — [{"name", "mount_path", "size_gb", "usage_warning",
+    "usage_warning_threshold", "encrypted"}]. Only the shape is checked; size limits are the server's."""
+    out: list[dict[str, Any]] = []
+    for item in items or []:
+        if not isinstance(item, Mapping):
+            raise ValueError("local_volumes items must be mappings with name, mount_path and size_gb")
+
+        def pick(snake: str, camel: str) -> Any:
+            return item.get(snake) if item.get(snake) is not None else item.get(camel)
+
+        mount = _require_str(pick("mount_path", "mountPath"), "local_volumes[].mount_path")
+        if not mount.startswith("/"):
+            raise ValueError("local_volumes[].mount_path must be an absolute path")
+        size = pick("size_gb", "sizeGb")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+            raise ValueError("local_volumes[].size_gb must be a positive integer (GiB)")
+        threshold = pick("usage_warning_threshold", "usageWarningThreshold")
+        if threshold is not None:
+            if isinstance(threshold, bool):
+                raise ValueError("local_volumes[].usage_warning_threshold must be a number")
+            try:
+                threshold = float(threshold)
+            except (TypeError, ValueError):
+                raise ValueError("local_volumes[].usage_warning_threshold must be a number") from None
+        warning, encrypted = pick("usage_warning", "usageWarning"), item.get("encrypted")
+        out.append(_drop_none({
+            "name": _require_str(item.get("name"), "local_volumes[].name"), "mountPath": mount, "sizeGb": size,
+            "usageWarning": None if warning is None else bool(warning), "usageWarningThreshold": threshold,
+            "encrypted": None if encrypted is None else bool(encrypted),
+        }))
+    return out
+
+
+def _deprecated(message: str) -> None:
+    # stacklevel 4 points at the code that called the client method (_deprecated → body builder → client method → caller).
+    warnings.warn(message, DeprecationWarning, stacklevel=4)
+
+
 def _drop_none(body: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in body.items() if v is not None}
 
@@ -111,11 +154,17 @@ def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: i
              volumes: Any, env: Mapping[str, Any] | None, secret_keys: Iterable[str] | None, ports: Any,
              command: str | None, internet_premium: bool, uptime_premium: bool, cpu_premium: bool,
              region: str | None, max_price_per_hour: Any, input_assets: Any = None, watched_folders: Any = None,
-             harvest_destination: Any = None) -> dict[str, Any]:
+             harvest_destination: Any = None, local_volumes: Any = None, cpu_line: str | None = None) -> dict[str, Any]:
     if isinstance(template_id, bool) or not isinstance(template_id, int) or template_id < 0:
         raise ValueError("template_id must be a non-negative integer")
-    if isinstance(gpu_count, bool) or not isinstance(gpu_count, int) or not 1 <= gpu_count <= 8:
-        raise ValueError("gpu_count must be an integer between 1 and 8")
+    # How many GPUs one pod may take is the server's rule; only the type is checked here.
+    if isinstance(gpu_count, bool) or not isinstance(gpu_count, int) or gpu_count < 1:
+        raise ValueError("gpu_count must be a positive integer")
+    if cpu_line is not None and not isinstance(cpu_line, str):
+        raise ValueError("cpu_line must be a string (a cpu_line from list_cpus)")
+    if region:
+        # The server places pods without a region (as the console does) and ignores the value, so it isn't sent.
+        _deprecated("region is ignored by the server; the argument will be removed in meshive 2.0")
     env_out, secrets = _env(env, secret_keys)
     return _drop_none({
         "name": _require_str(name, "name"),
@@ -126,8 +175,11 @@ def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: i
         "rentalType": _rental(rental_type),
         "vcpu": _optional_int(vcpu, "vcpu"),
         "ramGb": _optional_int(ram_gb, "ram_gb"),
+        # A CPU pod's line (list_cpus → cpu_line). Omitted = the server picks the cheapest line that fits.
+        "cpuLine": cpu_line.strip() if isinstance(cpu_line, str) and cpu_line.strip() else None,
         # The system disk is fixed by a server-side formula (quote resources.disk_gb) — not sent.
         "volumes": _volumes(volumes),
+        "localVolumes": _local_volumes(local_volumes) or None,
         "env": env_out,
         "secretKeys": secrets,
         "ports": _ports(ports),
@@ -135,7 +187,6 @@ def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: i
         "internetPremium": bool(internet_premium),
         "uptimePremium": bool(uptime_premium),
         "cpuPremium": bool(cpu_premium),
-        "region": region.strip() if isinstance(region, str) and region.strip() else None,
         "maxPricePerHourUsd": _price(max_price_per_hour, "max_price_per_hour"),
         "inputAssets": _pod_input_assets(input_assets) or None,
         "watchedFolders": _watched_folders(watched_folders) or None,
@@ -209,10 +260,11 @@ def watched_folders_body(expected_version: int, template: Mapping[str, Any] | No
 
 
 def placement(value: str) -> str:
-    choice = (value or "").strip().lower()
-    if choice not in PLACEMENTS:
-        raise ValueError(f"placement must be one of {', '.join(PLACEMENTS)}")
-    return choice
+    """start_pod placement, normalized (" Any_Node " → "any_node"). Which placements exist is the server's call
+    (an unknown one comes back as a 422), so only an empty value is refused here."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("placement must be a non-empty string, e.g. same_node or wait_any_node")
+    return value.strip().lower()
 
 
 def delete_pod_params(workspace: str, delete_local_storages: Iterable[str] | None) -> dict[str, str]:
@@ -227,20 +279,20 @@ def delete_pod_params(workspace: str, delete_local_storages: Iterable[str] | Non
 
 def storage_body(name: str, size_gb: int, *, storage_type: str, disk_type: str, encrypted: bool,
                  region: str | None, max_price_per_hour: Any) -> dict[str, Any]:
+    """Standalone storage. Which types the server creates this way is its rule (today network storage only — local
+    storage is created with a pod, see create_pod(local_volumes=...)), so storage_type is passed through. The server
+    ignores disk_type (always NVMe) and region, so neither is sent."""
     if isinstance(size_gb, bool) or not isinstance(size_gb, int) or size_gb < 1:
         raise ValueError("size_gb must be a positive integer")
-    kind = next((t for t in STORAGE_TYPES if t.lower() == (storage_type or "").strip().lower()), None)
-    if kind is None:
-        raise ValueError(f"storage_type must be one of {', '.join(STORAGE_TYPES)}")
-    disk = next((t for t in DISK_TYPES if t.lower() == (disk_type or "").strip().lower()), None)
-    if disk is None:
-        raise ValueError(f"disk_type must be one of {', '.join(DISK_TYPES)}")
-    # Encryption at rest is for network (nfs) storage only — the server rejects hostPath + encrypted with 422.
-    if encrypted and kind != "nfs":
-        raise ValueError("encrypted is only available for nfs (network) storage; hostPath volumes cannot be encrypted")
+    kind = _require_str(storage_type, "storage_type")
+    kind = next((t for t in STORAGE_TYPES if t.lower() == kind.lower()), kind)
+    if disk_type is not None and str(disk_type).strip().lower() != "nvme":
+        _deprecated("disk_type is ignored by the server (storage is always NVMe); "
+                    "the argument will be removed in meshive 2.0")
+    if region:
+        _deprecated("region is ignored by the server; the argument will be removed in meshive 2.0")
     return _drop_none({
-        "name": _require_str(name, "name"), "sizeGb": size_gb, "storageType": kind, "diskType": disk,
-        "encrypted": bool(encrypted), "region": region.strip() if isinstance(region, str) and region.strip() else None,
+        "name": _require_str(name, "name"), "sizeGb": size_gb, "storageType": kind, "encrypted": bool(encrypted),
         "maxPricePerHourUsd": _price(max_price_per_hour, "max_price_per_hour"),
     })
 

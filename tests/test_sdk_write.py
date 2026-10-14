@@ -1,13 +1,16 @@
 """Write surface — request assembly (path/query/body), Idempotency-Key, retries, new exceptions, headers=, logs."""
 import asyncio
 import json
+import warnings
 
 import httpx
 import pytest
 
 from meshive import (
+    MeshiveAPIError,
     NotFoundError,
     PermissionDeniedError,
+    PodCreationFailedError,
     AsyncMeshive,
     ConflictError,
     InsufficientCreditError,
@@ -54,7 +57,7 @@ def test_estimate_pod_builds_request():
                                         volumes=[("pv-data", "/data"), {"storage": "pv-b", "mount_path": "/b"}],
                                         env={"A": "1", "TOKEN": "x"}, secret_keys=["TOKEN"],
                                         ports=[8888, {"port": 6006, "name": "tb", "external": False}],
-                                        command="sleep infinity", region="KR", max_price_per_hour=0.5)
+                                        command="sleep infinity", max_price_per_hour=0.5)
     assert isinstance(est, PodEstimate) and est.price_per_hour == "0.068423" and est.availability["available_gpus"] == 2
     req = rec.last
     assert req.method == "POST" and req.url.path == "/v1/sdk/pods/estimate" and req.url.params["workspace"] == "ws 1"
@@ -67,7 +70,7 @@ def test_estimate_pod_builds_request():
         "env": {"A": "1", "TOKEN": "x"}, "secretKeys": ["TOKEN"],
         "ports": [{"port": 8888, "external": True}, {"port": 6006, "external": False, "name": "tb"}],
         "command": "sleep infinity", "internetPremium": False, "uptimePremium": False, "cpuPremium": False,
-        "region": "KR", "maxPricePerHourUsd": "0.5",
+        "maxPricePerHourUsd": "0.5",
     }
 
 
@@ -103,17 +106,53 @@ def test_pod_lifecycle_paths_and_params():
     c.delete_pod("p-0", "ws", delete_local_storages=["pv-a", " pv-b "])
     assert rec.last.method == "DELETE" and rec.last.url.params["deleteLocalStorages"] == "pv-a,pv-b"
     with pytest.raises(ValueError):
-        c.start_pod("p-0", "ws", placement="moon")
+        c.start_pod("p-0", "ws", placement=" ")
+
+
+@pytest.mark.parametrize("placement", ["same_node", "any_node", "wait_same_node", "wait_any_node"])
+def test_start_pod_sends_every_placement(placement):
+    rec = Recorder((202, {"podName": "p-0", "workspace": "ws", "action": "start"}))
+    sync_client(rec).start_pod("p-0", "ws", placement=f" {placement.upper()} ", allow_data_loss=True)
+    assert rec.last.url.params["placement"] == placement and rec.last.url.params["allow_data_loss"] == "true"
+
+
+def test_start_pod_leaves_unknown_placements_to_the_server():
+    """The server owns the list of placements — a value the SDK doesn't know is sent, and the server's 422 comes back."""
+    rec = Recorder((422, {"detail": [{"loc": ["query", "placement"], "msg": "Input should be 'same_node', ..."}]}))
+    with pytest.raises(MeshiveAPIError) as err:
+        sync_client(rec).start_pod("p-0", "ws", placement="next_week")
+    assert err.value.status_code == 422 and rec.last.url.params["placement"] == "next_week"
 
 
 @pytest.mark.parametrize("kwargs", [
-    dict(gpu_count=0), dict(gpu_count=9), dict(rental_type="hourly"),
+    dict(gpu_count=0), dict(gpu_count="2"), dict(gpu_count=True), dict(rental_type="hourly"),
     dict(env={"A": "1"}, secret_keys=["B"]), dict(volumes=[("pv", "data")]), dict(ports=[70000]),
-    dict(max_price_per_hour="free"), dict(max_price_per_hour=0),
+    dict(max_price_per_hour="free"), dict(max_price_per_hour=0), dict(cpu_line=3),
+    dict(local_volumes=[("scratch", "/scratch", 20)]),
+    dict(local_volumes=[{"mount_path": "/scratch", "size_gb": 20}]),
+    dict(local_volumes=[{"name": "scratch", "mount_path": "scratch", "size_gb": 20}]),
+    dict(local_volumes=[{"name": "scratch", "mount_path": "/scratch"}]),
+    dict(local_volumes=[{"name": "scratch", "mount_path": "/scratch", "size_gb": "20"}]),
+    dict(local_volumes=[{"name": "scratch", "mount_path": "/scratch", "size_gb": 20, "usage_warning_threshold": "most"}]),
 ])
 def test_pod_validation_errors(kwargs):
+    rec = Recorder((200, ESTIMATE))
     with pytest.raises(ValueError):
-        sync_client(Recorder((200, ESTIMATE))).estimate_pod("p", 1, workspace="ws", **kwargs)
+        sync_client(rec).estimate_pod("p", 1, workspace="ws", **kwargs)
+    assert rec.requests == []
+
+
+def test_pod_limits_are_left_to_the_server():
+    """Only the shape is checked locally — sizes and counts the server may accept go through (it answers with a 400)."""
+    rec = Recorder((200, ESTIMATE))
+    c = sync_client(rec)
+    c.estimate_pod("p", 1, workspace="ws", gpu_model="H100", gpu_count=16)
+    assert rec.body()["gpuCount"] == 16
+    c.estimate_pod("p", 1, workspace="ws", local_volumes=[{"name": "tiny", "mount_path": "/t", "size_gb": 1,
+                                                           "usage_warning_threshold": 5}])
+    assert rec.body()["localVolumes"] == [{"name": "tiny", "mountPath": "/t", "sizeGb": 1, "usageWarningThreshold": 5.0}]
+    c.estimate_pod("p", 1, workspace="ws", command="x" * 5000)
+    assert len(rec.body()["command"]) == 5000
 
 
 # --- Exceptions --------------------------------------------------------------------
@@ -132,21 +171,48 @@ def test_402_and_409_map_to_new_exceptions():
 def test_storage_methods():
     rec = Recorder((202, {"name": "vol", "workspace": "ws", "transactionId": 5, "pvName": None,
                           "estimate": {"pricePerHourUsd": "0.000097", "pricePerGbMonthUsd": "0.07", "sizeGb": 1,
-                                       "storageType": "nfs", "maxSizeGb": 305}}))
+                                       "storageType": "nfs", "diskType": "NVMe", "maxSizeGb": 305}}))
     c = sync_client(rec)
-    created = c.create_storage("vol", 1, workspace="ws", storage_type="NFS", disk_type="ssd", encrypted=True)
+    created = c.create_storage("vol", 1, workspace="ws", storage_type="NFS", encrypted=True)
     assert isinstance(created, StorageCreated) and created.estimate.max_size_gb == 305 and created.transaction_id == 5
-    assert rec.body() == {"name": "vol", "sizeGb": 1, "storageType": "nfs", "diskType": "SSD", "encrypted": True}
-    c.create_storage("vol", 1, workspace="ws", storage_type="hostpath")
-    assert rec.body() == {"name": "vol", "sizeGb": 1, "storageType": "hostPath", "diskType": "NVMe", "encrypted": False}
-    with pytest.raises(ValueError, match="nfs"):          # encryption is network storage only (the server also rejects hostPath+encrypted with 422)
-        c.estimate_storage("vol", 1, workspace="ws", storage_type="hostPath", encrypted=True)
+    assert created.estimate.disk_type == "NVMe"
+    assert rec.body() == {"name": "vol", "sizeGb": 1, "storageType": "nfs", "encrypted": True}   # no diskType/region
     c.delete_storage("pv-1", "ws")
     assert rec.last.method == "DELETE" and rec.last.url.path == "/v1/sdk/storages/pv-1"
     with pytest.raises(ValueError):
         c.estimate_storage("vol", 0, workspace="ws")
     with pytest.raises(ValueError):
-        c.estimate_storage("vol", 1, workspace="ws", storage_type="floppy")
+        c.estimate_storage("vol", 1, workspace="ws", storage_type=" ")
+
+
+def test_storage_types_are_left_to_the_server():
+    """Which storage types can be created alone is the server's rule: hostPath (any spelling) and unknown types are sent, and the
+    server's answer — "Local Storage Not Supported" for hostPath — comes back as it is."""
+    rec = Recorder((400, {"detail": {"title": "Local Storage Not Supported",
+                                     "message": "Create local storage together with a pod (local_volumes)."}}))
+    c = sync_client(rec)
+    with pytest.raises(MeshiveAPIError, match="local_volumes") as err:
+        c.create_storage("vol", 10, workspace="ws", storage_type="hostpath", encrypted=True)
+    assert err.value.title == "Local Storage Not Supported"
+    assert rec.body() == {"name": "vol", "sizeGb": 10, "storageType": "hostPath", "encrypted": True}
+    with pytest.raises(MeshiveAPIError):
+        c.estimate_storage("vol", 10, workspace="ws", storage_type="floppy")
+    assert rec.body()["storageType"] == "floppy"
+
+
+def test_storage_disk_type_and_region_are_deprecated_and_not_sent():
+    rec = Recorder((200, {"pricePerHourUsd": "0.0001", "sizeGb": 10, "storageType": "nfs", "diskType": "NVMe"}))
+    c = sync_client(rec)
+    with pytest.warns(DeprecationWarning, match="disk_type is ignored") as record:
+        c.estimate_storage("vol", 10, workspace="ws", disk_type="SSD")
+    assert record[0].filename == __file__          # the warning points at the caller, not at the SDK
+    with pytest.warns(DeprecationWarning, match="region is ignored"):
+        est = c.estimate_storage("vol", 10, workspace="ws", region="KR")
+    assert est.disk_type == "NVMe" and not {"diskType", "region"} & rec.body().keys()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")             # the defaults (and an explicit NVMe) don't warn
+        c.estimate_storage("vol", 10, workspace="ws")
+        c.create_storage("vol", 10, workspace="ws", disk_type="nvme", region=None)
 
 
 def test_serving_methods():
@@ -446,3 +512,283 @@ def test_ssh_access():
     assert "pw-123" not in repr(a) and "cHctMTIz" not in repr(a)
     with pytest.raises(NotFoundError, match="does not support SSH access"):
         sync_client(Recorder((404, {"detail": "Not Found"}))).ssh_access("p-0", "ws")
+
+
+# --- 1.1.0: local volumes, CPU lines, deprecated region ------------------------------------------------
+
+def test_create_pod_sends_local_volumes_and_cpu_line():
+    rec = Recorder((202, {"name": "p", "workspace": "ws", "transactionId": 8, "estimate": ESTIMATE}))
+    sync_client(rec).create_pod("p", 457, workspace="ws", cpu_line=" amd-epyc-4-ddr5 ", volumes=[("pv-net", "/data")],
+                                local_volumes=[{"name": "scratch", "mount_path": "/scratch", "size_gb": 50},
+                                               {"name": "keys", "mountPath": "/keys", "sizeGb": 10, "encrypted": True,
+                                                "usage_warning": True, "usage_warning_threshold": 0.8}])
+    body = rec.body()
+    assert body["cpuLine"] == "amd-epyc-4-ddr5" and "gpuModel" not in body
+    assert body["volumes"] == [{"storage": "pv-net", "mountPath": "/data"}]
+    assert body["localVolumes"] == [
+        {"name": "scratch", "mountPath": "/scratch", "sizeGb": 50},     # unset options are left to the server's defaults
+        {"name": "keys", "mountPath": "/keys", "sizeGb": 10, "usageWarning": True, "usageWarningThreshold": 0.8,
+         "encrypted": True}]
+    sync_client(rec).create_pod("p", 457, workspace="ws", cpu_line=" ", local_volumes=[])
+    assert not {"cpuLine", "localVolumes", "region"} & rec.body().keys()
+
+
+def test_region_is_deprecated_and_not_sent():
+    rec = Recorder((200, ESTIMATE))
+    with pytest.warns(DeprecationWarning, match="region is ignored by the server") as record:
+        sync_client(rec).estimate_pod("p", 457, workspace="ws", region="KR")
+    assert record[0].filename == __file__ and "removed in meshive 2.0" in str(record[0].message)
+    assert "region" not in rec.body()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        sync_client(rec).create_pod("p", 457, workspace="ws", region=None)
+
+
+def test_estimate_includes_new_local_storage():
+    payload = {**ESTIMATE, "pricePerHourUsd": "0.071", "breakdown": {"gpu": "0.068423", "local_storage": "0.002577"},
+               "volumes": [{"storage": "pv-net", "mount_path": "/data", "storage_type": "nfs"},
+                           {"storage": None, "name": "scratch", "mount_path": "/scratch", "storage_type": "hostPath",
+                            "size_gb": 50, "encrypted": False, "new": True}]}
+    est = sync_client(Recorder((200, payload))).estimate_pod(
+        "p", 457, workspace="ws", gpu_model="RTX 3060", volumes=[("pv-net", "/data")],
+        local_volumes=[{"name": "scratch", "mount_path": "/scratch", "size_gb": 50}])
+    assert est.price_per_hour == "0.071" and est.breakdown["local_storage"] == "0.002577"
+    assert est.volumes[1]["new"] is True and est.volumes[1]["storage"] is None
+
+
+def test_async_pod_writes_take_the_new_arguments():
+    rec = Recorder((202, {"name": "p", "workspace": "ws", "transactionId": 3, "estimate": ESTIMATE}))
+    start = Recorder((202, {"podName": "p-0", "action": "start"}))
+
+    async def main():
+        async with async_client(rec) as c:
+            with pytest.warns(DeprecationWarning, match="region"):
+                await c.create_pod("p", 1, workspace="ws", cpu_line="intel-xeon-3-ddr4", region="KR",
+                                   local_volumes=[{"name": "s", "mount_path": "/s", "size_gb": 20}])
+        async with async_client(start) as c:
+            await c.start_pod("p-0", "ws", placement="wait_same_node")
+        storage = Recorder((200, {"pricePerHourUsd": "0", "sizeGb": 10, "storageType": "nfs"}))
+        async with async_client(storage) as c:
+            with pytest.warns(DeprecationWarning, match="disk_type"):
+                await c.estimate_storage("v", 10, workspace="ws", storage_type="hostPath", disk_type="HDD")
+        return storage
+
+    storage = asyncio.run(main())
+    assert rec.body()["cpuLine"] == "intel-xeon-3-ddr4" and "region" not in rec.body()
+    assert rec.body()["localVolumes"] == [{"name": "s", "mountPath": "/s", "sizeGb": 20}]
+    assert start.last.url.params["placement"] == "wait_same_node"
+    assert storage.body() == {"name": "v", "sizeGb": 10, "storageType": "hostPath", "encrypted": False}
+
+
+# --- 1.1.0: CPU lines -------------------------------------------------------------------------------------
+
+CPU_LINE = {"rentalType": "demand", "cpuModel": "amd-epyc-4-ddr5", "cpuProductLine": "EPYC", "cpuVendor": "AMD",
+            "cpuGeneration": 4, "ddrType": 5, "cpuPricePerCore": "0.012", "ramPricePerGb": "0.002",
+            "baseEphemeralStorage": 5, "ephemeralStoragePerCore": 2, "scratchDiskInitialGb": 20,
+            "combinations": [{"maxCpu": 64, "maxRam": 262144, "maxStorage": 2000},
+                             {"maxCpu": 96, "maxRam": 131072, "maxStorage": 1000}]}
+
+
+def test_list_cpus_params_and_summary():
+    from meshive import CpuLine
+
+    rec = Recorder((200, [CPU_LINE]))
+    line, = sync_client(rec).list_cpus(rental_type="Spot")
+    assert rec.last.method == "GET" and rec.last.url.path == "/v1/sdk/cpus"
+    assert dict(rec.last.url.params) == {"rentalType": "spot"}
+    assert isinstance(line, CpuLine) and line.cpu_line == "amd-epyc-4-ddr5"
+    assert (line.vendor, line.product_line, line.generation, line.ddr_type) == ("AMD", "EPYC", 4, 5)
+    assert (line.price_per_core, line.ram_price_per_gb) == ("0.012", "0.002")
+    assert (line.max_vcpus_per_pod, line.max_ram_per_pod, line.machine_count) == (96, 262144, 2)
+    assert line.raw["scratchDiskInitialGb"] == 20
+    sync_client(rec).list_cpus()
+    assert dict(rec.last.url.params) == {"rentalType": "demand"}
+    with pytest.raises(ValueError):
+        sync_client(rec).list_cpus(rental_type="reserved")
+
+
+def test_cpu_line_missing_values_are_none_not_zero():
+    from meshive import CpuLine
+
+    line = CpuLine.from_dict({"cpuModel": "x"})
+    assert line.generation is None and line.ddr_type is None and line.price_per_core is None
+    assert line.max_vcpus_per_pod == 0 and line.machine_count == 0
+
+
+def test_list_cpus_on_an_older_server_and_async():
+    with pytest.raises(NotFoundError, match="does not support CPU lines"):
+        sync_client(Recorder((404, {"detail": "Not Found"}))).list_cpus()
+
+    async def run():
+        async with async_client(Recorder((200, [CPU_LINE]))) as c:
+            return await c.list_cpus()
+    assert asyncio.run(run())[0].max_vcpus_per_pod == 96
+
+
+# --- 1.1.0: one transaction by id ------------------------------------------------------------------------
+
+def _txn(status, steps=None, **extra):
+    return {"transactionId": 99, "namespace": "ws", "userAlias": "p", "resource": "statefulset",
+            "resourceName": "abc123", "action": "create", "status": status,
+            "createdAt": "2026-10-14T00:00:00Z", "updatedAt": "2026-10-14T00:01:00Z",
+            "transactionSteps": steps or [], **extra}
+
+
+PULL_FAILED = [
+    {"step": "create_statefulset", "status": "done", "detail": "", "updatedAt": "2026-10-14T00:00:10Z"},
+    {"step": "image_pull", "status": "failed", "detail": "", "updatedAt": "2026-10-14T00:01:00Z",
+     "failureDiagnostic": {"failureReason": "image pull stalled for 600s", "events": [], "containerStatuses": []}},
+]
+
+
+def test_get_transaction_reads_one_operation():
+    rec = Recorder((200, _txn("failed", PULL_FAILED)))
+    t = sync_client(rec).get_transaction(99, "ws")
+    assert rec.last.url.path == "/v1/sdk/transactions/99" and dict(rec.last.url.params) == {"workspace": "ws"}
+    assert t.transaction_id == 99 and t.status == "failed" and t.step == "image_pull"
+    assert t.failure_reason == "failed at step image_pull: image pull stalled for 600s"
+    sync_client(rec).get_transaction("99", "ws")        # PodCreated.transaction_id as the server sent it
+    assert rec.last.url.path == "/v1/sdk/transactions/99"
+    for bad in (None, "abc", -1, True):
+        with pytest.raises(ValueError):
+            sync_client(rec).get_transaction(bad, "ws")
+
+
+def test_get_transaction_not_found_and_older_servers():
+    missing = Recorder((404, {"detail": {"title": "Transaction Not Found", "message": "No pod transaction 5 in 'ws'."}}))
+    with pytest.raises(NotFoundError) as err:
+        sync_client(missing).get_transaction(5, "ws")
+    assert err.value.title == "Transaction Not Found"
+    with pytest.raises(NotFoundError, match="does not support transaction lookup"):
+        sync_client(Recorder((404, {"detail": "Not Found"}))).get_transaction(5, "ws")
+
+
+@pytest.mark.parametrize("diagnostic, detail, expected", [
+    ({"failureReason": "image pull stalled", "oomReason": "RAM limit 16Gi reached"}, "",
+     "failed at step run: image pull stalled; RAM limit 16Gi reached"),
+    ({"oomReason": "CUDA out of memory"}, "", "failed at step run: CUDA out of memory"),
+    ({"events": [{"type": "Normal", "reason": "Pulled", "message": "pulled"},
+                 {"type": "Warning", "reason": "BackOff", "message": "Back-off restarting failed container"}]}, "",
+     "failed at step run: Back-off restarting failed container"),
+    ({"events": [{"type": "Normal", "reason": "Scheduled", "message": None}]}, "", "failed at step run: Scheduled"),
+    ({}, "node went away", "failed at step run: node went away"),
+    (None, "", "failed at step run"),
+])
+def test_transaction_failure_reason(diagnostic, detail, expected):
+    from meshive import Transaction
+
+    step = {"step": "run", "status": "failed", "detail": detail, "updatedAt": "2026-10-14T00:01:00Z"}
+    if diagnostic is not None:
+        step["failureDiagnostic"] = diagnostic
+    assert Transaction.from_dict(_txn("failed", [step])).failure_reason == expected
+    assert Transaction.from_dict(_txn("in_progress", [step])).failure_reason is None
+    assert Transaction.from_dict(_txn("failed")).failure_reason == "failed"
+
+
+def test_async_get_transaction():
+    async def run():
+        async with async_client(Recorder((200, _txn("done")))) as c:
+            return await c.get_transaction(99, "ws")
+    assert asyncio.run(run()).status == "done"
+
+
+# --- 1.1.0: wait_for_new_pod follows the creation transaction ---------------------------------------------
+
+POD_ROW = {"podName": "p-0", "namespaceName": "ws", "userAlias": "p", "status": "creating", "rentalType": "demand",
+           "pricePerHour": "0.1", "isMaintenance": False}
+
+
+class Server:
+    """A fake API for waits: GET /pods, /pods/{name} and /transactions/{id} answer from lists that advance per call."""
+
+    def __init__(self, *, pods, transactions=None):
+        self.pods = list(pods)            # each item: a list of pods for GET /pods, or a status for GET /pods/p-0
+        self.transactions = list(transactions or [])
+        self.paths: list[str] = []
+
+    @staticmethod
+    def _next(items):
+        return items.pop(0) if len(items) > 1 else items[0]
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path.removeprefix("/v1/sdk")
+        self.paths.append(path)
+        if path.startswith("/transactions/"):
+            status, body = self._next(self.transactions)
+            return httpx.Response(status, json=body)
+        item = self._next(self.pods)
+        if path == "/pods":
+            return httpx.Response(200, json={"pods": item if isinstance(item, list) else [{**POD_ROW, "status": item}]})
+        return httpx.Response(200, json={**POD_ROW, "status": item if isinstance(item, str) else "creating"})
+
+
+def test_wait_for_new_pod_reports_a_failed_creation_at_once(slept):
+    server = Server(pods=[[]], transactions=[(200, _txn("in_progress")), (200, _txn("failed", PULL_FAILED))])
+    with pytest.raises(PodCreationFailedError) as err:
+        sync_client(server).wait_for_new_pod("p", "ws", transaction_id=99, interval=5)
+    assert err.value.pod_name == "p"
+    assert err.value.reason == "creation failed at step image_pull: image pull stalled for 600s"
+    assert server.paths == ["/pods", "/transactions/99", "/pods", "/transactions/99"] and slept == [5]
+
+
+def test_wait_for_new_pod_reports_a_cancelled_creation(slept):
+    server = Server(pods=[[]], transactions=[(200, _txn("superseded"))])
+    with pytest.raises(PodCreationFailedError, match="cancelled because the pod was deleted"):
+        sync_client(server).wait_for_new_pod("p", "ws", transaction_id=99)
+    assert server.paths == ["/pods", "/transactions/99"]
+
+
+def test_wait_for_new_pod_keeps_following_after_the_pod_appears(slept):
+    server = Server(pods=[[{**POD_ROW}], "creating"],
+                    transactions=[(200, _txn("in_progress")), (200, _txn("failed", PULL_FAILED))])
+    with pytest.raises(PodCreationFailedError, match="image pull stalled"):
+        sync_client(server).wait_for_new_pod("p", "ws", transaction_id="99")
+    assert server.paths == ["/pods", "/transactions/99", "/pods/p-0", "/transactions/99"]
+
+
+def test_wait_for_new_pod_stops_following_a_finished_transaction(slept):
+    server = Server(pods=[[], "creating", "running"], transactions=[(200, _txn("in_progress")), (200, _txn("done"))])
+    pod = sync_client(server).wait_for_new_pod("p", "ws", transaction_id=99)
+    assert pod.status == "running"
+    assert server.paths == ["/pods", "/transactions/99", "/pods", "/transactions/99", "/pods/p-0"]   # no lookups after done
+
+
+@pytest.mark.parametrize("answer", [
+    (404, {"detail": {"title": "Transaction Not Found", "message": "No pod transaction 99"}}),
+    (404, {"detail": "Not Found"}),           # a server without the lookup
+])
+def test_wait_for_new_pod_falls_back_when_the_transaction_cannot_be_read(slept, answer):
+    server = Server(pods=[[], [{**POD_ROW}], "running"], transactions=[answer])
+    assert sync_client(server).wait_for_new_pod("p", "ws", transaction_id=99).status == "running"
+    assert server.paths == ["/pods", "/transactions/99", "/pods", "/pods/p-0"]
+
+
+def test_wait_for_new_pod_without_transaction_id_watches_the_pod_only(slept):
+    server = Server(pods=[[], [{**POD_ROW}], "running"], transactions=[(200, _txn("failed", PULL_FAILED))])
+    assert sync_client(server).wait_for_new_pod("p", "ws").status == "running"
+    assert "/transactions/99" not in server.paths
+    with pytest.raises(ValueError):
+        sync_client(server).wait_for_new_pod("p", "ws", transaction_id="not-a-number")
+
+
+def test_wait_for_new_pod_until_a_terminal_status_is_not_cut_short(slept):
+    """Waiting *for* terminated means a failed creation is the answer, not an error."""
+    server = Server(pods=[[{**POD_ROW, "status": "terminated"}], "terminated"],
+                    transactions=[(200, _txn("failed", PULL_FAILED))])
+    pod = sync_client(server).wait_for_new_pod("p", "ws", until="terminated", transaction_id=99)
+    assert pod.status == "terminated" and "/transactions/99" not in server.paths
+
+
+def test_async_wait_for_new_pod_follows_the_transaction(slept):
+    server = Server(pods=[[]], transactions=[(200, _txn("failed", PULL_FAILED))])
+    fallback = Server(pods=[[{**POD_ROW}], "running"], transactions=[(404, {"detail": "Not Found"})])
+
+    async def run():
+        async with async_client(server) as c:
+            with pytest.raises(PodCreationFailedError, match="image_pull"):
+                await c.wait_for_new_pod("p", "ws", transaction_id=99)
+        async with async_client(fallback) as c:
+            return await c.wait_for_new_pod("p", "ws", transaction_id=99)
+
+    assert asyncio.run(run()).status == "running"
+    assert server.paths == ["/pods", "/transactions/99"] and fallback.paths == ["/pods", "/transactions/99", "/pods/p-0"]

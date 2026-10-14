@@ -1071,7 +1071,7 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("workspace", help="Workspace ID (namespace name).")
     p.add_argument("pod_name", help="Pod ID (pod name).")
     p.add_argument("--name", default=None, help="New name (label).")
-    p.add_argument("--template", type=int, default=None, metavar="ID", help="Move the pod to another template.")
+    p.add_argument("--template", type=int, default=None, metavar="ID", help="Move the pod to another template; its variables, ports and command start from it.")
     p.add_argument("--rental", choices=["demand", "spot"], default=None, help="Change the rental type.")
     p.add_argument("--gpu", default=None, metavar="MODEL", help="GPU model from `meshive gpus`.")
     p.add_argument("--gpu-count", type=int, default=None, metavar="N")

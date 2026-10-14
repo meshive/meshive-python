@@ -1016,8 +1016,8 @@ class Meshive(_BaseClient):
                    idempotency_key: str | None = None) -> PodUpdated:
         """Change a pod as the console's edit screen does (202 accepted). Only what you pass changes.
 
-        name renames it; template_id moves it to another template; rental_type, gpu_model, gpu_vram_gb, gpu_count,
-        vcpu, ram_gb and cpu_line change its hardware. env sets or adds environment variables (secret_keys marks some
+        name renames it; template_id moves it to another template (variables, ports and command then start from
+        it); rental_type, gpu_model, gpu_vram_gb, gpu_count, vcpu, ram_gb and cpu_line change its hardware. env sets or adds environment variables (secret_keys marks some
         of them secret) and remove_env removes variables you added (not the template's). ports opens new ports,
         template_ports changes the template's ports (as in create_pod) and remove_ports closes ports you added.
         command replaces the command ("" goes back to the template's). volumes attaches existing storage — network

@@ -54,6 +54,9 @@ a model set, all as in the web console. Code written for 1.0 and 1.1 keeps worki
   with, as console-created pods do, so a later change to the template doesn't change it when the pod is edited.
 - Changing a pod's template with `update_pod(template_id=...)` starts it from the new template's variables, ports and
   command; the estimate's `changes` now lists what you added that doesn't carry over.
+- Reading a pod with a read-only API key now returns `***` for secret values such as `ACCESS_PASSWORD`, as reading a
+  task already did. Keys with write scope still get the values, so `meshive pod --show-secrets` needs one; with a
+  read-only key it says so.
 
 ## v1.1.0
 

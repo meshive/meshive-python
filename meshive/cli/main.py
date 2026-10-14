@@ -610,6 +610,9 @@ def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
         fmt.render_table(["CREDENTIAL", "VALUE"], rows, enabled=color)
         if hidden:
             print(fmt.paint("Secret values are hidden. Add --show-secrets to print them.", "dim", color))
+        elif show_secrets and any(c.is_secret and c.value == "***" for c in pod.connect_credentials):
+            print(fmt.paint("The server hides secret values from read-only API keys. Use a key with write scope.",
+                            "dim", color))
 
 
 def _print_gpu_usages(gpus, color: bool) -> None:

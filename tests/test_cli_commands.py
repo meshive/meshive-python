@@ -448,6 +448,14 @@ def test_pod_connect_info_hides_secrets_by_default(capsys):
     assert "s3cret-pw" in out and "hidden" not in out
 
 
+def test_pod_show_secrets_explains_read_only_key_mask(capsys, monkeypatch):
+    # The server sends "***" for secret values to read-only keys.
+    pod = FakeClient().get_pod("pod-1", "team-ns")
+    pod.connect_credentials[0].value = "***"
+    monkeypatch.setattr(FakeClient, "get_pod", lambda self, pod_name, workspace: pod)
+    assert cli.main(["pod", "team-ns", "pod-1", "--show-secrets"]) == 0
+    assert "read-only API keys" in capsys.readouterr().out
+
 def test_machines_output(capsys):
     assert cli.main(["machines"]) == 0
     out = capsys.readouterr().out

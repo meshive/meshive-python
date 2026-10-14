@@ -135,8 +135,8 @@ class PodEndpoint:
 class ConnectCredential:
     """One value needed to connect — an env the template marks showOnConnect (e.g. ComfyUI's ACCESS_PASSWORD).
 
-    `is_secret` values are in a response anyone with the API key can read. Don't print them to screens or logs as-is —
-    they're left out of repr, and the CLI hides them without `--show-secrets`.
+    `is_secret` values come back only to API keys with write scope (a read-only key gets "***"). Don't print them to
+    screens or logs as-is — they're left out of repr, and the CLI hides them without `--show-secrets`.
     """
 
     key: str

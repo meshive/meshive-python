@@ -23,12 +23,24 @@ class WaitTimeoutError(MeshiveError, TimeoutError):
 
 
 class PodCreationFailedError(MeshiveError):
-    """wait_for_pod saw the pod end because creating it failed. `reason` is the server's explanation."""
+    """Creating the pod failed: wait_for_pod saw the pod end because of it, or wait_for_new_pod(transaction_id=...)
+    saw the creation transaction fail or get cancelled. `reason` is the server's explanation."""
 
     def __init__(self, pod_name: str, reason: str):
         super().__init__(f"Pod {pod_name} failed to start and was cleaned up: {reason}")
         self.pod_name = pod_name
         self.reason = reason
+
+
+class StorageConnectionError(MeshiveError):
+    """connect_storage: the server reported phase "error" — the storage's access pod could not be prepared.
+    `connection` is the StorageConnection as last read."""
+
+    def __init__(self, pv_name: str, connection: object = None):
+        super().__init__(f"Storage {pv_name} could not be opened for SSH access (phase: error). "
+                         "Try connecting again in a moment.")
+        self.pv_name = pv_name
+        self.connection = connection
 
 
 class MeshiveAPIError(MeshiveError):

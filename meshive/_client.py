@@ -6,8 +6,9 @@ only the transport differs (httpx.Client vs httpx.AsyncClient).
 Authentication: Meshive API key, `Authorization: Bearer meshive_...`. Reads, estimates, logs and downloads need the
 read scope; creating, changing or deleting pods, storage, servings, tasks, model registrations and asset imports, and
 SSH access, need the write scope.
-Read surface: account (me/api-keys/credit/earnings), workspaces (list/detail/members), pods (list/single/metrics),
-storage, machines (list/single/metrics), GPU availability, templates, serverless (servings/tasks), assets (Asset Hub).
+Read surface: account (me/api-keys/credit/earnings), workspaces (list/detail/members), pods (list/single/metrics,
+transactions), storage, machines (list/single/metrics), GPU and CPU availability, templates and their model sets,
+serverless (servings/tasks), assets (Asset Hub).
 Retries are safe for both: GETs are idempotent, and writes resend the same Idempotency-Key, so the
 server replays the first response instead of creating twice.
 """
@@ -40,6 +41,7 @@ from .exceptions import (
     PermissionDeniedError,
     PodCreationFailedError,
     RateLimitError,
+    StorageConnectionError,
     WaitTimeoutError,
 )
 from .models import (
@@ -49,6 +51,7 @@ from .models import (
     AssetImported,
     AssetPage,
     AssetStorage,
+    CpuLine,
     DownloadFile,
     TaskOutputs,
     Credit,
@@ -61,19 +64,25 @@ from .models import (
     MachineMetrics,
     Member,
     ModelDetection,
+    ModelSetList,
     Pod,
     PodCreated,
     PodEstimate,
     PodMetrics,
+    PodUpdated,
+    PodUpdateEstimate,
     ResourceAction,
     Serving,
     ServingModel,
     SshAccess,
     Storage,
+    StorageConnection,
     Transaction,
     WatchedFolders,
     StorageCreated,
     StorageEstimate,
+    StorageUpdated,
+    StorageUpdateEstimate,
     Task,
     TaskEstimate,
     TaskSubmitted,
@@ -193,6 +202,13 @@ def _gpus_params(rental_type: str, min_vram: int | None) -> dict[str, Any]:
     return params
 
 
+def _cpus_params(rental_type: str) -> dict[str, Any]:
+    rental = (rental_type or "").strip().lower()
+    if rental not in _RENTAL_TYPES:
+        raise ValueError(f"rental_type must be one of {', '.join(_RENTAL_TYPES)}")
+    return {"rentalType": rental}
+
+
 def _templates_params(workspace: str | None, app_type: str | None) -> dict[str, Any]:
     params: dict[str, Any] = {}
     if workspace:
@@ -296,6 +312,25 @@ _RETRY_BACKOFF = 0.5  # 0.5s → 1s → 2s ...
 # A script silently stuck for minutes is worse than an error.
 _MAX_RETRY_AFTER = 60.0
 
+# A long-running write (create_pod with a model set: the server fetches the set's files before it answers) waits up
+# to this long for the answer, and is resent automatically only when the server surely never started on it — the
+# connection was never made, or the request was refused with 429/503. After a timeout or a gateway error the first
+# request may still be running, and a resend with the same Idempotency-Key is refused with 409
+# 'Operation Outcome Unknown' until it ends.
+LONG_RUNNING_READ_TIMEOUT = 900.0
+_NOT_STARTED_EXCEPTIONS = (httpx.ConnectError, httpx.ConnectTimeout)
+_NOT_STARTED_STATUSES = frozenset({429, 503})
+
+
+def _may_resend(long_running: bool, *, exc: BaseException | None = None,
+                response: httpx.Response | None = None) -> bool:
+    """Whether a failed attempt may be resent at all (the retry budget and backoff are decided separately)."""
+    if not long_running:
+        return True
+    if exc is not None:
+        return isinstance(exc, _NOT_STARTED_EXCEPTIONS)
+    return response is not None and response.status_code in _NOT_STARTED_STATUSES
+
 
 class _BaseClient:
     def __init__(
@@ -343,6 +378,11 @@ class _BaseClient:
             payload = response.text or None
         _raise_for_status(response.status_code, payload, response.headers)
         return payload
+
+    def _long_timeout(self) -> httpx.Timeout:
+        """The client's timeout, with a read timeout of at least LONG_RUNNING_READ_TIMEOUT."""
+        read = None if self._timeout is None else max(float(self._timeout), LONG_RUNNING_READ_TIMEOUT)
+        return httpx.Timeout(self._timeout, read=read)
 
     def _retry_delay(self, attempt: int, response: httpx.Response | None = None) -> float | None:
         """Retry wait time (seconds). None when it shouldn't retry.
@@ -404,6 +444,50 @@ def _new_pod_expired(deadline: float, name: str, timeout: float) -> None:
         raise WaitTimeoutError(f"Pod {name!r} did not appear within {timeout:g}s.")
 
 
+# --- Shared connect_storage decisions ------------------------------------------
+
+def _connection_ready(connection: StorageConnection, pv_name: str) -> bool:
+    """True once the storage can be reached over SSH. Phase "error" raises; any other phase is still preparing."""
+    phase = connection.phase.lower()
+    if phase == "error":
+        raise StorageConnectionError(pv_name, connection)
+    return phase == "ready"
+
+
+def _connection_expired(deadline: float, pv_name: str, timeout: float, connection: StorageConnection) -> None:
+    if time.monotonic() >= deadline:
+        raise WaitTimeoutError(
+            f"Storage {pv_name} was not ready for SSH access within {timeout:g}s "
+            f"(last phase: {connection.phase or '-'}). It keeps getting ready; connect again later."
+        )
+
+
+class _CreationWatch:
+    """wait_for_new_pod(transaction_id=...) — follows the pod's creation transaction alongside the pod itself, so a
+    creation that failed (or was cancelled by deleting the pod) ends the wait at once with the server's reason.
+
+    It stops following when the transaction is done (the pod's own status takes over), when the transaction can't be
+    read (404: an older server or an id outside the workspace — the wait falls back to watching the pod only), and when
+    `until` names a terminal status (then a failed creation is what was waited for, not an error)."""
+
+    def __init__(self, name: str, transaction_id: int | str | None, targets: set[str]) -> None:
+        self.name = name
+        self.transaction_id = None if transaction_id is None else int(_int_segment(transaction_id, "transaction_id"))
+        self.active = self.transaction_id is not None and not targets & _POD_TERMINAL_STATUSES
+
+    def unreadable(self) -> None:
+        self.active = False
+
+    def check(self, txn: Transaction) -> None:
+        status = txn.status.lower()
+        if status == "failed":
+            raise PodCreationFailedError(self.name, f"creation {txn.failure_reason}")
+        if status == "superseded":
+            raise PodCreationFailedError(self.name, "the creation was cancelled because the pod was deleted")
+        if status == "done":
+            self.active = False
+
+
 class Meshive(_BaseClient):
     """Synchronous Meshive SDK client.
 
@@ -448,24 +532,29 @@ class Meshive(_BaseClient):
             attempt += 1
 
     def _send(self, method: str, path: str, *, params: dict[str, Any] | None = None,
-              json: dict[str, Any] | None = None, idempotency_key: str | None = None) -> Any:
-        """Write request. Sent with an Idempotency-Key, so on retry the server replays the first response (no double creation)."""
+              json: dict[str, Any] | None = None, idempotency_key: str | None = None,
+              long_running: bool = False) -> Any:
+        """Write request. Sent with an Idempotency-Key, so on retry the server replays the first response (no double creation).
+        long_running: a request the server may work on for minutes — a long read timeout, and resent only when the
+        server surely never started on it (see LONG_RUNNING_READ_TIMEOUT)."""
         url = self._url(path)
         headers = self._build_headers()
         headers["Idempotency-Key"] = idempotency_key or str(uuid.uuid4())
+        timeout = self._long_timeout() if long_running else httpx.USE_CLIENT_DEFAULT
         attempt = 0
         while True:
             try:
-                response = self._client.request(method, url, params=params, json=json, headers=headers)
+                response = self._client.request(method, url, params=params, json=json, headers=headers,
+                                                timeout=timeout)
             except _RETRY_EXCEPTIONS as exc:
-                delay = self._retry_delay(attempt)
+                delay = self._retry_delay(attempt) if _may_resend(long_running, exc=exc) else None
                 if delay is None:
                     exc.idempotency_key = headers["Idempotency-Key"]
                     exc.operation_method = method
                     exc.operation_path = path
                     raise
             else:
-                delay = self._retry_delay(attempt, response)
+                delay = self._retry_delay(attempt, response) if _may_resend(long_running, response=response) else None
                 if delay is None:
                     try:
                         data = self._process(response)
@@ -529,16 +618,31 @@ class Meshive(_BaseClient):
         with the reason, when the pod was cleaned up because creating it failed).
         A timeout raises WaitTimeoutError (both a MeshiveError and a built-in TimeoutError).
         """
+        return self._wait_for_pod(pod_name, workspace, until=until, timeout=timeout, interval=interval)
+
+    def _wait_for_pod(self, pod_name: str, workspace: str, *, until: str | Iterable[str], timeout: float,
+                      interval: float, watch: _CreationWatch | None = None) -> Pod:
         targets, terminal = _wait_targets(until)
         deadline = time.monotonic() + timeout
         last = ""
         while True:
+            self._check_creation(watch, workspace)
             pod = self.get_pod(pod_name, workspace)
             if _wait_reached(pod, targets, terminal, pod_name):
                 return pod
             last = pod.status
             _wait_expired(deadline, pod_name, targets, last)
             time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+
+    def _check_creation(self, watch: _CreationWatch | None, workspace: str) -> None:
+        if watch is None or not watch.active:
+            return
+        try:
+            txn = self.get_transaction(watch.transaction_id, workspace)
+        except NotFoundError:
+            watch.unreadable()
+            return
+        watch.check(txn)
 
     def wait_for_new_pod(
         self,
@@ -548,23 +652,31 @@ class Meshive(_BaseClient):
         until: str | Iterable[str] = "running",
         timeout: float = 600.0,
         interval: float = 5.0,
+        transaction_id: int | str | None = None,
     ) -> Pod:
         """Wait for a pod just created with `create_pod(name, ...)` to appear and reach `until`, and return it.
 
-            client.create_pod("my-pod", template_id, workspace="my-workspace", gpu_model="RTX 3060")
-            pod = client.wait_for_new_pod("my-pod", "my-workspace", until="running")
+            created = client.create_pod("my-pod", template_id, workspace="my-workspace", gpu_model="RTX 3060")
+            pod = client.wait_for_new_pod("my-pod", "my-workspace", transaction_id=created.transaction_id)
 
         create_pod returns before the pod has an ID, so this finds it by name (user_alias), then waits like
-        wait_for_pod. Raises WaitTimeoutError if it doesn't appear or reach `until` within `timeout` seconds.
+        wait_for_pod. With `transaction_id` (create_pod's `transaction_id`) it also follows the creation on every
+        poll: if the server records it as failed, or as cancelled because the pod was deleted, PodCreationFailedError
+        is raised right away with the reason instead of waiting for the pod. Without it, or on a server that can't
+        look the transaction up, only the pod is watched. Raises WaitTimeoutError if the pod doesn't appear or reach
+        `until` within `timeout` seconds.
         """
         if not name:
             raise ValueError("name is required")  # an empty name would match system pods, which have no label
+        watch = _CreationWatch(name, transaction_id, _wait_targets(until)[0])
         deadline = time.monotonic() + timeout
         while True:
             pod = next((p for p in self.list_pods(workspace) if p.user_alias == name), None)
             if pod is not None:
-                return self.wait_for_pod(pod.pod_name, workspace, until=until,
-                                         timeout=max(deadline - time.monotonic(), 0.0), interval=interval)
+                return self._wait_for_pod(pod.pod_name, workspace, until=until,
+                                          timeout=max(deadline - time.monotonic(), 0.0), interval=interval,
+                                          watch=watch)
+            self._check_creation(watch, workspace)
             _new_pod_expired(deadline, name, timeout)
             time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
 
@@ -594,6 +706,17 @@ class Meshive(_BaseClient):
         return [Transaction.from_dict(d)
                 for d in self._get("/transactions", params={"workspace": workspace})]
 
+    def get_transaction(self, transaction_id: int | str, workspace: str) -> Transaction:
+        """One pod operation by id (GET /transactions/{transaction_id}?workspace=), such as create_pod's
+        `transaction_id`. Unlike list_transactions there is no time window, so a finished or failed operation can be
+        read later; `failure_reason` says why a failed one failed. NotFoundError for an id outside the workspace."""
+        segment = _int_segment(transaction_id, "transaction_id")
+        try:
+            data = self._get(f"/transactions/{segment}", params={"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "transaction lookup") from None
+        return Transaction.from_dict(data)
+
     def get_storage(self, storage_name: str, workspace: str) -> Storage:
         """A single storage (GET /storages/{storage_name}?workspace=). Same argument order as get_pod."""
         segment = _path_segment(storage_name, "storage_name")
@@ -615,6 +738,15 @@ class Meshive(_BaseClient):
         """GPU tiers available to rent now, with prices (GET /gpus?rentalType=&vram=)."""
         return [GpuAvailability.from_dict(d)
                 for d in self._get("/gpus", params=_gpus_params(rental_type, min_vram))]
+
+    def list_cpus(self, *, rental_type: str = "demand") -> list[CpuLine]:
+        """CPU lines available to rent now, with prices (GET /cpus?rentalType=). Pass a line's `cpu_line` to
+        create_pod / estimate_pod to put a CPU pod on it."""
+        try:
+            data = self._get("/cpus", params=_cpus_params(rental_type))
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "CPU lines") from None
+        return [CpuLine.from_dict(d) for d in data]
 
     def list_api_keys(self) -> list[ApiKey]:
         """My active API keys — prefixes only, no plaintext (GET /api-keys)."""
@@ -646,6 +778,17 @@ class Meshive(_BaseClient):
         params = {"workspace": workspace} if workspace else None
         segment = _int_segment(template_id, "template_id")
         return Template.from_dict(self._get(f"/templates/{segment}", params=params))
+
+    def list_model_sets(self, workspace: str, template_id: int | str) -> ModelSetList:
+        """The model sets a template can start with — the console's model-set tiles (GET /model-sets?workspace=&templateId=).
+        Pass a set's slug to create_pod(model_set=...); a pod takes one set. `selectable` is False, with `reason`, when
+        the template adds its own set automatically or has no model folders."""
+        params = {"workspace": _query_value(workspace, "workspace"), "templateId": _int_segment(template_id, "template_id")}
+        try:
+            data = self._get("/model-sets", params=params)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "model sets") from None
+        return ModelSetList.from_dict(data)
 
     def list_servings(self, workspace: str) -> list[Serving]:
         """Serverless serving deployments in a workspace (GET /servings?workspace=)."""
@@ -738,15 +881,20 @@ class Meshive(_BaseClient):
                      ports: Any = None, command: str | None = None, internet_premium: bool = False,
                      uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
                      max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
-                     harvest_destination: Any = None) -> PodEstimate:
-        """Pod estimate — creates nothing (read scope is enough). Same arguments as create_pod."""
+                     harvest_destination: Any = None, local_volumes: Any = None,
+                     cpu_line: str | None = None, template_ports: Any = None,
+                     model_set: str | None = None, watched_template_folders: Any = None) -> PodEstimate:
+        """Pod estimate — creates nothing (read scope is enough). Same arguments as create_pod; the price includes any
+        new local_volumes (breakdown "local_storage"), and `model_set` describes the model set when one is given."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
                                internet_premium=internet_premium, uptime_premium=uptime_premium,
                                cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour,
                                input_assets=input_assets, watched_folders=watched_folders,
-                               harvest_destination=harvest_destination)
+                               harvest_destination=harvest_destination, local_volumes=local_volumes,
+                               cpu_line=cpu_line, template_ports=template_ports, model_set=model_set,
+                               watched_template_folders=watched_template_folders)
         return PodEstimate.from_dict(self._send("POST", "/pods/estimate",
                                                  params={"workspace": _query_value(workspace, "workspace")}, json=body))
 
@@ -757,21 +905,48 @@ class Meshive(_BaseClient):
                    ports: Any = None, command: str | None = None, internet_premium: bool = False,
                    uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
                    max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
-                   harvest_destination: Any = None, idempotency_key: str | None = None) -> PodCreated:
+                   harvest_destination: Any = None, idempotency_key: str | None = None, local_volumes: Any = None,
+                   cpu_line: str | None = None, template_ports: Any = None,
+                   model_set: str | None = None, watched_template_folders: Any = None) -> PodCreated:
         """Create a pod (202 accepted). It is billed hourly — check the price with estimate_pod first;
         max_price_per_hour caps the final hourly compute price. Placement above it can fail asynchronously.
         Storage (including the automatic PV) and asset storage charges are separate and not covered by the cap.
-        input_assets attaches Asset Hub assets ("asset_id" or {"asset", "target_dir", "role", "paths"}),
-        watched_folders are folders whose new files are uploaded as assets ("path" or {"path", "include", "include_existing"})."""
+        volumes attaches existing network storage ((pv_name, mount_path) or {"storage", "mount_path"}); local_volumes
+        creates new local storage on the pod's machine together with the pod ({"name", "mount_path", "size_gb", and
+        optionally "usage_warning", "usage_warning_threshold", "encrypted"}). cpu_line puts a CPU pod on a line from
+        list_cpus (default: the cheapest line that fits). region is deprecated and ignored.
+        ports opens new ports; template_ports changes the ports the template already opens, as the console's deploy
+        screen does: [{"port": 8080, "name": "ide", "new_port": 8443, "external": False}] — port is the template's
+        port, and each other key, when given, renames it, renumbers it or exposes/hides it (template ports can't be
+        removed). A port the template doesn't open is refused ('Port Not In Template'), and so is a clash with
+        another port or name ('Port In Use', 'Port Name In Use').
+        input_assets attaches Asset Hub assets ("asset_id" or {"asset", "target_dir", "role", "paths", "strip_prefix"};
+        with paths, strip_prefix "" keeps their folder structure — the console's Keep structure — and leaving it out
+        strips the folder they share). watched_folders are folders whose new files are uploaded as assets ("path" or
+        {"path", "include", "include_existing", "enabled"}); watched_template_folders sets the template's own watched
+        folders from the start, as the console's create screen does: {"/outputs": {"enabled": False}} turns one off and
+        {"/outputs": {"include": ["*.png"]}} changes its patterns (get_watched_folders lists them on a running pod).
+        Pass the result's transaction_id to wait_for_new_pod to learn right away if the creation fails.
+        model_set starts the pod with one of the template's model sets (a slug from list_model_sets; one per pod). The
+        server fetches the set's files before it answers, which can take minutes, so this request waits up to
+        LONG_RUNNING_READ_TIMEOUT seconds for the answer and is not resent after a timeout: the first request may
+        still be running, and a resend with the same idempotency_key is refused with ConflictError
+        'Operation Outcome Unknown' until it ends. After a timeout the pod may still be created — check list_pods,
+        or get_operation(err.idempotency_key, method="POST", path="/pods"), before trying again. If a file can't be
+        fetched the pod isn't created (400 'Model Set Unavailable', raw["detail"]["failed"]); files already fetched
+        stay in the workspace and are reused next time."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
                                internet_premium=internet_premium, uptime_premium=uptime_premium,
                                cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour,
                                input_assets=input_assets, watched_folders=watched_folders,
-                               harvest_destination=harvest_destination)
+                               harvest_destination=harvest_destination, local_volumes=local_volumes,
+                               cpu_line=cpu_line, template_ports=template_ports, model_set=model_set,
+                               watched_template_folders=watched_template_folders)
         return PodCreated.from_dict(self._send("POST", "/pods", params={"workspace": _query_value(workspace, "workspace")},
-                                                json=body, idempotency_key=idempotency_key))
+                                                json=body, idempotency_key=idempotency_key,
+                                                long_running="modelSet" in body))
 
     def stop_pod(self, pod_name: str, workspace: str, *, idempotency_key: str | None = None) -> ResourceAction:
         """Stop a pod (replicas=0). Pod billing stops; storage billing continues."""
@@ -779,15 +954,19 @@ class Meshive(_BaseClient):
                              params={"workspace": _query_value(workspace, "workspace")}, idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="pod")
 
-    def start_pod(self, pod_name: str, workspace: str, *, placement: str = "same_node",
+    def start_pod(self, pod_name: str, workspace: str, *, placement: str | None = None,
                   allow_data_loss: bool = False, idempotency_key: str | None = None) -> ResourceAction:
-        """Start a stopped pod. placement: same_node (original node) | any_node (moving nodes permanently deletes work files that aren't preserved).
-        allow_data_loss=True is a separate data-loss consent for this pod/move request."""
-        if not isinstance(allow_data_loss, bool):
-            raise ValueError("allow_data_loss must be an explicit boolean")
+        """Start a stopped pod. placement: same_node (its original node) | any_node (any node with capacity) |
+        wait_same_node / wait_any_node (the pod waits until capacity frees up, then starts). The server decides which
+        placements exist and refuses an unknown one. Without a placement (the default) the server picks what the web
+        console would: wait_any_node for a pod already waiting for any node; any_node, or wait_any_node if no node has
+        room now, when its original node can no longer run its configuration; otherwise same_node, or wait_same_node
+        if that node has no room now. The result's `placement` says which one was used.
+        Moving to another node (any_node, wait_any_node) permanently deletes work files that aren't preserved;
+        allow_data_loss=True is a separate data-loss consent for this pod/move request. Without it such a start is
+        refused with ConflictError 'Data Loss Consent Required', whose raw["detail"]["placement"] names the placement."""
         data = self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/start",
-                             params={"workspace": _query_value(workspace, "workspace"), "placement": _write.placement(placement),
-                                     "allow_data_loss": bool(allow_data_loss)},
+                             params=_write.start_pod_params(_query_value(workspace, "workspace"), placement, allow_data_loss),
                              idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="pod")
 
@@ -804,22 +983,107 @@ class Meshive(_BaseClient):
                              idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="pod")
 
+    def estimate_pod_update(self, pod_name: str, workspace: str, *, name: str | None = None,
+                            template_id: int | None = None, rental_type: str | None = None, gpu_model: str | None = None,
+                            gpu_vram_gb: int | None = None, gpu_count: int | None = None, vcpu: int | None = None,
+                            ram_gb: int | None = None, cpu_line: str | None = None, env: dict[str, str] | None = None,
+                            secret_keys: Iterable[str] | None = None, remove_env: Iterable[str] | None = None,
+                            ports: Any = None, template_ports: Any = None, remove_ports: Iterable[int] | None = None,
+                            command: str | None = None, volumes: Any = None, local_volumes: Any = None,
+                            detach_storages: Iterable[str] | None = None, allow_node_migration: bool | None = None,
+                            allow_data_loss: bool | None = None, drop_watched_folders: Iterable[str] | None = None,
+                            max_price_per_hour: Any = None) -> PodUpdateEstimate:
+        """What update_pod would change, whether a running pod restarts, and the new hourly price — changes nothing
+        (read scope is enough). Same arguments as update_pod."""
+        body = _write.pod_update_body(
+            name=name, template_id=template_id, rental_type=rental_type, gpu_model=gpu_model, gpu_vram_gb=gpu_vram_gb,
+            gpu_count=gpu_count, vcpu=vcpu, ram_gb=ram_gb, cpu_line=cpu_line, env=env, secret_keys=secret_keys,
+            remove_env=remove_env, ports=ports, template_ports=template_ports, remove_ports=remove_ports,
+            command=command, volumes=volumes, local_volumes=local_volumes, detach_storages=detach_storages,
+            allow_node_migration=allow_node_migration, allow_data_loss=allow_data_loss,
+            drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour)
+        try:
+            data = self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/estimate",
+                              params={"workspace": _query_value(workspace, "workspace")}, json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "pod editing") from None
+        return PodUpdateEstimate.from_dict(data)
+
+    def update_pod(self, pod_name: str, workspace: str, *, name: str | None = None,
+                   template_id: int | None = None, rental_type: str | None = None, gpu_model: str | None = None,
+                   gpu_vram_gb: int | None = None, gpu_count: int | None = None, vcpu: int | None = None,
+                   ram_gb: int | None = None, cpu_line: str | None = None, env: dict[str, str] | None = None,
+                   secret_keys: Iterable[str] | None = None, remove_env: Iterable[str] | None = None,
+                   ports: Any = None, template_ports: Any = None, remove_ports: Iterable[int] | None = None,
+                   command: str | None = None, volumes: Any = None, local_volumes: Any = None,
+                   detach_storages: Iterable[str] | None = None, allow_node_migration: bool | None = None,
+                   allow_data_loss: bool | None = None, drop_watched_folders: Iterable[str] | None = None,
+                   max_price_per_hour: Any = None,
+                   idempotency_key: str | None = None) -> PodUpdated:
+        """Change a pod as the console's edit screen does (202 accepted). Only what you pass changes.
+
+        name renames it; template_id moves it to another template (variables, ports and command then start from
+        it); rental_type, gpu_model, gpu_vram_gb, gpu_count, vcpu, ram_gb and cpu_line change its hardware. env sets or adds environment variables (secret_keys marks some
+        of them secret) and remove_env removes variables you added (not the template's). ports opens new ports,
+        template_ports changes the template's ports (as in create_pod) and remove_ports closes ports you added.
+        command replaces the command ("" goes back to the template's). volumes attaches existing storage — network
+        storage, or local storage on the pod's current machine — local_volumes creates new local storage there, and
+        detach_storages detaches storage by pv_name (its data stays). max_price_per_hour caps the new hourly price.
+
+        Most changes restart a running pod; estimate_pod_update says so before you commit. A rename alone is applied
+        in place without a restart (renamed_only, no transaction_id). Follow the change with
+        get_transaction(transaction_id) (action "update").
+
+        Some changes are refused until consent is given — ask the user, then call again with it:
+        ConflictError 'Node Migration Required' (the pod's machine can't fit the change; allow_node_migration=True
+        lets it move to another machine), ConflictError 'Data Loss Consent Required' (the move deletes the pod's
+        unpreserved workspace files; allow_data_loss=True as well), and MeshiveAPIError 400 whose
+        raw["detail"]["code"] is "harvest_roots_orphaned" (the change removes the watched folders in
+        raw["detail"]["paths"]; pass them as drop_watched_folders). ConflictError 'Resource values need
+        confirmation' (an older pod) asks for ram_gb to be passed explicitly. Other refusals ('Nothing To Change',
+        'Pod Type Locked', 'Incompatible Hardware', 'Port In Use', 'Cannot Change Resources', ...) carry the server's
+        explanation in the message."""
+        body = _write.pod_update_body(
+            name=name, template_id=template_id, rental_type=rental_type, gpu_model=gpu_model, gpu_vram_gb=gpu_vram_gb,
+            gpu_count=gpu_count, vcpu=vcpu, ram_gb=ram_gb, cpu_line=cpu_line, env=env, secret_keys=secret_keys,
+            remove_env=remove_env, ports=ports, template_ports=template_ports, remove_ports=remove_ports,
+            command=command, volumes=volumes, local_volumes=local_volumes, detach_storages=detach_storages,
+            allow_node_migration=allow_node_migration, allow_data_loss=allow_data_loss,
+            drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour)
+        try:
+            data = self._send("PATCH", f"/pods/{_path_segment(pod_name, 'pod_name')}",
+                              params={"workspace": _query_value(workspace, "workspace")}, json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "pod editing") from None
+        return PodUpdated.from_dict(data)
+
     # --- Writes: storage ---------------------------------------------------------------
 
     def estimate_storage(self, name: str, size_gb: int, *, workspace: str, storage_type: str = "nfs",
                          disk_type: str = "NVMe", encrypted: bool = False, region: str | None = None,
-                         max_price_per_hour: Any = None) -> StorageEstimate:
+                         max_price_per_hour: Any = None, usage_warning: bool | None = None,
+                         usage_warning_threshold: float | None = None) -> StorageEstimate:
+        """Storage estimate — creates nothing. Same arguments as create_storage."""
         body = _write.storage_body(name, size_gb, storage_type=storage_type, disk_type=disk_type, encrypted=encrypted,
-                                   region=region, max_price_per_hour=max_price_per_hour)
+                                   region=region, max_price_per_hour=max_price_per_hour, usage_warning=usage_warning,
+                                   usage_warning_threshold=usage_warning_threshold)
         return StorageEstimate.from_dict(self._send("POST", "/storages/estimate",
                                                      params={"workspace": _query_value(workspace, "workspace")}, json=body))
 
     def create_storage(self, name: str, size_gb: int, *, workspace: str, storage_type: str = "nfs",
                        disk_type: str = "NVMe", encrypted: bool = False, region: str | None = None,
-                       max_price_per_hour: Any = None, idempotency_key: str | None = None) -> StorageCreated:
-        """Create storage (PV) (202). Billed hourly by capacity while it exists."""
+                       max_price_per_hour: Any = None, idempotency_key: str | None = None,
+                       usage_warning: bool | None = None,
+                       usage_warning_threshold: float | None = None) -> StorageCreated:
+        """Create network storage (PV) (202). Billed hourly by capacity while it exists; the server's minimum size is
+        10 GiB. Local storage can't be created on its own (the server refuses storage_type "hostPath"); create it with
+        a pod: create_pod(local_volumes=...). usage_warning=True emails you when the storage fills past
+        usage_warning_threshold (a fraction in (0, 1], default 0.9), as the console's usage warning does; both are
+        sent only when given. disk_type and region are deprecated and ignored (storage is always NVMe)."""
         body = _write.storage_body(name, size_gb, storage_type=storage_type, disk_type=disk_type, encrypted=encrypted,
-                                   region=region, max_price_per_hour=max_price_per_hour)
+                                   region=region, max_price_per_hour=max_price_per_hour, usage_warning=usage_warning,
+                                   usage_warning_threshold=usage_warning_threshold)
         return StorageCreated.from_dict(self._send("POST", "/storages", params={"workspace": _query_value(workspace, "workspace")},
                                                     json=body, idempotency_key=idempotency_key))
 
@@ -828,6 +1092,75 @@ class Meshive(_BaseClient):
         data = self._send("DELETE", f"/storages/{_path_segment(storage_name, 'storage_name')}",
                              params={"workspace": _query_value(workspace, "workspace")}, idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="storage")
+
+    def estimate_storage_update(self, pv_name: str, workspace: str, *, name: str | None = None,
+                                size_gb: int | None = None, usage_warning: bool | None = None,
+                                usage_warning_threshold: float | None = None) -> StorageUpdateEstimate:
+        """What update_storage would do — the new size, price and usage warning next to the current ones. Changes
+        nothing (read scope is enough). Same arguments as update_storage."""
+        body = _write.storage_update_body(name=name, size_gb=size_gb, usage_warning=usage_warning,
+                                          usage_warning_threshold=usage_warning_threshold)
+        try:
+            data = self._send("POST", f"/storages/{_path_segment(pv_name, 'pv_name')}/estimate",
+                              params={"workspace": _query_value(workspace, "workspace")}, json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "storage editing") from None
+        return StorageUpdateEstimate.from_dict(data)
+
+    def update_storage(self, pv_name: str, workspace: str, *, name: str | None = None,
+                       size_gb: int | None = None, usage_warning: bool | None = None,
+                       usage_warning_threshold: float | None = None,
+                       idempotency_key: str | None = None) -> StorageUpdated:
+        """Change a storage as the console does (202 accepted). Only what you pass changes: name renames it, size_gb
+        grows it (GiB; storage can't shrink — 400 'Storage Cannot Shrink', raw["detail"]["currentSizeGb"]), and
+        usage_warning / usage_warning_threshold turn its usage warning on or off as in create_storage. Growing is
+        billed at the new size; check with estimate_storage_update first. A rename or a warning change alone is
+        applied at once, and transaction_id is then None (or the id of an earlier operation)."""
+        body = _write.storage_update_body(name=name, size_gb=size_gb, usage_warning=usage_warning,
+                                          usage_warning_threshold=usage_warning_threshold)
+        try:
+            data = self._send("PATCH", f"/storages/{_path_segment(pv_name, 'pv_name')}",
+                              params={"workspace": _query_value(workspace, "workspace")}, json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "storage editing") from None
+        return StorageUpdated.from_dict(data)
+
+    def get_storage_connection(self, pv_name: str, workspace: str) -> StorageConnection:
+        """Where a storage's SSH access stands (GET /storages/{pv}/connect): phase preparing | ready | error, the
+        access pod and, for encrypted storage, when it locks again. `ssh` is not filled here — see connect_storage."""
+        try:
+            data = self._get(f"/storages/{_path_segment(pv_name, 'pv_name')}/connect",
+                             params={"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "storage SSH access") from None
+        return StorageConnection.from_dict(data)
+
+    def connect_storage(self, pv_name: str, workspace: str, *, wait: bool = True, timeout: float = 300.0,
+                        interval: float = 3.0, idempotency_key: str | None = None) -> StorageConnection:
+        """Open a storage for SSH and SFTP, as the console's Connect does (write scope; safe to call again).
+
+        Plain storage is reached through its always-on access pod. Encrypted storage is unlocked and gets an access
+        pod, and it locks again automatically after `auto_lock_minutes`. With wait=True (the default) this polls every
+        `interval` seconds until the storage is ready and then fills `ssh` with a one-time SSH command and password
+        for the access pod (as ssh_access does — don't leave the password in logs). With wait=False it returns the
+        status as it is, with `ssh` filled only if the storage is ready already. Raises StorageConnectionError when
+        the server reports phase "error", and WaitTimeoutError when it isn't ready within `timeout` seconds."""
+        deadline = time.monotonic() + timeout
+        try:
+            data = self._send("POST", f"/storages/{_path_segment(pv_name, 'pv_name')}/connect",
+                              params={"workspace": _query_value(workspace, "workspace")},
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "storage SSH access") from None
+        connection = StorageConnection.from_dict(data)
+        while not _connection_ready(connection, pv_name) and wait:
+            _connection_expired(deadline, pv_name, timeout, connection)
+            time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+            connection = self.get_storage_connection(pv_name, workspace)
+        if connection.ready and connection.pod_name:
+            connection.ssh = self.ssh_access(connection.pod_name, workspace)
+        return connection
 
     # --- Writes: serving -----------------------------------------------------------------
 
@@ -1072,24 +1405,29 @@ class AsyncMeshive(_BaseClient):
             attempt += 1
 
     async def _send(self, method: str, path: str, *, params: dict[str, Any] | None = None,
-              json: dict[str, Any] | None = None, idempotency_key: str | None = None) -> Any:
-        """Write request. Sent with an Idempotency-Key, so on retry the server replays the first response (no double creation)."""
+              json: dict[str, Any] | None = None, idempotency_key: str | None = None,
+              long_running: bool = False) -> Any:
+        """Write request. Sent with an Idempotency-Key, so on retry the server replays the first response (no double creation).
+        long_running: a request the server may work on for minutes — a long read timeout, and resent only when the
+        server surely never started on it (see LONG_RUNNING_READ_TIMEOUT)."""
         url = self._url(path)
         headers = self._build_headers()
         headers["Idempotency-Key"] = idempotency_key or str(uuid.uuid4())
+        timeout = self._long_timeout() if long_running else httpx.USE_CLIENT_DEFAULT
         attempt = 0
         while True:
             try:
-                response = await self._client.request(method, url, params=params, json=json, headers=headers)
+                response = await self._client.request(method, url, params=params, json=json, headers=headers,
+                                                timeout=timeout)
             except _RETRY_EXCEPTIONS as exc:
-                delay = self._retry_delay(attempt)
+                delay = self._retry_delay(attempt) if _may_resend(long_running, exc=exc) else None
                 if delay is None:
                     exc.idempotency_key = headers["Idempotency-Key"]
                     exc.operation_method = method
                     exc.operation_path = path
                     raise
             else:
-                delay = self._retry_delay(attempt, response)
+                delay = self._retry_delay(attempt, response) if _may_resend(long_running, response=response) else None
                 if delay is None:
                     try:
                         data = self._process(response)
@@ -1147,16 +1485,31 @@ class AsyncMeshive(_BaseClient):
         interval: float = 5.0,
     ) -> Pod:
         """Poll until the pod reaches the `until` state (same rules as the sync wait_for_pod)."""
+        return await self._wait_for_pod(pod_name, workspace, until=until, timeout=timeout, interval=interval)
+
+    async def _wait_for_pod(self, pod_name: str, workspace: str, *, until: str | Iterable[str], timeout: float,
+                            interval: float, watch: _CreationWatch | None = None) -> Pod:
         targets, terminal = _wait_targets(until)
         deadline = time.monotonic() + timeout
         last = ""
         while True:
+            await self._check_creation(watch, workspace)
             pod = await self.get_pod(pod_name, workspace)
             if _wait_reached(pod, targets, terminal, pod_name):
                 return pod
             last = pod.status
             _wait_expired(deadline, pod_name, targets, last)
             await asyncio.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+
+    async def _check_creation(self, watch: _CreationWatch | None, workspace: str) -> None:
+        if watch is None or not watch.active:
+            return
+        try:
+            txn = await self.get_transaction(watch.transaction_id, workspace)
+        except NotFoundError:
+            watch.unreadable()
+            return
+        watch.check(txn)
 
     async def wait_for_new_pod(
         self,
@@ -1166,17 +1519,21 @@ class AsyncMeshive(_BaseClient):
         until: str | Iterable[str] = "running",
         timeout: float = 600.0,
         interval: float = 5.0,
+        transaction_id: int | str | None = None,
     ) -> Pod:
         """Wait for a pod just created with `create_pod(name, ...)` to appear and reach `until` (same rules as the
-        sync wait_for_new_pod)."""
+        sync wait_for_new_pod, including `transaction_id` to report a failed creation right away)."""
         if not name:
             raise ValueError("name is required")  # an empty name would match system pods, which have no label
+        watch = _CreationWatch(name, transaction_id, _wait_targets(until)[0])
         deadline = time.monotonic() + timeout
         while True:
             pod = next((p for p in await self.list_pods(workspace) if p.user_alias == name), None)
             if pod is not None:
-                return await self.wait_for_pod(pod.pod_name, workspace, until=until,
-                                               timeout=max(deadline - time.monotonic(), 0.0), interval=interval)
+                return await self._wait_for_pod(pod.pod_name, workspace, until=until,
+                                                timeout=max(deadline - time.monotonic(), 0.0), interval=interval,
+                                                watch=watch)
+            await self._check_creation(watch, workspace)
             _new_pod_expired(deadline, name, timeout)
             await asyncio.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
 
@@ -1202,6 +1559,16 @@ class AsyncMeshive(_BaseClient):
         data = await self._get("/transactions", params={"workspace": workspace})
         return [Transaction.from_dict(d) for d in data]
 
+    async def get_transaction(self, transaction_id: int | str, workspace: str) -> Transaction:
+        """One pod operation by id (GET /transactions/{transaction_id}?workspace=). Same contract as the sync client."""
+        segment = _int_segment(transaction_id, "transaction_id")
+        try:
+            data = await self._get(f"/transactions/{segment}",
+                                   params={"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "transaction lookup") from None
+        return Transaction.from_dict(data)
+
     async def get_storage(self, storage_name: str, workspace: str) -> Storage:
         """A single storage (GET /storages/{storage_name}?workspace=)."""
         segment = _path_segment(storage_name, "storage_name")
@@ -1224,6 +1591,14 @@ class AsyncMeshive(_BaseClient):
         """GPU tiers available to rent now, with prices (GET /gpus?rentalType=&vram=)."""
         data = await self._get("/gpus", params=_gpus_params(rental_type, min_vram))
         return [GpuAvailability.from_dict(d) for d in data]
+
+    async def list_cpus(self, *, rental_type: str = "demand") -> list[CpuLine]:
+        """CPU lines available to rent now, with prices (GET /cpus?rentalType=). Pass a line's `cpu_line` to create_pod."""
+        try:
+            data = await self._get("/cpus", params=_cpus_params(rental_type))
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "CPU lines") from None
+        return [CpuLine.from_dict(d) for d in data]
 
     async def list_api_keys(self) -> list[ApiKey]:
         """My active API keys — prefixes only, no plaintext (GET /api-keys)."""
@@ -1256,6 +1631,15 @@ class AsyncMeshive(_BaseClient):
         params = {"workspace": workspace} if workspace else None
         segment = _int_segment(template_id, "template_id")
         return Template.from_dict(await self._get(f"/templates/{segment}", params=params))
+
+    async def list_model_sets(self, workspace: str, template_id: int | str) -> ModelSetList:
+        """The model sets a template can start with (GET /model-sets?workspace=&templateId=). Same contract as the sync client."""
+        params = {"workspace": _query_value(workspace, "workspace"), "templateId": _int_segment(template_id, "template_id")}
+        try:
+            data = await self._get("/model-sets", params=params)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "model sets") from None
+        return ModelSetList.from_dict(data)
 
     async def list_servings(self, workspace: str) -> list[Serving]:
         """Serverless serving deployments in a workspace (GET /servings?workspace=)."""
@@ -1351,15 +1735,20 @@ class AsyncMeshive(_BaseClient):
                      ports: Any = None, command: str | None = None, internet_premium: bool = False,
                      uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
                      max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
-                     harvest_destination: Any = None) -> PodEstimate:
-        """Pod estimate — creates nothing (read scope is enough). Same arguments as create_pod."""
+                     harvest_destination: Any = None, local_volumes: Any = None,
+                     cpu_line: str | None = None, template_ports: Any = None,
+                     model_set: str | None = None, watched_template_folders: Any = None) -> PodEstimate:
+        """Pod estimate — creates nothing (read scope is enough). Same arguments as create_pod; the price includes any
+        new local_volumes (breakdown "local_storage"), and `model_set` describes the model set when one is given."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
                                internet_premium=internet_premium, uptime_premium=uptime_premium,
                                cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour,
                                input_assets=input_assets, watched_folders=watched_folders,
-                               harvest_destination=harvest_destination)
+                               harvest_destination=harvest_destination, local_volumes=local_volumes,
+                               cpu_line=cpu_line, template_ports=template_ports, model_set=model_set,
+                               watched_template_folders=watched_template_folders)
         return PodEstimate.from_dict(await self._send("POST", "/pods/estimate",
                                                  params={"workspace": _query_value(workspace, "workspace")}, json=body))
 
@@ -1370,21 +1759,48 @@ class AsyncMeshive(_BaseClient):
                    ports: Any = None, command: str | None = None, internet_premium: bool = False,
                    uptime_premium: bool = False, cpu_premium: bool = False, region: str | None = None,
                    max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
-                   harvest_destination: Any = None, idempotency_key: str | None = None) -> PodCreated:
+                   harvest_destination: Any = None, idempotency_key: str | None = None, local_volumes: Any = None,
+                   cpu_line: str | None = None, template_ports: Any = None,
+                   model_set: str | None = None, watched_template_folders: Any = None) -> PodCreated:
         """Create a pod (202 accepted). It is billed hourly — check the price with estimate_pod first;
         max_price_per_hour caps the final hourly compute price. Placement above it can fail asynchronously.
         Storage (including the automatic PV) and asset storage charges are separate and not covered by the cap.
-        input_assets attaches Asset Hub assets ("asset_id" or {"asset", "target_dir", "role", "paths"}),
-        watched_folders are folders whose new files are uploaded as assets ("path" or {"path", "include", "include_existing"})."""
+        volumes attaches existing network storage ((pv_name, mount_path) or {"storage", "mount_path"}); local_volumes
+        creates new local storage on the pod's machine together with the pod ({"name", "mount_path", "size_gb", and
+        optionally "usage_warning", "usage_warning_threshold", "encrypted"}). cpu_line puts a CPU pod on a line from
+        list_cpus (default: the cheapest line that fits). region is deprecated and ignored.
+        ports opens new ports; template_ports changes the ports the template already opens, as the console's deploy
+        screen does: [{"port": 8080, "name": "ide", "new_port": 8443, "external": False}] — port is the template's
+        port, and each other key, when given, renames it, renumbers it or exposes/hides it (template ports can't be
+        removed). A port the template doesn't open is refused ('Port Not In Template'), and so is a clash with
+        another port or name ('Port In Use', 'Port Name In Use').
+        input_assets attaches Asset Hub assets ("asset_id" or {"asset", "target_dir", "role", "paths", "strip_prefix"};
+        with paths, strip_prefix "" keeps their folder structure — the console's Keep structure — and leaving it out
+        strips the folder they share). watched_folders are folders whose new files are uploaded as assets ("path" or
+        {"path", "include", "include_existing", "enabled"}); watched_template_folders sets the template's own watched
+        folders from the start, as the console's create screen does: {"/outputs": {"enabled": False}} turns one off and
+        {"/outputs": {"include": ["*.png"]}} changes its patterns (get_watched_folders lists them on a running pod).
+        Pass the result's transaction_id to wait_for_new_pod to learn right away if the creation fails.
+        model_set starts the pod with one of the template's model sets (a slug from list_model_sets; one per pod). The
+        server fetches the set's files before it answers, which can take minutes, so this request waits up to
+        LONG_RUNNING_READ_TIMEOUT seconds for the answer and is not resent after a timeout: the first request may
+        still be running, and a resend with the same idempotency_key is refused with ConflictError
+        'Operation Outcome Unknown' until it ends. After a timeout the pod may still be created — check list_pods,
+        or get_operation(err.idempotency_key, method="POST", path="/pods"), before trying again. If a file can't be
+        fetched the pod isn't created (400 'Model Set Unavailable', raw["detail"]["failed"]); files already fetched
+        stay in the workspace and are reused next time."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
                                internet_premium=internet_premium, uptime_premium=uptime_premium,
                                cpu_premium=cpu_premium, region=region, max_price_per_hour=max_price_per_hour,
                                input_assets=input_assets, watched_folders=watched_folders,
-                               harvest_destination=harvest_destination)
+                               harvest_destination=harvest_destination, local_volumes=local_volumes,
+                               cpu_line=cpu_line, template_ports=template_ports, model_set=model_set,
+                               watched_template_folders=watched_template_folders)
         return PodCreated.from_dict(await self._send("POST", "/pods", params={"workspace": _query_value(workspace, "workspace")},
-                                                json=body, idempotency_key=idempotency_key))
+                                                json=body, idempotency_key=idempotency_key,
+                                                long_running="modelSet" in body))
 
     async def stop_pod(self, pod_name: str, workspace: str, *, idempotency_key: str | None = None) -> ResourceAction:
         """Stop a pod (replicas=0). Pod billing stops; storage billing continues."""
@@ -1392,15 +1808,19 @@ class AsyncMeshive(_BaseClient):
                              params={"workspace": _query_value(workspace, "workspace")}, idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="pod")
 
-    async def start_pod(self, pod_name: str, workspace: str, *, placement: str = "same_node",
+    async def start_pod(self, pod_name: str, workspace: str, *, placement: str | None = None,
                   allow_data_loss: bool = False, idempotency_key: str | None = None) -> ResourceAction:
-        """Start a stopped pod. placement: same_node (original node) | any_node (moving nodes permanently deletes work files that aren't preserved).
-        allow_data_loss=True is a separate data-loss consent for this pod/move request."""
-        if not isinstance(allow_data_loss, bool):
-            raise ValueError("allow_data_loss must be an explicit boolean")
+        """Start a stopped pod. placement: same_node (its original node) | any_node (any node with capacity) |
+        wait_same_node / wait_any_node (the pod waits until capacity frees up, then starts). The server decides which
+        placements exist and refuses an unknown one. Without a placement (the default) the server picks what the web
+        console would: wait_any_node for a pod already waiting for any node; any_node, or wait_any_node if no node has
+        room now, when its original node can no longer run its configuration; otherwise same_node, or wait_same_node
+        if that node has no room now. The result's `placement` says which one was used.
+        Moving to another node (any_node, wait_any_node) permanently deletes work files that aren't preserved;
+        allow_data_loss=True is a separate data-loss consent for this pod/move request. Without it such a start is
+        refused with ConflictError 'Data Loss Consent Required', whose raw["detail"]["placement"] names the placement."""
         data = await self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/start",
-                             params={"workspace": _query_value(workspace, "workspace"), "placement": _write.placement(placement),
-                                     "allow_data_loss": bool(allow_data_loss)},
+                             params=_write.start_pod_params(_query_value(workspace, "workspace"), placement, allow_data_loss),
                              idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="pod")
 
@@ -1417,22 +1837,84 @@ class AsyncMeshive(_BaseClient):
                              idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="pod")
 
+    async def estimate_pod_update(self, pod_name: str, workspace: str, *, name: str | None = None,
+                                  template_id: int | None = None, rental_type: str | None = None, gpu_model: str | None = None,
+                                  gpu_vram_gb: int | None = None, gpu_count: int | None = None, vcpu: int | None = None,
+                                  ram_gb: int | None = None, cpu_line: str | None = None, env: dict[str, str] | None = None,
+                                  secret_keys: Iterable[str] | None = None, remove_env: Iterable[str] | None = None,
+                                  ports: Any = None, template_ports: Any = None, remove_ports: Iterable[int] | None = None,
+                                  command: str | None = None, volumes: Any = None, local_volumes: Any = None,
+                                  detach_storages: Iterable[str] | None = None, allow_node_migration: bool | None = None,
+                                  allow_data_loss: bool | None = None, drop_watched_folders: Iterable[str] | None = None,
+                                  max_price_per_hour: Any = None) -> PodUpdateEstimate:
+        """What update_pod would change and cost (POST /pods/{pod}/estimate). Same contract as the sync client."""
+        body = _write.pod_update_body(
+            name=name, template_id=template_id, rental_type=rental_type, gpu_model=gpu_model, gpu_vram_gb=gpu_vram_gb,
+            gpu_count=gpu_count, vcpu=vcpu, ram_gb=ram_gb, cpu_line=cpu_line, env=env, secret_keys=secret_keys,
+            remove_env=remove_env, ports=ports, template_ports=template_ports, remove_ports=remove_ports,
+            command=command, volumes=volumes, local_volumes=local_volumes, detach_storages=detach_storages,
+            allow_node_migration=allow_node_migration, allow_data_loss=allow_data_loss,
+            drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour)
+        try:
+            data = await self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/estimate",
+                              params={"workspace": _query_value(workspace, "workspace")}, json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "pod editing") from None
+        return PodUpdateEstimate.from_dict(data)
+
+    async def update_pod(self, pod_name: str, workspace: str, *, name: str | None = None,
+                         template_id: int | None = None, rental_type: str | None = None, gpu_model: str | None = None,
+                         gpu_vram_gb: int | None = None, gpu_count: int | None = None, vcpu: int | None = None,
+                         ram_gb: int | None = None, cpu_line: str | None = None, env: dict[str, str] | None = None,
+                         secret_keys: Iterable[str] | None = None, remove_env: Iterable[str] | None = None,
+                         ports: Any = None, template_ports: Any = None, remove_ports: Iterable[int] | None = None,
+                         command: str | None = None, volumes: Any = None, local_volumes: Any = None,
+                         detach_storages: Iterable[str] | None = None, allow_node_migration: bool | None = None,
+                         allow_data_loss: bool | None = None, drop_watched_folders: Iterable[str] | None = None,
+                         max_price_per_hour: Any = None,
+                         idempotency_key: str | None = None) -> PodUpdated:
+        """Change a pod (PATCH /pods/{pod}, 202). Same contract as the sync client."""
+        body = _write.pod_update_body(
+            name=name, template_id=template_id, rental_type=rental_type, gpu_model=gpu_model, gpu_vram_gb=gpu_vram_gb,
+            gpu_count=gpu_count, vcpu=vcpu, ram_gb=ram_gb, cpu_line=cpu_line, env=env, secret_keys=secret_keys,
+            remove_env=remove_env, ports=ports, template_ports=template_ports, remove_ports=remove_ports,
+            command=command, volumes=volumes, local_volumes=local_volumes, detach_storages=detach_storages,
+            allow_node_migration=allow_node_migration, allow_data_loss=allow_data_loss,
+            drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour)
+        try:
+            data = await self._send("PATCH", f"/pods/{_path_segment(pod_name, 'pod_name')}",
+                              params={"workspace": _query_value(workspace, "workspace")}, json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "pod editing") from None
+        return PodUpdated.from_dict(data)
+
     # --- Writes: storage ---------------------------------------------------------------
 
     async def estimate_storage(self, name: str, size_gb: int, *, workspace: str, storage_type: str = "nfs",
                          disk_type: str = "NVMe", encrypted: bool = False, region: str | None = None,
-                         max_price_per_hour: Any = None) -> StorageEstimate:
+                         max_price_per_hour: Any = None, usage_warning: bool | None = None,
+                         usage_warning_threshold: float | None = None) -> StorageEstimate:
+        """Storage estimate — creates nothing. Same arguments as create_storage."""
         body = _write.storage_body(name, size_gb, storage_type=storage_type, disk_type=disk_type, encrypted=encrypted,
-                                   region=region, max_price_per_hour=max_price_per_hour)
+                                   region=region, max_price_per_hour=max_price_per_hour, usage_warning=usage_warning,
+                                   usage_warning_threshold=usage_warning_threshold)
         return StorageEstimate.from_dict(await self._send("POST", "/storages/estimate",
                                                      params={"workspace": _query_value(workspace, "workspace")}, json=body))
 
     async def create_storage(self, name: str, size_gb: int, *, workspace: str, storage_type: str = "nfs",
                        disk_type: str = "NVMe", encrypted: bool = False, region: str | None = None,
-                       max_price_per_hour: Any = None, idempotency_key: str | None = None) -> StorageCreated:
-        """Create storage (PV) (202). Billed hourly by capacity while it exists."""
+                       max_price_per_hour: Any = None, idempotency_key: str | None = None,
+                       usage_warning: bool | None = None,
+                       usage_warning_threshold: float | None = None) -> StorageCreated:
+        """Create network storage (PV) (202). Billed hourly by capacity while it exists; the server's minimum size is
+        10 GiB. Local storage can't be created on its own (the server refuses storage_type "hostPath"); create it with
+        a pod: create_pod(local_volumes=...). usage_warning=True emails you when the storage fills past
+        usage_warning_threshold (a fraction in (0, 1], default 0.9), as the console's usage warning does; both are
+        sent only when given. disk_type and region are deprecated and ignored (storage is always NVMe)."""
         body = _write.storage_body(name, size_gb, storage_type=storage_type, disk_type=disk_type, encrypted=encrypted,
-                                   region=region, max_price_per_hour=max_price_per_hour)
+                                   region=region, max_price_per_hour=max_price_per_hour, usage_warning=usage_warning,
+                                   usage_warning_threshold=usage_warning_threshold)
         return StorageCreated.from_dict(await self._send("POST", "/storages", params={"workspace": _query_value(workspace, "workspace")},
                                                     json=body, idempotency_key=idempotency_key))
 
@@ -1441,6 +1923,62 @@ class AsyncMeshive(_BaseClient):
         data = await self._send("DELETE", f"/storages/{_path_segment(storage_name, 'storage_name')}",
                              params={"workspace": _query_value(workspace, "workspace")}, idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="storage")
+
+    async def estimate_storage_update(self, pv_name: str, workspace: str, *, name: str | None = None,
+                                      size_gb: int | None = None, usage_warning: bool | None = None,
+                                      usage_warning_threshold: float | None = None) -> StorageUpdateEstimate:
+        """What update_storage would change and cost (POST /storages/{pv}/estimate). Same contract as the sync client."""
+        body = _write.storage_update_body(name=name, size_gb=size_gb, usage_warning=usage_warning,
+                                          usage_warning_threshold=usage_warning_threshold)
+        try:
+            data = await self._send("POST", f"/storages/{_path_segment(pv_name, 'pv_name')}/estimate",
+                              params={"workspace": _query_value(workspace, "workspace")}, json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "storage editing") from None
+        return StorageUpdateEstimate.from_dict(data)
+
+    async def update_storage(self, pv_name: str, workspace: str, *, name: str | None = None,
+                             size_gb: int | None = None, usage_warning: bool | None = None,
+                             usage_warning_threshold: float | None = None,
+                             idempotency_key: str | None = None) -> StorageUpdated:
+        """Change a storage (PATCH /storages/{pv}, 202). Same contract as the sync client."""
+        body = _write.storage_update_body(name=name, size_gb=size_gb, usage_warning=usage_warning,
+                                          usage_warning_threshold=usage_warning_threshold)
+        try:
+            data = await self._send("PATCH", f"/storages/{_path_segment(pv_name, 'pv_name')}",
+                              params={"workspace": _query_value(workspace, "workspace")}, json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "storage editing") from None
+        return StorageUpdated.from_dict(data)
+
+    async def get_storage_connection(self, pv_name: str, workspace: str) -> StorageConnection:
+        """A storage's SSH access status (GET /storages/{pv}/connect). Same contract as the sync client."""
+        try:
+            data = await self._get(f"/storages/{_path_segment(pv_name, 'pv_name')}/connect",
+                             params={"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "storage SSH access") from None
+        return StorageConnection.from_dict(data)
+
+    async def connect_storage(self, pv_name: str, workspace: str, *, wait: bool = True, timeout: float = 300.0,
+                        interval: float = 3.0, idempotency_key: str | None = None) -> StorageConnection:
+        """Open a storage for SSH and SFTP and wait until it is ready. Same contract as the sync client."""
+        deadline = time.monotonic() + timeout
+        try:
+            data = await self._send("POST", f"/storages/{_path_segment(pv_name, 'pv_name')}/connect",
+                              params={"workspace": _query_value(workspace, "workspace")},
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "storage SSH access") from None
+        connection = StorageConnection.from_dict(data)
+        while not _connection_ready(connection, pv_name) and wait:
+            _connection_expired(deadline, pv_name, timeout, connection)
+            await asyncio.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+            connection = await self.get_storage_connection(pv_name, workspace)
+        if connection.ready and connection.pod_name:
+            connection.ssh = await self.ssh_access(connection.pod_name, workspace)
+        return connection
 
     # --- Writes: serving -----------------------------------------------------------------
 

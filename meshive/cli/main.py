@@ -4,6 +4,7 @@ import json
 import os
 import sys
 from collections.abc import Callable
+from datetime import datetime, timezone
 
 import httpx
 
@@ -18,6 +19,7 @@ from ..models import (
     Asset,
     AssetPage,
     AssetStorage,
+    CpuLine,
     Credit,
     CreditHistoryEntry,
     Earnings,
@@ -25,6 +27,7 @@ from ..models import (
     Machine,
     MachineMetrics,
     Member,
+    ModelSetList,
     Pod,
     PodMetrics,
     Serving,
@@ -35,6 +38,7 @@ from ..models import (
     WhoAmI,
     Workspace,
     WorkspaceDetail,
+    _parse_dt,
 )
 
 # Pod lifecycle statuses (server enum). For --status validation — the server doesn't take this filter, so
@@ -77,6 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  meshive pod <workspace> <pod>  Show a single pod\n"
             "  meshive storages <workspace>   List storages (volumes) in a workspace\n"
             "  meshive gpus                   List GPUs available to rent, with prices\n"
+            "  meshive cpus                   List CPU lines for CPU pods, with prices\n"
             "  meshive templates              List templates\n"
             "  meshive assets <workspace>     List assets (datasets, models, outputs, ...)\n"
             "  meshive tasks <workspace>      List serverless tasks\n"
@@ -88,9 +93,13 @@ def build_parser() -> argparse.ArgumentParser:
             "  meshive earnings               Show your earnings (as a host)\n"
             "\n"
             "Write commands (need a key with the write scope; they ask for confirmation unless --yes):\n"
-            "  meshive pod-create <ws> <name> --template ID --gpu MODEL [--estimate]\n"
+            "  meshive pod-create <ws> <name> --template ID --gpu MODEL [--model-set SLUG] [--estimate]\n"
+            "  meshive model-sets <ws> --template ID  (the SLUGs a template offers)\n"
+            "  meshive pod-update <ws> <pod> --gpu MODEL [--estimate]\n"
             "  meshive pod-stop|pod-start|pod-restart|pod-delete <ws> <pod>\n"
             "  meshive storage-create <ws> <name> --size GiB  meshive storage-delete <ws> <pv>\n"
+            "  meshive storage-update <ws> <pv> --size GiB\n"
+            "  meshive storage-connect <ws> <pv>  (SSH and SFTP access to a storage)\n"
             "  meshive task-submit <ws> <name> --script FILE --image IMG --cpu-preset micro-2c8g\n"
             "  meshive logs <ws> <pod>          meshive task-logs <task>\n"
             "\n"
@@ -193,6 +202,12 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Show in-flight pod operations (why a pod is still creating).")
     p_txn.add_argument("workspace", help="Workspace ID (namespace name).")
 
+    p_txn_one = sub.add_parser("transaction", parents=[common],
+                               help="Show one pod operation by ID: status, steps and why it failed (no time limit).")
+    p_txn_one.add_argument("workspace", help="Workspace ID (namespace name).")
+    p_txn_one.add_argument("transaction_id", type=int,
+                           help="Transaction ID, as printed by `pod-create` or `meshive transactions`.")
+
     # --- storages -------------------------------------------------------------
     p_storages = sub.add_parser("storages", parents=[common],
                                 help="List storages (volumes) in a workspace.")
@@ -258,6 +273,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_gpus.add_argument("--model", default=None, metavar="SUBSTR",
                         help="Filter by GPU model substring (client-side), e.g. h100.")
 
+    p_cpus = sub.add_parser("cpus", parents=[common],
+                            help="List CPU lines for CPU pods, with prices (LINE goes to `pod-create --cpu-line`).")
+    p_cpus.add_argument("--rental", choices=["demand", "spot"], default="demand",
+                        help="Rental type to price for (default: demand).")
+
     p_templates = sub.add_parser("templates", parents=[common],
                                  help="List templates (official, plus a workspace's custom ones).")
     p_templates.add_argument("--workspace", default=None, metavar="ID",
@@ -271,6 +291,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_template.add_argument("template_id", type=int, help="Template ID. See ID column of `meshive templates`.")
     p_template.add_argument("--workspace", default=None, metavar="ID",
                             help="Required for a custom template: the workspace that owns it.")
+
+    p_model_sets = sub.add_parser("model-sets", parents=[common],
+                                  help="List the model sets a template can start with "
+                                       "(SLUG goes to `pod-create --model-set`).")
+    p_model_sets.add_argument("workspace", help="Workspace ID (namespace name).")
+    p_model_sets.add_argument("--template", type=int, required=True, metavar="ID", dest="template_id",
+                              help="Template ID. See ID column of `meshive templates`.")
 
     # --- serverless -----------------------------------------------------------
     p_servings = sub.add_parser("servings", parents=[common],
@@ -564,7 +591,8 @@ def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
         print(fmt.paint(fmt.clean(f"can't start on its node now: {pod.same_node_unavailable_reason.replace('_', ' ')}"),
                         "yellow", color))
     if pod.is_maintenance:
-        print(fmt.paint("⚠ under maintenance", "yellow", color))
+        # The server sets is_maintenance while the host's maintenance window is open, and doesn't bill the pod then.
+        print(fmt.paint("⚠ host maintenance: not billed while the window is open", "yellow", color))
     if pod.endpoints:
         print()
         rows = [[e.name or "-", str(e.port), e.external_url or e.internal_url or "-", e.readiness]
@@ -583,6 +611,9 @@ def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
         fmt.render_table(["CREDENTIAL", "VALUE"], rows, enabled=color)
         if hidden:
             print(fmt.paint("Secret values are hidden. Add --show-secrets to print them.", "dim", color))
+        elif show_secrets and any(c.is_secret and c.value == "***" for c in pod.connect_credentials):
+            print(fmt.paint("The server hides secret values from read-only API keys. Use a key with write scope.",
+                            "dim", color))
 
 
 def _print_gpu_usages(gpus, color: bool) -> None:
@@ -654,7 +685,8 @@ def _print_storage(s: Storage, color: bool) -> None:
     print(f"encrypted: {fmt.yes_no(s.encrypted)}")
     print(f"created:   {created}")
     if s.is_maintenance:
-        print(fmt.paint("⚠ under maintenance", "yellow", color))
+        # The volume isn't billed during the window; price/hr above stays the list price (server value).
+        print(fmt.paint("⚠ host maintenance: not billed while the window is open", "yellow", color))
 
 
 def _gpu_cell(machine: Machine) -> str:
@@ -725,6 +757,28 @@ def _print_gpus(gpus: list[GpuAvailability], color: bool) -> None:
     )
 
 
+def _cpu_cell(line: CpuLine) -> str:
+    """'AMD EPYC gen 4' — vendor, product line and generation as one label."""
+    label = " ".join(part for part in (line.vendor, line.product_line) if part) or "-"
+    return f"{label} gen {line.generation}" if line.generation else label
+
+
+def _print_cpus(lines: list[CpuLine], color: bool) -> None:
+    if not lines:
+        print("No CPU lines available.")
+        return
+    rows = [[c.cpu_line, _cpu_cell(c), f"DDR{c.ddr_type}" if c.ddr_type else "-", c.rental_type or "-",
+             fmt.money_hourly(c.price_per_core), fmt.money_hourly(c.ram_price_per_gb), str(c.max_vcpus_per_pod),
+             fmt.gib(c.max_ram_per_pod), str(c.machine_count)] for c in lines]
+    fmt.render_table(
+        ["LINE", "CPU", "RAM", "RENTAL", "PER vCPU/HR", "PER GiB/HR", "MAX vCPU", "MAX RAM", "MACHINES"],
+        rows,
+        aligns=["l", "l", "l", "l", "r", "r", "r", "r", "r"],
+        enabled=color,
+    )
+    print(fmt.paint("Pass LINE to `meshive pod-create --cpu-line` to pick the line of a CPU pod.", "dim", color))
+
+
 def _template_source(t: Template) -> str:
     return "official" if t.is_official else "custom"
 
@@ -755,6 +809,34 @@ def _print_template(t: Template, color: bool) -> None:
     print(f"cuda:        {fmt.clean(t.cuda_version or '-')}")
     print(f"framework:   {fmt.clean(framework)}")
     print(f"description: {fmt.clean(t.description or '-')}")
+
+
+def _model_set_vram(value: float | None, estimated: bool | None) -> str:
+    return "-" if value is None else f"{'~' if estimated else ''}{value:g} GB"
+
+
+def _model_set_licenses(names: list[str], unknown: int) -> str:
+    cell = ", ".join(dict.fromkeys(n for n in names if n))     # each license once, in order
+    if unknown:
+        cell += f"{' + ' if cell else ''}{unknown} unknown"
+    return cell or "-"
+
+
+def _print_model_sets(sets: ModelSetList, color: bool) -> None:
+    if not sets.selectable:
+        reason = f": {sets.reason}" if sets.reason else "."
+        print(fmt.clean(f"This template doesn't take a model set{reason}"))
+        return
+    if not sets.model_sets:
+        print("No model sets for this template.")
+        return
+    rows = [[m.slug, m.name or "-", m.task or "-", str(len(m.items)), fmt.bytes_human(m.total_size_bytes),
+             _model_set_vram(m.min_vram_gb, m.min_vram_estimated),
+             _model_set_licenses([x.license for x in m.licenses], m.license_unknown_count)] for m in sets.model_sets]
+    fmt.render_table(["SLUG", "NAME", "TASK", "FILES", "SIZE", "MIN VRAM", "LICENSE"], rows,
+                     aligns=["l", "l", "l", "r", "r", "r", "l"], enabled=color)
+    print(fmt.paint("Pass SLUG to `meshive pod-create --model-set` (one set per pod). -o json lists each set's files "
+                    "and workflows.", "dim", color))
 
 
 def _serving_label(s: Serving) -> str:
@@ -1103,19 +1185,55 @@ def _print_transactions(transactions: list[Transaction], color: bool) -> None:
     fmt.render_table(
         ["POD", "TXN", "ACTION", "STATUS", "STEP", "PROGRESS", "DETAIL", "UPDATED"],
         rows, colors=colors, enabled=color)
-    # If an input asset download failed, a few lines from the end of that container's log — the same excerpt as the console's failure card (sanitized by the server).
     for t in transactions:
-        for log in t.init_logs:
-            if not log.lines:
-                continue
-            print()
-            print(fmt.paint(f"txn {t.transaction_id} {log.container} log"
-                            f"{' (before restart)' if log.previous else ''}:", "dim", color))
-            for line in log.lines[-_INIT_LOG_LINES:]:
-                print(f"  {fmt.clean(line)}")
+        _print_init_logs(t, color)
+
+
+def _print_init_logs(t: Transaction, color: bool) -> None:
+    """If an input asset download failed, a few lines from the end of that container's log — the same excerpt as the console's failure card (sanitized by the server)."""
+    for log in t.init_logs:
+        if not log.lines:
+            continue
+        print()
+        print(fmt.paint(f"txn {t.transaction_id} {log.container} log"
+                        f"{' (before restart)' if log.previous else ''}:", "dim", color))
+        for line in log.lines[-_INIT_LOG_LINES:]:
+            print(f"  {fmt.clean(line)}")
 
 
 _INIT_LOG_LINES = 10
+
+
+def _print_transaction(t: Transaction, color: bool) -> None:
+    print(f"pod:         {fmt.clean(t.user_alias or '-')} ({fmt.clean(t.resource_name or '-')})")
+    print(f"transaction: {t.transaction_id}")
+    print(f"action:      {fmt.clean(t.action or '-')}")
+    print(f"status:      {fmt.paint(fmt.clean(fmt.status_cell(t.status)), fmt.status_color(t.status), color)}")
+    step = t.step or "-"
+    if t.step_status:
+        step += f" ({t.step_status})"
+    progress = _txn_progress(t)
+    if progress != "-":
+        step += f", {progress}"
+    print(f"step:        {fmt.clean(step)}")
+    print(f"updated:     {fmt.relative_time(t.updated_at)}")
+    if t.failure_reason:
+        print(fmt.paint(fmt.clean(f"reason:      {t.failure_reason}"), "red", color))
+    steps = sorted((s for s in t.raw.get("transactionSteps") or [] if isinstance(s, dict)), key=_step_sort_key)
+    if steps:
+        print()
+        rows = [[str(s.get("step") or "-"), fmt.status_cell(str(s.get("status") or "")),
+                 fmt.clean(str(s.get("detail") or "-")), fmt.relative_time(_parse_dt(s.get("updatedAt")))]
+                for s in steps]
+        colors = [[None, fmt.status_color(str(s.get("status") or "")), None, "dim"] for s in steps]
+        fmt.render_table(["STEP", "STATUS", "DETAIL", "UPDATED"], rows, colors=colors, enabled=color)
+    _print_init_logs(t, color)
+
+
+def _step_sort_key(step: dict) -> datetime:
+    """Steps in the order they happened (the server sends them sorted by name). Steps without a time keep their place."""
+    at = _parse_dt(step.get("updatedAt")) or datetime.min
+    return at if at.tzinfo else at.replace(tzinfo=timezone.utc)
 
 
 def _txn_progress(t: Transaction) -> str:
@@ -1130,6 +1248,12 @@ def _cmd_transactions(client: Meshive, args: argparse.Namespace, output: str, co
     transactions = client.list_transactions(args.workspace)
     _emit(output, [t.raw for t in transactions], [str(t.transaction_id) for t in transactions],
           lambda: _print_transactions(transactions, color))
+    return 0
+
+
+def _cmd_transaction(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    t = client.get_transaction(args.transaction_id, args.workspace)
+    _emit(output, t.raw, [str(t.transaction_id)], lambda: _print_transaction(t, color))
     return 0
 
 
@@ -1189,6 +1313,12 @@ def _cmd_gpus(client: Meshive, args: argparse.Namespace, output: str, color: boo
     return 0
 
 
+def _cmd_cpus(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    lines = client.list_cpus(rental_type=args.rental)
+    _emit(output, [c.raw for c in lines], [c.cpu_line for c in lines], lambda: _print_cpus(lines, color))
+    return 0
+
+
 def _cmd_templates(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     templates = client.list_templates(args.workspace, app_type=args.app_type)
     if args.name:
@@ -1201,6 +1331,12 @@ def _cmd_templates(client: Meshive, args: argparse.Namespace, output: str, color
 def _cmd_template(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     template = client.get_template(args.template_id, workspace=args.workspace)
     _emit(output, template.raw, [str(template.template_id)], lambda: _print_template(template, color))
+    return 0
+
+
+def _cmd_model_sets(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    sets = client.list_model_sets(args.workspace, args.template_id)
+    _emit(output, sets.raw, [m.slug for m in sets], lambda: _print_model_sets(sets, color))
     return 0
 
 
@@ -1330,6 +1466,7 @@ _HANDLERS: dict[str, Handler] = {
     "pod": _cmd_pod,
     "pod-metrics": _cmd_pod_metrics,
     "transactions": _cmd_transactions, "txn": _cmd_transactions,
+    "transaction": _cmd_transaction,
     "storages": _cmd_storages,
     "storage": _cmd_storage,
     "machines": _cmd_machines, "m": _cmd_machines,
@@ -1337,8 +1474,10 @@ _HANDLERS: dict[str, Handler] = {
     "machine-metrics": _cmd_machine_metrics,
     "earnings": _cmd_earnings,
     "gpus": _cmd_gpus,
+    "cpus": _cmd_cpus,
     "templates": _cmd_templates,
     "template": _cmd_template,
+    "model-sets": _cmd_model_sets,
     "servings": _cmd_servings,
     "serving": _cmd_serving,
     "tasks": _cmd_tasks,

@@ -32,7 +32,9 @@ Python 3.10 to 3.13 and runs `pip-audit`.
 - Everything in this repository is written in English (see [CLAUDE.md](CLAUDE.md)).
 - **Tolerant parsing.** A new response field gets a default in `from_dict`, so the SDK keeps working against
   servers that don't send it yet. A value the server didn't send is `None`, never a made-up `False` or `0`.
-- **Validate before sending.** Bad arguments raise `ValueError` before any request goes out.
+- **Check the shape, leave the rules to the server.** Missing or mistyped arguments raise `ValueError` before any
+  request goes out. Which values are allowed (sizes, counts, placements, storage types) is the server's call, so the
+  SDK never refuses a value the server accepts; the server's error explains what is allowed.
 - **Writes are safe to retry.** Every write sends an `Idempotency-Key`, and automatic retries reuse it.
 - **Amounts and units match the console.** Use `formatting` for money. Sizes are 1024-based (GiB, MiB); GPU VRAM
   keeps the usual GB label.

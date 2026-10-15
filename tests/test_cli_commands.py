@@ -19,6 +19,7 @@ from meshive.models import (
     AssetFile,
     AssetUsage,
     ConnectCredential,
+    CpuLine,
     Credit,
     CreditHistoryEntry,
     DailyCost,
@@ -150,6 +151,29 @@ class FakeClient:
                                 raw={"gpuModel": "NVIDIA H100"}),
                 GpuAvailability("NVIDIA RTX 4090", 24, rental_type, "0.60", 8, 32, 3, 2, 2,
                                 raw={"gpuModel": "NVIDIA RTX 4090"})]
+
+    def list_cpus(self, *, rental_type="demand"):
+        FakeClient.last_call = ("list_cpus", (), {"rental_type": rental_type})
+        return [CpuLine.from_dict({"rentalType": rental_type, "cpuModel": "amd-epyc-4-ddr5", "cpuVendor": "AMD",
+                                   "cpuProductLine": "EPYC", "cpuGeneration": 4, "ddrType": 5, "cpuPricePerCore": "0.012",
+                                   "ramPricePerGb": "0.0021", "combinations": [{"maxCpu": 64, "maxRam": 262144}]}),
+                CpuLine.from_dict({"rentalType": rental_type, "cpuModel": "intel-xeon-0-ddr0", "cpuVendor": "Intel",
+                                   "cpuProductLine": "Xeon", "cpuGeneration": 0, "ddrType": 0, "cpuPricePerCore": "0.01",
+                                   "ramPricePerGb": "0.002", "combinations": []})]
+
+    def get_transaction(self, transaction_id, workspace):
+        FakeClient.last_call = ("get_transaction", (transaction_id, workspace), {})
+        return Transaction.from_dict({
+            "transactionId": transaction_id, "userAlias": "trainer", "resourceName": "5f0e1d2c3b4a6978",
+            "action": "create", "status": "failed", "updatedAt": "2026-10-14T00:02:00Z",
+            "transactionSteps": [
+                {"step": "start", "status": "done", "detail": "Starting Pod creation process",
+                 "updatedAt": "2026-10-14T00:00:00Z"},
+                {"step": "fetch_assets", "status": "failed", "detail": "", "updatedAt": "2026-10-14T00:02:00Z",
+                 "failureDiagnostic": {"failureReason": "source fetch failed: HTTP 403",
+                                       "initLogs": [{"container": "source-fetch", "lines": ["GET x", "403"]}]}},
+                {"step": "create_statefulset", "status": "done", "detail": "", "updatedAt": "2026-10-14T00:01:00Z"},
+            ]})
 
     def list_api_keys(self):
         return [ApiKey(7, "laptop", "meshive_a1b2c3d4", ["read"], "active", raw={"id": 7})]
@@ -424,6 +448,14 @@ def test_pod_connect_info_hides_secrets_by_default(capsys):
     assert "s3cret-pw" in out and "hidden" not in out
 
 
+def test_pod_show_secrets_explains_read_only_key_mask(capsys, monkeypatch):
+    # The server sends "***" for secret values to read-only keys.
+    pod = FakeClient().get_pod("pod-1", "team-ns")
+    pod.connect_credentials[0].value = "***"
+    monkeypatch.setattr(FakeClient, "get_pod", lambda self, pod_name, workspace: pod)
+    assert cli.main(["pod", "team-ns", "pod-1", "--show-secrets"]) == 0
+    assert "read-only API keys" in capsys.readouterr().out
+
 def test_machines_output(capsys):
     assert cli.main(["machines"]) == 0
     out = capsys.readouterr().out
@@ -648,7 +680,7 @@ def test_storage_single_output(capsys):
     assert cli.main(["storage", "ns", "pv-data"]) == 0
     out = capsys.readouterr().out
     assert "pv-data" in out and "pod-run" in out
-    assert "encrypted: yes" in out and "under maintenance" in out
+    assert "encrypted: yes" in out and "host maintenance: not billed while the window is open" in out
     assert "100 GiB, 60.0% used (40 GiB free)" in out
     assert cli.main(["storage", "ns", "pv-data", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == {"pvName": "pv-data"}
@@ -711,6 +743,20 @@ def test_gpus_output_and_passthrough(capsys):
 
     assert cli.main(["gpus", "-o", "name"]) == 0
     assert capsys.readouterr().out.splitlines() == ["NVIDIA H100", "NVIDIA RTX 4090"]
+
+
+def test_cpus_output_and_passthrough(capsys):
+    assert cli.main(["cpus"]) == 0
+    out = capsys.readouterr().out
+    assert FakeClient.last_call == ("list_cpus", (), {"rental_type": "demand"})
+    assert "amd-epyc-4-ddr5" in out and "AMD EPYC gen 4" in out and "DDR5" in out
+    assert "$0.012" in out and "$0.002" in out and "256 GiB" in out and "--cpu-line" in out
+    assert "Intel Xeon " in out and "DDR0" not in out and "gen 0" not in out      # unknown generation/DDR aren't shown
+    assert cli.main(["cpus", "--rental", "spot", "-o", "name"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["amd-epyc-4-ddr5", "intel-xeon-0-ddr0"]
+    assert FakeClient.last_call == ("list_cpus", (), {"rental_type": "spot"})
+    assert cli.main(["cpus", "-o", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)[0]["cpuModel"] == "amd-epyc-4-ddr5"
 
 
 def test_api_keys_output_and_alias(capsys):
@@ -963,6 +1009,30 @@ def test_transactions_output_alias_and_name(capsys):
     assert cli.main(["transactions", "ns", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == [{"transactionId": 73213}, {"transactionId": 73214},
                                                    {"transactionId": 73215}]
+
+
+def test_transaction_shows_steps_in_order_and_the_reason(capsys):
+    assert cli.main(["transaction", "ns", "73216"]) == 0
+    out = capsys.readouterr().out
+    assert FakeClient.last_call == ("get_transaction", (73216, "ns"), {})
+    assert "trainer (5f0e1d2c3b4a6978)" in out and "73216" in out and "failed" in out
+    assert "reason:      failed at step fetch_assets: source fetch failed: HTTP 403" in out
+    # Steps in the order they happened, not the server's alphabetical order.
+    assert out.index("Starting Pod creation process") < out.index("create_statefulset") < out.index("fetch_assets  ")
+    assert "txn 73216 source-fetch log:" in out and "  403" in out
+    assert cli.main(["transaction", "ns", "73216", "-o", "name"]) == 0
+    assert capsys.readouterr().out.strip() == "73216"
+    assert cli.main(["transaction", "ns", "73216", "-o", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["transactionId"] == 73216
+
+
+def test_transaction_needs_a_workspace_and_a_numeric_id(capsys):
+    for argv in (["transaction", "73216"], ["transaction", "ns", "abc"],
+                 ["transaction", "73216", "--workspace", "ns"]):      # the workspace is positional, as in `pod-start`
+        with pytest.raises(SystemExit) as exit_:
+            cli.main(argv)
+        assert exit_.value.code == 2
+    capsys.readouterr()
 
 
 def test_transactions_table_paints_status_on_a_tty(monkeypatch, capsys):

@@ -60,6 +60,10 @@ a model set, all as in the web console. Code written for 1.0 and 1.1 keeps worki
 - Reading a pod now returns `***` for secret variables, as reading a task already did. Keys with write scope still
   get the logins shown on Connect, such as `ACCESS_PASSWORD`, so `meshive pod --show-secrets` needs one; with a
   read-only key the CLI says so.
+- Pods and storage on a machine whose host has an open maintenance window aren't billed until the window ends. For
+  such a pod, `is_maintenance` is `True`, `billing_active` is `False` and `price_per_hour` is `0`, and the workspace
+  price leaves it out. `meshive pod` and `meshive storage` now say "host maintenance: not billed while the window is
+  open" instead of "under maintenance".
 
 ## v1.1.0
 

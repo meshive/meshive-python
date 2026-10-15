@@ -591,7 +591,8 @@ def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
         print(fmt.paint(fmt.clean(f"can't start on its node now: {pod.same_node_unavailable_reason.replace('_', ' ')}"),
                         "yellow", color))
     if pod.is_maintenance:
-        print(fmt.paint("⚠ under maintenance", "yellow", color))
+        # The server sets is_maintenance while the host's maintenance window is open, and doesn't bill the pod then.
+        print(fmt.paint("⚠ host maintenance: not billed while the window is open", "yellow", color))
     if pod.endpoints:
         print()
         rows = [[e.name or "-", str(e.port), e.external_url or e.internal_url or "-", e.readiness]
@@ -684,7 +685,8 @@ def _print_storage(s: Storage, color: bool) -> None:
     print(f"encrypted: {fmt.yes_no(s.encrypted)}")
     print(f"created:   {created}")
     if s.is_maintenance:
-        print(fmt.paint("⚠ under maintenance", "yellow", color))
+        # The volume isn't billed during the window; price/hr above stays the list price (server value).
+        print(fmt.paint("⚠ host maintenance: not billed while the window is open", "yellow", color))
 
 
 def _gpu_cell(machine: Machine) -> str:

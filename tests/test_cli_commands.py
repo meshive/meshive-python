@@ -680,7 +680,7 @@ def test_storage_single_output(capsys):
     assert cli.main(["storage", "ns", "pv-data"]) == 0
     out = capsys.readouterr().out
     assert "pv-data" in out and "pod-run" in out
-    assert "encrypted: yes" in out and "under maintenance" in out
+    assert "encrypted: yes" in out and "host maintenance: not billed while the window is open" in out
     assert "100 GiB, 60.0% used (40 GiB free)" in out
     assert cli.main(["storage", "ns", "pv-data", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == {"pvName": "pv-data"}

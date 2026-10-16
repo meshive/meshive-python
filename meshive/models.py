@@ -1750,13 +1750,24 @@ class ModelSetItem:
     license: str | None = None
     license_url: str | None = None
     already_in_workspace: bool | None = None   # fetched before; the pod reuses it instead of downloading again
+    hf_gated: str | None = None    # gated on Hugging Face: "auto" (accept the license) or "manual" (owner approval)
 
     @classmethod
     def from_dict(cls, d: dict) -> "ModelSetItem":
         return cls(entry_slug=str(d.get("entrySlug", "") or ""), name=str(d.get("name", "") or ""),
                    category=str(d.get("category", "") or ""), size_bytes=_optional_int(d.get("sizeBytes")),
                    default_role=d.get("defaultRole"), license=d.get("license"), license_url=d.get("licenseUrl"),
-                   already_in_workspace=_optional_bool(d.get("alreadyInWorkspace")))
+                   already_in_workspace=_optional_bool(d.get("alreadyInWorkspace")),
+                   hf_gated=d.get("hfGated") or None)
+
+
+@dataclass
+class ModelSetGatedSource:
+    """A Hugging Face repo in a model set that is gated — where its license is accepted (or access requested)."""
+
+    hf_repo: str
+    url: str
+    mode: str                      # "auto" (accept the license) or "manual" (the owner approves each account)
 
 
 @dataclass
@@ -1793,6 +1804,10 @@ class ModelSet:
     license_unknown_count: int = 0             # files whose license isn't known
     workflows: list[ModelSetWorkflow] = field(default_factory=list)
     items: list[ModelSetItem] = field(default_factory=list)
+    # Gated on Hugging Face: the files download with your own workspace token — pass create_pod(hf_token_id=...) on
+    # the set's Quick Deploy template. gated_sources says where to accept the license first.
+    hf_token_required: bool = False
+    gated_sources: list[ModelSetGatedSource] = field(default_factory=list)
     raw: dict = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -1810,6 +1825,10 @@ class ModelSet:
                                         task=w.get("task"))
                        for w in d.get("workflows") or [] if isinstance(w, dict)],
             items=[ModelSetItem.from_dict(i) for i in d.get("items") or [] if isinstance(i, dict)],
+            hf_token_required=bool(d.get("hfTokenRequired", False)),
+            gated_sources=[ModelSetGatedSource(hf_repo=str(g.get("hf_repo") or g.get("hfRepo") or ""),
+                                               url=str(g.get("url") or ""), mode=str(g.get("mode") or ""))
+                           for g in d.get("gatedSources") or [] if isinstance(g, dict)],
             raw=d,
         )
 

@@ -883,7 +883,8 @@ class Meshive(_BaseClient):
                      max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
                      harvest_destination: Any = None, local_volumes: Any = None,
                      cpu_line: str | None = None, template_ports: Any = None,
-                     model_set: str | None = None, watched_template_folders: Any = None) -> PodEstimate:
+                     model_set: str | None = None, watched_template_folders: Any = None,
+                     hf_token_id: int | None = None) -> PodEstimate:
         """Pod estimate — creates nothing (read scope is enough). Same arguments as create_pod; the price includes any
         new local_volumes (breakdown "local_storage"), and `model_set` describes the model set when one is given."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
@@ -894,7 +895,7 @@ class Meshive(_BaseClient):
                                input_assets=input_assets, watched_folders=watched_folders,
                                harvest_destination=harvest_destination, local_volumes=local_volumes,
                                cpu_line=cpu_line, template_ports=template_ports, model_set=model_set,
-                               watched_template_folders=watched_template_folders)
+                               watched_template_folders=watched_template_folders, hf_token_id=hf_token_id)
         return PodEstimate.from_dict(self._send("POST", "/pods/estimate",
                                                  params={"workspace": _query_value(workspace, "workspace")}, json=body))
 
@@ -907,7 +908,8 @@ class Meshive(_BaseClient):
                    max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
                    harvest_destination: Any = None, idempotency_key: str | None = None, local_volumes: Any = None,
                    cpu_line: str | None = None, template_ports: Any = None,
-                   model_set: str | None = None, watched_template_folders: Any = None) -> PodCreated:
+                   model_set: str | None = None, watched_template_folders: Any = None,
+                   hf_token_id: int | None = None) -> PodCreated:
         """Create a pod (202 accepted). It is billed hourly — check the price with estimate_pod first;
         max_price_per_hour caps the final hourly compute price. Placement above it can fail asynchronously.
         Storage (including the automatic PV) and asset storage charges are separate and not covered by the cap.
@@ -934,7 +936,14 @@ class Meshive(_BaseClient):
         'Operation Outcome Unknown' until it ends. After a timeout the pod may still be created — check list_pods,
         or get_operation(err.idempotency_key, method="POST", path="/pods"), before trying again. If a file can't be
         fetched the pod isn't created (400 'Model Set Unavailable', raw["detail"]["failed"]); files already fetched
-        stay in the workspace and are reused next time."""
+        stay in the workspace and are reused next time.
+        hf_token_id is for Quick Deploy templates whose model set is gated on Hugging Face (list_model_sets shows
+        hf_token_required): the id of a workspace token (list_hf_tokens) whose Hugging Face account accepted the
+        model's license, as the console's Quick Deploy panel asks for. The files download with that token. Without it
+        the server refuses with 400 'Hugging Face token required'; 'License not accepted' / 'Access not approved' mean
+        the token's account hasn't accepted the license (or isn't approved yet), and 'Hugging Face token rejected'
+        means the token itself is invalid. Like model_set, this request waits for the files to be linked and isn't
+        resent after a timeout."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
@@ -943,10 +952,10 @@ class Meshive(_BaseClient):
                                input_assets=input_assets, watched_folders=watched_folders,
                                harvest_destination=harvest_destination, local_volumes=local_volumes,
                                cpu_line=cpu_line, template_ports=template_ports, model_set=model_set,
-                               watched_template_folders=watched_template_folders)
+                               watched_template_folders=watched_template_folders, hf_token_id=hf_token_id)
         return PodCreated.from_dict(self._send("POST", "/pods", params={"workspace": _query_value(workspace, "workspace")},
                                                 json=body, idempotency_key=idempotency_key,
-                                                long_running="modelSet" in body))
+                                                long_running="modelSet" in body or "hfTokenId" in body))
 
     def stop_pod(self, pod_name: str, workspace: str, *, idempotency_key: str | None = None) -> ResourceAction:
         """Stop a pod (replicas=0). Pod billing stops; storage billing continues."""
@@ -1737,7 +1746,8 @@ class AsyncMeshive(_BaseClient):
                      max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
                      harvest_destination: Any = None, local_volumes: Any = None,
                      cpu_line: str | None = None, template_ports: Any = None,
-                     model_set: str | None = None, watched_template_folders: Any = None) -> PodEstimate:
+                     model_set: str | None = None, watched_template_folders: Any = None,
+                     hf_token_id: int | None = None) -> PodEstimate:
         """Pod estimate — creates nothing (read scope is enough). Same arguments as create_pod; the price includes any
         new local_volumes (breakdown "local_storage"), and `model_set` describes the model set when one is given."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
@@ -1748,7 +1758,7 @@ class AsyncMeshive(_BaseClient):
                                input_assets=input_assets, watched_folders=watched_folders,
                                harvest_destination=harvest_destination, local_volumes=local_volumes,
                                cpu_line=cpu_line, template_ports=template_ports, model_set=model_set,
-                               watched_template_folders=watched_template_folders)
+                               watched_template_folders=watched_template_folders, hf_token_id=hf_token_id)
         return PodEstimate.from_dict(await self._send("POST", "/pods/estimate",
                                                  params={"workspace": _query_value(workspace, "workspace")}, json=body))
 
@@ -1761,7 +1771,8 @@ class AsyncMeshive(_BaseClient):
                    max_price_per_hour: Any = None, input_assets: Any = None, watched_folders: Any = None,
                    harvest_destination: Any = None, idempotency_key: str | None = None, local_volumes: Any = None,
                    cpu_line: str | None = None, template_ports: Any = None,
-                   model_set: str | None = None, watched_template_folders: Any = None) -> PodCreated:
+                   model_set: str | None = None, watched_template_folders: Any = None,
+                   hf_token_id: int | None = None) -> PodCreated:
         """Create a pod (202 accepted). It is billed hourly — check the price with estimate_pod first;
         max_price_per_hour caps the final hourly compute price. Placement above it can fail asynchronously.
         Storage (including the automatic PV) and asset storage charges are separate and not covered by the cap.
@@ -1788,7 +1799,14 @@ class AsyncMeshive(_BaseClient):
         'Operation Outcome Unknown' until it ends. After a timeout the pod may still be created — check list_pods,
         or get_operation(err.idempotency_key, method="POST", path="/pods"), before trying again. If a file can't be
         fetched the pod isn't created (400 'Model Set Unavailable', raw["detail"]["failed"]); files already fetched
-        stay in the workspace and are reused next time."""
+        stay in the workspace and are reused next time.
+        hf_token_id is for Quick Deploy templates whose model set is gated on Hugging Face (list_model_sets shows
+        hf_token_required): the id of a workspace token (list_hf_tokens) whose Hugging Face account accepted the
+        model's license, as the console's Quick Deploy panel asks for. The files download with that token. Without it
+        the server refuses with 400 'Hugging Face token required'; 'License not accepted' / 'Access not approved' mean
+        the token's account hasn't accepted the license (or isn't approved yet), and 'Hugging Face token rejected'
+        means the token itself is invalid. Like model_set, this request waits for the files to be linked and isn't
+        resent after a timeout."""
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
@@ -1797,10 +1815,10 @@ class AsyncMeshive(_BaseClient):
                                input_assets=input_assets, watched_folders=watched_folders,
                                harvest_destination=harvest_destination, local_volumes=local_volumes,
                                cpu_line=cpu_line, template_ports=template_ports, model_set=model_set,
-                               watched_template_folders=watched_template_folders)
+                               watched_template_folders=watched_template_folders, hf_token_id=hf_token_id)
         return PodCreated.from_dict(await self._send("POST", "/pods", params={"workspace": _query_value(workspace, "workspace")},
                                                 json=body, idempotency_key=idempotency_key,
-                                                long_running="modelSet" in body))
+                                                long_running="modelSet" in body or "hfTokenId" in body))
 
     async def stop_pod(self, pod_name: str, workspace: str, *, idempotency_key: str | None = None) -> ResourceAction:
         """Stop a pod (replicas=0). Pod billing stops; storage billing continues."""

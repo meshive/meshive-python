@@ -1091,3 +1091,36 @@ def test_new_commands_in_help(capsys):
         cli.main(["--help"])
     out = capsys.readouterr().out
     assert "pod-update" in out and "storage-update" in out and "storage-connect" in out and "--model-set" in out
+
+
+# Gated model sets (Hugging Face license) — `pod-create --hf-token`
+
+def test_pod_create_with_an_hf_token(capsys):
+    assert cli.main(["pod-create", "ws", "p", "--template", "483", "--hf-token", "4", "--yes"]) == 0
+    assert _last("estimate_pod")[2]["hf_token_id"] == 4 and _last("create_pod")[2]["hf_token_id"] == 4
+    assert "can take several minutes" in capsys.readouterr().err
+    assert cli.main(["pod-create", "ws", "p", "--template", "483", "--estimate"]) == 0
+    assert _last("estimate_pod")[2]["hf_token_id"] is None
+
+
+def test_pod_create_hf_token_refusals_say_what_to_do(capsys, monkeypatch):
+    from meshive.exceptions import MeshiveAPIError
+    for title in ("Hugging Face token required", "License not accepted", "Hugging Face token rejected"):
+        err = MeshiveAPIError(400, "FLUX 3 Image Klein is gated on Hugging Face.", title=title, raw={})
+        monkeypatch.setattr(FakeClient, "create_pod", _fake("create_pod", err))
+        assert cli.main(["pod-create", "ws", "p", "--template", "483", "--yes"]) == 1
+        out = capsys.readouterr().err
+        assert title in out and "--hf-token ID" in out and "meshive hf-tokens ws" in out
+
+
+def test_model_sets_point_gated_sets_at_the_license(capsys, monkeypatch):
+    monkeypatch.setattr(FakeClient, "list_model_sets", _fake("list_model_sets", lambda: ModelSetList.from_dict({
+        "templateId": 483, "selectable": False, "reason": "This template adds its own model set.",
+        "modelSets": [{"slug": "flux3-klein", "name": "FLUX 3 Image Klein", "hfTokenRequired": True,
+                       "gatedSources": [{"hf_repo": "org/gated", "url": "https://huggingface.co/org/gated",
+                                         "mode": "auto"}]}]})), raising=False)
+    assert cli.main(["model-sets", "ws", "--template", "483"]) == 0
+    out = capsys.readouterr().out
+    assert "doesn't take a model set" in out
+    assert "flux3-klein is gated on Hugging Face" in out and "https://huggingface.co/org/gated" in out
+    assert "--hf-token ID" in out

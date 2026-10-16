@@ -298,6 +298,7 @@ def _pod_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         input_assets=[_pod_input_asset(v) for v in args.pod_input_asset or []] or None,
         watched_folders=args.watch or None, model_set=args.model_set,
         watched_template_folders={path: {"enabled": False} for path in args.watch_off or []} or None,
+        hf_token_id=args.hf_token,
     )
 
 
@@ -381,6 +382,10 @@ def _toggle(template: dict[str, Any], user: list[dict[str, Any]], path: str, ena
 
 
 _MODEL_SET_ERRORS = ("Model Set Not For Template", "Model Set Unavailable")
+# A gated model set (Hugging Face license) refused at create: the token is missing, its account hasn't accepted the
+# license (or isn't approved yet), or the token itself was rejected.
+_HF_TOKEN_ERRORS = ("Hugging Face token required", "License not accepted", "Access not approved",
+                    "Hugging Face token rejected", "Token Not Found", "Model Set Needs a Token")
 
 
 def _error_detail(err: MeshiveAPIError) -> dict[str, Any]:
@@ -391,6 +396,11 @@ def _error_detail(err: MeshiveAPIError) -> dict[str, Any]:
 def _explain_model_set_error(err: MeshiveAPIError, args: argparse.Namespace) -> bool:
     """A refused model set: the server's error plus what it names — the sets the template offers, or the files that
     couldn't be fetched. False for other errors."""
+    if err.title in _HF_TOKEN_ERRORS:
+        print(fmt.clean(f"Error: {err}"), file=sys.stderr)
+        print(f"Accept the model's license on Hugging Face with the account the token belongs to, then pass "
+              f"`--hf-token ID` (see `meshive hf-tokens {args.workspace}`).", file=sys.stderr)
+        return True
     if err.title not in _MODEL_SET_ERRORS:
         return False
     detail = _error_detail(err)
@@ -430,13 +440,14 @@ def _pod_create(client: Meshive, args: argparse.Namespace, output: str, color: b
         _print_pod_estimate(estimate, color)
     if not _confirm(args, f"Create pod '{args.name}' at {fmt.money_hourly(estimate.price_per_hour)}/hr?"):
         return 2
-    if args.model_set:
+    fetches_set = bool(args.model_set or args.hf_token is not None)
+    if fetches_set:
         print("Fetching the model set's files before the pod is created; this can take several minutes.",
               file=sys.stderr)
     try:
         created = client.create_pod(args.name, args.template, workspace=args.workspace, **kwargs)
     except httpx.TimeoutException:
-        if not args.model_set:
+        if not fetches_set:
             raise
         # The SDK doesn't resend this create after a timeout: the server may still be fetching files for it.
         waited = max(args.timeout, LONG_RUNNING_READ_TIMEOUT)
@@ -1062,6 +1073,9 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--model-set", default=None, metavar="SLUG",
                    help="Start the pod with this model set (see `meshive model-sets`). Its files are fetched before "
                         "the pod is created, which can take several minutes.")
+    p.add_argument("--hf-token", type=int, default=None, metavar="ID",
+                   help="Quick Deploy templates whose model set is gated on Hugging Face: a token ID from "
+                        "`meshive hf-tokens` whose account accepted the model's license. The files download with it.")
     p.add_argument("--estimate", action="store_true", help="Only show the estimate; create nothing.")
     p.add_argument("--wait", default=None, metavar="STATUS",
                    help="After creating, wait until the pod reaches STATUS (e.g. running); a failed creation ends the "
@@ -1219,7 +1233,8 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     # --- serving models ---
     p = sub.add_parser("models", parents=[common], help="List the models registered for serving (their ID goes to serving-deploy).")
     p.add_argument("workspace")
-    p = sub.add_parser("hf-tokens", parents=[common], help="List the workspace's Hugging Face tokens (for private repos).")
+    p = sub.add_parser("hf-tokens", parents=[common],
+                       help="List the workspace's Hugging Face tokens (for private and gated repos).")
     p.add_argument("workspace")
     p = sub.add_parser("model-detect", parents=[common], help="Check whether a Hugging Face repo can be served (exit 1 if not).")
     p.add_argument("workspace"); p.add_argument("repo", help="Hugging Face repo, e.g. Qwen/Qwen3-0.6B.")

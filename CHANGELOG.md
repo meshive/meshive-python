@@ -12,6 +12,32 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## v1.3.0
+
+Quick Deploy model sets that are gated on Hugging Face can now be deployed from the SDK and CLI, with your own
+Hugging Face token, as in the console's Quick Deploy panel. Code written for 1.0 to 1.2 keeps working.
+
+### What's new
+
+- **Gated model sets.** Some model sets (for example FLUX 3 Image Klein) come from Hugging Face repos that ask you to
+  accept a license first. Their files download with your own workspace token: accept the license on the model page
+  with your Hugging Face account, then pass that account's token to `create_pod(..., hf_token_id=...)` or
+  `meshive pod-create ... --hf-token ID` on the set's Quick Deploy template. `list_hf_tokens` /
+  `meshive hf-tokens WORKSPACE` list the token IDs; tokens are added in the console.
+- **`list_model_sets` shows which sets are gated.** `ModelSet.hf_token_required` is true for them,
+  `ModelSet.gated_sources` lists each repo with the page where you accept its license (`mode` is `"auto"` when
+  accepting is enough, `"manual"` when the repo owner approves each account), and `ModelSetItem.hf_gated` marks the
+  gated files. `meshive model-sets` prints where to accept the license.
+
+### Changes
+
+- A create with `hf_token_id` waits for the server to link the set's files, like `model_set`, and isn't resent after
+  a timeout.
+- Refusals name what to fix: `Hugging Face token required` (no token), `License not accepted` or
+  `Access not approved` (the token's account hasn't accepted the license or isn't approved yet),
+  `Hugging Face token rejected` (the token is invalid or expired). A gated set passed as `model_set` on another
+  template is refused with `Model Set Needs a Token`. The CLI prints the next step for each.
+
 ## v1.2.0
 
 Pods and storage can now be changed after they are created, storage can be opened over SSH, and pods can start with

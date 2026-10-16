@@ -93,7 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  meshive earnings               Show your earnings (as a host)\n"
             "\n"
             "Write commands (need a key with the write scope; they ask for confirmation unless --yes):\n"
-            "  meshive pod-create <ws> <name> --template ID --gpu MODEL [--model-set SLUG] [--estimate]\n"
+            "  meshive pod-create <ws> <name> --template ID --gpu MODEL [--model-set SLUG] [--hf-token ID] [--estimate]\n"
             "  meshive model-sets <ws> --template ID  (the SLUGs a template offers)\n"
             "  meshive pod-update <ws> <pod> --gpu MODEL [--estimate]\n"
             "  meshive pod-stop|pod-start|pod-restart|pod-delete <ws> <pod>\n"
@@ -822,10 +822,22 @@ def _model_set_licenses(names: list[str], unknown: int) -> str:
     return cell or "-"
 
 
+def _print_gated_sets(sets: ModelSetList, color: bool) -> None:
+    """Sets gated on Hugging Face download with the user's own token — say where to accept the license."""
+    for m in sets.model_sets:
+        if not m.hf_token_required:
+            continue
+        where = ", ".join(g.url for g in m.gated_sources if g.url) or "the model page on Hugging Face"
+        print(fmt.paint(fmt.clean(f"{m.slug} is gated on Hugging Face: accept its license at {where}, then create "
+                                  f"the pod from its Quick Deploy template with `--hf-token ID` "
+                                  f"(see `meshive hf-tokens`)."), "dim", color))
+
+
 def _print_model_sets(sets: ModelSetList, color: bool) -> None:
     if not sets.selectable:
         reason = f": {sets.reason}" if sets.reason else "."
         print(fmt.clean(f"This template doesn't take a model set{reason}"))
+        _print_gated_sets(sets, color)
         return
     if not sets.model_sets:
         print("No model sets for this template.")
@@ -837,6 +849,7 @@ def _print_model_sets(sets: ModelSetList, color: bool) -> None:
                      aligns=["l", "l", "l", "r", "r", "r", "l"], enabled=color)
     print(fmt.paint("Pass SLUG to `meshive pod-create --model-set` (one set per pod). -o json lists each set's files "
                     "and workflows.", "dim", color))
+    _print_gated_sets(sets, color)
 
 
 def _serving_label(s: Serving) -> str:

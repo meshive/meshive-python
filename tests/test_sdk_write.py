@@ -1450,3 +1450,56 @@ def test_async_pod_and_storage_edit():
     assert pod.requests[1].method == "PATCH" and pod.body(1) == {"gpuModel": "RTX 4090", "allowNodeMigration": True}
     assert pod.requests[1].headers["Idempotency-Key"] == "edit-0002"
     assert s_est.size_gb == 200 and s_upd.transaction_id == 77 and storage.requests[1].method == "PATCH"
+
+
+# Gated model sets (Hugging Face license): the files download with the user's own workspace token.
+
+GATED_MODEL_SETS = {"templateId": 483, "selectable": False,
+                    "reason": "This template adds its own model set when the pod is created.",
+                    "modelSets": [{
+                        "slug": "flux3-klein", "name": "FLUX 3 Image Klein", "hfTokenRequired": True,
+                        "gatedSources": [{"hf_repo": "black-forest-labs/flux-3-image-klein-comfy",
+                                          "url": "https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy",
+                                          "mode": "auto"}],
+                        "items": [{"entrySlug": "dm", "name": "dm", "category": "diffusion_model", "hfGated": "auto"},
+                                  {"entrySlug": "vae", "name": "vae", "category": "vae"}]}]}
+
+
+def test_list_model_sets_parses_gated_sets():
+    from meshive import ModelSetGatedSource
+
+    sets = sync_client(Recorder((200, GATED_MODEL_SETS))).list_model_sets("ws", 483)
+    s, = sets
+    assert s.hf_token_required is True
+    assert s.gated_sources == [ModelSetGatedSource(
+        hf_repo="black-forest-labs/flux-3-image-klein-comfy",
+        url="https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy", mode="auto")]
+    assert [i.hf_gated for i in s.items] == ["auto", None]
+    plain, = sync_client(Recorder((200, MODEL_SETS))).list_model_sets("ws", 457)
+    assert plain.hf_token_required is False and plain.gated_sources == []
+
+
+def test_create_pod_with_an_hf_token_waits_long():
+    rec = Recorder((202, {"name": "p", "workspace": "ws", "transactionId": 7, "estimate": ESTIMATE}))
+    sync_client(rec).create_pod("p", 483, workspace="ws", gpu_model="RTX 5090", hf_token_id=4)
+    assert rec.body()["hfTokenId"] == 4 and "modelSet" not in rec.body()
+    assert rec.last.extensions["timeout"]["read"] == 900.0     # the server links the set's files before it answers
+    sync_client(rec).create_pod("p", 483, workspace="ws", gpu_model="RTX 5090")
+    assert "hfTokenId" not in rec.body() and rec.last.extensions["timeout"]["read"] < 900
+    rec = Recorder((200, ESTIMATE))
+    sync_client(rec).estimate_pod("p", 483, workspace="ws", hf_token_id=4)
+    assert rec.body()["hfTokenId"] == 4
+    for bad in ("4", True, 0):
+        with pytest.raises(ValueError, match="hf_token_id"):
+            sync_client(rec).estimate_pod("p", 483, workspace="ws", hf_token_id=bad)
+
+
+def test_async_create_pod_sends_the_hf_token():
+    rec = Recorder((202, {"name": "p", "workspace": "ws", "transactionId": 7, "estimate": ESTIMATE}))
+
+    async def main():
+        async with async_client(rec) as client:
+            await client.create_pod("p", 483, workspace="ws", hf_token_id=4)
+
+    asyncio.run(main())
+    assert rec.body()["hfTokenId"] == 4 and rec.last.extensions["timeout"]["read"] == 900.0

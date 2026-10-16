@@ -191,7 +191,8 @@ def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: i
              region: str | None, max_price_per_hour: Any, input_assets: Any = None, watched_folders: Any = None,
              harvest_destination: Any = None, local_volumes: Any = None, cpu_line: str | None = None,
              template_ports: Any = None, model_set: str | None = None,
-             watched_template_folders: Mapping[str, Any] | None = None) -> dict[str, Any]:
+             watched_template_folders: Mapping[str, Any] | None = None,
+             hf_token_id: int | None = None) -> dict[str, Any]:
     if isinstance(template_id, bool) or not isinstance(template_id, int) or template_id < 0:
         raise ValueError("template_id must be a non-negative integer")
     # How many GPUs one pod may take is the server's rule; only the type is checked here.
@@ -235,6 +236,9 @@ def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: i
         "harvestDestination": _harvest_destination(harvest_destination),
         # One model set per pod (list_model_sets → slug). Omitted = none.
         "modelSet": model_set.strip() if isinstance(model_set, str) and model_set.strip() else None,
+        # Quick Deploy templates whose model set is gated on Hugging Face: the user's own workspace token
+        # (list_hf_tokens → id), as the console's Quick Deploy panel sends it. Omitted = none.
+        "hfTokenId": _optional_int(hf_token_id, "hf_token_id"),
     })
 
 

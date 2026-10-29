@@ -12,6 +12,28 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## v1.4.0
+
+Pods made from templates without an output folder (for example NIM or vLLM) can now save files from your own folders,
+and a template's output folder can be moved when you create a pod. Code written for 1.0 to 1.3 keeps working.
+
+### What's new
+
+- **Folders on any pod with storage.** `create_pod(..., watched_folders=[...])` and `meshive pod-create --watch PATH`
+  work on templates that don't declare an output folder, as long as the pod has storage to hold the folders (a
+  volume, or local storage). `set_watched_folders` / `meshive pod-watch --add` add them to a running pod without a
+  restart.
+- **Move the template's output folder.** `watched_template_folders={"/workspace/output": {"path": "/workspace/results"}}`
+  or `meshive pod-create --watch-move /workspace/output=/workspace/results` puts the template's output folder
+  somewhere else. `$MESHIVE_OUTPUT_DIR` and the folder's storage follow. Only output folders move; a running pod's
+  template folders can't be moved (turn one off and add a folder of yours instead).
+- **Turn on folder saving for an older pod.** Pods made before this release on such templates have no uploader:
+  `get_watched_folders` reports `editable_reason == "no_sidecar"`, and `WatchedFolders.can_enable_saving` is true
+  when the pod has storage for folders. `update_pod(..., enable_folder_saving=True)` or
+  `meshive pod-update --enable-folder-saving` adds it (a running pod restarts once). A pod that already has the
+  uploader, or has no storage for folders, is refused before anything restarts. `meshive pod-watch --add` on such
+  a pod says which of the two to do first.
+
 ## v1.3.0
 
 Quick Deploy model sets that are gated on Hugging Face can now be deployed from the SDK and CLI, with your own

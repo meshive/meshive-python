@@ -491,10 +491,17 @@ def test_pod_assets_and_watched_folders():
     assert body["watchedFolders"] == [{"path": "/workspace/later", "includeExisting": False, "enabled": False}]
     assert body["watchedTemplateFolders"] == {"/outputs": {"enabled": False},
                                               "/workspace/config": {"enabled": True, "include": ["*.yaml"]}}
+    # Moving the template's output folder (its $MESHIVE_OUTPUT_DIR and storage follow on the server)
+    rec = Recorder((202, {"name": "p", "workspace": "ws", "transactionId": 3, "estimate": {"pricePerHourUsd": "1"}}))
+    sync_client(rec).create_pod("p", 457, workspace="ws",
+                                watched_template_folders={"/workspace/output": {"path": "/workspace/results"}})
+    assert rec.body()["watchedTemplateFolders"] == {"/workspace/output": {"enabled": True,
+                                                                          "path": "/workspace/results"}}
     for bad in (dict(input_assets=[{"asset": "asset_b", "include_paths": ["unet/"]}]),
                 dict(input_assets=[{"asset": "asset_b", "strip_prefix": True}]),
                 dict(watched_template_folders=["/outputs"]),
-                dict(watched_template_folders={"/outputs": False})):
+                dict(watched_template_folders={"/outputs": False}),
+                dict(watched_template_folders={"/outputs": {"path": " "}})):
         with pytest.raises(ValueError):
             sync_client(Recorder()).create_pod("p", 457, workspace="ws", **bad)
     with pytest.raises(ValueError, match="unknown key.*include_paths.*paths"):
@@ -1363,6 +1370,23 @@ def test_update_pod_sends_only_what_is_given(kwargs, body):
     updated = sync_client(rec).update_pod("p-0", "ws", **kwargs)
     assert rec.body() == body
     assert updated.renamed_only is True and updated.transaction_id is None
+
+
+def test_enable_folder_saving_is_a_change_only_when_true():
+    rec = Recorder((202, {"podName": "p-0", "workspace": "ws", "accepted": True, "transactionId": 901,
+                          "renamedOnly": False, "estimate": POD_UPDATE_ESTIMATE}))
+    sync_client(rec).update_pod("p-0", "ws", enable_folder_saving=True)
+    assert rec.body() == {"enableFolderSaving": True}
+    with pytest.raises(ValueError):          # False asks for nothing — there is no change to send
+        sync_client(Recorder()).update_pod("p-0", "ws", enable_folder_saving=False)
+    with pytest.raises(ValueError):
+        sync_client(Recorder()).update_pod("p-0", "ws", enable_folder_saving="yes")
+
+
+def test_a_running_pods_template_folder_cannot_be_moved():
+    with pytest.raises(ValueError, match="can't be moved"):
+        sync_client(Recorder()).set_watched_folders("p-0", "ws", expected_version=1,
+                                                    template={"/outputs": {"path": "/data/out"}})
 
 
 def test_estimate_pod_update():

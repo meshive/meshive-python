@@ -505,6 +505,28 @@ def test_pod_create_watch_off_turns_template_folders_off():
     assert _last("estimate_pod")[2]["watched_template_folders"] == {"/outputs": {"enabled": False}}
 
 
+def test_pod_create_watch_move_moves_a_template_output_folder():
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--estimate",
+                     "--watch-move", "/workspace/output=/workspace/results", "--watch-off", "/outputs"]) == 0
+    assert _last("estimate_pod")[2]["watched_template_folders"] == {
+        "/outputs": {"enabled": False}, "/workspace/output": {"path": "/workspace/results"}}
+
+
+def test_pod_create_watch_move_needs_both_paths(capsys):
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--estimate",
+                     "--watch-move", "/workspace/output"]) != 0
+    assert "TEMPLATE_PATH=NEW_PATH" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("can_enable, hint", [(True, "--enable-folder-saving"), (False, "attach storage")])
+def test_pod_watch_on_a_pod_without_the_uploader_says_what_to_do(capsys, monkeypatch, can_enable, hint):
+    monkeypatch.setattr(FakeClient, "WATCHED", {"version": "0:1", "editable": False, "editableReason": "no_sidecar",
+                                                "roots": [], "canEnableSaving": can_enable})
+    assert cli.main(["pod-watch", "ws", "p-0", "--add", "/workspace/out", "--yes"]) == 1
+    assert hint in capsys.readouterr().err
+    assert not any(c[0] == "set_watched_folders" for c in FakeClient.instances[-1].calls)
+
+
 def test_pod_watch_shows_and_rewrites_with_the_version(capsys, non_tty):
     assert cli.main(["pod-watch", "ws", "p-0"]) == 0
     out = capsys.readouterr().out
@@ -1004,6 +1026,11 @@ def test_pod_update_maps_every_flag(capsys, edit_client):
 def test_pod_update_sends_only_the_flags_given(capsys, edit_client):
     assert cli.main(["pod-update", "ws", "p-0", "--gpu", "RTX 4090", "--yes"]) == 0
     assert _last("update_pod")[2] == {"gpu_model": "RTX 4090"}
+
+
+def test_pod_update_enable_folder_saving(capsys, edit_client):
+    assert cli.main(["pod-update", "ws", "p-0", "--enable-folder-saving", "--yes"]) == 0
+    assert _last("update_pod")[2] == {"enable_folder_saving": True}
 
 
 def test_pod_update_estimate(capsys, edit_client):

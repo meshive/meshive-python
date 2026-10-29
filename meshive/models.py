@@ -249,6 +249,8 @@ class WatchedFolders:
     applied: bool | None = None          # whether the sidecar has received this version (None if unknown)
     restart_hint: bool = False           # takes effect only after a restart
     folders: list[WatchedFolder] | None = None   # None = can't be determined
+    # editable_reason "no_sidecar" but the pod has storage: update_pod(enable_folder_saving=True) adds the uploader
+    can_enable_saving: bool = False
     raw: dict = field(default_factory=dict, repr=False)
 
     @property
@@ -263,6 +265,7 @@ class WatchedFolders:
             version=d.get("version"), editable=bool(d.get("editable", False)),
             editable_reason=d.get("editableReason"), applied=d.get("applied"),
             restart_hint=bool(d.get("restartHint", False)),
+            can_enable_saving=bool(d.get("canEnableSaving", False)),
             folders=None if roots is None else [
                 WatchedFolder(path=str(r.get("path", "")), origin=str(r.get("origin", "")),
                               enabled=bool(r.get("enabled", True)), role=str(r.get("role", "") or ""),

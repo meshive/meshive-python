@@ -297,9 +297,20 @@ def _pod_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         max_price_per_hour=args.max_price,
         input_assets=[_pod_input_asset(v) for v in args.pod_input_asset or []] or None,
         watched_folders=args.watch or None, model_set=args.model_set,
-        watched_template_folders={path: {"enabled": False} for path in args.watch_off or []} or None,
+        watched_template_folders=_template_folder_settings(args.watch_off, args.watch_move) or None,
         hf_token_id=args.hf_token,
     )
+
+
+def _template_folder_settings(watch_off: list[str] | None, watch_move: list[str] | None) -> dict[str, Any]:
+    """--watch-off PATH and --watch-move PATH=NEW_PATH → watched_template_folders."""
+    settings: dict[str, Any] = {path: {"enabled": False} for path in watch_off or []}
+    for value in watch_move or []:
+        old, sep, new = value.partition("=")
+        if not sep or not old.strip() or not new.strip():
+            raise ValueError(f"--watch-move expects TEMPLATE_PATH=NEW_PATH, got {value!r}")
+        settings.setdefault(old.strip(), {})["path"] = new.strip()
+    return settings
 
 
 def _pod_input_asset(value: str) -> Any:
@@ -331,6 +342,12 @@ def cmd_pod_watch(client: Meshive, args: argparse.Namespace, output: str, color:
         if current.folders is None or current.revision is None:
             print(f"Error: this pod's watched folders can't be changed now ({current.editable_reason or 'unknown'}).",
                   file=sys.stderr)
+            return 1
+        if current.editable_reason == "no_sidecar" and (args.add or args.on):
+            hint = (f"run `meshive pod-update {args.workspace} {args.pod_name} --enable-folder-saving` first "
+                    "(the pod restarts once)" if current.can_enable_saving
+                    else "attach storage with `meshive pod-update --volume` or `--local-volume` first")
+            print(f"Error: this pod has no uploader to watch folders — {hint}.", file=sys.stderr)
             return 1
         template = {f.path: {"enabled": f.enabled, "include": f.include_override}
                     for f in current.folders if f.origin == "template"}
@@ -718,6 +735,7 @@ def _pod_update_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         allow_node_migration=True if args.allow_node_migration else None,
         allow_data_loss=True if args.allow_data_loss else None,
         drop_watched_folders=args.drop_watched_folder or None,
+        enable_folder_saving=True if args.enable_folder_saving else None,
     )
     return {k: v for k, v in kwargs.items() if v is not None}
 
@@ -1070,6 +1088,9 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--watch-off", action="append", metavar="PATH",
                    help="Turn off one of the template's watched folders from the start (repeatable), as the console's "
                         "create screen does; `meshive pod-watch --on` turns it back on.")
+    p.add_argument("--watch-move", action="append", metavar="PATH=NEW_PATH",
+                   help="Move one of the template's output folders to another path (repeatable); $MESHIVE_OUTPUT_DIR "
+                        "and its storage follow.")
     p.add_argument("--model-set", default=None, metavar="SLUG",
                    help="Start the pod with this model set (see `meshive model-sets`). Its files are fetched before "
                         "the pod is created, which can take several minutes.")
@@ -1119,6 +1140,9 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
                    help="Separately consent to permanent loss of unpreserved workspace files if the pod moves.")
     p.add_argument("--drop-watched-folder", action="append", metavar="PATH",
                    help="Agree that the change removes this watched folder (repeatable); the error names them.")
+    p.add_argument("--enable-folder-saving", action="store_true",
+                   help="Add the uploader to an older pod so its folders can be watched (needs storage; a running "
+                        "pod restarts). `meshive pod-watch` shows whether a pod needs it.")
     p.add_argument("--max-price", default=None, metavar="USD", help="Cap the new compute USD/hour rate.")
     p.add_argument("--estimate", action="store_true", help="Only show the changes and the new price; change nothing.")
     _yes(p)

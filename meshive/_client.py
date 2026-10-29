@@ -926,8 +926,11 @@ class Meshive(_BaseClient):
         with paths, strip_prefix "" keeps their folder structure — the console's Keep structure — and leaving it out
         strips the folder they share). watched_folders are folders whose new files are uploaded as assets ("path" or
         {"path", "include", "include_existing", "enabled"}); watched_template_folders sets the template's own watched
-        folders from the start, as the console's create screen does: {"/outputs": {"enabled": False}} turns one off and
-        {"/outputs": {"include": ["*.png"]}} changes its patterns (get_watched_folders lists them on a running pod).
+        folders from the start, as the console's create screen does: {"/outputs": {"enabled": False}} turns one off,
+        {"/outputs": {"include": ["*.png"]}} changes its patterns and {"/outputs": {"path": "/workspace/results"}} moves
+        an output folder — $MESHIVE_OUTPUT_DIR and its storage follow (get_watched_folders lists them on a running pod).
+        Templates without an output folder (for example NIM or vLLM) take watched_folders too, as long as the pod has
+        storage to hold them.
         Pass the result's transaction_id to wait_for_new_pod to learn right away if the creation fails.
         model_set starts the pod with one of the template's model sets (a slug from list_model_sets; one per pod). The
         server fetches the set's files before it answers, which can take minutes, so this request waits up to
@@ -1001,7 +1004,8 @@ class Meshive(_BaseClient):
                             command: str | None = None, volumes: Any = None, local_volumes: Any = None,
                             detach_storages: Iterable[str] | None = None, allow_node_migration: bool | None = None,
                             allow_data_loss: bool | None = None, drop_watched_folders: Iterable[str] | None = None,
-                            max_price_per_hour: Any = None) -> PodUpdateEstimate:
+                            max_price_per_hour: Any = None,
+                            enable_folder_saving: bool | None = None) -> PodUpdateEstimate:
         """What update_pod would change, whether a running pod restarts, and the new hourly price — changes nothing
         (read scope is enough). Same arguments as update_pod."""
         body = _write.pod_update_body(
@@ -1010,7 +1014,8 @@ class Meshive(_BaseClient):
             remove_env=remove_env, ports=ports, template_ports=template_ports, remove_ports=remove_ports,
             command=command, volumes=volumes, local_volumes=local_volumes, detach_storages=detach_storages,
             allow_node_migration=allow_node_migration, allow_data_loss=allow_data_loss,
-            drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour)
+            drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour,
+            enable_folder_saving=enable_folder_saving)
         try:
             data = self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/estimate",
                               params={"workspace": _query_value(workspace, "workspace")}, json=body)
@@ -1027,7 +1032,7 @@ class Meshive(_BaseClient):
                    command: str | None = None, volumes: Any = None, local_volumes: Any = None,
                    detach_storages: Iterable[str] | None = None, allow_node_migration: bool | None = None,
                    allow_data_loss: bool | None = None, drop_watched_folders: Iterable[str] | None = None,
-                   max_price_per_hour: Any = None,
+                   max_price_per_hour: Any = None, enable_folder_saving: bool | None = None,
                    idempotency_key: str | None = None) -> PodUpdated:
         """Change a pod as the console's edit screen does (202 accepted). Only what you pass changes.
 
@@ -1038,6 +1043,8 @@ class Meshive(_BaseClient):
         command replaces the command ("" goes back to the template's). volumes attaches existing storage — network
         storage, or local storage on the pod's current machine — local_volumes creates new local storage there, and
         detach_storages detaches storage by pv_name (its data stays). max_price_per_hour caps the new hourly price.
+        enable_folder_saving=True adds the uploader to a pod made before every pod with storage got one, so you can
+        watch folders on it (get_watched_folders says editable_reason "no_sidecar"); it needs storage on the pod.
 
         Most changes restart a running pod; estimate_pod_update says so before you commit. A rename alone is applied
         in place without a restart (renamed_only, no transaction_id). Follow the change with
@@ -1058,7 +1065,8 @@ class Meshive(_BaseClient):
             remove_env=remove_env, ports=ports, template_ports=template_ports, remove_ports=remove_ports,
             command=command, volumes=volumes, local_volumes=local_volumes, detach_storages=detach_storages,
             allow_node_migration=allow_node_migration, allow_data_loss=allow_data_loss,
-            drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour)
+            drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour,
+            enable_folder_saving=enable_folder_saving)
         try:
             data = self._send("PATCH", f"/pods/{_path_segment(pod_name, 'pod_name')}",
                               params={"workspace": _query_value(workspace, "workspace")}, json=body,
@@ -1789,8 +1797,11 @@ class AsyncMeshive(_BaseClient):
         with paths, strip_prefix "" keeps their folder structure — the console's Keep structure — and leaving it out
         strips the folder they share). watched_folders are folders whose new files are uploaded as assets ("path" or
         {"path", "include", "include_existing", "enabled"}); watched_template_folders sets the template's own watched
-        folders from the start, as the console's create screen does: {"/outputs": {"enabled": False}} turns one off and
-        {"/outputs": {"include": ["*.png"]}} changes its patterns (get_watched_folders lists them on a running pod).
+        folders from the start, as the console's create screen does: {"/outputs": {"enabled": False}} turns one off,
+        {"/outputs": {"include": ["*.png"]}} changes its patterns and {"/outputs": {"path": "/workspace/results"}} moves
+        an output folder — $MESHIVE_OUTPUT_DIR and its storage follow (get_watched_folders lists them on a running pod).
+        Templates without an output folder (for example NIM or vLLM) take watched_folders too, as long as the pod has
+        storage to hold them.
         Pass the result's transaction_id to wait_for_new_pod to learn right away if the creation fails.
         model_set starts the pod with one of the template's model sets (a slug from list_model_sets; one per pod). The
         server fetches the set's files before it answers, which can take minutes, so this request waits up to
@@ -1864,7 +1875,8 @@ class AsyncMeshive(_BaseClient):
                                   command: str | None = None, volumes: Any = None, local_volumes: Any = None,
                                   detach_storages: Iterable[str] | None = None, allow_node_migration: bool | None = None,
                                   allow_data_loss: bool | None = None, drop_watched_folders: Iterable[str] | None = None,
-                                  max_price_per_hour: Any = None) -> PodUpdateEstimate:
+                                  max_price_per_hour: Any = None,
+                                  enable_folder_saving: bool | None = None) -> PodUpdateEstimate:
         """What update_pod would change and cost (POST /pods/{pod}/estimate). Same contract as the sync client."""
         body = _write.pod_update_body(
             name=name, template_id=template_id, rental_type=rental_type, gpu_model=gpu_model, gpu_vram_gb=gpu_vram_gb,
@@ -1872,7 +1884,8 @@ class AsyncMeshive(_BaseClient):
             remove_env=remove_env, ports=ports, template_ports=template_ports, remove_ports=remove_ports,
             command=command, volumes=volumes, local_volumes=local_volumes, detach_storages=detach_storages,
             allow_node_migration=allow_node_migration, allow_data_loss=allow_data_loss,
-            drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour)
+            drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour,
+            enable_folder_saving=enable_folder_saving)
         try:
             data = await self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/estimate",
                               params={"workspace": _query_value(workspace, "workspace")}, json=body)
@@ -1889,7 +1902,7 @@ class AsyncMeshive(_BaseClient):
                          command: str | None = None, volumes: Any = None, local_volumes: Any = None,
                          detach_storages: Iterable[str] | None = None, allow_node_migration: bool | None = None,
                          allow_data_loss: bool | None = None, drop_watched_folders: Iterable[str] | None = None,
-                         max_price_per_hour: Any = None,
+                         max_price_per_hour: Any = None, enable_folder_saving: bool | None = None,
                          idempotency_key: str | None = None) -> PodUpdated:
         """Change a pod (PATCH /pods/{pod}, 202). Same contract as the sync client."""
         body = _write.pod_update_body(
@@ -1898,7 +1911,8 @@ class AsyncMeshive(_BaseClient):
             remove_env=remove_env, ports=ports, template_ports=template_ports, remove_ports=remove_ports,
             command=command, volumes=volumes, local_volumes=local_volumes, detach_storages=detach_storages,
             allow_node_migration=allow_node_migration, allow_data_loss=allow_data_loss,
-            drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour)
+            drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour,
+            enable_folder_saving=enable_folder_saving)
         try:
             data = await self._send("PATCH", f"/pods/{_path_segment(pod_name, 'pod_name')}",
                               params={"workspace": _query_value(workspace, "workspace")}, json=body,

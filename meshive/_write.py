@@ -232,7 +232,8 @@ def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: i
         "inputAssets": _pod_input_assets(input_assets) or None,
         "watchedFolders": _watched_folders(watched_folders) or None,
         # The template's own watched folders, as the console's create screen sets them: {path: {"enabled", "include"}}.
-        "watchedTemplateFolders": _template_folders(watched_template_folders, "watched_template_folders") or None,
+        "watchedTemplateFolders": _template_folders(watched_template_folders, "watched_template_folders",
+                                                    allow_path=True) or None,
         "harvestDestination": _harvest_destination(harvest_destination),
         # One model set per pod (list_model_sets → slug). Omitted = none.
         "modelSet": model_set.strip() if isinstance(model_set, str) and model_set.strip() else None,
@@ -260,7 +261,7 @@ def _flag(value: Any, name: str) -> bool | None:
 # Pod edit fields that are a change. The rest of the body (consents, the price cap) only qualifies a change.
 _POD_UPDATE_CHANGES = ("name", "templateId", "rentalType", "gpuModel", "gpuVramGb", "gpuCount", "vcpu", "ramGb",
                        "cpuLine", "env", "secretKeys", "removeEnv", "ports", "templatePorts", "removePorts", "command",
-                       "volumes", "localVolumes", "detachStorages")
+                       "volumes", "localVolumes", "detachStorages", "enableFolderSaving")
 
 
 def pod_update_body(*, name: str | None = None, template_id: int | None = None, rental_type: str | None = None,
@@ -272,7 +273,7 @@ def pod_update_body(*, name: str | None = None, template_id: int | None = None, 
                     local_volumes: Any = None, detach_storages: str | Iterable[str] | None = None,
                     allow_node_migration: bool | None = None, allow_data_loss: bool | None = None,
                     drop_watched_folders: str | Iterable[str] | None = None,
-                    max_price_per_hour: Any = None) -> dict[str, Any]:
+                    max_price_per_hour: Any = None, enable_folder_saving: bool | None = None) -> dict[str, Any]:
     """PATCH /pods/{pod} (and its estimate) body — only what is given is sent, so the rest of the pod stays as it is.
     command="" is sent (it means "back to the template's command"). Which changes the pod allows is the server's call."""
     if template_id is not None and (isinstance(template_id, bool) or not isinstance(template_id, int) or template_id < 0):
@@ -308,6 +309,8 @@ def pod_update_body(*, name: str | None = None, template_id: int | None = None, 
         "allowDataLoss": _flag(allow_data_loss, "allow_data_loss"),
         "dropWatchedFolders": _strings(drop_watched_folders, "drop_watched_folders"),
         "maxPricePerHourUsd": _price(max_price_per_hour, "max_price_per_hour"),
+        # Only True asks for something; False is the same as not passing it.
+        "enableFolderSaving": True if _flag(enable_folder_saving, "enable_folder_saving") else None,
     })
     if not any(key in body for key in _POD_UPDATE_CHANGES):
         raise ValueError("pass at least one change, such as name, gpu_model, env, ports or volumes")
@@ -388,9 +391,10 @@ def watched_folders_body(expected_version: int, template: Mapping[str, Any] | No
             "user": _watched_folders(user)}
 
 
-def _template_folders(template: Mapping[str, Any] | None, name: str) -> dict[str, Any]:
+def _template_folders(template: Mapping[str, Any] | None, name: str, *, allow_path: bool = False) -> dict[str, Any]:
     """The template's watched folders by path — {path: {"enabled": bool, "include": [globs] or None}}. include None
-    keeps the template's patterns."""
+    keeps the template's patterns. When creating a pod (allow_path), "path" moves an output folder to another path;
+    a running pod's template folders can't be moved."""
     if template is None:
         return {}
     if not isinstance(template, Mapping):
@@ -400,9 +404,14 @@ def _template_folders(template: Mapping[str, Any] | None, name: str) -> dict[str
         toggle = {} if toggle is None else toggle
         if not isinstance(toggle, Mapping):     # {path: False} would otherwise read as "on"
             raise ValueError(f"{name}[{path!r}] must be a mapping like {{'enabled': False}}")
+        moved = toggle.get("path")
+        if moved is not None and not allow_path:
+            raise ValueError(f"{name}[{path!r}]: a running pod's template folder can't be moved — turn it off and "
+                             "add a folder of yours instead")
         toggles[_require_str(path, f"{name} path")] = _drop_none({
             "enabled": bool(toggle.get("enabled", True)),
-            "include": list(toggle["include"]) if toggle.get("include") is not None else None})
+            "include": list(toggle["include"]) if toggle.get("include") is not None else None,
+            "path": None if moved is None else _require_str(moved, f"{name}[{path!r}].path")})
     return toggles
 
 

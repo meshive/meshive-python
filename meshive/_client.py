@@ -19,6 +19,7 @@ import math
 import os
 import time
 import uuid
+import warnings
 from collections.abc import Iterable
 from datetime import date, datetime
 from pathlib import Path
@@ -109,6 +110,18 @@ def _not_supported(err: MeshiveAPIError, what: str) -> MeshiveAPIError:
         return err
     return NotFoundError(404, f"This Meshive API server does not support {what} yet (it predates this SDK "
                               "release). Use the console for now.", raw=err.raw)
+
+
+def _check_output_include(body: dict[str, Any], submitted: TaskSubmitted) -> TaskSubmitted:
+    """A server older than the output filter accepts the request and drops outputInclude, so the task uploads every file
+    in /outputs. A server that keeps the filter echoes outputInclude on the task, so a missing key means it was dropped.
+    The task has been submitted either way; this only warns. The message names the task, so a caller that turns warnings
+    into errors still knows which task it got (resubmitting would run a second one)."""
+    if body.get("outputInclude") and "outputInclude" not in submitted.task.raw:
+        # stacklevel 3 points at the code that called submit_task (_check_output_include → submit_task → caller).
+        warnings.warn("this server ignores output_include; every file in /outputs will be uploaded "
+                      f"(task {submitted.task.task_id} was submitted)", RuntimeWarning, stacklevel=3)
+    return submitted
 
 
 def _download_target(dest: str | os.PathLike[str], rel: str) -> Path:
@@ -1328,11 +1341,13 @@ class Meshive(_BaseClient):
                       args: Iterable[str] | None = None, gpu_model: str | None = None, gpu_count: int | None = None,
                       gpu_vram_gb: int | None = None, cpu_preset: str | None = None, max_duration: int = 3600,
                       webhook_url: str | None = None, input_assets: Any = None,
-                      max_price_per_hour: Any = None) -> TaskEstimate:
+                      max_price_per_hour: Any = None,
+                      output_include: str | Iterable[str] | None = None) -> TaskEstimate:
         body = _write.task_body(name, script, image=image, template_id=template_id, requirements=requirements, env=env,
                                 secret_keys=secret_keys, args=args, gpu_model=gpu_model, gpu_count=gpu_count,
                                 gpu_vram_gb=gpu_vram_gb, cpu_preset=cpu_preset, max_duration=max_duration,
-                                webhook_url=webhook_url, input_assets=input_assets, max_price_per_hour=max_price_per_hour)
+                                webhook_url=webhook_url, input_assets=input_assets, max_price_per_hour=max_price_per_hour,
+                                output_include=output_include)
         return TaskEstimate.from_dict(self._send("POST", "/tasks/estimate",
                                                   params={"workspace": _query_value(workspace, "workspace")}, json=body))
 
@@ -1342,14 +1357,25 @@ class Meshive(_BaseClient):
                     args: Iterable[str] | None = None, gpu_model: str | None = None, gpu_count: int | None = None,
                     gpu_vram_gb: int | None = None, cpu_preset: str | None = None, max_duration: int = 3600,
                     webhook_url: str | None = None, input_assets: Any = None, max_price_per_hour: Any = None,
+                    output_include: str | Iterable[str] | None = None,
                     idempotency_key: str | None = None) -> TaskSubmitted:
-        """Submit a one-shot task (202). To get logs, use print(..., flush=True) in the script (mind buffering)."""
+        """Submit a one-shot task (202). To get logs, use print(..., flush=True) in the script (mind buffering).
+
+        output_include uploads only the files in /outputs that match these globs (paths relative to /outputs,
+        case-sensitive): "*.safetensors" matches at any depth, "samples/*.png" only in that folder, and "checkpoints/"
+        every folder named checkpoints, at any depth, with everything in it. Omitted, every file is uploaded. Files
+        left out still use the /outputs disk while the task runs (counting toward the disk charge where /outputs is
+        billed as a volume), and are discarded when it ends. The returned task's output_include echoes
+        the filter; a server that predates the filter ignores it, and a RuntimeWarning says so.
+        """
         body = _write.task_body(name, script, image=image, template_id=template_id, requirements=requirements, env=env,
                                 secret_keys=secret_keys, args=args, gpu_model=gpu_model, gpu_count=gpu_count,
                                 gpu_vram_gb=gpu_vram_gb, cpu_preset=cpu_preset, max_duration=max_duration,
-                                webhook_url=webhook_url, input_assets=input_assets, max_price_per_hour=max_price_per_hour)
-        return TaskSubmitted.from_dict(self._send("POST", "/tasks", params={"workspace": _query_value(workspace, "workspace")},
-                                                   json=body, idempotency_key=idempotency_key))
+                                webhook_url=webhook_url, input_assets=input_assets, max_price_per_hour=max_price_per_hour,
+                                output_include=output_include)
+        return _check_output_include(body, TaskSubmitted.from_dict(self._send(
+            "POST", "/tasks", params={"workspace": _query_value(workspace, "workspace")}, json=body,
+            idempotency_key=idempotency_key)))
 
     def stop_task(self, task_id: str, *, idempotency_key: str | None = None) -> ResourceAction:
         data = self._send("POST", f"/tasks/{_path_segment(task_id, 'task_id')}/stop", idempotency_key=idempotency_key)
@@ -2161,11 +2187,13 @@ class AsyncMeshive(_BaseClient):
                       args: Iterable[str] | None = None, gpu_model: str | None = None, gpu_count: int | None = None,
                       gpu_vram_gb: int | None = None, cpu_preset: str | None = None, max_duration: int = 3600,
                       webhook_url: str | None = None, input_assets: Any = None,
-                      max_price_per_hour: Any = None) -> TaskEstimate:
+                      max_price_per_hour: Any = None,
+                      output_include: str | Iterable[str] | None = None) -> TaskEstimate:
         body = _write.task_body(name, script, image=image, template_id=template_id, requirements=requirements, env=env,
                                 secret_keys=secret_keys, args=args, gpu_model=gpu_model, gpu_count=gpu_count,
                                 gpu_vram_gb=gpu_vram_gb, cpu_preset=cpu_preset, max_duration=max_duration,
-                                webhook_url=webhook_url, input_assets=input_assets, max_price_per_hour=max_price_per_hour)
+                                webhook_url=webhook_url, input_assets=input_assets, max_price_per_hour=max_price_per_hour,
+                                output_include=output_include)
         return TaskEstimate.from_dict(await self._send("POST", "/tasks/estimate",
                                                   params={"workspace": _query_value(workspace, "workspace")}, json=body))
 
@@ -2175,14 +2203,25 @@ class AsyncMeshive(_BaseClient):
                     args: Iterable[str] | None = None, gpu_model: str | None = None, gpu_count: int | None = None,
                     gpu_vram_gb: int | None = None, cpu_preset: str | None = None, max_duration: int = 3600,
                     webhook_url: str | None = None, input_assets: Any = None, max_price_per_hour: Any = None,
+                    output_include: str | Iterable[str] | None = None,
                     idempotency_key: str | None = None) -> TaskSubmitted:
-        """Submit a one-shot task (202). To get logs, use print(..., flush=True) in the script (mind buffering)."""
+        """Submit a one-shot task (202). To get logs, use print(..., flush=True) in the script (mind buffering).
+
+        output_include uploads only the files in /outputs that match these globs (paths relative to /outputs,
+        case-sensitive): "*.safetensors" matches at any depth, "samples/*.png" only in that folder, and "checkpoints/"
+        every folder named checkpoints, at any depth, with everything in it. Omitted, every file is uploaded. Files
+        left out still use the /outputs disk while the task runs (counting toward the disk charge where /outputs is
+        billed as a volume), and are discarded when it ends. The returned task's output_include echoes
+        the filter; a server that predates the filter ignores it, and a RuntimeWarning says so.
+        """
         body = _write.task_body(name, script, image=image, template_id=template_id, requirements=requirements, env=env,
                                 secret_keys=secret_keys, args=args, gpu_model=gpu_model, gpu_count=gpu_count,
                                 gpu_vram_gb=gpu_vram_gb, cpu_preset=cpu_preset, max_duration=max_duration,
-                                webhook_url=webhook_url, input_assets=input_assets, max_price_per_hour=max_price_per_hour)
-        return TaskSubmitted.from_dict(await self._send("POST", "/tasks", params={"workspace": _query_value(workspace, "workspace")},
-                                                   json=body, idempotency_key=idempotency_key))
+                                webhook_url=webhook_url, input_assets=input_assets, max_price_per_hour=max_price_per_hour,
+                                output_include=output_include)
+        return _check_output_include(body, TaskSubmitted.from_dict(await self._send(
+            "POST", "/tasks", params={"workspace": _query_value(workspace, "workspace")}, json=body,
+            idempotency_key=idempotency_key)))
 
     async def stop_task(self, task_id: str, *, idempotency_key: str | None = None) -> ResourceAction:
         data = await self._send("POST", f"/tasks/{_path_segment(task_id, 'task_id')}/stop", idempotency_key=idempotency_key)

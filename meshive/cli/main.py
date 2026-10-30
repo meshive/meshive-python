@@ -948,6 +948,8 @@ def _print_task(t: Task, color: bool) -> None:
         files = f"{t.output_files_completed or 0} of {t.output_files_declared or 0} files"
         size = f"{fmt.bytes_human(t.output_bytes_completed)} of {fmt.bytes_human(t.output_bytes_declared)}"
         print(f"outputs:     {fmt.clean(t.output_upload_state)}, {files}, {size}")
+    if t.output_include:
+        print(f"output filter: {fmt.clean(', '.join(t.output_include))}")
     if t.output_upload_last_error:
         print(fmt.paint(fmt.clean(f"upload error: {t.output_upload_last_error}"), "red", color))
     if t.outputs_purged_at:

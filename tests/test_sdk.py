@@ -245,6 +245,13 @@ def test_task_detail_fields():
     assert bare.output_files_declared is None and bare.input_assets == []
 
 
+def test_task_output_filter():
+    assert Task.from_dict({"externalId": "t", "outputInclude": ["*.png", "samples/"]}).output_include == ["*.png",
+                                                                                                         "samples/"]
+    assert Task.from_dict({"externalId": "t", "outputInclude": None}).output_include is None     # every file
+    assert Task.from_dict({"externalId": "t"}).output_include is None      # a server that predates the filter
+
+
 def test_list_machines_parses():
     seen = {}
 

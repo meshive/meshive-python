@@ -235,7 +235,8 @@ class FakeClient:
                     raw={"externalId": task_id, "scriptContent": "print(1)"},
                     output_upload_state="uploading", output_files_declared=4, output_files_completed=1,
                     output_bytes_declared=4096, output_bytes_completed=1024, output_upload_last_error="AccessDenied",
-                    input_assets=[TaskInputAsset("asset_w", "weights", "/inputs/w")])
+                    input_assets=[TaskInputAsset("asset_w", "weights", "/inputs/w")],
+                    output_include=["*.safetensors", "samples/"])
 
     def list_assets(self, workspace, *, asset_type=None, status=None, page=1, page_size=20):
         FakeClient.last_call = ("list_assets", (workspace,),
@@ -906,6 +907,7 @@ def test_task_single_output(capsys):
     assert "exit code:   0" in out and "6 cores / 24 GiB" in out
     assert "outputs:     uploading, 1 of 4 files, 1.0 KiB of 4.0 KiB" in out
     assert "upload error: AccessDenied" in out
+    assert "output filter: *.safetensors, samples/" in out
     assert "weights" in out and "/inputs/w" in out          # input asset table
     assert cli.main(["task", "task_a", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["scriptContent"] == "print(1)"

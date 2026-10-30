@@ -1527,3 +1527,103 @@ def test_async_create_pod_sends_the_hf_token():
 
     asyncio.run(main())
     assert rec.body()["hfTokenId"] == 4 and rec.last.extensions["timeout"]["read"] == 900.0
+
+
+# --- 1.5.0: task output filter -------------------------------------------------------------------------------
+
+TASK_ACCEPTED = {"externalId": "task_1", "name": "train", "namespaceName": "ws", "status": "queued"}
+TASK_ESTIMATE = {"pricePerHourUsd": None, "maxCostUsd": None, "maxDurationS": 3600, "resources": {}}
+
+
+def _task_rec(task: dict) -> Recorder:
+    return Recorder((202, {"task": task, "estimate": TASK_ESTIMATE}))
+
+
+def test_task_output_include_is_sent_as_a_list_only_when_given():
+    rec = _task_rec({**TASK_ACCEPTED, "outputInclude": ["*.safetensors", "samples/*.png"]})
+    c = sync_client(rec)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")             # the server kept the filter: no warning
+        submitted = c.submit_task("train", "print(1)", workspace="ws", image="img", cpu_preset="micro-2c8g",
+                                  output_include=["*.safetensors", "samples/*.png"])
+    assert rec.body()["outputInclude"] == ["*.safetensors", "samples/*.png"]
+    assert submitted.task.output_include == ["*.safetensors", "samples/*.png"]
+
+    rec = Recorder((200, TASK_ESTIMATE))
+    sync_client(rec).estimate_task("t", "print(1)", workspace="ws", image="img", cpu_preset="micro-2c8g",
+                                   output_include="checkpoints/")
+    assert rec.body()["outputInclude"] == ["checkpoints/"]           # one glob → a one-item list
+
+    for unused in (None, [], ()):
+        rec = Recorder((200, TASK_ESTIMATE))
+        sync_client(rec).estimate_task("t", "print(1)", workspace="ws", image="img", cpu_preset="micro-2c8g",
+                                       output_include=unused)
+        assert "outputInclude" not in rec.body()                     # not sent when unused: every file uploads
+    rec = _task_rec(TASK_ACCEPTED)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")             # nothing asked for, nothing to warn about
+        sync_client(rec).submit_task("t", "print(1)", workspace="ws", image="img", cpu_preset="micro-2c8g")
+    assert "outputInclude" not in rec.body()
+
+
+@pytest.mark.parametrize("bad", ["", " ", ["*.png", ""], [None], [3], 3, {"*.png": True}])
+def test_task_output_include_shape_is_checked_before_sending(bad):
+    rec = Recorder((200, TASK_ESTIMATE))
+    with pytest.raises(ValueError, match="output_include"):
+        sync_client(rec).estimate_task("t", "print(1)", workspace="ws", image="img", cpu_preset="micro-2c8g",
+                                       output_include=bad)
+    assert rec.requests == []
+
+
+def test_task_output_include_patterns_are_left_to_the_server():
+    # The pattern rules (leading /outputs, negation, limits) are the server's; the SDK sends what it is given.
+    rec = Recorder((200, TASK_ESTIMATE))
+    sync_client(rec).estimate_task("t", "print(1)", workspace="ws", image="img", cpu_preset="micro-2c8g",
+                                   output_include=["/outputs/a.png", "!b.png", "**/c"])
+    assert rec.body()["outputInclude"] == ["/outputs/a.png", "!b.png", "**/c"]
+
+
+def test_submit_task_warns_when_the_server_drops_the_output_filter():
+    rec = _task_rec(TASK_ACCEPTED)                 # an older server: no outputInclude on the task
+    with pytest.warns(RuntimeWarning, match="ignores output_include; every file in /outputs will be uploaded") as caught:
+        submitted = sync_client(rec).submit_task("t", "print(1)", workspace="ws", image="img",
+                                                 cpu_preset="micro-2c8g", output_include="*.png")
+    assert caught[0].filename == __file__          # points at the caller, not inside the SDK
+    assert "(task task_1 was submitted)" in str(caught[0].message)
+    assert submitted.task.task_id == "task_1" and submitted.task.output_include is None
+
+
+def test_submit_task_names_the_task_when_warnings_are_errors():
+    # Warnings turned into errors lose the return value, but the task already exists: the error must say which one.
+    rec = _task_rec(TASK_ACCEPTED)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(RuntimeWarning, match=r"\(task task_1 was submitted\)"):
+            sync_client(rec).submit_task("t", "print(1)", workspace="ws", image="img", cpu_preset="micro-2c8g",
+                                         output_include="*.png")
+    assert len(rec.requests) == 1                  # submitted once; nothing is retried behind the caller's back
+
+
+def test_async_task_methods_take_the_output_filter():
+    estimate = Recorder((200, TASK_ESTIMATE))
+    kept = _task_rec({**TASK_ACCEPTED, "outputInclude": ["*.png"]})
+    dropped = _task_rec(TASK_ACCEPTED)
+
+    async def run():
+        async with async_client(estimate) as c:
+            await c.estimate_task("t", "print(1)", workspace="ws", image="img", cpu_preset="micro-2c8g",
+                                  output_include=["*.png"])
+        async with async_client(kept) as c:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                first = await c.submit_task("t", "print(1)", workspace="ws", image="img", cpu_preset="micro-2c8g",
+                                            output_include="*.png")
+        async with async_client(dropped) as c:
+            with pytest.warns(RuntimeWarning, match="ignores output_include") as caught:
+                await c.submit_task("t", "print(1)", workspace="ws", image="img", cpu_preset="micro-2c8g",
+                                    output_include="*.png")
+        return first, caught
+
+    first, caught = asyncio.run(run())
+    assert estimate.body()["outputInclude"] == ["*.png"] and kept.body()["outputInclude"] == ["*.png"]
+    assert first.task.output_include == ["*.png"] and caught[0].filename == __file__

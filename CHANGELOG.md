@@ -12,6 +12,26 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## v1.5.0
+
+A task can now keep only some of the files it writes to `/outputs`, as the console's submit form does: the rest are
+not uploaded and don't become part of the task's output asset. Code written for 1.0 to 1.4 keeps working.
+
+### What's new
+
+- **Output filter for tasks.** `submit_task(..., output_include=["*.safetensors", "samples/*.png"])` and
+  `meshive task-submit ... --output-include '*.safetensors' --output-include 'samples/*.png'` upload only the files
+  in `/outputs` that match. Patterns are relative to `/outputs` and case-sensitive: `*.png` matches at any depth and
+  `samples/*.png` only from `/outputs` (a slash anchors a pattern; a trailing one doesn't). A trailing slash takes
+  whole folders: `checkpoints/` matches every folder named `checkpoints`, at any depth, with everything in it.
+  Leaving it out uploads every file, as before. `estimate_task` takes the same argument, and the server explains a
+  pattern it can't use. Files left out still use the `/outputs` disk while the task runs and are discarded when it
+  ends. If no file matches, the task still succeeds and creates no output asset.
+- **See a task's filter.** `Task.output_include` lists its patterns (`None` = every file), and `meshive task` prints
+  them as `output filter:`. A server that predates the filter accepts the task and uploads every file;
+  `submit_task` then issues a `RuntimeWarning` that names the task (it is submitted either way), and
+  `meshive task-submit` prints a warning.
+
 ## v1.4.0
 
 Pods made from templates without an output folder (for example NIM or vLLM) can now save files from your own folders,

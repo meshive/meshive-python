@@ -13,6 +13,7 @@ import argparse
 import json
 import shlex
 import sys
+import warnings
 from pathlib import Path
 from typing import Any, Callable
 
@@ -1000,7 +1001,7 @@ def cmd_task_submit(client: Meshive, args: argparse.Namespace, output: str, colo
                   env=_parse_env(args.env), secret_keys=args.secret or [], args=args.arg or [], gpu_model=args.gpu,
                   gpu_count=args.gpu_count, gpu_vram_gb=args.vram, cpu_preset=args.cpu_preset,
                   max_duration=args.max_duration, webhook_url=args.webhook, input_assets=_parse_input_assets(args.input_asset),
-                  max_price_per_hour=args.max_price)
+                  max_price_per_hour=args.max_price, output_include=args.output_include)
     estimate = client.estimate_task(args.name, script or "", workspace=args.workspace, **kwargs)
     if args.estimate:
         _emit_estimate(output, estimate, lambda: _print_task_estimate(estimate, color))
@@ -1010,11 +1011,18 @@ def cmd_task_submit(client: Meshive, args: argparse.Namespace, output: str, colo
     cost = fmt.money(estimate.max_cost) if estimate.max_cost is not None else "an unknown amount"
     if not _confirm(args, f"Submit task '{args.name}' (up to {cost})?"):
         return 2
-    submitted = client.submit_task(args.name, script or "", workspace=args.workspace, **kwargs)
+    with warnings.catch_warnings(record=True) as caught:
+        # The SDK warns when the server ignored --output-include; print it like the CLI's other warnings.
+        warnings.simplefilter("always", RuntimeWarning)
+        submitted = client.submit_task(args.name, script or "", workspace=args.workspace, **kwargs)
+    for warning in caught:
+        print(f"Warning: {warning.message}", file=sys.stderr)
     task = submitted.task
     _emit(output, submitted.raw, [task.task_id], lambda: _kv([
         ("accepted", "yes"), ("task", task.task_id), ("name", task.name), ("status", task.status),
-        ("pod", task.pod_name or "-"), ("logs", f"meshive task-logs {task.task_id}")]))
+        ("pod", task.pod_name or "-"),
+        *([("output filter", ", ".join(task.output_include))] if task.output_include else []),
+        ("logs", f"meshive task-logs {task.task_id}")]))
     return 0
 
 
@@ -1290,6 +1298,11 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--webhook", default=None, metavar="URL")
     p.add_argument("--input-asset", action="append", metavar="ASSET_ID")
     p.add_argument("--max-price", default=None, metavar="USD", help="Final compute USD/hour cap; storage and Asset Hub charges are separate.")
+    p.add_argument("--output-include", action="append", metavar="GLOB",
+                   help="Only upload files in /outputs matching GLOB, relative to /outputs: '*.safetensors' (any depth), "
+                        "'samples/*.png' (that folder), 'checkpoints/' (every folder of that name, with its contents); "
+                        "repeatable. Default: every file. "
+                        "Files left out still use /outputs disk while the task runs.")
     p.add_argument("--estimate", action="store_true", help="Only show the estimate; submit nothing.")
     _yes(p)
     p = sub.add_parser("task-stop", parents=[common], help="Stop a running task."); p.add_argument("task_id")

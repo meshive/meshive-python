@@ -1171,10 +1171,14 @@ class Task:
     output_bytes_completed: int | None = None
     output_upload_last_error: str | None = None   # reason of the last upload failure (credential error, ...)
     outputs_purged_at: datetime | None = None      # when the outputs were deleted
+    # Output filter: only files in /outputs matching these globs are uploaded. None = every file (or a server that
+    # predates the filter).
+    output_include: list[str] | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Task":
         exit_code = d.get("exitCode")
+        include = d.get("outputInclude")
         return cls(
             failed_asset_id=d.get("failedAssetExternalId"),
             input_assets=[TaskInputAsset(asset_id=str(a.get("assetExternalId", "") or ""),
@@ -1190,6 +1194,7 @@ class Task:
             output_bytes_completed=d.get("outputBytesCompleted"),
             output_upload_last_error=d.get("outputUploadLastError"),
             outputs_purged_at=_parse_dt(d.get("outputsPurgedAt")),
+            output_include=[str(p) for p in include] if isinstance(include, list) else None,
             task_id=d.get("externalId", ""),
             name=d.get("name", ""),
             namespace_name=d.get("namespaceName", ""),

@@ -570,10 +570,19 @@ def serving_scale_body(*, min_replicas: int | None, max_replicas: int | None, au
 
 # --- Tasks --------------------------------------------------------------------
 
+def _output_include(values: Any) -> list[str] | None:
+    """Output filter — one glob or a list of globs, relative to /outputs. None or empty → None (not sent: every file is
+    uploaded). Only the shape is checked; which patterns are valid is the server's rule."""
+    if values is not None and (isinstance(values, Mapping) or not isinstance(values, (str, Iterable))):
+        raise ValueError("output_include must be a glob or a list of globs, e.g. ['*.safetensors', 'samples/*.png']")
+    return _strings(values, "output_include")
+
+
 def task_body(name: str, script: str, *, image: str | None, template_id: int | None, requirements: str | None,
               env: Mapping[str, Any] | None, secret_keys: Iterable[str] | None, args: Iterable[str] | None,
               gpu_model: str | None, gpu_count: int | None, gpu_vram_gb: int | None, cpu_preset: str | None,
-              max_duration: int, webhook_url: str | None, input_assets: Any, max_price_per_hour: Any) -> dict[str, Any]:
+              max_duration: int, webhook_url: str | None, input_assets: Any, max_price_per_hour: Any,
+              output_include: str | Iterable[str] | None = None) -> dict[str, Any]:
     script_text = script if isinstance(script, str) else ""
     if not script_text.strip():
         raise ValueError("script must be a non-empty string (Python source)")
@@ -610,6 +619,8 @@ def task_body(name: str, script: str, *, image: str | None, template_id: int | N
         "gpuVramGb": _optional_int(gpu_vram_gb, "gpu_vram_gb"), "cpuPreset": cpu_preset or None,
         "maxDurationS": max_duration, "webhookUrl": webhook_url or None, "inputAssets": assets,
         "maxPricePerHourUsd": _price(max_price_per_hour, "max_price_per_hour"),
+        # Only files in /outputs matching these globs are uploaded. Omitted = every file (the body is unchanged).
+        "outputInclude": _output_include(output_include),
     })
 
 

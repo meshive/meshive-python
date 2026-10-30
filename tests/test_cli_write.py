@@ -1151,3 +1151,49 @@ def test_model_sets_point_gated_sets_at_the_license(capsys, monkeypatch):
     assert "doesn't take a model set" in out
     assert "flux3-klein is gated on Hugging Face" in out and "https://huggingface.co/org/gated" in out
     assert "--hf-token ID" in out
+
+
+# --- 1.5.0: task output filter -------------------------------------------------------------------------------
+
+TASK_ARGV = ["task-submit", "ws", "t", "--script-text", "print(1)", "--image", "img", "--cpu-preset", "micro-2c8g", "--yes"]
+
+
+def test_task_submit_output_include(capsys, monkeypatch):
+    def submit_task(self, *a, **kw):                                # a server that keeps the filter echoes it
+        self.calls.append(("submit_task", a, kw))
+        return TaskSubmitted.from_dict({"task": {**TASK, "outputInclude": kw["output_include"]}, "estimate": {}})
+
+    monkeypatch.setattr(FakeClient, "submit_task", submit_task)
+    patterns = ["*.safetensors", "samples/*.png,b.png"]          # repeatable; a comma is part of the pattern
+    assert cli.main(TASK_ARGV + ["--output-include", "*.safetensors", "--output-include", "samples/*.png,b.png"]) == 0
+    assert _last("estimate_task")[2]["output_include"] == patterns
+    assert _last("submit_task")[2]["output_include"] == patterns
+    captured = capsys.readouterr()
+    assert "output filter: *.safetensors, samples/*.png,b.png" in captured.out and "Warning" not in captured.err
+
+    assert cli.main(TASK_ARGV) == 0                                 # not given: every file, nothing printed
+    assert _last("estimate_task")[2]["output_include"] is None and _last("submit_task")[2]["output_include"] is None
+    assert "output filter" not in capsys.readouterr().out
+
+
+def test_task_submit_says_when_the_server_ignores_the_output_filter(capsys, monkeypatch):
+    from meshive._client import _check_output_include
+
+    def submit_task(self, *a, **kw):                                # an older server: the task has no outputInclude
+        self.calls.append(("submit_task", a, kw))
+        return _check_output_include({"outputInclude": kw["output_include"]},
+                                     TaskSubmitted.from_dict({"task": TASK, "estimate": {}}))
+
+    monkeypatch.setattr(FakeClient, "submit_task", submit_task)
+    assert cli.main(TASK_ARGV + ["--output-include", "*.png"]) == 0
+    captured = capsys.readouterr()
+    assert ("Warning: this server ignores output_include; every file in /outputs will be uploaded "
+            "(task task_1 was submitted)") in captured.err
+    assert "task_1" in captured.out and "output filter" not in captured.out
+
+
+def test_task_submit_help_shows_the_output_filter(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["task-submit", "--help"])
+    out = capsys.readouterr().out
+    assert "--output-include GLOB" in out and "/outputs" in out

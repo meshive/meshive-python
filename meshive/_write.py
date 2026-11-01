@@ -192,6 +192,11 @@ def workspace_body(name: str | None) -> dict[str, Any]:
     return {"name": _require_str(name, "name")}
 
 
+def workspace_update_body(name: str) -> dict[str, Any]:
+    """Renaming needs a name: unlike workspace_body, a blank one is refused rather than left for the server to generate."""
+    return {"name": _require_str(name, "name")}
+
+
 # --- Pods ---------------------------------------------------------------------
 
 def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: int, gpu_vram_gb: int | None,

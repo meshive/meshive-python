@@ -94,6 +94,8 @@ def build_parser() -> argparse.ArgumentParser:
             "\n"
             "Write commands (need a key with the write scope; they ask for confirmation unless --yes):\n"
             "  meshive workspace-create [name] [--estimate] [--wait]  (free; --wait returns once it is running)\n"
+            "  meshive workspace-update <ws> --name NAME [--estimate]  (rename it)\n"
+            "  meshive workspace-delete <ws> [--check]  (only an empty workspace; --check changes nothing)\n"
             "  meshive pod-create <ws> <name> --template ID --gpu MODEL [--model-set SLUG] [--hf-token ID] [--estimate]\n"
             "  meshive model-sets <ws> --template ID  (the SLUGs a template offers)\n"
             "  meshive pod-update <ws> <pod> --gpu MODEL [--estimate]\n"

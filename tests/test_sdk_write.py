@@ -1766,6 +1766,205 @@ def test_async_workspace_methods_mirror_sync():
     assert len(old.requests) == 2                            # the malformed name never left the client
 
 
+# Renaming and deleting a workspace
+
+WS_ID = "ab12cd34ef567890"
+WS_UPDATE_ESTIMATE = {"workspace": WS_ID, "currentName": "research", "name": "research-2"}
+WS_UPDATED = {"workspace": WS_ID, "name": "research-2"}
+WS_DELETE_CHECK = {"workspace": WS_ID, "name": "research", "deletable": True, "blockers": {}}
+WS_DELETE_BLOCKED = {"workspace": WS_ID, "name": "research", "deletable": False,
+                     "blockers": {"assets": 3, "operations_in_progress": 1}}
+WS_DELETED = {"resource": "workspace", "id": WS_ID, "workspace": WS_ID, "action": "delete", "accepted": True,
+              "result": {"message": "Workspace deletion initiated"}}
+WS_NOT_EMPTY = {"detail": {"title": "Workspace Not Empty", "message": "It still holds 3 assets.",
+                           "blockers": {"assets": 3}}}
+
+
+def test_workspace_update_body_refuses_a_blank_name():
+    assert _write.workspace_update_body("  research-2 ") == {"name": "research-2"}
+    for bad in ("", "   ", None, 3, ["a"]):                  # never "let the server generate one": that would rename at random
+        with pytest.raises(ValueError, match="name"):
+            _write.workspace_update_body(bad)
+
+
+def test_update_workspace_builds_request_and_parses():
+    rec = Recorder((200, WS_UPDATED))
+    updated = sync_client(rec).update_workspace(WS_ID, name=" research-2 ", idempotency_key="ws-key-0003")
+    assert (updated.workspace, updated.name) == (WS_ID, "research-2") and updated.raw["workspace"] == WS_ID
+    assert rec.last.method == "PATCH" and rec.last.url.path == f"/v1/sdk/workspaces/{WS_ID}" and not rec.last.url.params
+    assert rec.last.headers["Idempotency-Key"] == "ws-key-0003" and rec.body() == {"name": "research-2"}
+
+
+def test_update_workspace_name_is_keyword_only():
+    client = sync_client(Recorder((200, WS_UPDATED)))
+    with pytest.raises(TypeError):
+        client.update_workspace(WS_ID, "research-2")
+    with pytest.raises(TypeError):
+        client.update_workspace(WS_ID)
+
+
+def test_estimate_workspace_update_builds_request_and_changes_nothing():
+    rec = Recorder((200, WS_UPDATE_ESTIMATE))
+    est = sync_client(rec).estimate_workspace_update(WS_ID, name="research-2")
+    assert (est.workspace, est.current_name, est.name) == (WS_ID, "research", "research-2")
+    assert rec.last.method == "POST" and rec.last.url.path == f"/v1/sdk/workspaces/{WS_ID}/estimate"
+    assert not rec.last.url.params and rec.body() == {"name": "research-2"}
+    with pytest.raises(TypeError):                           # nothing to replay: an estimate takes no idempotency key
+        sync_client(rec).estimate_workspace_update(WS_ID, name="x", idempotency_key="k")
+
+
+def test_check_workspace_delete_is_a_read():
+    rec = Recorder((200, WS_DELETE_BLOCKED))
+    check = sync_client(rec).check_workspace_delete(WS_ID)
+    assert rec.last.method == "GET" and rec.last.url.path == f"/v1/sdk/workspaces/{WS_ID}/delete-check"
+    assert "Idempotency-Key" not in rec.last.headers and rec.last.content == b""
+    assert check.deletable is False and check.blockers == {"assets": 3, "operations_in_progress": 1}
+    check = sync_client(Recorder((200, WS_DELETE_CHECK))).check_workspace_delete(WS_ID)
+    assert check.deletable is True and check.blockers == {} and (check.workspace, check.name) == (WS_ID, "research")
+
+
+def test_delete_workspace_builds_request_and_parses():
+    rec = Recorder((202, WS_DELETED))
+    action = sync_client(rec).delete_workspace(WS_ID, idempotency_key="ws-key-0004")
+    assert isinstance(action, ResourceAction)
+    assert (action.resource, action.id, action.workspace, action.action) == ("workspace", WS_ID, WS_ID, "delete")
+    assert action.accepted is True and action.result == {"message": "Workspace deletion initiated"}
+    assert rec.last.method == "DELETE" and rec.last.url.path == f"/v1/sdk/workspaces/{WS_ID}"
+    assert not rec.last.url.params and rec.last.content == b""          # never a force flag
+    assert rec.last.headers["Idempotency-Key"] == "ws-key-0004"
+    bare = sync_client(Recorder((202, {"id": WS_ID, "action": "delete"}))).delete_workspace(WS_ID)
+    assert bare.resource == "workspace"
+
+
+def test_delete_workspace_retry_resends_the_key(slept):
+    rec = Recorder((503, {"detail": {"title": "Scheduling Busy", "message": "busy"}}), (202, WS_DELETED))
+    action = sync_client(rec).delete_workspace(WS_ID)
+    assert action.id == WS_ID and len(rec.requests) == 2
+    keys = {r.headers["Idempotency-Key"] for r in rec.requests}
+    assert len(keys) == 1 and keys != {""}                   # a replay, not a second delete that finds nothing to delete
+
+
+def test_workspace_id_is_encoded_and_checked_before_sending():
+    rec = Recorder((200, WS_UPDATED))
+    client = sync_client(rec)
+    client.update_workspace("../me", name="x")
+    assert rec.last.url.raw_path == b"/v1/sdk/workspaces/..%2Fme"        # can't change the path structure
+    client.delete_workspace("a/b")
+    assert rec.last.url.raw_path == b"/v1/sdk/workspaces/a%2Fb"
+    client.estimate_workspace_update("a/b", name="x")
+    assert rec.last.url.raw_path == b"/v1/sdk/workspaces/a%2Fb/estimate"
+    client.check_workspace_delete("a/b")
+    assert rec.last.url.raw_path == b"/v1/sdk/workspaces/a%2Fb/delete-check"
+    sent = len(rec.requests)
+    for call in (lambda: client.update_workspace("", name="x"), lambda: client.update_workspace(" ", name="x"),
+                 lambda: client.update_workspace(WS_ID, name=""), lambda: client.update_workspace(WS_ID, name="  "),
+                 lambda: client.estimate_workspace_update("", name="x"), lambda: client.estimate_workspace_update(WS_ID, name=" "),
+                 lambda: client.check_workspace_delete(""), lambda: client.delete_workspace(" "),
+                 lambda: client.delete_workspace(None)):
+        with pytest.raises(ValueError):
+            call()
+    assert len(rec.requests) == sent
+
+
+@pytest.mark.parametrize("workspace", [".", ".."])
+def test_dot_segments_are_refused_before_sending(workspace):
+    # httpx collapses them, so /workspaces/./estimate would reach the estimate for creating a workspace.
+    rec = Recorder((200, WS_UPDATED))
+    client = sync_client(rec)
+    for call in (lambda: client.estimate_workspace_update(workspace, name="x"),
+                 lambda: client.update_workspace(workspace, name="x"),
+                 lambda: client.check_workspace_delete(workspace), lambda: client.delete_workspace(workspace)):
+        with pytest.raises(ValueError, match="workspace"):
+            call()
+    assert rec.requests == []
+
+
+@pytest.mark.parametrize("answer", [(405, {"detail": "Method Not Allowed"}), (404, {"detail": "Not Found"})])
+@pytest.mark.parametrize("call, feature", [
+    (lambda c: c.update_workspace(WS_ID, name="x"), "workspace renaming"),
+    (lambda c: c.estimate_workspace_update(WS_ID, name="x"), "workspace renaming"),
+    (lambda c: c.check_workspace_delete(WS_ID), "workspace deletion"),
+    (lambda c: c.delete_workspace(WS_ID), "workspace deletion"),
+])
+def test_workspace_rename_and_delete_on_an_older_server(answer, call, feature):
+    with pytest.raises(NotFoundError, match=f"does not support {feature}"):
+        call(sync_client(Recorder(answer)))
+
+
+def test_delete_workspace_not_empty_keeps_the_blockers():
+    with pytest.raises(ConflictError) as err:
+        sync_client(Recorder((409, WS_NOT_EMPTY))).delete_workspace(WS_ID)
+    assert err.value.title == "Workspace Not Empty" and "3 assets" in err.value.message
+    assert err.value.raw["detail"]["blockers"] == {"assets": 3}
+
+
+def test_workspace_rename_and_delete_errors_from_the_server_pass_through():
+    taken = {"detail": {"title": "Name Taken", "message": "You already have a workspace named research."}}
+    missing = {"detail": {"title": "Workspace Not Found", "message": "No such workspace."}}
+    for call in (lambda c: c.update_workspace(WS_ID, name="research"), lambda c: c.estimate_workspace_update(WS_ID, name="research")):
+        with pytest.raises(ConflictError) as err:
+            call(sync_client(Recorder((409, taken))))
+        assert err.value.title == "Name Taken"
+    for call in (lambda c: c.update_workspace(WS_ID, name="x"), lambda c: c.estimate_workspace_update(WS_ID, name="x"),
+                 lambda c: c.check_workspace_delete(WS_ID), lambda c: c.delete_workspace(WS_ID)):
+        with pytest.raises(NotFoundError) as err:            # a 404 that has a title is the server's answer, not an old server
+            call(sync_client(Recorder((404, missing))))
+        assert err.value.title == "Workspace Not Found" and "does not support" not in str(err.value)
+        with pytest.raises(PermissionDeniedError):           # a viewer can't change a workspace
+            call(sync_client(Recorder((403, {"detail": {"title": "Forbidden", "message": "Not an admin"}}))))
+
+
+def test_async_workspace_rename_and_delete_mirror_sync():
+    updated = Recorder((200, WS_UPDATED))
+    estimate = Recorder((200, WS_UPDATE_ESTIMATE))
+    check = Recorder((200, WS_DELETE_BLOCKED))
+    deleted = Recorder((202, {"id": WS_ID, "action": "delete"}))
+    old = Recorder((405, {"detail": "Method Not Allowed"}))
+    not_empty = Recorder((409, WS_NOT_EMPTY))
+
+    async def main():
+        async with async_client(updated) as c:
+            renamed = await c.update_workspace(WS_ID, name=" research-2 ", idempotency_key="ws-key-0005")
+        async with async_client(estimate) as c:
+            est = await c.estimate_workspace_update(WS_ID, name="research-2")
+        async with async_client(check) as c:
+            result = await c.check_workspace_delete(WS_ID)
+        async with async_client(deleted) as c:
+            action = await c.delete_workspace(WS_ID, idempotency_key="ws-key-0006")
+        async with async_client(not_empty) as c:
+            with pytest.raises(ConflictError) as err:
+                await c.delete_workspace(WS_ID)
+            assert err.value.raw["detail"]["blockers"] == {"assets": 3}
+        async with async_client(old) as c:
+            with pytest.raises(NotFoundError, match="does not support workspace renaming"):
+                await c.update_workspace(WS_ID, name="x")
+            with pytest.raises(NotFoundError, match="does not support workspace renaming"):
+                await c.estimate_workspace_update(WS_ID, name="x")
+            with pytest.raises(NotFoundError, match="does not support workspace deletion"):
+                await c.check_workspace_delete(WS_ID)
+            with pytest.raises(NotFoundError, match="does not support workspace deletion"):
+                await c.delete_workspace(WS_ID)
+            with pytest.raises(ValueError, match="name"):
+                await c.update_workspace(WS_ID, name=" ")
+            with pytest.raises(ValueError, match="workspace"):
+                await c.delete_workspace("")
+        return renamed, est, result, action
+
+    renamed, est, result, action = asyncio.run(main())
+    assert renamed.name == "research-2" and updated.last.method == "PATCH"
+    assert updated.last.url.path == f"/v1/sdk/workspaces/{WS_ID}" and updated.body() == {"name": "research-2"}
+    assert updated.last.headers["Idempotency-Key"] == "ws-key-0005"
+    assert est.current_name == "research" and estimate.last.method == "POST"
+    assert estimate.last.url.path == f"/v1/sdk/workspaces/{WS_ID}/estimate" and estimate.body() == {"name": "research-2"}
+    assert result.blockers == {"assets": 3, "operations_in_progress": 1} and check.last.method == "GET"
+    assert check.last.url.path == f"/v1/sdk/workspaces/{WS_ID}/delete-check"
+    assert "Idempotency-Key" not in check.last.headers
+    assert action.resource == "workspace" and action.id == WS_ID and deleted.last.method == "DELETE"
+    assert deleted.last.url.path == f"/v1/sdk/workspaces/{WS_ID}" and not deleted.last.url.params
+    assert deleted.last.headers["Idempotency-Key"] == "ws-key-0006"
+    assert len(old.requests) == 4                            # the malformed arguments never left the client
+
+
 # wait_for_workspace
 
 def test_wait_for_workspace_returns_when_running(slept):

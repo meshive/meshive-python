@@ -79,9 +79,12 @@ from .models import (
     WhoAmI,
     Workspace,
     WorkspaceCreated,
+    WorkspaceDeleteCheck,
     WorkspaceDetail,
     WorkspaceEstimate,
     WorkspaceResources,
+    WorkspaceUpdated,
+    WorkspaceUpdateEstimate,
 )
 
 version = __version__
@@ -161,6 +164,9 @@ __all__ = [
     "TaskSubmitted",
     "WorkspaceEstimate",
     "WorkspaceCreated",
+    "WorkspaceUpdateEstimate",
+    "WorkspaceUpdated",
+    "WorkspaceDeleteCheck",
     "Logs",
     "LogLine",
     # exceptions

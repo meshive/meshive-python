@@ -8,10 +8,11 @@ import pytest
 
 
 cli = importlib.import_module("meshive.cli.main")  # cli.__init__ exposes the main function, which shadows the submodule
-from meshive import Meshive, MeshiveError, NotFoundError, WaitTimeoutError
+from meshive import ConflictError, Meshive, MeshiveError, NotFoundError, WaitTimeoutError
 from meshive.models import (Pod, Logs, PodCreated, PodEstimate, ResourceAction, Serving, StorageCreated, StorageEstimate,
                             TaskEstimate, TaskSubmitted, ModelDetection, ServingModel, AssetImported, WatchedFolders, SshAccess,
-                            Transaction, Workspace, WorkspaceCreated, WorkspaceEstimate)
+                            Transaction, Workspace, WorkspaceCreated, WorkspaceDeleteCheck, WorkspaceEstimate,
+                            WorkspaceUpdated, WorkspaceUpdateEstimate)
 
 ESTIMATE = {"pricePerHourUsd": "0.068423", "breakdown": {"gpu": "0.068423"},
             "resources": {"gpu_model": "RTX 3060", "vram_gb": 12, "gpu_count": 1, "vcpu": 4, "ram_gb": 12, "disk_gb": 25,
@@ -151,6 +152,25 @@ class FakeClient:
     def wait_for_workspace(self, *a, **kw):
         self._rec("wait_for_workspace", *a, **kw)
         return Workspace.from_dict({"namespaceName": a[0], "workspaceName": a[0], "status": "running"})
+
+    def estimate_workspace_update(self, *a, **kw):
+        self.calls.append(("estimate_workspace_update", a, kw))   # kw has name=, which collides with _rec's positional argument
+        return WorkspaceUpdateEstimate.from_dict({"workspace": a[0], "currentName": "research", "name": kw["name"]})
+
+    def update_workspace(self, *a, **kw):
+        self.calls.append(("update_workspace", a, kw))
+        return WorkspaceUpdated.from_dict({"workspace": a[0], "name": kw["name"]})
+
+    DELETE_CHECK = {"name": "research", "deletable": True, "blockers": {}}
+
+    def check_workspace_delete(self, *a, **kw):
+        self._rec("check_workspace_delete", *a, **kw)
+        return WorkspaceDeleteCheck.from_dict({"workspace": a[0], **self.DELETE_CHECK})
+
+    def delete_workspace(self, *a, **kw):
+        self._rec("delete_workspace", *a, **kw)
+        return ResourceAction.from_dict({"id": a[0], "workspace": a[0], "action": "delete",
+                                         "result": {"message": "Workspace deletion initiated"}}, resource="workspace")
 
     def close(self):
         pass
@@ -424,6 +444,8 @@ class _CtrlC(_Tty):
     (["pod-start", "ws", "p-0", "--any-node"], "y\ny\n"),        # billing restarts + data-loss consent, two questions
     (["serving-scale", "42", "--max-replicas", "4"], "y\n"),
     (["serving-resume", "42"], "y\n"),
+    (["workspace-update", "ws", "--name", "new"], "y\n"),
+    (["workspace-delete", "ws"], "y\n"),
 ])
 def test_confirm_question_goes_to_stderr(capsys, monkeypatch, argv, answers):
     """Confirmation prompts go to stderr — when answering in a terminal while stdout goes to a file or pipe (`-o json > out.json`, `| jq`),
@@ -1305,3 +1327,206 @@ def test_workspace_create_help_and_epilog(capsys):
     out = " ".join(capsys.readouterr().out.split())
     assert "meshive workspace-create [name] [--estimate] [--wait]" in out
     assert "Create a workspace (free by itself; pods, storage and tasks in it are billed as usual)." in out
+
+
+# --- 1.6.0: workspace-update, workspace-delete -----------------------------------------------------------------
+
+WS_ID = "ab12cd34ef567890"
+BLOCKED = {"name": "research", "deletable": False, "blockers": {"assets": 3, "operations_in_progress": 1}}
+
+
+def _called(*names):
+    return [c[0] for c in FakeClient.instances[-1].calls if c[0] in names]
+
+
+def test_workspace_update_estimate_changes_nothing(capsys, non_tty):
+    assert cli.main(["workspace-update", WS_ID, "--name", "research-2", "--estimate"]) == 0
+    out = capsys.readouterr().out
+    assert "current name:" in out and "research" in out and "new name:" in out and "research-2" in out and WS_ID in out
+    assert _last("estimate_workspace_update")[1:] == ((WS_ID,), {"name": "research-2"})
+    assert _called("update_workspace") == []
+    assert cli.main(["workspace-update", WS_ID, "--name", "research-2", "--estimate", "-o", "name"]) == 0
+    assert capsys.readouterr().out == f"{WS_ID}\n"
+    assert _called("update_workspace") == []
+    assert cli.main(["workspace-update", WS_ID, "--name", "research-2", "--estimate", "-o", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["currentName"] == "research"
+    assert _called("update_workspace") == []
+
+
+def test_workspace_update_confirms_before_renaming(capsys, non_tty):
+    assert cli.main(["workspace-update", WS_ID, "--name", "research-2"]) == 2
+    captured = capsys.readouterr()
+    assert "Error: this command needs confirmation. Re-run with --yes to confirm." in captured.err
+    assert "research-2" in captured.out                                          # the summary came first
+    assert _called("estimate_workspace_update", "update_workspace") == ["estimate_workspace_update"]
+
+    assert cli.main(["workspace-update", WS_ID, "--name", "research-2", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "workspace id:" in out and WS_ID in out and "name:" in out and "research-2" in out
+    assert _called("estimate_workspace_update", "update_workspace") == ["estimate_workspace_update", "update_workspace"]
+    assert _last("update_workspace")[1:] == ((WS_ID,), {"name": "research-2"})
+
+
+def test_workspace_update_prints_the_id_for_scripts(capsys):
+    assert cli.main(["workspace-update", WS_ID, "--name", "research-2", "--yes", "-o", "name"]) == 0
+    assert capsys.readouterr().out == f"{WS_ID}\n"
+    assert cli.main(["workspace-update", WS_ID, "--name", "research-2", "--yes", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"workspace": WS_ID, "name": "research-2"}
+
+
+def test_workspace_update_question_names_both_and_is_cleaned(capsys, monkeypatch):
+    """Names are server text, and the question is printed outside _kv, so it has to clean them itself."""
+    monkeypatch.setattr(FakeClient, "estimate_workspace_update", _fake("estimate_workspace_update", WorkspaceUpdateEstimate.from_dict(
+        {"workspace": WS_ID, "currentName": "\x1b[31mold", "name": "new"})), raising=False)
+    monkeypatch.setattr("sys.stdin", _Tty("n\n"))
+    assert cli.main(["workspace-update", WS_ID, "--name", "new"]) == 2
+    err = capsys.readouterr().err
+    assert "Rename workspace '[31mold' to 'new'?" in err and "\x1b" not in err
+    assert _called("update_workspace") == []
+
+
+def test_workspace_update_refused_estimate_renames_nothing(capsys, monkeypatch):
+    conflict = ConflictError(409, "You already have a workspace named research.", title="Name Taken")
+    monkeypatch.setattr(FakeClient, "estimate_workspace_update", _fake("estimate_workspace_update", conflict), raising=False)
+    assert cli.main(["workspace-update", WS_ID, "--name", "research", "--yes"]) == 1
+    assert "already have a workspace" in capsys.readouterr().err
+    assert _called("update_workspace") == []
+
+
+def test_workspace_update_blank_name_is_a_usage_error(capsys, monkeypatch):
+    monkeypatch.setattr(FakeClient, "estimate_workspace_update",
+                        _fake("estimate_workspace_update", ValueError("name must be a non-empty string")), raising=False)
+    assert cli.main(["workspace-update", WS_ID, "--name", " ", "--yes"]) == 2
+    assert "name must be a non-empty string" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as exit_:
+        cli.main(["workspace-update", WS_ID, "--yes"])                  # --name is required: there is nothing else to change
+    assert exit_.value.code == 2
+
+
+def test_workspace_delete_check_when_empty(capsys, non_tty):
+    assert cli.main(["workspace-delete", WS_ID, "--check"]) == 0
+    out = capsys.readouterr().out
+    assert WS_ID in out and "research" in out and "can delete:" in out and "yes" in out and "Still in it" not in out
+    assert _called("check_workspace_delete", "delete_workspace") == ["check_workspace_delete"]
+    assert _last("check_workspace_delete")[1:] == ((WS_ID,), {})
+    assert cli.main(["workspace-delete", WS_ID, "--check", "-o", "name"]) == 0
+    assert capsys.readouterr().out == f"{WS_ID}\n"
+    assert cli.main(["workspace-delete", WS_ID, "--check", "-o", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["deletable"] is True
+
+
+def test_workspace_delete_check_when_blocked_exits_1(capsys, monkeypatch, non_tty):
+    monkeypatch.setattr(FakeClient, "DELETE_CHECK", BLOCKED)
+    assert cli.main(["workspace-delete", WS_ID, "--check", "--yes"]) == 1      # --yes doesn't turn a check into a delete
+    out = capsys.readouterr().out
+    assert "can delete:" in out and "no" in out and "assets: 3" in out and "operations in progress: 1" in out
+    assert _called("delete_workspace") == []
+    assert cli.main(["workspace-delete", WS_ID, "--check", "-o", "json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["deletable"] is False and payload["blockers"]["assets"] == 3
+    assert cli.main(["workspace-delete", WS_ID, "--check", "-o", "name"]) == 1
+    assert capsys.readouterr().out == f"{WS_ID}\n"
+
+
+@pytest.mark.parametrize("flags", [[], ["--yes"], ["-o", "json"], ["-o", "name", "--yes"]])
+def test_workspace_delete_blocked_stops_without_asking(capsys, monkeypatch, flags):
+    monkeypatch.setattr(FakeClient, "DELETE_CHECK", BLOCKED)
+    stdin = _Tty("y\n")
+    monkeypatch.setattr("sys.stdin", stdin)
+    assert cli.main(["workspace-delete", WS_ID, *flags]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""                                     # nothing a script could take for a result
+    assert "research" in captured.err and "assets: 3" in captured.err and "operations in progress: 1" in captured.err
+    assert "clear on their own" in captured.err and "Clear the others first" in captured.err
+    assert "in the console" in captured.err and "Delete everything" not in captured.err and "[y/N]" not in captured.err
+    assert stdin.tell() == 0                                      # the answer was never read
+    assert _called("check_workspace_delete", "delete_workspace") == ["check_workspace_delete"]
+
+
+@pytest.mark.parametrize("blockers, waits, clears", [
+    ({"operations_in_progress": 1}, True, False),                 # just created: there is nothing to clear
+    ({"task_outputs": 1}, True, False),
+    ({"pending_payouts": 2}, True, False),                        # deleting in the console would lose them
+    ({"storages": 1}, False, True),                               # a network volume stays until it is deleted
+    ({"a_new_kind": 1}, False, True),                             # the server may add kinds
+])
+def test_workspace_delete_hint_fits_what_is_left(capsys, monkeypatch, blockers, waits, clears):
+    monkeypatch.setattr(FakeClient, "DELETE_CHECK", {"name": "research", "deletable": False, "blockers": blockers})
+    assert cli.main(["workspace-delete", WS_ID, "--yes"]) == 1
+    err = capsys.readouterr().err
+    assert "can't be deleted yet" in err
+    assert ("clear on their own" in err) is waits and ("loses them" in err) is waits
+    assert ("Clear these first" in err) is clears and ("removes what's in it for good" in err) is clears
+    assert _called("delete_workspace") == []
+
+
+def test_workspace_delete_without_deletable_in_the_answer_is_blocked(capsys, monkeypatch):
+    monkeypatch.setattr(FakeClient, "DELETE_CHECK", {"name": "research"})
+    assert cli.main(["workspace-delete", WS_ID, "--yes"]) == 1
+    assert _called("delete_workspace") == []
+
+
+def test_workspace_delete_confirms_after_the_check(capsys, non_tty):
+    assert cli.main(["workspace-delete", WS_ID]) == 2
+    assert "--yes" in capsys.readouterr().err
+    assert _called("check_workspace_delete", "delete_workspace") == ["check_workspace_delete"]
+
+    assert cli.main(["workspace-delete", WS_ID, "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert f"workspace: {WS_ID}" in out and "action:" in out and "delete" in out and "accepted:" in out
+    assert "Deleting in the background" in out and "within a moment" in out and "name stays taken for a while" in out
+    assert _called("check_workspace_delete", "delete_workspace") == ["check_workspace_delete", "delete_workspace"]
+    assert _last("delete_workspace")[1:] == ((WS_ID,), {})        # never a force option
+
+
+def test_workspace_delete_prints_the_id_for_scripts(capsys):
+    assert cli.main(["workspace-delete", WS_ID, "--yes", "-o", "name"]) == 0
+    assert capsys.readouterr().out == f"{WS_ID}\n"
+    assert cli.main(["workspace-delete", WS_ID, "--yes", "-o", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["action"] == "delete" and payload["id"] == WS_ID
+
+
+def test_workspace_delete_question_names_it_and_is_cleaned(capsys, monkeypatch):
+    monkeypatch.setattr(FakeClient, "DELETE_CHECK", {"name": "\x1b[31mlab", "deletable": True, "blockers": {}})
+    monkeypatch.setattr("sys.stdin", _Tty("n\n"))
+    assert cli.main(["workspace-delete", WS_ID]) == 2
+    err = capsys.readouterr().err
+    assert f"Delete workspace '[31mlab' ({WS_ID})? This can't be undone." in err and "\x1b" not in err
+    assert _called("delete_workspace") == []
+
+
+def test_workspace_delete_refused_by_the_server_after_a_clean_check(capsys, monkeypatch):
+    """Something can land in the workspace between the check and the delete; the server's refusal is what counts."""
+    refused = ConflictError(409, "It still holds 1 pod.", title="Workspace Not Empty")
+    monkeypatch.setattr(FakeClient, "delete_workspace", _fake("delete_workspace", refused), raising=False)
+    assert cli.main(["workspace-delete", WS_ID, "--yes"]) == 1
+    captured = capsys.readouterr()
+    assert "It still holds 1 pod." in captured.err and captured.out == ""
+
+
+@pytest.mark.parametrize("argv", [["workspace-update", WS_ID, "--name", "x"], ["workspace-delete", WS_ID]])
+def test_workspace_rename_and_delete_on_an_older_server(capsys, monkeypatch, argv):
+    error = NotFoundError(404, "This Meshive API server does not support this yet.")
+    for method in ("estimate_workspace_update", "check_workspace_delete"):
+        monkeypatch.setattr(FakeClient, method, _fake(method, error), raising=False)
+    assert cli.main(argv) == 1
+    assert "does not support" in capsys.readouterr().err
+    assert _called("update_workspace", "delete_workspace") == []
+
+
+def test_workspace_update_and_delete_help_and_epilog(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["workspace-update", "--help"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert all(text in out for text in ("--name NAME", "--estimate", "--yes", "63 characters"))
+    with pytest.raises(SystemExit):
+        cli.main(["workspace-delete", "--help"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert all(text in out for text in ("--check", "--yes", "exit 0 if it can, 1 if not"))
+    assert "force" not in out
+    with pytest.raises(SystemExit):
+        cli.main(["--help"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "meshive workspace-update <ws> --name NAME [--estimate]" in out
+    assert "meshive workspace-delete <ws> [--check]" in out

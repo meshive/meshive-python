@@ -91,8 +91,11 @@ from .models import (
     WhoAmI,
     Workspace,
     WorkspaceCreated,
+    WorkspaceDeleteCheck,
     WorkspaceDetail,
     WorkspaceEstimate,
+    WorkspaceUpdated,
+    WorkspaceUpdateEstimate,
 )
 
 
@@ -147,9 +150,12 @@ def _incomplete(download: AssetDownload) -> MeshiveError:
 
 def _path_segment(value: str, name: str) -> str:
     """Encode a URL path segment. Percent-encodes so values containing `/`, `?`, `#`, ... can't change the path structure
-    (`../me` → a different endpoint) or inject a query."""
+    (`../me` → a different endpoint) or inject a query. `.` and `..` have nothing to encode and httpx collapses them, so
+    they are refused."""
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
+    if value in (".", ".."):
+        raise ValueError(f"{name} must not be '.' or '..'")
     return quote(value, safe="")
 
 
@@ -965,6 +971,57 @@ class Meshive(_BaseClient):
         except MeshiveAPIError as err:
             raise _not_supported(err, "workspace creation") from None
         return WorkspaceCreated.from_dict(data)
+
+    def estimate_workspace_update(self, workspace: str, *, name: str) -> WorkspaceUpdateEstimate:
+        """Check a new name for a workspace and show it next to the current one — changes nothing (read scope is
+        enough, but the admin or billing role is still needed). Same arguments as update_workspace; a name that is
+        already taken is a ConflictError ('Name Taken')."""
+        body = _write.workspace_update_body(name)
+        try:
+            data = self._send("POST", f"/workspaces/{_path_segment(workspace, 'workspace')}/estimate", json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace renaming") from None
+        return WorkspaceUpdateEstimate.from_dict(data)
+
+    def update_workspace(self, workspace: str, *, name: str, idempotency_key: str | None = None) -> WorkspaceUpdated:
+        """Rename a workspace (admin or billing role). Its ID stays the same, so whatever uses the ID keeps working, and
+        every member sees the new name. A name is up to 63 characters and must be unique among your workspaces: a taken
+        one is a ConflictError ('Name Taken'). Renaming to the current name changes nothing and succeeds.
+
+        The rename is applied at once. `updated.name` is the confirmed name; the workspace list can take a moment to
+        show it, so keep using the ID rather than the name right after."""
+        body = _write.workspace_update_body(name)
+        try:
+            data = self._send("PATCH", f"/workspaces/{_path_segment(workspace, 'workspace')}", json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace renaming") from None
+        return WorkspaceUpdated.from_dict(data)
+
+    def check_workspace_delete(self, workspace: str) -> WorkspaceDeleteCheck:
+        """Whether delete_workspace would go through, and if not, what is still in the workspace — changes nothing (read
+        scope is enough, but the admin or billing role is still needed). `check.deletable` is True for an empty
+        workspace; `check.blockers` counts what is left, by kind."""
+        try:
+            data = self._get(f"/workspaces/{_path_segment(workspace, 'workspace')}/delete-check")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace deletion") from None
+        return WorkspaceDeleteCheck.from_dict(data)
+
+    def delete_workspace(self, workspace: str, *, idempotency_key: str | None = None) -> ResourceAction:
+        """Delete an empty workspace (202 accepted; admin or billing role). This can't be undone. A workspace that still
+        holds anything is refused with ConflictError('Workspace Not Empty', raw["detail"]["blockers"]); see
+        check_workspace_delete for what counts. A person can still delete it in the console, which removes what's in it
+        for good.
+
+        The deletion runs in the background: the workspace leaves your list within a moment, and its name stays taken
+        for a while."""
+        try:
+            data = self._send("DELETE", f"/workspaces/{_path_segment(workspace, 'workspace')}",
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace deletion") from None
+        return ResourceAction.from_dict(data, resource="workspace")
 
     # --- Writes: pods (write scope) ---------------------------------------------------
 
@@ -1885,6 +1942,45 @@ class AsyncMeshive(_BaseClient):
         except MeshiveAPIError as err:
             raise _not_supported(err, "workspace creation") from None
         return WorkspaceCreated.from_dict(data)
+
+    async def estimate_workspace_update(self, workspace: str, *, name: str) -> WorkspaceUpdateEstimate:
+        """Check a new name for a workspace — changes nothing (read scope is enough). Same contract as the sync client."""
+        body = _write.workspace_update_body(name)
+        try:
+            data = await self._send("POST", f"/workspaces/{_path_segment(workspace, 'workspace')}/estimate", json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace renaming") from None
+        return WorkspaceUpdateEstimate.from_dict(data)
+
+    async def update_workspace(self, workspace: str, *, name: str,
+                               idempotency_key: str | None = None) -> WorkspaceUpdated:
+        """Rename a workspace (PATCH /workspaces/{namespace}). Same contract as the sync client."""
+        body = _write.workspace_update_body(name)
+        try:
+            data = await self._send("PATCH", f"/workspaces/{_path_segment(workspace, 'workspace')}", json=body,
+                                    idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace renaming") from None
+        return WorkspaceUpdated.from_dict(data)
+
+    async def check_workspace_delete(self, workspace: str) -> WorkspaceDeleteCheck:
+        """Whether delete_workspace would go through — changes nothing (read scope is enough). Same contract as the sync
+        client."""
+        try:
+            data = await self._get(f"/workspaces/{_path_segment(workspace, 'workspace')}/delete-check")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace deletion") from None
+        return WorkspaceDeleteCheck.from_dict(data)
+
+    async def delete_workspace(self, workspace: str, *, idempotency_key: str | None = None) -> ResourceAction:
+        """Delete an empty workspace (202 accepted). This can't be undone. Same contract as the sync client: a workspace
+        that still holds anything is a ConflictError ('Workspace Not Empty')."""
+        try:
+            data = await self._send("DELETE", f"/workspaces/{_path_segment(workspace, 'workspace')}",
+                                    idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace deletion") from None
+        return ResourceAction.from_dict(data, resource="workspace")
 
     # --- Writes: pods (write scope) ---------------------------------------------------
 

@@ -268,6 +268,33 @@ def test_workspace_estimate_and_created_models():
     assert {"WorkspaceEstimate", "WorkspaceCreated"} <= set(meshive.__all__)
 
 
+def test_workspace_update_and_delete_check_models():
+    import meshive
+
+    est = meshive.WorkspaceUpdateEstimate.from_dict({"workspace": "ab12cd34ef567890", "currentName": "old", "name": "new"})
+    assert (est.workspace, est.current_name, est.name) == ("ab12cd34ef567890", "old", "new") and est.raw["name"] == "new"
+    bare = meshive.WorkspaceUpdateEstimate.from_dict({})        # tolerant of fields the server didn't send
+    assert (bare.workspace, bare.current_name, bare.name) == ("", "", "")
+
+    updated = meshive.WorkspaceUpdated.from_dict({"workspace": "ab12cd34ef567890", "name": "new"})
+    assert (updated.workspace, updated.name) == ("ab12cd34ef567890", "new") and updated.raw["workspace"]
+    empty = meshive.WorkspaceUpdated.from_dict({})
+    assert (empty.workspace, empty.name) == ("", "")
+
+    clear = meshive.WorkspaceDeleteCheck.from_dict({"workspace": "ab12cd34ef567890", "name": "lab", "deletable": True,
+                                                    "blockers": {}})
+    assert clear.deletable is True and clear.blockers == {} and (clear.workspace, clear.name) == ("ab12cd34ef567890", "lab")
+    blocked = meshive.WorkspaceDeleteCheck.from_dict({"workspace": "x", "name": "lab", "deletable": False,
+                                                      "blockers": {"assets": 3, "task_outputs": "2"}})
+    assert blocked.deletable is False and blocked.blockers == {"assets": 3, "task_outputs": 2}
+    assert blocked.raw["blockers"]["task_outputs"] == "2"       # raw keeps the payload as it came
+    unknown = meshive.WorkspaceDeleteCheck.from_dict({"blockers": None})
+    # A response without the field isn't a promise that the workspace is empty: falsy, so callers don't go ahead.
+    assert unknown.deletable is None and not unknown.deletable and unknown.blockers == {}
+
+    assert {"WorkspaceUpdateEstimate", "WorkspaceUpdated", "WorkspaceDeleteCheck"} <= set(meshive.__all__)
+
+
 def test_list_machines_parses():
     seen = {}
 

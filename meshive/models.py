@@ -1602,8 +1602,8 @@ class PodCreated:
 class ResourceAction:
     """Accepted response for stop/start/restart/delete/scale, etc. State changes are asynchronous — poll with the read methods."""
 
-    resource: str                  # pod | storage | serving | task
-    id: str                        # pod_name / pv_name / serving id / task id
+    resource: str                  # pod | storage | serving | task | workspace
+    id: str                        # pod_name / pv_name / serving id / task id / workspace ID
     action: str
     workspace: str | None = None
     accepted: bool = True
@@ -1984,6 +1984,57 @@ class WorkspaceCreated:
         return cls(workspace=str(d.get("workspace", "") or ""), name=str(d.get("name", "") or ""),
                    transaction_id=d.get("transactionId"), estimate=WorkspaceEstimate.from_dict(d.get("estimate") or {}),
                    raw=d)
+
+
+@dataclass
+class WorkspaceUpdateEstimate:
+    """POST /v1/sdk/workspaces/{namespace}/estimate response — what update_workspace would change. Changes nothing."""
+
+    workspace: str                 # the workspace ID (namespace name); a rename doesn't change it
+    current_name: str
+    name: str                      # the new name
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "WorkspaceUpdateEstimate":
+        return cls(workspace=str(d.get("workspace", "") or ""), current_name=str(d.get("currentName", "") or ""),
+                   name=str(d.get("name", "") or ""), raw=d)
+
+
+@dataclass
+class WorkspaceUpdated:
+    """PATCH /v1/sdk/workspaces/{namespace} response. A rename is applied at once; `name` is the confirmed new name, which
+    the workspace list can take a moment to show."""
+
+    workspace: str                 # the workspace ID (namespace name); a rename doesn't change it
+    name: str
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "WorkspaceUpdated":
+        return cls(workspace=str(d.get("workspace", "") or ""), name=str(d.get("name", "") or ""), raw=d)
+
+
+@dataclass
+class WorkspaceDeleteCheck:
+    """GET /v1/sdk/workspaces/{namespace}/delete-check response — whether delete_workspace would go through. Changes nothing.
+
+    `blockers` counts what is still in the workspace, by kind, and lists only kinds with something left: pods, storages,
+    servings, tasks (finished ones too), task_outputs (still being saved), assets, templates, models (custom ones),
+    credentials, webhooks, inference_keys, members (other than you), invitations, pending_payouts and
+    operations_in_progress. The server may add kinds, so treat the keys as open-ended."""
+
+    workspace: str                 # the workspace ID (namespace name)
+    name: str
+    deletable: bool | None         # None from a response without the field; only True means it can be deleted
+    blockers: dict[str, int] = field(default_factory=dict)
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "WorkspaceDeleteCheck":
+        return cls(workspace=str(d.get("workspace", "") or ""), name=str(d.get("name", "") or ""),
+                   deletable=_optional_bool(d.get("deletable")),
+                   blockers={str(kind): _as_int(count) for kind, count in (d.get("blockers") or {}).items()}, raw=d)
 
 
 @dataclass

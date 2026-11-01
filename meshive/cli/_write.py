@@ -1,13 +1,15 @@
-"""CLI write commands: workspace-create, pod-create/update/stop/start/restart/delete, storage-create/update/connect/delete,
+"""CLI write commands: workspace-create/update/delete, pod-create/update/stop/start/restart/delete, storage-create/update/connect/delete,
 serving-deploy/scale/pause/resume/delete, task-submit/stop, logs, task-logs.
 Also models, hf-tokens, model-detect, model-register, model-delete (model registration for serving), asset-import, civitai-keys.
 
 Rule: commands that cost money or can't be undone (create/start/deploy/submit/delete, plus serving-scale and
 serving-resume, which can raise cost) first show an estimate or summary and ask for confirmation without `--yes` (exit 2 if not a TTY).
-workspace-create, model-register and asset-import cost nothing and don't ask.
+workspace-create, model-register and asset-import cost nothing and don't ask. workspace-update is free but asks, because
+every member of the workspace sees the new name.
 `--estimate` shows the estimate and stops. `pod-create --wait` exits 1 if the pod isn't ready in time or its creation fails
 (the accepted transaction is printed, and a failure's reason). `workspace-create --wait` waits for `running` and exits 1
-if that doesn't happen in time.
+if that doesn't happen in time. `workspace-delete` checks first: a workspace that isn't empty exits 1 without asking, and
+`--check` stops after the check (exit 0 if it can be deleted, 1 if not).
 """
 from __future__ import annotations
 
@@ -25,7 +27,8 @@ from . import _format as fmt
 from .._client import LONG_RUNNING_READ_TIMEOUT, Meshive
 from ..exceptions import ConflictError, MeshiveAPIError, MeshiveError, PodCreationFailedError, WaitTimeoutError
 from ..models import (Logs, PodEstimate, PodUpdated, PodUpdateEstimate, ResourceAction, StorageConnection,
-                      StorageEstimate, StorageUpdateEstimate, TaskEstimate, WorkspaceEstimate)
+                      StorageEstimate, StorageUpdateEstimate, TaskEstimate, WorkspaceDeleteCheck, WorkspaceEstimate,
+                      WorkspaceUpdateEstimate)
 
 Handler = Callable[[Meshive, argparse.Namespace, str, bool], int]
 
@@ -58,8 +61,7 @@ def _confirm(args: argparse.Namespace, question: str) -> bool:
     if getattr(args, "yes", False):
         return True
     if not sys.stdin.isatty():
-        print("Error: this command spends credit or deletes resources. Re-run with --yes to confirm.",
-              file=sys.stderr)
+        print("Error: this command needs confirmation. Re-run with --yes to confirm.", file=sys.stderr)
         return False
     # Ask on stderr — when stdout isn't a terminal, input() writes the prompt to stdout, so with `-o json > out.json`, `| jq`
     # or `id=$(… -o name)` the prompt ends up in the result and the person never sees it. Flush stdout before asking, as input() does —
@@ -318,6 +320,76 @@ def cmd_workspace_create(client: Meshive, args: argparse.Namespace, output: str,
                             "you create anything in it.", "dim", color))
 
     _emit(output, created.raw, [created.workspace], show)
+    return 0
+
+
+def _print_workspace_update_estimate(est: WorkspaceUpdateEstimate) -> None:
+    _kv([("workspace id", est.workspace), ("current name", est.current_name), ("new name", est.name)])
+
+
+def cmd_workspace_update(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    estimate = client.estimate_workspace_update(args.workspace, name=args.name)
+    if args.estimate:
+        _emit(output, estimate.raw, [estimate.workspace], lambda: _print_workspace_update_estimate(estimate))
+        return 0
+    if output == "table":
+        _print_workspace_update_estimate(estimate)
+    question = f"Rename workspace '{estimate.current_name}' to '{estimate.name}'? Other members see the new name too."
+    if not _confirm(args, fmt.clean(question)):
+        return 2
+    updated = client.update_workspace(args.workspace, name=args.name)
+    _emit(output, updated.raw, [updated.workspace], lambda: _kv([("workspace id", updated.workspace),
+                                                                 ("name", updated.name)]))
+    return 0
+
+
+# Kinds that go away without the user doing anything. Any other kind, including one a newer server adds, needs clearing.
+_CLEARS_BY_ITSELF = frozenset({"operations_in_progress", "task_outputs", "pending_payouts"})
+_CLEARS_BY_ITSELF_HINT = (
+    "Operations in progress clear on their own, usually within minutes, at most about 30 minutes. Task outputs clear "
+    "on their own, about 30 minutes after the task ended or when its upload finishes; if they are still there after "
+    "that, look at the task in the console or contact support. Pending payouts clear once the earnings are paid out, "
+    "usually within a day; earnings on hold, or a failed payout, can take longer, so contact support. Deleting the "
+    "workspace in the console before that loses them.")
+
+
+def _blocker_lines(check: WorkspaceDeleteCheck) -> list[str]:
+    return [fmt.clean(f"  {kind.replace('_', ' ')}: {count}") for kind, count in check.blockers.items()]
+
+
+def _print_workspace_delete_check(check: WorkspaceDeleteCheck, color: bool) -> None:
+    _kv([("workspace id", check.workspace), ("name", check.name), ("can delete", fmt.yes_no(bool(check.deletable)))])
+    if not check.deletable:
+        print(fmt.paint("Still in it:", "dim", color))
+        print("\n".join(_blocker_lines(check)))
+
+
+def _print_workspace_deleted(action: ResourceAction, color: bool) -> None:
+    _print_action(action, color)
+    print(fmt.paint("Deleting in the background. It leaves `meshive workspaces` within a moment; its name stays taken "
+                    "for a while.", "dim", color))
+
+
+def cmd_workspace_delete(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    check = client.check_workspace_delete(args.workspace)
+    if args.check:
+        _emit(output, check.raw, [check.workspace], lambda: _print_workspace_delete_check(check, color))
+        return 0 if check.deletable else 1
+    if not check.deletable:
+        # Before any question: --yes can't get past this, and the server would refuse anyway.
+        print(fmt.clean(f"Error: workspace '{check.name}' can't be deleted yet. Still in it:"), file=sys.stderr)
+        print("\n".join(_blocker_lines(check)), file=sys.stderr)
+        waits = check.blockers.keys() & _CLEARS_BY_ITSELF
+        if waits:
+            print(_CLEARS_BY_ITSELF_HINT, file=sys.stderr)
+        if check.blockers.keys() - _CLEARS_BY_ITSELF:
+            print(f"Clear {'the others' if waits else 'these'} first, or delete the workspace in the console, which "
+                  "removes what's in it for good.", file=sys.stderr)
+        return 1
+    if not _confirm(args, fmt.clean(f"Delete workspace '{check.name}' ({check.workspace})? This can't be undone.")):
+        return 2
+    action = client.delete_workspace(args.workspace)
+    _emit(output, action.raw, [action.id], lambda: _print_workspace_deleted(action, color))
     return 0
 
 
@@ -1100,6 +1172,18 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
                    help="After creating, wait until the workspace is running (pods and tasks are refused before that).")
     p.add_argument("--wait-timeout", type=float, default=180.0, metavar="SECONDS",
                    help="Give up waiting after this long (default: 180).")
+    p = sub.add_parser("workspace-update", parents=[common],
+                       help="Rename a workspace (shows the current and new name first).")
+    p.add_argument("workspace", help="Workspace ID (namespace name).")
+    p.add_argument("--name", required=True, help="New name: unique among yours, up to 63 characters.")
+    p.add_argument("--estimate", action="store_true", help="Only check the name and show the change; rename nothing.")
+    _yes(p)
+    p = sub.add_parser("workspace-delete", parents=[common],
+                       help="Delete an empty workspace. One that still holds anything is refused (exit 1).")
+    p.add_argument("workspace", help="Workspace ID (namespace name).")
+    p.add_argument("--check", action="store_true",
+                   help="Only show whether it can be deleted and what is left in it (exit 0 if it can, 1 if not).")
+    _yes(p)
 
     # --- pods ---
     p = sub.add_parser("pod-create", parents=[common], help="Create a pod (shows the estimate first).")
@@ -1367,6 +1451,8 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
 
 HANDLERS: dict[str, Handler] = {
     "workspace-create": cmd_workspace_create,
+    "workspace-update": cmd_workspace_update,
+    "workspace-delete": cmd_workspace_delete,
     "pod-create": cmd_pod_create,
     "pod-update": cmd_pod_update,
     "pod-stop": _pod_action("stop_pod", False, ""),

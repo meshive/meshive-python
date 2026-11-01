@@ -14,8 +14,8 @@ pip install -U meshive
 
 ## v1.6.0
 
-You can now create a workspace from the SDK and CLI, and wait until it is ready to use. Code written for 1.0 to 1.5
-keeps working.
+You can now create, rename and delete workspaces from the SDK and CLI, and wait until a new one is ready to use. Code
+written for 1.0 to 1.5 keeps working.
 
 ### What's new
 
@@ -33,8 +33,25 @@ keeps working.
   `MeshiveError` at once. A workspace that isn't in your workspace list yet, or is listed as `terminated`, is waited
   for like `creating`, because the list can lag a moment behind a create. If the time runs out, `WaitTimeoutError`
   names the workspace and the last status seen; a workspace that is still `terminated` then failed to set up.
+- **Rename a workspace.** `update_workspace(workspace, name="research-2")` and
+  `meshive workspace-update <workspace> --name research-2` change its name. The ID stays the same, so whatever uses it
+  keeps working, and every member sees the new name. The admin and billing roles can rename; a viewer gets
+  `PermissionDeniedError`. The rules for a new name are the ones for a new workspace, a taken name raises
+  `ConflictError` ("Name Taken"), and a blank one raises `ValueError`. `estimate_workspace_update` and
+  `meshive workspace-update --estimate` show the current and new name and change nothing; a read-only key can run
+  them, with the same roles. The command asks before renaming unless you pass `--yes`.
+- **Delete an empty workspace.** `delete_workspace(workspace)` and `meshive workspace-delete <workspace>` delete a
+  workspace that holds nothing, which can't be undone. The same admin and billing roles can do this. Anything still in
+  it refuses the delete with `ConflictError` ("Workspace Not Empty"), and `err.raw["detail"]["blockers"]` counts what
+  is left: pods, storage, servings, tasks (finished ones too), task outputs still being saved, assets, custom templates
+  and models, credentials, webhooks, inference keys, other members, open invitations, payouts still pending and
+  operations in progress. `check_workspace_delete(workspace)` and `meshive workspace-delete <workspace> --check` show
+  the same list and delete nothing; a read-only key can run them, with the same roles, and `--check` exits 1 if the
+  workspace can't be deleted. A person can still delete a workspace that holds things in the console, which removes
+  what's in it for good. The deletion runs in the background: the workspace leaves your list within a moment, and its
+  name stays taken for a while.
 - **Older servers.** A server that predates this release answers with `NotFoundError`, saying it doesn't support
-  workspace creation yet.
+  workspace creation, renaming or deletion yet.
 
 ## v1.5.0
 

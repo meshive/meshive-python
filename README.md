@@ -123,7 +123,7 @@ except WaitTimeoutError:
 | `PermissionDeniedError` | 403: the key is **Read only**, or your workspace role can't make changes. |
 | `NotFoundError` | 404: no such pod, task, asset, ... |
 | `InsufficientCreditError` | 402: not enough credit to create or start something. |
-| `ConflictError` | 409: no capacity, a name already taken, a price above your cap, storage still in use, ... `err.title` says which. |
+| `ConflictError` | 409: no capacity, a name already taken, a price above your cap, storage still in use, a workspace that isn't empty, ... `err.title` says which. |
 | `RateLimitError` | 429 after the automatic retries. `err.retry_after` says how long to wait. |
 | `WaitTimeoutError` | A `wait_for_*` call ran out of time. Also a built-in `TimeoutError`. |
 | `PodCreationFailedError` | The platform couldn't create the pod and cleaned it up; the message says why. |
@@ -133,6 +133,7 @@ except WaitTimeoutError:
 | To... | Run |
 | --- | --- |
 | Create a workspace (free by itself) and wait until it is running | `meshive workspace-create <name> --wait` |
+| Rename a workspace, or delete an empty one | `meshive workspace-update <workspace> --name <name>`, `meshive workspace-delete <workspace>` |
 | Run a script on a GPU and collect the results | `meshive task-submit <workspace> train --script train.py --image python:3.12-slim --gpu "RTX 3060"` |
 | Serve a Hugging Face model behind an API | `meshive model-register <workspace> Qwen/Qwen3-0.6B`, then `meshive serving-deploy` |
 | Bring in a model or dataset from Hugging Face, CivitAI or a URL | `meshive asset-import <workspace> <repo or URL>` |
@@ -184,7 +185,7 @@ The API key is looked up in this order: the `--api-key` option (or `Meshive(api_
 | `402` / `InsufficientCreditError` | Top up credit in the [console](https://console.meshive.ai). |
 | `409` with "No Capacity" | That GPU is sold out right now. `meshive gpus` shows what is available. |
 | A pod stays `creating` for minutes | `meshive transactions <workspace>` shows the current step, such as an image download and its progress. |
-| A script stops with exit code `2` | A command that spends credit wanted confirmation. Add `--yes`, or check with `--estimate` first. |
+| A script stops with exit code `2` | A command needed confirmation. Add `--yes`, or check first with `--estimate` (`--check` for `workspace-delete`). |
 | "could not reach the Meshive API" | Check your network, and `MESHIVE_BASE_URL` if you set it. |
 
 ### Exit codes
@@ -192,7 +193,7 @@ The API key is looked up in this order: the `--api-key` option (or `Meshive(api_
 | Code | Meaning |
 | --- | --- |
 | `0` | Success. |
-| `1` | The API returned an error, the key is missing or invalid, or the API couldn't be reached. |
+| `1` | The API returned an error, the key is missing or invalid, the API couldn't be reached, or `workspace-delete` found the workspace isn't empty. |
 | `2` | Bad arguments, or a command needed confirmation and didn't get it (no terminal and no `--yes`, or you answered no). |
 | `130` | Interrupted with Ctrl-C. |
 

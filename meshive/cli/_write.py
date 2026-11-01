@@ -367,8 +367,6 @@ def cmd_ssh(client: Meshive, args: argparse.Namespace, output: str, color: bool)
     def show() -> None:
         _kv([("command", access.command), ("password", access.password),
              ("expires", fmt.relative_time(access.expires_at) if access.expires_at else "-")])
-        if access.web_url:
-            print(fmt.paint(f"Browser terminal: {fmt.clean(access.web_url)}", "dim", color))
         print(fmt.paint("One-time password — run the command and paste it when asked.", "dim", color))
 
     _emit(output, access.raw, [access.command], show)
@@ -744,8 +742,6 @@ def cmd_storage_connect(client: Meshive, args: argparse.Namespace, output: str, 
             pairs += [("command", access.command), ("password", access.password),
                       ("expires", fmt.relative_time(access.expires_at) if access.expires_at else "-")]
         _kv(pairs)
-        if access and access.web_url:
-            print(fmt.paint(f"Browser terminal: {fmt.clean(access.web_url)}", "dim", color))
         if access:
             print(fmt.paint("One-time password — run the command and paste it when asked.", "dim", color))
         else:

@@ -131,7 +131,7 @@ class FakeClient:
     def ssh_access(self, *a, **kw):
         self._rec("ssh_access", *a, **kw)
         return SshAccess.from_dict({"password": "pw-123", "sshUrl": "ssh -p 2222 root@m.example",
-                                    "sshWebUrl": "https://m.example/?password=x", "expiredAt": 4_000_000_000})
+                                    "sshWebUrl": "https://m.example/", "expiredAt": 4_000_000_000})
 
     def import_asset(self, *a, **kw):
         self.calls.append(("import_asset", a, kw))
@@ -569,6 +569,7 @@ def test_ssh_prints_the_command_and_password_only(capsys):
     assert cli.main(["ssh", "ws", "p-0"]) == 0
     out = capsys.readouterr().out
     assert "ssh -p 2222 root@m.example" in out and "pw-123" in out and "in " in out   # expiry is a time in the future
+    assert "Browser terminal" not in out and "https://m.example" not in out    # only the console can open that page
     assert _last("ssh_access")[1] == ("p-0", "ws")
     assert cli.main(["ssh", "ws", "p-0", "-o", "name"]) == 0
     assert capsys.readouterr().out.strip() == "ssh -p 2222 root@m.example"
@@ -889,6 +890,7 @@ def test_storage_connect_prints_the_ssh_command(capsys, monkeypatch):
     assert cli.main(["storage-connect", "ws", "pv-1"]) == 0
     out = capsys.readouterr().out
     assert "ssh -p 2222 gateway@m.example" in out and "pw-123" in out and "pv-1-access-0" in out
+    assert "Browser terminal" not in out
     assert "locks again automatically in about 30 min" in out
     assert _last("connect_storage")[1:] == (("pv-1", "ws"), {"wait": True, "timeout": 300.0})
     assert cli.main(["storage-connect", "ws", "pv-1", "-o", "name"]) == 0

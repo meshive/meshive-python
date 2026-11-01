@@ -281,7 +281,7 @@ class SshAccess:
 
     command: str                   # e.g. "ssh -p 2222 gateway@<host>" (the server picks the user name)
     password: str = field(repr=False)
-    web_url: str = field(default="", repr=False)   # browser terminal — the password is in the URL
+    web_url: str = field(default="", repr=False)   # browser terminal the console opens — it cannot connect on its own
     expires_at: datetime | None = None
     raw: dict = field(default_factory=dict, repr=False)
 

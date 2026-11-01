@@ -1953,6 +1953,40 @@ class TaskSubmitted:
 
 
 @dataclass
+class WorkspaceEstimate:
+    """POST /v1/sdk/workspaces/estimate response — what creating a workspace would do. A workspace costs nothing by
+    itself; pods, storage and tasks in it are billed as usual."""
+
+    name: str | None               # the name that was checked; None when none was given (the server generates one)
+    price_per_hour: str            # USD/h (string) — "0"
+    note: str = ""
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "WorkspaceEstimate":
+        return cls(name=_optional_str(d.get("name")), price_per_hour=str(d.get("pricePerHourUsd", "0")),
+                   note=d.get("note") or "", raw=d)
+
+
+@dataclass
+class WorkspaceCreated:
+    """POST /v1/sdk/workspaces response (202). The workspace is set up in the background: its status is `creating` until
+    it is `running`, and pods and tasks are refused until then. `wait_for_workspace(created.workspace)` waits for it."""
+
+    workspace: str                 # the workspace ID (namespace name) every other call takes as `workspace`
+    name: str                      # the name shown in the console
+    transaction_id: int | str | None
+    estimate: WorkspaceEstimate
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "WorkspaceCreated":
+        return cls(workspace=str(d.get("workspace", "") or ""), name=str(d.get("name", "") or ""),
+                   transaction_id=d.get("transactionId"), estimate=WorkspaceEstimate.from_dict(d.get("estimate") or {}),
+                   raw=d)
+
+
+@dataclass
 class LogLine:
     line: str
     ts: str | None = None

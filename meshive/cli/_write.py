@@ -1,11 +1,13 @@
-"""CLI write commands: pod-create/update/stop/start/restart/delete, storage-create/update/connect/delete,
+"""CLI write commands: workspace-create, pod-create/update/stop/start/restart/delete, storage-create/update/connect/delete,
 serving-deploy/scale/pause/resume/delete, task-submit/stop, logs, task-logs.
 Also models, hf-tokens, model-detect, model-register, model-delete (model registration for serving), asset-import, civitai-keys.
 
 Rule: commands that cost money or can't be undone (create/start/deploy/submit/delete, plus serving-scale and
 serving-resume, which can raise cost) first show an estimate or summary and ask for confirmation without `--yes` (exit 2 if not a TTY).
+workspace-create, model-register and asset-import cost nothing and don't ask.
 `--estimate` shows the estimate and stops. `pod-create --wait` exits 1 if the pod isn't ready in time or its creation fails
-(the accepted transaction is printed, and a failure's reason).
+(the accepted transaction is printed, and a failure's reason). `workspace-create --wait` waits for `running` and exits 1
+if that doesn't happen in time.
 """
 from __future__ import annotations
 
@@ -23,7 +25,7 @@ from . import _format as fmt
 from .._client import LONG_RUNNING_READ_TIMEOUT, Meshive
 from ..exceptions import ConflictError, MeshiveAPIError, MeshiveError, PodCreationFailedError, WaitTimeoutError
 from ..models import (Logs, PodEstimate, PodUpdated, PodUpdateEstimate, ResourceAction, StorageConnection,
-                      StorageEstimate, StorageUpdateEstimate, TaskEstimate)
+                      StorageEstimate, StorageUpdateEstimate, TaskEstimate, WorkspaceEstimate)
 
 Handler = Callable[[Meshive, argparse.Namespace, str, bool], int]
 
@@ -38,7 +40,8 @@ def _emit(output: str, raw: object, ids: list[str], show: Callable[[], None]) ->
         show()
 
 
-def _emit_estimate(output: str, estimate: PodEstimate | StorageEstimate | TaskEstimate | PodUpdateEstimate | StorageUpdateEstimate,
+def _emit_estimate(output: str, estimate: (PodEstimate | StorageEstimate | TaskEstimate | PodUpdateEstimate
+                                           | StorageUpdateEstimate | WorkspaceEstimate),
                    show: Callable[[], None]) -> None:
     """`--estimate` output. json is the server payload only, table is the estimate table, name is one headline number
     like credit and asset-storage — the hourly estimate with the table's rounding (3 decimals), without `$` or thousands separators. Not printed when the unit price is unknown (CPU-preset tasks)."""
@@ -279,6 +282,43 @@ def _print_logs(logs: Logs, color: bool) -> None:
     if logs.finished:
         footer += ", finished"
     print(fmt.paint(footer, "dim", color), file=sys.stderr)
+
+
+# =============================================================================
+# Workspaces
+# =============================================================================
+
+def _print_workspace_estimate(est: WorkspaceEstimate, color: bool) -> None:
+    _kv([("estimate", fmt.paint(f"{fmt.money_hourly(est.price_per_hour)}/hr", "green", color)),
+         ("name", est.name or "(generated when created)")])
+    if est.note:
+        print(fmt.paint(est.note, "dim", color))
+
+
+def cmd_workspace_create(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    # An empty workspace costs nothing (what runs in it is billed as usual) → no confirmation, like asset-import.
+    if args.estimate:
+        estimate = client.estimate_workspace(args.name)
+        _emit_estimate(output, estimate, lambda: _print_workspace_estimate(estimate, color))
+        return 0
+    created = client.create_workspace(args.name)
+    ready = None
+    if args.wait:
+        # On stderr first: if the wait fails, the workspace still exists and this is the only place its ID is printed.
+        print(f"Workspace {created.workspace} accepted; waiting for it to be running.", file=sys.stderr)
+        ready = client.wait_for_workspace(created.workspace, timeout=args.wait_timeout)
+
+    def show() -> None:
+        _kv([("accepted", "yes"), ("name", created.name), ("workspace id", created.workspace),
+             ("transaction", str(created.transaction_id))] + ([("status", ready.status)] if ready else []))
+        if ready:
+            print(fmt.paint("Running: you can create pods, storage and tasks in it.", "dim", color))
+        else:
+            print(fmt.paint("Setting up in the background. Wait until `meshive workspaces` shows it as running before "
+                            "you create anything in it.", "dim", color))
+
+    _emit(output, created.raw, [created.workspace], show)
+    return 0
 
 
 # =============================================================================
@@ -1053,6 +1093,18 @@ def _yes(parser: argparse.ArgumentParser) -> None:
 
 
 def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser) -> None:
+    # --- workspaces ---
+    p = sub.add_parser("workspace-create", parents=[common],
+                       help="Create a workspace (free by itself; pods, storage and tasks in it are billed as usual).")
+    p.add_argument("name", nargs="?", default=None,
+                   help="Workspace name: unique among yours, up to 63 characters. "
+                        "Leave it out and one is generated.")
+    p.add_argument("--estimate", action="store_true", help="Only check the name and show the estimate; create nothing.")
+    p.add_argument("--wait", action="store_true",
+                   help="After creating, wait until the workspace is running (pods and tasks are refused before that).")
+    p.add_argument("--wait-timeout", type=float, default=180.0, metavar="SECONDS",
+                   help="Give up waiting after this long (default: 180).")
+
     # --- pods ---
     p = sub.add_parser("pod-create", parents=[common], help="Create a pod (shows the estimate first).")
     p.add_argument("workspace", help="Workspace ID (namespace name).")
@@ -1318,6 +1370,7 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
 
 
 HANDLERS: dict[str, Handler] = {
+    "workspace-create": cmd_workspace_create,
     "pod-create": cmd_pod_create,
     "pod-update": cmd_pod_update,
     "pod-stop": _pod_action("stop_pod", False, ""),

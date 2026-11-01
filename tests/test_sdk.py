@@ -252,6 +252,22 @@ def test_task_output_filter():
     assert Task.from_dict({"externalId": "t"}).output_include is None      # a server that predates the filter
 
 
+def test_workspace_estimate_and_created_models():
+    import meshive
+
+    est =meshive.WorkspaceEstimate.from_dict({"name": "research", "pricePerHourUsd": "0", "note": "Free."})
+    assert (est.name, est.price_per_hour, est.note) == ("research", "0", "Free.") and est.raw["name"] == "research"
+    bare = meshive.WorkspaceEstimate.from_dict({})              # tolerant of fields the server didn't send
+    assert (bare.name, bare.price_per_hour, bare.note) == (None, "0", "")
+    created = meshive.WorkspaceCreated.from_dict({"workspace": "my-workspace-ab12", "name": "Research",
+                                                  "transactionId": 321, "estimate": {"pricePerHourUsd": "0"}})
+    assert (created.workspace, created.name, created.transaction_id) == ("my-workspace-ab12", "Research", 321)
+    assert created.estimate.price_per_hour == "0" and created.estimate.name is None
+    empty = meshive.WorkspaceCreated.from_dict({})
+    assert (empty.workspace, empty.name, empty.transaction_id) == ("", "", None) and empty.estimate.note == ""
+    assert {"WorkspaceEstimate", "WorkspaceCreated"} <= set(meshive.__all__)
+
+
 def test_list_machines_parses():
     seen = {}
 

@@ -93,6 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  meshive earnings               Show your earnings (as a host)\n"
             "\n"
             "Write commands (need a key with the write scope; they ask for confirmation unless --yes):\n"
+            "  meshive workspace-create [name] [--estimate] [--wait]  (free; --wait returns once it is running)\n"
             "  meshive pod-create <ws> <name> --template ID --gpu MODEL [--model-set SLUG] [--hf-token ID] [--estimate]\n"
             "  meshive model-sets <ws> --template ID  (the SLUGs a template offers)\n"
             "  meshive pod-update <ws> <pod> --gpu MODEL [--estimate]\n"

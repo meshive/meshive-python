@@ -78,7 +78,9 @@ from .models import (
     Template,
     WhoAmI,
     Workspace,
+    WorkspaceCreated,
     WorkspaceDetail,
+    WorkspaceEstimate,
     WorkspaceResources,
 )
 
@@ -157,6 +159,8 @@ __all__ = [
     "PodUpdated",
     "TaskEstimate",
     "TaskSubmitted",
+    "WorkspaceEstimate",
+    "WorkspaceCreated",
     "Logs",
     "LogLine",
     # exceptions

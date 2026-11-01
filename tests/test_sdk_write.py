@@ -8,6 +8,7 @@ import pytest
 
 from meshive import (
     MeshiveAPIError,
+    MeshiveError,
     NotFoundError,
     PermissionDeniedError,
     PodCreationFailedError,
@@ -22,8 +23,12 @@ from meshive import (
     StorageCreated,
     TaskSubmitted,
     WaitTimeoutError,
+    WorkspaceCreated,
+    WorkspaceEstimate,
 )
-from tests.test_sdk import async_client, isolate_config_dir, slept, sync_client  # noqa: F401  (autouse fixtures)
+from meshive import _client, _write
+from tests.test_sdk import (_counting_handler, async_client, isolate_config_dir, slept,  # noqa: F401  (autouse fixtures)
+                            sync_client)
 
 ESTIMATE = {"pricePerHourUsd": "0.068423", "breakdown": {"gpu": "0.068423"}, "resources": {"gpu_model": "RTX 3060"},
             "availability": {"available_gpus": 2}, "template": {"id": 457}, "volumes": [], "note": "Estimated"}
@@ -1627,3 +1632,242 @@ def test_async_task_methods_take_the_output_filter():
     first, caught = asyncio.run(run())
     assert estimate.body()["outputInclude"] == ["*.png"] and kept.body()["outputInclude"] == ["*.png"]
     assert first.task.output_include == ["*.png"] and caught[0].filename == __file__
+
+
+# --- 1.6.0: workspaces ----------------------------------------------------------------------------------------
+
+WORKSPACE_ESTIMATE = {"name": None, "pricePerHourUsd": "0",
+                      "note": "A workspace costs nothing by itself. Pods, storage and tasks in it are billed as usual."}
+WORKSPACE_CREATED = {"workspace": "my-workspace-ab12", "name": "my-workspace-ab12", "accepted": True,
+                     "transactionId": 321, "estimate": WORKSPACE_ESTIMATE}
+
+
+def _listed(status, namespace="my-workspace-ab12", name=None):
+    return {"namespaceName": namespace, "workspaceName": name or namespace, "description": "", "memberCount": 1,
+            "status": status, "pricePerHour": "0", "resources": {"pod": 0, "storage": 0, "serverless": 0}}
+
+
+def _workspace_list(*items):
+    return httpx.Response(200, json=list(items))
+
+
+@pytest.fixture
+def clock(monkeypatch, slept):
+    """A clock that only moves when the code sleeps, so a wait can run to its deadline without waiting for real."""
+    now = [0.0]
+
+    def sleep(seconds):
+        slept.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr(_client.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(_client.time, "sleep", sleep)
+    return now
+
+
+def test_workspace_body_sends_a_name_only_when_given():
+    assert _write.workspace_body(None) == {}
+    assert _write.workspace_body("") == _write.workspace_body("   ") == {}     # the server generates one for blank too
+    assert _write.workspace_body("  research ") == {"name": "research"}
+    for bad in (3, ["a"]):
+        with pytest.raises(ValueError, match="name"):
+            _write.workspace_body(bad)
+
+
+def test_create_workspace_builds_request_and_parses():
+    rec = Recorder((202, {**WORKSPACE_CREATED, "name": "research", "estimate": {**WORKSPACE_ESTIMATE, "name": "research"}}))
+    created = sync_client(rec).create_workspace(" research ", idempotency_key="ws-key-0001")
+    assert isinstance(created, WorkspaceCreated)
+    assert rec.last.method == "POST" and rec.last.url.path == "/v1/sdk/workspaces" and not rec.last.url.params
+    assert rec.last.headers["Idempotency-Key"] == "ws-key-0001" and rec.body() == {"name": "research"}
+    assert (created.workspace, created.name, created.transaction_id) == ("my-workspace-ab12", "research", 321)
+    assert isinstance(created.estimate, WorkspaceEstimate) and created.estimate.name == "research"
+    assert created.estimate.price_per_hour == "0" and "costs nothing" in created.estimate.note
+    assert created.raw["workspace"] == "my-workspace-ab12"
+
+
+def test_create_workspace_without_a_name_sends_an_empty_body_and_a_generated_key(slept):
+    rec = Recorder((503, {"detail": {"title": "Scheduling Busy", "message": "busy"}}), (202, WORKSPACE_CREATED))
+    created = sync_client(rec).create_workspace()
+    assert created.workspace == "my-workspace-ab12" and created.estimate.name is None
+    assert [r.content for r in rec.requests] == [b"{}", b"{}"]
+    keys = {r.headers["Idempotency-Key"] for r in rec.requests}
+    assert len(keys) == 1 and keys != {""}                   # the retry resends the key, so it can't create twice
+
+
+def test_estimate_workspace_builds_request_and_creates_nothing():
+    rec = Recorder((200, {**WORKSPACE_ESTIMATE, "name": "research"}))
+    est = sync_client(rec).estimate_workspace(" research ")
+    assert isinstance(est, WorkspaceEstimate) and (est.name, est.price_per_hour) == ("research", "0")
+    assert rec.last.method == "POST" and rec.last.url.path == "/v1/sdk/workspaces/estimate"
+    assert not rec.last.url.params and rec.body() == {"name": "research"}
+    rec = Recorder((200, WORKSPACE_ESTIMATE))
+    est = sync_client(rec).estimate_workspace()
+    assert est.name is None and "billed as usual" in est.note and rec.body() == {}
+    with pytest.raises(TypeError):                           # nothing to replay: an estimate takes no idempotency key
+        sync_client(rec).estimate_workspace("x", idempotency_key="k")
+
+
+def test_workspace_name_shape_is_checked_before_sending():
+    rec = Recorder((202, WORKSPACE_CREATED))
+    for call in (lambda c: c.create_workspace(7), lambda c: c.estimate_workspace(["a"])):
+        with pytest.raises(ValueError, match="name"):
+            call(sync_client(rec))
+    assert rec.requests == []
+
+
+@pytest.mark.parametrize("answer", [(405, {"detail": "Method Not Allowed"}), (404, {"detail": "Not Found"})])
+def test_workspace_creation_on_an_older_server(answer):
+    for call in (lambda c: c.create_workspace("research"), lambda c: c.estimate_workspace("research")):
+        with pytest.raises(NotFoundError, match="does not support workspace creation"):
+            call(sync_client(Recorder(answer)))
+
+
+def test_workspace_creation_errors_from_the_server_pass_through(slept):
+    taken = {"detail": {"title": "Name Taken", "message": "You already have a workspace named research."}}
+    with pytest.raises(ConflictError) as err:
+        sync_client(Recorder((409, taken))).create_workspace("research")
+    assert err.value.title == "Name Taken" and "research" in err.value.message
+    with pytest.raises(PermissionDeniedError):               # a read-only key can't create, but can estimate
+        sync_client(Recorder((403, {"detail": {"title": "Forbidden", "message": "write scope"}}))).create_workspace()
+    with pytest.raises(NotFoundError) as err:                # a 404 that has a title is the server's answer, not an old server
+        sync_client(Recorder((404, {"detail": {"title": "Not Found", "message": "x"}}))).create_workspace()
+    assert err.value.title == "Not Found" and "does not support" not in str(err.value)
+    busy = (503, {"detail": {"title": "No Cluster Available", "message": "try later"}})
+    rec = Recorder(busy)
+    with pytest.raises(MeshiveAPIError) as err:
+        sync_client(rec, max_retries=1).create_workspace("research")
+    assert err.value.status_code == 503 and err.value.title == "No Cluster Available" and len(rec.requests) == 2
+
+
+def test_async_workspace_methods_mirror_sync():
+    created = Recorder((202, WORKSPACE_CREATED))
+    estimate = Recorder((200, {**WORKSPACE_ESTIMATE, "name": "research"}))
+    old = Recorder((405, {"detail": "Method Not Allowed"}))
+
+    async def main():
+        async with async_client(created) as c:
+            made = await c.create_workspace(idempotency_key="ws-key-0002")
+        async with async_client(estimate) as c:
+            est = await c.estimate_workspace("research")
+        async with async_client(old) as c:
+            with pytest.raises(NotFoundError, match="does not support workspace creation"):
+                await c.create_workspace("research")
+            with pytest.raises(NotFoundError, match="does not support workspace creation"):
+                await c.estimate_workspace()
+            with pytest.raises(ValueError, match="name"):
+                await c.create_workspace(7)
+        return made, est
+
+    made, est = asyncio.run(main())
+    assert made.workspace == "my-workspace-ab12" and created.last.url.path == "/v1/sdk/workspaces"
+    assert created.last.headers["Idempotency-Key"] == "ws-key-0002" and created.body() == {}
+    assert est.name == "research" and estimate.last.url.path == "/v1/sdk/workspaces/estimate"
+    assert len(old.requests) == 2                            # the malformed name never left the client
+
+
+# wait_for_workspace
+
+def test_wait_for_workspace_returns_when_running(slept):
+    handler, calls = _counting_handler([_workspace_list(_listed("running", name="Research"))])
+    ws = sync_client(handler).wait_for_workspace("my-workspace-ab12")
+    assert ws.status == "running" and ws.namespace_name == "my-workspace-ab12" and ws.workspace_name == "Research"
+    assert calls["n"] == 1 and slept == []
+
+
+def test_wait_for_workspace_polls_through_creating(slept):
+    handler, calls = _counting_handler([_workspace_list(_listed("creating")), _workspace_list(_listed("creating")),
+                                        _workspace_list(_listed("running"))])
+    assert sync_client(handler).wait_for_workspace("my-workspace-ab12", interval=2.0).status == "running"
+    assert calls["n"] == 3 and slept == [2.0, 2.0]
+
+
+def test_wait_for_workspace_matches_the_id_not_the_display_name(slept):
+    other = _listed("running", namespace="other-ns", name="my-workspace-ab12")     # someone's display name equals our id
+    handler, calls = _counting_handler([_workspace_list(other, _listed("creating", name="Other name")),
+                                        _workspace_list(other, _listed("running", name="Other name"))])
+    ws = sync_client(handler).wait_for_workspace("my-workspace-ab12")
+    assert ws.namespace_name == "my-workspace-ab12" and calls["n"] == 2
+
+
+def test_wait_for_workspace_stops_at_once_on_error(slept):
+    handler, calls = _counting_handler([_workspace_list(_listed("creating")), _workspace_list(_listed("error"))])
+    with pytest.raises(MeshiveError, match="my-workspace-ab12 reached status 'error'") as err:
+        sync_client(handler).wait_for_workspace("my-workspace-ab12")
+    assert not isinstance(err.value, WaitTimeoutError) and calls["n"] == 2 and slept == [3.0]
+
+
+def test_wait_for_workspace_waits_for_one_that_is_not_listed_yet(slept):
+    # The list can lag a moment behind the create: the workspace is missing, then creating, then running.
+    handler, calls = _counting_handler([_workspace_list(_listed("running", namespace="elsewhere")), _workspace_list(),
+                                        _workspace_list(_listed("creating")), _workspace_list(_listed("running"))])
+    assert sync_client(handler).wait_for_workspace("my-workspace-ab12").status == "running"
+    assert calls["n"] == 4 and slept == [3.0, 3.0, 3.0]
+
+
+def test_wait_for_workspace_waits_through_a_terminated_blip(slept):
+    handler, calls = _counting_handler([_workspace_list(_listed("creating")), _workspace_list(_listed("terminated")),
+                                        _workspace_list(_listed("running"))])
+    assert sync_client(handler).wait_for_workspace("my-workspace-ab12").status == "running"
+    assert calls["n"] == 3 and slept == [3.0, 3.0]
+
+
+@pytest.mark.parametrize("statuses, last", [
+    ([_listed("creating")], "creating"),
+    ([_listed("creating"), _listed("terminated")], "terminated"),
+    ([_listed("TERMINATED")], "TERMINATED"),
+])
+def test_wait_for_workspace_times_out_naming_the_last_status(clock, statuses, last):
+    handler, calls = _counting_handler([_workspace_list(s) for s in statuses])
+    with pytest.raises(WaitTimeoutError) as err:
+        sync_client(handler).wait_for_workspace("my-workspace-ab12", timeout=10, interval=4)
+    message = str(err.value)
+    assert "my-workspace-ab12" in message and f"last status: {last})" in message
+    assert "'terminated' means its setup failed" in message and isinstance(err.value, TimeoutError)
+    assert calls["n"] == 4 and clock[0] == 10                # polls at 0, 4, 8, 10 and gives up at the deadline
+
+
+def test_wait_for_workspace_times_out_when_it_never_shows_up(clock):
+    handler, calls = _counting_handler([_workspace_list(_listed("running", namespace="elsewhere"))])
+    with pytest.raises(WaitTimeoutError, match=r"workspace my-workspace-ab12 .*not in the workspace list"):
+        sync_client(handler).wait_for_workspace("my-workspace-ab12", timeout=6, interval=3)
+    assert calls["n"] == 3
+
+
+def test_wait_for_workspace_remembers_the_last_status_it_saw(clock):
+    handler, _ = _counting_handler([_workspace_list(_listed("creating")), _workspace_list()])
+    with pytest.raises(WaitTimeoutError, match="last status: creating"):
+        sync_client(handler).wait_for_workspace("my-workspace-ab12", timeout=6, interval=3)
+
+
+def test_wait_for_workspace_checks_its_argument_first(slept):
+    handler, calls = _counting_handler([_workspace_list(_listed("running"))])
+    for bad in ("", "  ", None):
+        with pytest.raises(ValueError, match="workspace"):
+            sync_client(handler).wait_for_workspace(bad)
+    assert calls["n"] == 0
+
+
+def test_async_wait_for_workspace(slept):
+    states = [_workspace_list(), _workspace_list(_listed("creating")), _workspace_list(_listed("terminated")),
+              _workspace_list(_listed("running"))]
+    handler, calls = _counting_handler(states)
+    failing, failing_calls = _counting_handler([_workspace_list(_listed("creating")), _workspace_list(_listed("error"))])
+    late, _ = _counting_handler([_workspace_list(_listed("creating"))])
+
+    async def run():
+        async with async_client(handler) as c:
+            ws = await c.wait_for_workspace("my-workspace-ab12", interval=1.5)
+        async with async_client(failing) as c:
+            with pytest.raises(MeshiveError, match="status 'error'") as err:
+                await c.wait_for_workspace("my-workspace-ab12")
+        async with async_client(late) as c:
+            with pytest.raises(WaitTimeoutError, match="last status: creating"):
+                await c.wait_for_workspace("my-workspace-ab12", timeout=0.0)
+            with pytest.raises(ValueError, match="workspace"):
+                await c.wait_for_workspace(" ")
+        return ws, err.value
+
+    ws, error = asyncio.run(run())
+    assert ws.status == "running" and calls["n"] == 4 and slept == [1.5, 1.5, 1.5, 3.0]
+    assert not isinstance(error, WaitTimeoutError) and failing_calls["n"] == 2

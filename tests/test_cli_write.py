@@ -8,10 +8,10 @@ import pytest
 
 
 cli = importlib.import_module("meshive.cli.main")  # cli.__init__ exposes the main function, which shadows the submodule
-from meshive import Meshive, WaitTimeoutError
+from meshive import Meshive, MeshiveError, NotFoundError, WaitTimeoutError
 from meshive.models import (Pod, Logs, PodCreated, PodEstimate, ResourceAction, Serving, StorageCreated, StorageEstimate,
                             TaskEstimate, TaskSubmitted, ModelDetection, ServingModel, AssetImported, WatchedFolders, SshAccess,
-                            Transaction)
+                            Transaction, Workspace, WorkspaceCreated, WorkspaceEstimate)
 
 ESTIMATE = {"pricePerHourUsd": "0.068423", "breakdown": {"gpu": "0.068423"},
             "resources": {"gpu_model": "RTX 3060", "vram_gb": 12, "gpu_count": 1, "vcpu": 4, "ram_gb": 12, "disk_gb": 25,
@@ -19,6 +19,8 @@ ESTIMATE = {"pricePerHourUsd": "0.068423", "breakdown": {"gpu": "0.068423"},
             "availability": {"available_gpus": 2}, "template": {"id": 457, "name": "VSCode"}, "volumes": [], "note": "Estimated"}
 STORAGE_ESTIMATE = {"pricePerHourUsd": "0.000097", "pricePerGbMonthUsd": "0.07", "storageType": "nfs", "maxSizeGb": 305}
 TASK_ESTIMATE = {"pricePerHourUsd": None, "maxCostUsd": None, "maxDurationS": 3600, "resources": {}, "note": "CPU"}
+WORKSPACE_ESTIMATE = {"name": None, "pricePerHourUsd": "0",
+                      "note": "A workspace costs nothing by itself. Pods, storage and tasks in it are billed as usual."}
 TASK = {"externalId": "task_1", "name": "train", "namespaceName": "ws", "status": "queued", "podName": "task-1",
         "image": "img", "gpuModel": None, "gpuCount": 0, "cpuCores": 2, "ramGb": 8, "pricePerHour": "0",
         "costSoFar": "0", "totalCost": "0"}
@@ -135,6 +137,20 @@ class FakeClient:
         self.calls.append(("import_asset", a, kw))
         return AssetImported.from_dict({"assetExternalId": "asset_abc", "name": "llama", "status": "active",
                                         "ingestSource": "hf_import", "fileCount": 4, "totalBytes": 2048, "isGated": True})
+
+    def estimate_workspace(self, *a, **kw):
+        self._rec("estimate_workspace", *a, **kw)
+        return WorkspaceEstimate.from_dict({**WORKSPACE_ESTIMATE, "name": a[0]})
+
+    def create_workspace(self, *a, **kw):
+        self._rec("create_workspace", *a, **kw)
+        name = a[0] if a and a[0] else "my-workspace-ab12"      # the server generates a name when none is given
+        return WorkspaceCreated.from_dict({"workspace": "my-workspace-ab12", "name": name, "accepted": True,
+                                           "transactionId": 321, "estimate": {**WORKSPACE_ESTIMATE, "name": a[0]}})
+
+    def wait_for_workspace(self, *a, **kw):
+        self._rec("wait_for_workspace", *a, **kw)
+        return Workspace.from_dict({"namespaceName": a[0], "workspaceName": a[0], "status": "running"})
 
     def close(self):
         pass
@@ -1197,3 +1213,93 @@ def test_task_submit_help_shows_the_output_filter(capsys):
         cli.main(["task-submit", "--help"])
     out = capsys.readouterr().out
     assert "--output-include GLOB" in out and "/outputs" in out
+
+
+# --- 1.6.0: workspace-create ---------------------------------------------------------------------------------
+
+def test_workspace_create_needs_no_confirmation(capsys, non_tty):
+    assert cli.main(["workspace-create"]) == 0
+    out = capsys.readouterr().out
+    assert "accepted:" in out and "yes" in out and "my-workspace-ab12" in out and "321" in out
+    assert "workspace id:" in out and "transaction:" in out
+    assert "Setting up in the background" in out and "meshive workspaces" in out
+    assert "--wait" not in out                                        # rerunning with it would create a second one
+    assert _last("create_workspace")[1:] == ((None,), {})            # no name: the server generates one
+    assert [c[0] for c in FakeClient.instances[-1].calls] == ["create_workspace"]    # no estimate first, nothing waited for
+
+
+def test_workspace_create_passes_the_name_and_prints_the_id_for_scripts(capsys):
+    assert cli.main(["workspace-create", "research", "-o", "name"]) == 0
+    assert capsys.readouterr().out == "my-workspace-ab12\n"
+    assert _last("create_workspace")[1:] == (("research",), {})
+    assert cli.main(["workspace-create", "research", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["workspace"] == "my-workspace-ab12" and payload["transactionId"] == 321
+    assert cli.main(["workspace-create", "research"]) == 0
+    assert "research" in capsys.readouterr().out
+
+
+def test_workspace_create_estimate_creates_nothing(capsys, non_tty):
+    assert cli.main(["workspace-create", "research", "--estimate"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("estimate:") and "$0.000/hr" in out and "research" in out
+    assert "costs nothing by itself" in out and "billed as usual" in out
+    assert _last("estimate_workspace")[1:] == (("research",), {})
+    assert [c[0] for c in FakeClient.instances[-1].calls] == ["estimate_workspace"]
+
+    assert cli.main(["workspace-create", "--estimate"]) == 0                 # no name: the server picks one
+    assert "(generated when created)" in capsys.readouterr().out
+    assert cli.main(["workspace-create", "research", "--estimate", "-o", "name"]) == 0
+    assert capsys.readouterr().out == "0.000\n"                              # the hourly estimate, like the other commands
+    assert cli.main(["workspace-create", "research", "--estimate", "-o", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["pricePerHourUsd"] == "0"
+    assert cli.main(["workspace-create", "research", "--estimate", "--wait"]) == 0     # nothing created, nothing to wait for
+    assert all(c[0] not in ("create_workspace", "wait_for_workspace") for i in FakeClient.instances for c in i.calls)
+
+
+def test_workspace_create_wait_prints_after_the_workspace_is_running(capsys, non_tty):
+    assert cli.main(["workspace-create", "research", "--wait"]) == 0
+    out = capsys.readouterr().out
+    assert "status:" in out and "running" in out and "Running: you can create pods, storage and tasks in it." in out
+    assert "Setting up" not in out
+    calls = FakeClient.instances[-1].calls
+    assert [c[0] for c in calls] == ["create_workspace", "wait_for_workspace"]
+    assert calls[1][1:] == (("my-workspace-ab12",), {"timeout": 180.0})       # the id, not the display name
+    assert cli.main(["workspace-create", "--wait", "--wait-timeout", "30", "-o", "name"]) == 0
+    assert capsys.readouterr().out == "my-workspace-ab12\n"
+    assert _last("wait_for_workspace")[2] == {"timeout": 30.0}
+
+
+@pytest.mark.parametrize("error, message", [
+    (WaitTimeoutError("Timed out waiting for workspace my-workspace-ab12 to be running (last status: creating). "
+                      "A status of 'terminated' means its setup failed."), "my-workspace-ab12 to be running"),
+    (MeshiveError("Workspace my-workspace-ab12 reached status 'error' while waiting for it to be running."),
+     "reached status 'error'"),
+])
+def test_workspace_create_wait_failures_exit_1(capsys, monkeypatch, error, message):
+    monkeypatch.setattr(FakeClient, "wait_for_workspace", _fake("wait_for_workspace", error), raising=False)
+    assert cli.main(["workspace-create", "research", "--wait"]) == 1
+    captured = capsys.readouterr()
+    assert message in captured.err and "Error:" in captured.err and captured.out == ""
+    assert _last("create_workspace")[1] == ("research",)              # it was created; stderr already has its ID
+    assert captured.err.startswith("Workspace ") and " accepted; waiting" in captured.err
+
+
+def test_workspace_create_on_an_older_server(capsys, monkeypatch):
+    error = NotFoundError(404, "This Meshive API server does not support workspace creation yet.")
+    monkeypatch.setattr(FakeClient, "create_workspace", _fake("create_workspace", error), raising=False)
+    assert cli.main(["workspace-create", "research"]) == 1
+    assert "does not support workspace creation" in capsys.readouterr().err
+
+
+def test_workspace_create_help_and_epilog(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["workspace-create", "--help"])
+    out = " ".join(capsys.readouterr().out.split())             # help text is wrapped to the terminal width
+    assert all(text in out for text in ("[name]", "--estimate", "--wait", "--wait-timeout SECONDS", "63 characters",
+                                        "one is generated", "until the workspace is running"))
+    with pytest.raises(SystemExit):
+        cli.main(["--help"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "meshive workspace-create [name] [--estimate] [--wait]" in out
+    assert "Create a workspace (free by itself; pods, storage and tasks in it are billed as usual)." in out

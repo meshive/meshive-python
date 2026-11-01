@@ -4,8 +4,8 @@ Both clients share the request building and response parsing logic (_build_heade
 only the transport differs (httpx.Client vs httpx.AsyncClient).
 
 Authentication: Meshive API key, `Authorization: Bearer meshive_...`. Reads, estimates, logs and downloads need the
-read scope; creating, changing or deleting pods, storage, servings, tasks, model registrations and asset imports, and
-SSH access, need the write scope.
+read scope; creating, changing or deleting workspaces, pods, storage, servings, tasks, model registrations and asset
+imports, and SSH access, need the write scope.
 Read surface: account (me/api-keys/credit/earnings), workspaces (list/detail/members), pods (list/single/metrics,
 transactions), storage, machines (list/single/metrics), GPU and CPU availability, templates and their model sets,
 serverless (servings/tasks), assets (Asset Hub).
@@ -90,7 +90,9 @@ from .models import (
     Template,
     WhoAmI,
     Workspace,
+    WorkspaceCreated,
     WorkspaceDetail,
+    WorkspaceEstimate,
 )
 
 
@@ -457,6 +459,31 @@ def _new_pod_expired(deadline: float, name: str, timeout: float) -> None:
         raise WaitTimeoutError(f"Pod {name!r} did not appear within {timeout:g}s.")
 
 
+# --- Shared wait_for_workspace decisions -------------------------------------------
+# `running` is the only status that means pods and tasks are accepted. `error` can't recover, so it ends the wait at
+# once. Nothing else does: the list can lag a moment behind a create, so a new workspace may be missing from it at
+# first, and `terminated` can show for a poll before `running`. Those keep polling until the deadline.
+
+def _find_workspace(workspaces: list[Workspace], namespace: str) -> Workspace | None:
+    return next((w for w in workspaces if w.namespace_name == namespace), None)
+
+
+def _workspace_running(workspace: Workspace, namespace: str) -> bool:
+    status = workspace.status.lower()
+    if status == "error":
+        raise MeshiveError(f"Workspace {namespace} reached status 'error' while waiting for it to be running.")
+    return status == "running"
+
+
+def _workspace_wait_expired(deadline: float, namespace: str, last: str) -> None:
+    if time.monotonic() < deadline:
+        return
+    raise WaitTimeoutError(
+        f"Timed out waiting for workspace {namespace} to be running "
+        f"(last status: {last or 'not in the workspace list'}). A status of 'terminated' means its setup failed."
+    )
+
+
 # --- Shared connect_storage decisions ------------------------------------------
 
 def _connection_ready(connection: StorageConnection, pv_name: str) -> bool:
@@ -693,6 +720,31 @@ class Meshive(_BaseClient):
             _new_pod_expired(deadline, name, timeout)
             time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
 
+    def wait_for_workspace(self, workspace: str, *, timeout: float = 180.0, interval: float = 3.0) -> Workspace:
+        """Poll until the workspace is `running` and return it as listed at that point.
+
+            created = client.create_workspace("research")
+            workspace = client.wait_for_workspace(created.workspace)
+
+        A new workspace is `creating` while it is set up, and pods and tasks are refused until it is `running`. It is
+        found by `workspace` (the ID, not the display name) in list_workspaces(). A workspace missing from the list,
+        or listed as `terminated`, is waited for like `creating`: the list can lag a moment behind a create, and
+        `terminated` can show for a poll before `running`. Status `error` raises MeshiveError at once. When the time
+        runs out, WaitTimeoutError names the last status seen; a workspace that is still `terminated` then failed to
+        set up.
+        """
+        namespace = _query_value(workspace, "workspace")
+        deadline = time.monotonic() + timeout
+        last = ""
+        while True:
+            found = _find_workspace(self.list_workspaces(), namespace)
+            if found is not None:
+                if _workspace_running(found, namespace):
+                    return found
+                last = found.status
+            _workspace_wait_expired(deadline, namespace, last)
+            time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+
     # --- Read surface: workspaces, storage, metrics, account, templates, serverless, assets ---
 
     def get_workspace(self, workspace: str) -> WorkspaceDetail:
@@ -884,6 +936,35 @@ class Meshive(_BaseClient):
             part.unlink(missing_ok=True)
             raise
         return target
+
+    # --- Writes: workspaces ------------------------------------------------------------
+
+    def estimate_workspace(self, name: str | None = None) -> WorkspaceEstimate:
+        """Check a workspace name and show what creating it would cost (nothing) — creates nothing (read scope is
+        enough). Same argument as create_workspace; a name that is already taken is a ConflictError ('Name Taken')."""
+        body = _write.workspace_body(name)
+        try:
+            data = self._send("POST", "/workspaces/estimate", json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace creation") from None
+        return WorkspaceEstimate.from_dict(data)
+
+    def create_workspace(self, name: str | None = None, *, idempotency_key: str | None = None) -> WorkspaceCreated:
+        """Create a workspace (202 accepted). A workspace costs nothing by itself; the pods, storage and tasks in it are
+        billed as usual. Without a name the server generates one (like `my-workspace-ab12`); a name must be unique
+        among your workspaces, and a taken one is a ConflictError ('Name Taken').
+
+        The workspace is set up in the background: `created.workspace` is its ID, and its status is `creating` until it
+        is `running`. Pods and tasks are refused until then, and storage and serving can fail if used earlier, so call
+        wait_for_workspace(created.workspace) before creating anything in it. API keys act across your whole account,
+        so the key that created the workspace can use it.
+        """
+        body = _write.workspace_body(name)
+        try:
+            data = self._send("POST", "/workspaces", json=body, idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace creation") from None
+        return WorkspaceCreated.from_dict(data)
 
     # --- Writes: pods (write scope) ---------------------------------------------------
 
@@ -1580,6 +1661,20 @@ class AsyncMeshive(_BaseClient):
             _new_pod_expired(deadline, name, timeout)
             await asyncio.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
 
+    async def wait_for_workspace(self, workspace: str, *, timeout: float = 180.0, interval: float = 3.0) -> Workspace:
+        """Poll until the workspace is `running` (same rules as the sync wait_for_workspace)."""
+        namespace = _query_value(workspace, "workspace")
+        deadline = time.monotonic() + timeout
+        last = ""
+        while True:
+            found = _find_workspace(await self.list_workspaces(), namespace)
+            if found is not None:
+                if _workspace_running(found, namespace):
+                    return found
+                last = found.status
+            _workspace_wait_expired(deadline, namespace, last)
+            await asyncio.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+
     # --- Read surface (same rules as the sync client) ---------------------------
 
     async def get_workspace(self, workspace: str) -> WorkspaceDetail:
@@ -1768,6 +1863,28 @@ class AsyncMeshive(_BaseClient):
             part.unlink(missing_ok=True)
             raise
         return target
+
+    # --- Writes: workspaces ------------------------------------------------------------
+
+    async def estimate_workspace(self, name: str | None = None) -> WorkspaceEstimate:
+        """Check a workspace name — creates nothing (read scope is enough). Same contract as the sync client."""
+        body = _write.workspace_body(name)
+        try:
+            data = await self._send("POST", "/workspaces/estimate", json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace creation") from None
+        return WorkspaceEstimate.from_dict(data)
+
+    async def create_workspace(self, name: str | None = None, *,
+                               idempotency_key: str | None = None) -> WorkspaceCreated:
+        """Create a workspace (202 accepted). Same contract as the sync client: it is set up in the background, so
+        call wait_for_workspace(created.workspace) before creating anything in it."""
+        body = _write.workspace_body(name)
+        try:
+            data = await self._send("POST", "/workspaces", json=body, idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace creation") from None
+        return WorkspaceCreated.from_dict(data)
 
     # --- Writes: pods (write scope) ---------------------------------------------------
 

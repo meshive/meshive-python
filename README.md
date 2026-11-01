@@ -132,6 +132,7 @@ except WaitTimeoutError:
 
 | To... | Run |
 | --- | --- |
+| Create a workspace (free by itself) and wait until it is running | `meshive workspace-create <name> --wait` |
 | Run a script on a GPU and collect the results | `meshive task-submit <workspace> train --script train.py --image python:3.12-slim --gpu "RTX 3060"` |
 | Serve a Hugging Face model behind an API | `meshive model-register <workspace> Qwen/Qwen3-0.6B`, then `meshive serving-deploy` |
 | Bring in a model or dataset from Hugging Face, CivitAI or a URL | `meshive asset-import <workspace> <repo or URL>` |

@@ -182,6 +182,16 @@ def _drop_none(body: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in body.items() if v is not None}
 
 
+# --- Workspaces ---------------------------------------------------------------
+
+def workspace_body(name: str | None) -> dict[str, Any]:
+    """No name or a blank one → an empty body (the server generates one, as it does for a blank name). Which names are
+    allowed (length, characters, already taken) is the server's rule, so a name is only checked for being text."""
+    if name is None or (isinstance(name, str) and not name.strip()):
+        return {}
+    return {"name": _require_str(name, "name")}
+
+
 # --- Pods ---------------------------------------------------------------------
 
 def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: int, gpu_vram_gb: int | None,

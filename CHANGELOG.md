@@ -12,6 +12,30 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## v1.6.0
+
+You can now create a workspace from the SDK and CLI, and wait until it is ready to use. Code written for 1.0 to 1.5
+keeps working.
+
+### What's new
+
+- **Create a workspace.** `create_workspace("research")` and `meshive workspace-create research` create an empty
+  workspace and return its ID (`created.workspace`) at once. A workspace costs nothing by itself; the pods, storage
+  and tasks in it are billed as usual, so the command doesn't ask for confirmation. Leave the name out and the server
+  generates one (like `my-workspace-ab12`). A name is up to 63 characters and must be unique among your workspaces: a
+  taken one raises `ConflictError` ("Name Taken"). API keys work across your whole account, so the key that created
+  the workspace can use it once it is running. `estimate_workspace` and `meshive workspace-create --estimate` check
+  the name and create nothing; a read-only key can run them. `AsyncMeshive` has the same methods.
+- **Wait until it is running.** A new workspace is `creating` while it is set up, and pods and tasks are refused
+  until it is `running`. Storage and serving don't check, so they can fail if you use them earlier.
+  `wait_for_workspace(created.workspace)` and `meshive workspace-create --wait` poll until the workspace is
+  `running` (up to 180 seconds by default; `--wait-timeout SECONDS` on the command line). Status `error` raises
+  `MeshiveError` at once. A workspace that isn't in your workspace list yet, or is listed as `terminated`, is waited
+  for like `creating`, because the list can lag a moment behind a create. If the time runs out, `WaitTimeoutError`
+  names the workspace and the last status seen; a workspace that is still `terminated` then failed to set up.
+- **Older servers.** A server that predates this release answers with `NotFoundError`, saying it doesn't support
+  workspace creation yet.
+
 ## v1.5.0
 
 A task can now keep only some of the files it writes to `/outputs`, as the console's submit form does: the rest are

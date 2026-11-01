@@ -53,6 +53,13 @@ written for 1.0 to 1.5 keeps working.
 - **Older servers.** A server that predates this release answers with `NotFoundError`, saying it doesn't support
   workspace creation, renaming or deletion yet.
 
+### Changes
+
+- **`meshive ssh` and `meshive storage-connect` no longer print a browser terminal link.** The browser terminal now
+  gets its login from the console, so the link can't connect on its own. Open it from the console with **Connect →
+  Open Web Terminal**. Both commands still print the ssh command and the one-time password. `SshAccess.web_url` is
+  still there, but it no longer connects by itself.
+
 ## v1.5.0
 
 A task can now keep only some of the files it writes to `/outputs`, as the console's submit form does: the rest are

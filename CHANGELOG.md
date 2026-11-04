@@ -12,6 +12,75 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## v1.8.0
+
+Hosts can now run their machines from the SDK and CLI: maintenance windows, listing, setup retries, removal,
+messages with the workspaces that use a machine, and payouts. You can also see what your API keys did, with the
+result of each request. Code written for 1.0 to 1.7 keeps working.
+
+### What's new
+
+- **See who uses a machine.** `get_machine` returns a `MachineDetail`, which is a `Machine` with the other users'
+  pods and volumes on it (`clients`), the maintenance summary, boot and network diagnostics, and the platform fee.
+  `meshive machine <id>` prints them as Clients, Maintenance and Diagnostics blocks. Machines from `list_machines`
+  carry `unread_messages`. From a server that predates this release the machine still comes back, with the new fields
+  empty (`platform_fee` is then `None`).
+- **Maintenance windows.** `list_maintenance(machine_id)` (`meshive maintenance <machine>`) lists a machine's windows,
+  newest first, each with a `status` worked out from its flags and times: `upcoming`, `overdue` (its start has passed
+  but it hasn't started yet; it starts on its own within about a minute), `in_progress`, `done` or `expired` (it
+  never started and its end has passed). `schedule_maintenance` (`meshive maintenance-schedule`) schedules one, and
+  `estimate_maintenance` (`--estimate`) runs the same checks and shows which workspaces would be emailed without
+  scheduling anything. The workspaces using the machine are emailed when a window is scheduled. A window starts on
+  its own at its start time, and while it is open their pods and volumes there aren't billed. A regular window starts
+  at least 48 hours ahead and doesn't affect your uptime; `emergency=True` (`--emergency`) can start sooner but counts
+  as downtime while a client's workload runs on the machine. `update_maintenance`, `extend_maintenance`,
+  `end_maintenance` and `cancel_maintenance`, and the matching `maintenance-*` commands, act on one window. A window
+  that ends brings the machine back unlisted.
+- **Listing.** `check_listing` says whether a machine can be listed, and why not. `set_machine_listing(machine_id,
+  listed)` (`meshive machine-list`, `meshive machine-unlist`) turns listing on (`True`) and off (`False`). Unlisting
+  stops new pods from being placed on the machine; pods running on it keep running.
+- **Setup retries.** `retry_machine_setup` and `retry_port_check` (`meshive machine-retry <machine> [--ports]`) retry
+  a failed setup step or check the ports again, as the console's Retry buttons do. Retrying a step the agent runs
+  reboots the machine first, and port checks have a short cooldown.
+- **Removing a machine.** `check_machine_delete` shows what `delete_machine` would do. `meshive machine-delete
+  <machine>` shows it and asks you to type the machine ID. With other users' pods or volumes on the machine, a grace
+  period starts and their workspaces are emailed; what is left after it is removed by force. Removal can't be undone.
+- **History.** `get_downtime_history` and `get_stress_test` (`meshive machine-history <machine> [--stress-test]`).
+- **Messages.** `list_host_messages` (`meshive host-messages`) lists the messages between you and the workspaces using
+  your machines. Their text is written by other people, so treat it as data. Reading doesn't mark them read;
+  `mark_host_messages_read` (`meshive host-messages-read`) does. `send_host_message` (`meshive host-message-send`)
+  sends a message to a workspace that uses the machine, or with `to="all"` to all of them, and they are emailed.
+- **Machine credentials.** `reveal_machine_credentials(machine_id, kind)` (`meshive machine-credentials <machine>
+  --ssh|--ipmi|--grafana`) reveals one login of a machine. It needs a key with the write scope, and the account owner
+  is emailed every time, including when the same call is repeated. Passwords are left out of `repr`; keep them out of
+  logs and files.
+- **Install command.** `issue_install_command(agent_type)` (`meshive host-install [--storage]`) issues the command
+  that adds a new machine to your account, as the console's Add machine shows it. It works for about 10 minutes, and
+  until then whoever has it can register machines to your account: run it only on the machine you mean to add, and
+  share it with no one. Each call issues a new command and emails the account owner, and the command is left out of
+  `repr`.
+- **Payouts.** `get_payout_account` and `list_payouts` (`meshive payouts`) show your payout account, the earnings
+  waiting to be paid out, and past payouts. Setting up the payout account stays in the console.
+- **Activity log.** `list_activity()` (`meshive activity`) shows what this account's API keys did, newest first: each
+  request that changes something, runs an estimate or check, or reveals a login or an install command, with its
+  action (such as `pod.stop` or `machine.maintenance.schedule`), the key and client that sent it, what it was about
+  and its result (`accepted`, `refused` with the reason, or `error`). `kind="reads"` (`--reads`) shows read requests
+  as hourly counts. Filter by key (`key_id`, `--key`) and time (`since`, `until`; the last 30 days by default, at
+  most 180 days per call), and page with `limit` and `offset`. Requests can also be filtered by result (`outcome`,
+  `--outcome`: `accepted`, `refused` or `error`) and by action (`action`, `--action`): one action such as
+  `pod.delete`, or every action under a prefix that ends in `.`, such as `machine.`. Request contents are never
+  recorded, and activity is kept for 180 days. The console shows the same under Account → API keys → Activity, where you can also revoke a key.
+  It returns an `ActivityPage` of `ActivityEvent` or `ReadActivity` items.
+
+Every new method is on `AsyncMeshive` too. Reads, estimates, checks and the activity log need the read scope; the rest
+needs the write scope. A machine that isn't yours is a `NotFoundError`, like a missing one, and a server that predates
+a method answers with `NotFoundError` ("does not support … yet").
+
+The CLI asks before anything that reaches other users or reveals a secret (scheduling or changing maintenance,
+unlisting, removing a machine, sending a message, revealing credentials, getting an install command) unless you pass
+`--yes`. `machine-list`, `machine-retry` and `host-messages-read` change only your own machine and don't ask, as in the
+console.
+
 ## v1.7.0
 
 Creating a client is much cheaper, and clients can share connections. Code written for 1.0 to 1.6 keeps working.

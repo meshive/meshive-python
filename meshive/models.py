@@ -296,12 +296,12 @@ class SshAccess:
 
 @dataclass
 class Machine:
-    """GET /v1/sdk/machines[/{machine_id}] item — a machine registered by a host.
+    """GET /v1/sdk/machines item — a machine registered by a host (get_machine returns a MachineDetail).
 
     Same schema (camelCase) as the web console's machine data, but the SDK read surface
-    gets a trimmed DTO without sensitive fields (ssh/ipmi credentials, grafana, bootReport, ...).
+    gets a trimmed DTO without credentials (SSH, IPMI, Grafana) — reveal_machine_credentials returns those.
     Only commonly used scalars are typed — display fields that were nested, such as
-    status/gpu/earning, are lifted up — and the rest (specs, the whole state, podUses, ...) is in `.raw`.
+    status/gpu/earning, are lifted up — and the rest (specs, the whole state, price, ...) is in `.raw`.
     """
 
     machine_id: str       # id (lookup key)
@@ -314,6 +314,9 @@ class Machine:
     uptime_rate: float     # uptimeRate (0.0~1.0)
     host_tier: str         # hostTier
     raw: dict = field(default_factory=dict, repr=False)
+    # Messages from the workspaces using the machine that the host hasn't read yet (list_host_messages shows them).
+    # 0 from servers that don't report it.
+    unread_messages: int = 0
 
     @classmethod
     def from_dict(cls, d: dict) -> "Machine":
@@ -330,6 +333,7 @@ class Machine:
             earning_hourly=_as_float(earning.get("hourly", 0)),
             uptime_rate=_as_float(d.get("uptimeRate", 0)),
             host_tier=d.get("hostTier", "") or "",
+            unread_messages=_as_int(d.get("unreadMessages")),
             raw=d,
         )
 
@@ -1920,7 +1924,7 @@ class PodUpdated:
 
 @dataclass
 class TaskEstimate:
-    """POST /v1/sdk/tasks/estimate response. None for CPU-preset tasks, whose price depends on the node they land on."""
+    """POST /v1/sdk/tasks/estimate response. A CPU-preset task gets its cheapest fitting CPU line's price (None if none fits)."""
 
     price_per_hour: str | None
     max_cost: str | None           # total bill ceiling, None when storage/fetch costs cannot be bounded
@@ -2072,3 +2076,654 @@ class Logs:
                    lines=lines, count=_as_int(d.get("count")) or len(lines), truncated=bool(d.get("truncated", False)),
                    note=d.get("note"), container=d.get("container"), task_id=d.get("taskId"),
                    finished=d.get("finished"), next_cursor=d.get("nextCursor"), raw=d)
+
+
+# =============================================================================
+# Host surface — machine details, maintenance, listing, removal, messages, credentials, payouts
+# =============================================================================
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """A time without an offset is UTC, as the server reads it."""
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=timezone.utc)
+
+
+@dataclass
+class MachinePodUse:
+    """A pod of another user's workspace that runs on your machine (the console's Clients tab)."""
+
+    workspace: str                 # the renter's workspace ID — send_host_message(to=...) takes it
+    pod_name: str
+    statefulset_name: str
+    category: str                  # WORKLOAD | SERVING_SERVERLESS (a serverless replica)
+    status: str
+    cpu_request: float
+    gpu_request: int
+    ram_request: int               # MiB, as the console shows it
+    price_per_hour: str            # compute only (USD/h); the pod's storage is a MachineStorageUse
+    rental_type: str
+    created_at: datetime | None = None
+    stop_reason_code: str | None = None
+    stop_reason_detail: str | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MachinePodUse":
+        return cls(workspace=str(d.get("namespaceName", "") or ""), pod_name=str(d.get("resourceName", "") or ""),
+                   statefulset_name=str(d.get("statefulsetName", "") or ""), category=str(d.get("category", "") or ""),
+                   status=str(d.get("status", "") or ""), cpu_request=_as_float(d.get("cpuRequest")),
+                   gpu_request=_as_int(d.get("gpuRequest")), ram_request=_as_int(d.get("ramRequest")),
+                   price_per_hour=str(d.get("pricePerHour", "0")), rental_type=str(d.get("rentalType", "") or ""),
+                   created_at=_parse_dt(d.get("createdAt")), stop_reason_code=d.get("stopReasonCode"),
+                   stop_reason_detail=d.get("stopReasonDetail"), raw=d)
+
+
+@dataclass
+class MachineStorageUse:
+    """A storage volume of another user's workspace on your machine (the console's Clients tab)."""
+
+    workspace: str
+    pv_name: str
+    storage_type: str
+    status: str
+    capacity_gb: float             # GiB
+    available_size_gb: float | None
+    usage_rate: float | None       # 0.0~1.0; None when it isn't measured
+    price_per_hour: str            # USD/h
+    rental_type: str
+    created_at: datetime | None = None
+    linked_pod_names: list[str] = field(default_factory=list)   # pods that mount it now
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MachineStorageUse":
+        return cls(workspace=str(d.get("namespaceName", "") or ""), pv_name=str(d.get("pvName", "") or ""),
+                   storage_type=str(d.get("storageType", "") or ""), status=str(d.get("status", "") or ""),
+                   capacity_gb=_as_float(d.get("capacityGb")),
+                   available_size_gb=_as_optional_float(d.get("availableSizeGb")),
+                   usage_rate=_as_optional_float(d.get("usageRate")), price_per_hour=str(d.get("pricePerHour", "0")),
+                   rental_type=str(d.get("rentalType", "") or ""), created_at=_parse_dt(d.get("createdAt")),
+                   linked_pod_names=[str(n) for n in d.get("linkedPodNames") or []], raw=d)
+
+
+@dataclass
+class MachineClients:
+    """What other users run on your machine: their pods and storage volumes. Stopped ones are listed too."""
+
+    pods: list[MachinePodUse] = field(default_factory=list)
+    storages: list[MachineStorageUse] = field(default_factory=list)
+
+    @property
+    def workspaces(self) -> list[str]:
+        """The workspace IDs that have a pod or a volume here, sorted."""
+        return sorted({p.workspace for p in self.pods if p.workspace}
+                      | {s.workspace for s in self.storages if s.workspace})
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "MachineClients":
+        d = d if isinstance(d, dict) else {}
+        return cls(pods=[MachinePodUse.from_dict(p) for p in d.get("pods") or [] if isinstance(p, dict)],
+                   storages=[MachineStorageUse.from_dict(s) for s in d.get("storages") or [] if isinstance(s, dict)])
+
+
+@dataclass
+class MachineDetail(Machine):
+    """GET /v1/sdk/machines/{machine_id} response — a Machine with what the console's machine view shows.
+
+    clients is who uses the machine (other users' workspaces). schedules is the maintenance summary
+    ({"upcoming": [...], "ongoing": ...}); list_maintenance has every window with its status. boot_report and
+    network_warnings are the diagnostics the console shows (None / [] when there are none). platform_fee is the
+    current platform fee as a fraction (0.2 = 20%) and promotional_fee_until is when a promotional fee ends. Fields
+    an older server doesn't send stay empty (platform_fee None), so the detail of an older server still parses.
+    """
+
+    clients: MachineClients = field(default_factory=MachineClients)
+    schedules: dict = field(default_factory=dict)
+    boot_report: dict | None = None
+    network_warnings: list[dict] = field(default_factory=list)
+    platform_fee: float | None = None
+    promotional_fee_until: datetime | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MachineDetail":
+        detail = super().from_dict(d)
+        schedules, boot = d.get("schedules"), d.get("bootReport")
+        detail.clients = MachineClients.from_dict(d.get("clients"))
+        detail.schedules = schedules if isinstance(schedules, dict) else {}
+        detail.boot_report = boot if isinstance(boot, dict) else None
+        detail.network_warnings = [w for w in d.get("networkWarnings") or [] if isinstance(w, dict)]
+        detail.platform_fee = _as_optional_float(d.get("platformFee"))
+        detail.promotional_fee_until = _parse_dt(d.get("promotionalFeeUntil"))
+        return detail
+
+
+# A window's status, derived from its flags and times as the console shows it.
+MAINTENANCE_STATUSES = ("upcoming", "overdue", "in_progress", "done", "expired")
+
+
+def _maintenance_status(is_start: bool, is_done: bool, start: datetime | None, end: datetime | None,
+                        now: datetime) -> str:
+    if is_done:
+        return "done"
+    if is_start:
+        return "in_progress"
+    if end is not None and end <= now:
+        return "expired"          # never started and its time is over
+    if start is not None and start <= now:
+        return "overdue"          # due to start but not started yet; it starts on its own within about a minute
+    return "upcoming"
+
+
+@dataclass
+class MaintenanceWindow:
+    """GET /v1/sdk/machines/{machine_id}/maintenance item — one maintenance window (newest first in the list).
+
+    `status` is worked out from the flags and times when the window is read: upcoming, overdue (its start has passed
+    but it hasn't started yet: it starts on its own within about a minute, nothing needs to be done), in_progress,
+    done, or expired (it never started and its end has passed). While a window is in progress the pods and volumes
+    on the machine aren't billed. Times are UTC.
+    """
+
+    id: int
+    machine_id: str
+    reason: str
+    description: str
+    start_time: datetime | None
+    end_time: datetime | None
+    is_emergency: bool
+    is_start: bool
+    is_done: bool
+    status: str
+    extend_count: int = 0
+    ended_at: datetime | None = None   # when it actually closed (ended early or expired); None while open
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict, *, now: datetime | None = None) -> "MaintenanceWindow":
+        start, end = _as_utc(_parse_dt(d.get("startTime"))), _as_utc(_parse_dt(d.get("endTime")))
+        is_start, is_done = bool(d.get("isStart", False)), bool(d.get("isDone", False))
+        moment = _as_utc(now) if now is not None else datetime.now(timezone.utc)
+        return cls(id=_as_int(d.get("id")), machine_id=str(d.get("machineId", "") or ""),
+                   reason=str(d.get("reason", "") or ""), description=str(d.get("description", "") or ""),
+                   start_time=start, end_time=end, is_emergency=bool(d.get("isEmergency", False)),
+                   is_start=is_start, is_done=is_done,
+                   status=_maintenance_status(is_start, is_done, start, end, moment),
+                   extend_count=_as_int(d.get("extendCount")), ended_at=_as_utc(_parse_dt(d.get("endedAt"))), raw=d)
+
+
+@dataclass
+class MaintenanceEstimate:
+    """POST /v1/sdk/machines/{machine_id}/maintenance/estimate response — what schedule_maintenance would do, with the
+    same checks. Creates nothing and emails no one.
+
+    notice_hours is how long before the start it is scheduled. affected_workspaces are the workspaces with a pod or
+    volume on the machine now: they are emailed when the window is scheduled. uptime_effect is "none" for a regular
+    window and "downtime_while_client_workloads_run" for an emergency one (it counts as downtime while a client's
+    workload runs on the machine). billing is "not_billed_while_open": pods and volumes on the machine aren't billed
+    while the window is open, and the machine earns nothing from them."""
+
+    machine_id: str
+    reason: str
+    start_time: datetime | None
+    end_time: datetime | None
+    is_emergency: bool
+    notice_hours: float
+    affected_workspaces: list[str] = field(default_factory=list)
+    uptime_effect: str = ""
+    billing: str = ""
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MaintenanceEstimate":
+        return cls(machine_id=str(d.get("machineId", "") or ""), reason=str(d.get("reason", "") or ""),
+                   start_time=_as_utc(_parse_dt(d.get("startTime"))), end_time=_as_utc(_parse_dt(d.get("endTime"))),
+                   is_emergency=bool(d.get("isEmergency", False)), notice_hours=_as_float(d.get("noticeHours")),
+                   affected_workspaces=[str(w) for w in d.get("affectedWorkspaces") or []],
+                   uptime_effect=str(d.get("uptimeEffect", "") or ""), billing=str(d.get("billing", "") or ""), raw=d)
+
+
+@dataclass
+class MaintenanceAction:
+    """Response of schedule/update/cancel/extend/end_maintenance. action is schedule | edit | cancel | extend | end;
+    window is the window after the change (None after cancel)."""
+
+    maintenance_id: int | None
+    machine_id: str
+    action: str
+    accepted: bool = True
+    window: MaintenanceWindow | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MaintenanceAction":
+        window = d.get("window")
+        return cls(maintenance_id=_optional_int(d.get("maintenanceId")), machine_id=str(d.get("machineId", "") or ""),
+                   action=str(d.get("action", "") or ""), accepted=bool(d.get("accepted", True)),
+                   window=MaintenanceWindow.from_dict(window) if isinstance(window, dict) else None, raw=d)
+
+
+@dataclass
+class ListingCheck:
+    """GET /v1/sdk/machines/{machine_id}/listing-check response — whether listing the machine would go through.
+    Changes nothing. When listable is False, title and reason say why (the console's refusal, or "Already Listed")."""
+
+    machine_id: str
+    listed: bool
+    listable: bool
+    title: str | None = None
+    reason: str | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ListingCheck":
+        return cls(machine_id=str(d.get("machineId", "") or ""), listed=bool(d.get("listed", False)),
+                   listable=bool(d.get("listable", False)), title=_optional_str(d.get("title")),
+                   reason=_optional_str(d.get("reason")), raw=d)
+
+
+@dataclass
+class ListingResult:
+    """Response of set_machine_listing. listed is the listing the machine now has."""
+
+    machine_id: str
+    listed: bool
+    accepted: bool = True
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ListingResult":
+        return cls(machine_id=str(d.get("machineId", "") or ""), listed=bool(d.get("listed", False)),
+                   accepted=bool(d.get("accepted", True)), raw=d)
+
+
+@dataclass
+class RetryResult:
+    """Response of retry_machine_setup / retry_port_check (202 accepted). check is "setup" or "ports"."""
+
+    machine_id: str
+    check: str
+    accepted: bool = True
+    message: str = ""
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RetryResult":
+        return cls(machine_id=str(d.get("machineId", "") or ""), check=str(d.get("check", "") or ""),
+                   accepted=bool(d.get("accepted", True)), message=str(d.get("message", "") or ""), raw=d)
+
+
+@dataclass
+class MachineDeleteCheck:
+    """GET /v1/sdk/machines/{machine_id}/delete-check response — what delete_machine would do. Changes nothing.
+
+    mode is "immediate" when nothing of other users is on the machine, and "grace_period" when something is: then
+    their workspaces are emailed, and what is left after grace_hours is removed by force (data on local volumes is
+    lost). pod_count includes serverless replicas (serving_replica_count of them). already_deleting means a removal
+    is already under way."""
+
+    machine_id: str
+    name: str
+    mode: str
+    already_deleting: bool
+    pod_count: int = 0
+    serving_replica_count: int = 0
+    pv_count: int = 0
+    workspace_count: int = 0
+    pending_maintenance_count: int = 0   # windows not finished yet; removing the machine cancels them
+    grace_hours: int = 0
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MachineDeleteCheck":
+        return cls(machine_id=str(d.get("machineId", "") or ""), name=str(d.get("name", "") or ""),
+                   mode=str(d.get("mode", "") or ""), already_deleting=bool(d.get("alreadyDeleting", False)),
+                   pod_count=_as_int(d.get("podCount")), serving_replica_count=_as_int(d.get("servingReplicaCount")),
+                   pv_count=_as_int(d.get("pvCount")), workspace_count=_as_int(d.get("workspaceCount")),
+                   pending_maintenance_count=_as_int(d.get("pendingMaintenanceCount")),
+                   grace_hours=_as_int(d.get("graceHours")), raw=d)
+
+
+@dataclass
+class MachineDeleted:
+    """DELETE /v1/sdk/machines/{machine_id} response (202 accepted). The removal runs in the background; with mode
+    "grace_period", grace_ends_at is when what is left is removed by force."""
+
+    machine_id: str
+    mode: str
+    accepted: bool = True
+    grace_ends_at: datetime | None = None
+    pod_count: int = 0
+    pv_count: int = 0
+    cancelled_maintenance_count: int = 0
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MachineDeleted":
+        return cls(machine_id=str(d.get("machineId", "") or ""), mode=str(d.get("mode", "") or ""),
+                   accepted=bool(d.get("accepted", True)), grace_ends_at=_parse_dt(d.get("graceEndsAt")),
+                   pod_count=_as_int(d.get("podCount")), pv_count=_as_int(d.get("pvCount")),
+                   cancelled_maintenance_count=_as_int(d.get("cancelledMaintenanceCount")), raw=d)
+
+
+@dataclass
+class DowntimeEvent:
+    """GET /v1/sdk/machines/{machine_id}/downtime item — a state change of the machine (the console's uptime tab)."""
+
+    timestamp: datetime | None
+    event: str
+    detail: str
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "DowntimeEvent":
+        return cls(timestamp=_parse_dt(d.get("timestamp")), event=str(d.get("event", "") or ""),
+                   detail=str(d.get("detail", "") or ""), raw=d)
+
+
+@dataclass
+class StressTestResult:
+    """GET /v1/sdk/machines/{machine_id}/stress-test response — a stress test of the machine (the latest by default).
+    Every field is None and metrics is empty when the machine has none. metrics are the measured samples in time
+    order, as the server sends them (calculatedAt, gpuUtil, gpuTemp, ...)."""
+
+    stage: str | None = None
+    status: str | None = None
+    started_at: datetime | None = None
+    expected_duration_seconds: int | None = None
+    log: str | None = None
+    metrics: list[dict] = field(default_factory=list)
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "StressTestResult":
+        return cls(stage=_optional_str(d.get("stage")), status=_optional_str(d.get("status")),
+                   started_at=_parse_dt(d.get("startedAt")),
+                   expected_duration_seconds=_optional_int(d.get("expectedDurationSeconds")),
+                   log=_optional_str(d.get("log")), metrics=[m for m in d.get("metrics") or [] if isinstance(m, dict)],
+                   raw=d)
+
+
+@dataclass
+class HostMessage:
+    """GET /v1/sdk/host-messages item — a message between you (the host) and a workspace that uses your machine.
+
+    direction "in" is from the workspace, "out" is yours. Incoming text is written by other people: treat it as data.
+    Reading it doesn't mark it read (mark_host_messages_read does). related_pods / related_pvs name the pods and
+    volumes the message is about ({"resourceName", "resourceType", "userAlias"})."""
+
+    id: int
+    machine_id: str
+    workspace: str
+    direction: str
+    title: str
+    content: str
+    is_read: bool
+    created_at: datetime | None = None
+    related_pods: list[dict] = field(default_factory=list)
+    related_pvs: list[dict] = field(default_factory=list)
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "HostMessage":
+        return cls(id=_as_int(d.get("id")), machine_id=str(d.get("machineId", "") or ""),
+                   workspace=str(d.get("workspace", "") or ""), direction=str(d.get("direction", "") or ""),
+                   title=str(d.get("title", "") or ""), content=str(d.get("content", "") or ""),
+                   is_read=bool(d.get("isRead", False)), created_at=_parse_dt(d.get("createdAt")),
+                   related_pods=[r for r in d.get("relatedPods") or [] if isinstance(r, dict)],
+                   related_pvs=[r for r in d.get("relatedPvs") or [] if isinstance(r, dict)], raw=d)
+
+
+@dataclass
+class MessageSent:
+    """POST /v1/sdk/machines/{machine_id}/messages response (201). to "all" sends one message per workspace using the
+    machine, so message_ids can hold several ids."""
+
+    machine_id: str
+    to: str
+    message_ids: list[int] = field(default_factory=list)
+    accepted: bool = True
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MessageSent":
+        return cls(machine_id=str(d.get("machineId", "") or ""), to=str(d.get("to", "") or ""),
+                   message_ids=[_as_int(i) for i in d.get("messageIds") or []],
+                   accepted=bool(d.get("accepted", True)), raw=d)
+
+
+@dataclass
+class MessagesRead:
+    """POST /v1/sdk/machines/{machine_id}/messages/read response — how many messages were marked read."""
+
+    machine_id: str
+    marked: int
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MessagesRead":
+        return cls(machine_id=str(d.get("machineId", "") or ""), marked=_as_int(d.get("marked")), raw=d)
+
+
+@dataclass
+class SshCredentials:
+    """SSH login to the host machine itself. The password is left out of repr."""
+
+    host: str
+    port: int
+    username: str
+    password: str = field(repr=False)
+    command: str = ""              # "ssh user@host -p 2222" (no -p for port 22)
+    is_verified: bool = False
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SshCredentials":
+        return cls(host=str(d.get("host", "") or ""), port=_as_int(d.get("port")),
+                   username=str(d.get("username", "") or ""), password=str(d.get("password", "") or ""),
+                   command=str(d.get("command", "") or ""), is_verified=bool(d.get("isVerified", False)))
+
+
+@dataclass
+class IpmiCredentials:
+    """IPMI (out-of-band management) login of the machine. The password is left out of repr."""
+
+    username: str | None
+    password: str | None = field(repr=False)
+    status: str = ""
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "IpmiCredentials":
+        return cls(username=_optional_str(d.get("username")), password=_optional_str(d.get("password")),
+                   status=str(d.get("status", "") or ""))
+
+
+@dataclass
+class GrafanaCredentials:
+    """Login to the machine's Grafana dashboard. The password is left out of repr."""
+
+    url: str
+    username: str
+    password: str = field(repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "GrafanaCredentials":
+        return cls(url=str(d.get("url", "") or ""), username=str(d.get("username", "") or ""),
+                   password=str(d.get("password", "") or ""))
+
+
+@dataclass
+class MachineCredentials:
+    """POST /v1/sdk/machines/{machine_id}/credentials response — the one kind of login that was asked for (ssh, ipmi
+    or grafana); the other two are None. The account owner is emailed every time credentials are revealed. Passwords
+    are left out of repr; don't print them to logs or save them in files."""
+
+    machine_id: str
+    kind: str
+    ssh: SshCredentials | None = None
+    ipmi: IpmiCredentials | None = None
+    grafana: GrafanaCredentials | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MachineCredentials":
+        ssh, ipmi, grafana = d.get("ssh"), d.get("ipmi"), d.get("grafana")
+        return cls(machine_id=str(d.get("machineId", "") or ""), kind=str(d.get("kind", "") or ""),
+                   ssh=SshCredentials.from_dict(ssh) if isinstance(ssh, dict) else None,
+                   ipmi=IpmiCredentials.from_dict(ipmi) if isinstance(ipmi, dict) else None,
+                   grafana=GrafanaCredentials.from_dict(grafana) if isinstance(grafana, dict) else None, raw=d)
+
+
+@dataclass
+class InstallCommand:
+    """POST /v1/sdk/host/install-command response — the command that installs the Meshive agent on a new machine and
+    registers it to your account, as the console's Add machine shows it. Until expires_at (about 10 minutes) whoever
+    has the command can register machines to your account, so it is left out of repr: run it only on the machine you
+    mean to add, and share it with no one. The account owner is emailed when one is issued."""
+
+    agent_type: str                # compute | storage
+    command: str = field(repr=False)
+    expires_at: datetime | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "InstallCommand":
+        return cls(agent_type=str(d.get("agentType", "") or ""), command=str(d.get("command", "") or ""),
+                   expires_at=_parse_dt(d.get("expiresAt")), raw=d)
+
+
+@dataclass
+class PayoutAccount:
+    """GET /v1/sdk/payouts/account response — your payout account and what is waiting to be paid out (USD).
+
+    Payouts are sent automatically once pending_amount reaches minimum_payout and the account is fully onboarded.
+    Setting the account up, and its dashboard, are in the console (Earnings)."""
+
+    has_account: bool
+    is_fully_onboarded: bool
+    account_status: str | None
+    pending_amount: float
+    minimum_payout: float
+    currency: str = "usd"
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PayoutAccount":
+        return cls(has_account=bool(d.get("hasAccount", False)),
+                   is_fully_onboarded=bool(d.get("isFullyOnboarded", False)),
+                   account_status=_optional_str(d.get("accountStatus")),
+                   pending_amount=_as_float(d.get("pendingAmount")), minimum_payout=_as_float(d.get("minimumPayout")),
+                   currency=str(d.get("currency") or "usd"), raw=d)
+
+
+@dataclass
+class Payout:
+    """GET /v1/sdk/payouts item — one payout of your earnings (USD). paid_date is None until the transfer is confirmed."""
+
+    amount: float
+    is_paid: bool
+    settle_date: date | None
+    paid_date: datetime | None = None
+    payment_method: str | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Payout":
+        return cls(amount=_as_float(d.get("amount")), is_paid=bool(d.get("isPaid", False)),
+                   settle_date=_parse_date(d.get("settleDate")), paid_date=_parse_dt(d.get("paidDate")),
+                   payment_method=_optional_str(d.get("paymentMethod")), raw=d)
+
+
+# =============================================================================
+# API-key activity log
+# =============================================================================
+
+# ActivityEvent.outcome values: the server took the request, answered it with a 4xx, or failed (5xx).
+ACTIVITY_OUTCOMES = ("accepted", "refused", "error")
+
+
+@dataclass
+class ActivityEvent:
+    """GET /v1/sdk/activity item (kind "events") — one request of an API key of this account that wasn't a read, with
+    its result. The console shows the same rows under Account → API keys → Activity.
+
+    action is a stable name such as "pod.create", "storage.delete" or "machine.maintenance.schedule"; estimates, which
+    change nothing, end in ".estimate". outcome is "accepted", "refused" (error_title says why) or "error".
+    operation_id is the request's Idempotency-Key, set only for writes the server deduplicates (None otherwise), and
+    replayed is True when the server answered a retry with the first response instead of acting again. resource_id,
+    workspace and machine_id come from the request path (None for a create, whose new name was in the request).
+    source is what the client said about itself; the key is what identifies who sent the request. Request contents
+    are never recorded. key_revoked is True when the key has since been revoked or deleted. Times are UTC.
+    """
+
+    id: int
+    created_at: datetime | None
+    key_id: int | None
+    key_name: str | None
+    key_prefix: str | None
+    key_revoked: bool
+    source: str                    # "SDK & CLI", "MCP (claude-code 2.1)", ...
+    action: str
+    resource_type: str | None      # pod, storage, serving, task, workspace, machine, maintenance, ...
+    resource_id: str | None
+    workspace: str | None
+    machine_id: str | None
+    status_code: int
+    outcome: str
+    error_title: str | None = None
+    operation_id: str | None = None
+    replayed: bool = False
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ActivityEvent":
+        return cls(id=_as_int(d.get("id")), created_at=_as_utc(_parse_dt(d.get("createdAt"))),
+                   key_id=_optional_int(d.get("keyId")), key_name=_optional_str(d.get("keyName")),
+                   key_prefix=_optional_str(d.get("keyPrefix")), key_revoked=bool(d.get("keyRevoked", False)),
+                   source=str(d.get("source", "") or ""), action=str(d.get("action", "") or ""),
+                   resource_type=_optional_str(d.get("resourceType")), resource_id=_optional_str(d.get("resourceId")),
+                   workspace=_optional_str(d.get("workspace")), machine_id=_optional_str(d.get("machineId")),
+                   status_code=_as_int(d.get("statusCode")), outcome=str(d.get("outcome", "") or ""),
+                   error_title=_optional_str(d.get("errorTitle")), operation_id=_optional_str(d.get("operationId")),
+                   replayed=bool(d.get("replayed", False)), raw=d)
+
+
+@dataclass
+class ReadActivity:
+    """GET /v1/sdk/activity item (kind "reads") — how many read requests one API key made in one hour (UTC) from one
+    source, for one kind of resource (the first part of the path: "pods", "machines", "tasks", "activity", ...). Reads
+    are counted, not recorded one by one, and the current hour's count can lag by a few seconds."""
+
+    hour: datetime | None
+    key_id: int | None
+    key_name: str | None
+    key_prefix: str | None
+    source: str
+    resource_type: str
+    count: int
+    last_at: datetime | None = None    # the hour's latest read
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ReadActivity":
+        return cls(hour=_as_utc(_parse_dt(d.get("hour"))), key_id=_optional_int(d.get("keyId")),
+                   key_name=_optional_str(d.get("keyName")), key_prefix=_optional_str(d.get("keyPrefix")),
+                   source=str(d.get("source", "") or ""), resource_type=str(d.get("resourceType", "") or ""),
+                   count=_as_int(d.get("count")), last_at=_as_utc(_parse_dt(d.get("lastAt"))), raw=d)
+
+
+@dataclass
+class ActivityPage:
+    """list_activity response, newest first. items are ActivityEvent for kind "events" and ReadActivity for kind
+    "reads". total is how many events match (for paging with offset); None for reads, which aren't totalled."""
+
+    items: list[ActivityEvent] | list[ReadActivity]
+    total: int | None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict, *, kind: str = "events") -> "ActivityPage":
+        d = d if isinstance(d, dict) else {}
+        rows = [r for r in d.get("items") or [] if isinstance(r, dict)]
+        if kind == "reads":
+            return cls(items=[ReadActivity.from_dict(r) for r in rows], total=None, raw=d)
+        return cls(items=[ActivityEvent.from_dict(r) for r in rows], total=_optional_int(d.get("total")), raw=d)

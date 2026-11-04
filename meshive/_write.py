@@ -8,8 +8,10 @@ the server's own. Prices are sent as strings whether given as Decimal, float or 
 """
 from __future__ import annotations
 
+import math
 import warnings
 from collections.abc import Iterable, Mapping
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import urlparse
@@ -637,6 +639,113 @@ def task_body(name: str, script: str, *, image: str | None, template_id: int | N
         # Only files in /outputs matching these globs are uploaded. Omitted = every file (the body is unchanged).
         "outputInclude": _output_include(output_include),
     })
+
+
+# --- Host machines ----------------------------------------------------------------
+
+# The kinds of machine login reveal_machine_credentials can reveal, and the agents issue_install_command installs.
+MACHINE_CREDENTIAL_KINDS = ("ssh", "ipmi", "grafana")
+AGENT_TYPES = ("compute", "storage")
+
+
+def listing_method(listed: Any) -> str:
+    """set_machine_listing: POST …/listing lists the machine, DELETE unlists it. Only a real bool is taken, so a string
+    such as "false" can't list a machine by accident."""
+    if not isinstance(listed, bool):
+        raise ValueError("listed must be an explicit boolean (True to list the machine, False to unlist it)")
+    return "POST" if listed else "DELETE"
+
+
+def _when(value: Any, name: str) -> str:
+    """A maintenance time — a datetime or an ISO 8601 string. Whether it is valid and far enough ahead is the server's
+    call; a time without an offset is read as UTC there."""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    raise ValueError(f"{name} must be a datetime or an ISO 8601 string, e.g. 2026-11-20T09:00:00Z")
+
+
+def _text(value: Any, name: str) -> str:
+    """Optional free text (a description, a message body): any string, "" included."""
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    return value
+
+
+def maintenance_body(*, reason: str, start: Any, end: Any, description: str = "",
+                     emergency: bool = False) -> dict[str, Any]:
+    """POST …/maintenance (and its estimate) body. A reason is required, as in the console. The 48-hour notice for a
+    regular window, overlaps and the machine's state are the server's checks."""
+    if not isinstance(emergency, bool):
+        raise ValueError("emergency must be an explicit boolean")   # an emergency window counts as downtime
+    return {"reason": _require_str(reason, "reason"), "description": _text(description, "description"),
+            "startTime": _when(start, "start"), "endTime": _when(end, "end"), "isEmergency": emergency}
+
+
+def maintenance_update_body(*, reason: str | None = None, description: str | None = None, start: Any = None,
+                            end: Any = None) -> dict[str, Any]:
+    """PATCH /maintenance/{id} body — only what is given is sent; the rest of the window stays as it is."""
+    body = _drop_none({
+        "reason": None if reason is None else _require_str(reason, "reason"),
+        "description": None if description is None else _text(description, "description"),
+        "startTime": None if start is None else _when(start, "start"),
+        "endTime": None if end is None else _when(end, "end"),
+    })
+    if not body:
+        raise ValueError("pass at least one of reason, description, start, end")
+    return body
+
+
+def maintenance_extend_body(*, hours: Any, reason: str, description: str = "") -> dict[str, Any]:
+    """POST /maintenance/{id}/extend body. The upper limit on hours is the server's."""
+    if isinstance(hours, bool) or not isinstance(hours, (int, float, Decimal)):
+        raise ValueError("hours must be a number of hours greater than 0")
+    amount = float(hours)
+    if not math.isfinite(amount) or amount <= 0:
+        raise ValueError("hours must be a number of hours greater than 0")
+    return {"hours": amount, "reason": _require_str(reason, "reason"), "description": _text(description, "description")}
+
+
+def host_message_body(*, to: str, title: str, content: str = "") -> dict[str, Any]:
+    """POST …/messages body. to is a workspace ID or "all"; who may be sent to and the length limits are the server's."""
+    return {"to": _require_str(to, "to"), "title": _require_str(title, "title"), "content": _text(content, "content")}
+
+
+def message_ids_body(message_ids: Any) -> dict[str, Any]:
+    """POST …/messages/read body. How many ids one request takes is the server's rule."""
+    items = [message_ids] if isinstance(message_ids, (int, str)) else list(message_ids or [])
+    ids = []
+    for item in items:
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise ValueError("message_ids must be message ids (non-negative integers)")
+        ids.append(item)
+    if not ids:
+        raise ValueError("pass at least one message id")
+    return {"messageIds": ids}
+
+
+def credentials_body(kind: str) -> dict[str, Any]:
+    value = kind.strip().lower() if isinstance(kind, str) else ""
+    if value not in MACHINE_CREDENTIAL_KINDS:
+        raise ValueError(f"kind must be one of {', '.join(MACHINE_CREDENTIAL_KINDS)}")
+    return {"kind": value}
+
+
+def install_command_body(agent_type: str) -> dict[str, Any]:
+    value = agent_type.strip().lower() if isinstance(agent_type, str) else ""
+    if value not in AGENT_TYPES:
+        raise ValueError(f"agent_type must be one of {', '.join(AGENT_TYPES)}")
+    return {"agentType": value}
+
+
+def host_messages_params(machine_id: str | None, unread_only: bool) -> dict[str, Any]:
+    if not isinstance(unread_only, bool):
+        raise ValueError("unread_only must be an explicit boolean")
+    params: dict[str, Any] = {"unreadOnly": unread_only}
+    if machine_id is not None:
+        params["machineId"] = _require_str(machine_id, "machine_id")
+    return params
 
 
 # --- Logs ---------------------------------------------------------------------

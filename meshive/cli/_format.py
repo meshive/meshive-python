@@ -63,6 +63,10 @@ _STATUS_COLOR = {
     "node_not_ready": "red",    # machine state.name
     "agent_not_ready": "red",   # machine state.name
     "delete_machine": "red",    # machine state.name
+    "upcoming": "cyan",         # maintenance window (derived status)
+    "overdue": "yellow",
+    "in_progress": "yellow",
+    "done": "gray",
 }
 
 _STATUS_ICON = "●"  # ●
@@ -208,6 +212,15 @@ def temperature(celsius: float | None) -> str:
     except (TypeError, ValueError):
         return "-"
     return f"{value:.0f}°C" if math.isfinite(value) else "-"
+
+
+def utc_time(value: datetime | None) -> str:
+    """datetime → 'YYYY-MM-DD HH:MM UTC' (maintenance windows are set and emailed in UTC). None → '-'."""
+    if value is None:
+        return "-"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def date_str(value: date | None) -> str:

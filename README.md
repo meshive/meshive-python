@@ -35,8 +35,8 @@ one of them stops installing after its removal date. Environments where it is al
 
 ## Quickstart
 
-**1. Get an API key.** In the [console](https://console.meshive.ai), open your workspace's
-**Settings → API keys**. Pick **Read & write** so you can create pods.
+**1. Get an API key.** In the [console](https://console.meshive.ai), open
+**Account → API keys**. Pick **Read & write** so you can create pods.
 
 **2. Log in.**
 
@@ -150,7 +150,10 @@ except WaitTimeoutError:
 | See why a pod is still starting | `meshive transactions <workspace>` |
 | Watch a pod's usage and logs | `meshive pod-metrics <workspace> <pod>`, `meshive logs <workspace> <pod>` |
 | Check your credit and spending | `meshive credit`, `meshive workspace <workspace>` |
-| Host your own machines and see earnings | `meshive machines`, `meshive earnings` |
+| See what your API keys (and agents using them) did, with results | `meshive activity`, `meshive activity --reads` |
+| Host your own machines and see earnings | `meshive machines`, `meshive earnings`, `meshive payouts` |
+| Schedule maintenance on a hosted machine, list or unlist it for rent, or remove it | `meshive maintenance-schedule <machine> ...`, `meshive machine-list <machine>`, `meshive machine-unlist <machine>`, `meshive machine-delete <machine>` |
+| Read and answer messages from the workspaces using your machines | `meshive host-messages`, `meshive host-message-send <machine> --to <workspace>` |
 
 Every command has `--help`. The [CLI reference](https://docs.meshive.ai/sdk-cli/cli/) lists them all.
 
@@ -185,7 +188,7 @@ The API key is looked up in this order: the `--api-key` option (or `Meshive(api_
 | You see | What to do |
 | --- | --- |
 | An error about a missing API key | Run `meshive login`, or set `MESHIVE_API_KEY`. |
-| `401` / `AuthenticationError` | The key is wrong or has expired. Create a new one under **Settings → API keys** and log in again. |
+| `401` / `AuthenticationError` | The key is wrong or has expired. Create a new one under **Account → API keys** and log in again. |
 | `403` / `PermissionDeniedError` when creating or deleting | The key is **Read only**, or your role in that workspace is viewer. Use a **Read & write** key. |
 | `402` / `InsufficientCreditError` | Top up credit in the [console](https://console.meshive.ai). |
 | `409` with "No Capacity" | That GPU is sold out right now. `meshive gpus` shows what is available. |

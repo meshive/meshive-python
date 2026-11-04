@@ -1,6 +1,8 @@
 """CLI write commands: workspace-create/update/delete, pod-create/update/stop/start/restart/delete, storage-create/update/connect/delete,
 serving-deploy/scale/pause/resume/delete, task-submit/stop, logs, task-logs.
 Also models, hf-tokens, model-detect, model-register, model-delete (model registration for serving), asset-import, civitai-keys.
+Hosting: maintenance-schedule/update/end/extend/cancel, machine-list/unlist/retry/delete, host-message-send,
+host-messages-read, machine-credentials, host-install.
 
 Rule: commands that cost money or can't be undone (create/start/deploy/submit/delete, plus serving-scale and
 serving-resume, which can raise cost) first show an estimate or summary and ask for confirmation without `--yes` (exit 2 if not a TTY).
@@ -10,6 +12,9 @@ every member of the workspace sees the new name.
 (the accepted transaction is printed, and a failure's reason). `workspace-create --wait` waits for `running` and exits 1
 if that doesn't happen in time. `workspace-delete` checks first: a workspace that isn't empty exits 1 without asking, and
 `--check` stops after the check (exit 0 if it can be deleted, 1 if not).
+Hosting commands that reach other users (maintenance, unlisting, removal, messages) or reveal a secret (machine
+credentials, install commands) ask first; machine-delete asks for the machine ID to be typed. machine-list,
+machine-retry and host-messages-read change only your own machine's state and don't ask, as in the console.
 """
 from __future__ import annotations
 
@@ -26,9 +31,10 @@ import httpx
 from . import _format as fmt
 from .._client import LONG_RUNNING_READ_TIMEOUT, Meshive
 from ..exceptions import ConflictError, MeshiveAPIError, MeshiveError, PodCreationFailedError, WaitTimeoutError
-from ..models import (Logs, PodEstimate, PodUpdated, PodUpdateEstimate, ResourceAction, StorageConnection,
-                      StorageEstimate, StorageUpdateEstimate, TaskEstimate, WorkspaceDeleteCheck, WorkspaceEstimate,
-                      WorkspaceUpdateEstimate)
+from ..models import (ListingResult, Logs, MachineClients, MachineDeleteCheck, MachineDeleted, MaintenanceAction,
+                      MaintenanceEstimate, PodEstimate, PodUpdated, PodUpdateEstimate, ResourceAction,
+                      StorageConnection, StorageEstimate, StorageUpdateEstimate, TaskEstimate, WorkspaceDeleteCheck,
+                      WorkspaceEstimate, WorkspaceUpdateEstimate)
 
 Handler = Callable[[Meshive, argparse.Namespace, str, bool], int]
 
@@ -1153,6 +1159,289 @@ def cmd_task_logs(client: Meshive, args: argparse.Namespace, output: str, color:
 
 
 # =============================================================================
+# Hosting — maintenance, listing, retries, removal, messages, credentials, install
+# =============================================================================
+
+_UPTIME_EFFECTS = {"none": "not affected",
+                   "downtime_while_client_workloads_run": "counts as downtime while a client's workload runs on it"}
+_BILLING = {"not_billed_while_open": "pods and volumes on the machine aren't billed while the window is open"}
+
+
+def _window_kind(emergency: bool) -> str:
+    return "emergency" if emergency else "regular"
+
+
+def _print_maintenance_estimate(est: MaintenanceEstimate, color: bool) -> None:
+    _kv([("machine", est.machine_id), ("reason", est.reason),
+         ("window", f"{fmt.utc_time(est.start_time)} → {fmt.utc_time(est.end_time)}"),
+         ("type", _window_kind(est.is_emergency)), ("notice", f"{est.notice_hours:.1f} hours"),
+         ("emailed now", ", ".join(est.affected_workspaces) or "nobody (no workspace uses the machine now)"),
+         ("uptime", _UPTIME_EFFECTS.get(est.uptime_effect, est.uptime_effect or "-")),
+         ("billing", _BILLING.get(est.billing, est.billing or "-"))])
+
+
+_ACTION_NOTES = {
+    "end": "The machine comes back unlisted. List it again with `meshive machine-list {machine}` when the work is done.",
+    "cancel": "Workspaces that were notified don't get a cancellation email.",
+}
+
+
+def _print_maintenance_action(action: MaintenanceAction, color: bool) -> None:
+    pairs = [("maintenance", "-" if action.maintenance_id is None else str(action.maintenance_id)),
+             ("machine", action.machine_id or "-"), ("action", action.action or "-"),
+             ("accepted", fmt.yes_no(action.accepted))]
+    window = action.window
+    if window is not None:
+        pairs += [("status", window.status), ("type", _window_kind(window.is_emergency)),
+                  ("window", f"{fmt.utc_time(window.start_time)} → {fmt.utc_time(window.end_time)}")]
+    _kv(pairs)
+    note = _ACTION_NOTES.get(action.action)
+    if note:
+        print(fmt.paint(fmt.clean(note.format(machine=action.machine_id or "<machine>")), "dim", color))
+
+
+def _maintenance_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    return dict(reason=args.reason, start=args.start, end=args.end, description=args.description or "",
+                emergency=args.emergency)
+
+
+def cmd_maintenance_schedule(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    kwargs = _maintenance_kwargs(args)
+    estimate = client.estimate_maintenance(args.machine_id, **kwargs)
+    if args.estimate:
+        _emit(output, estimate.raw, [estimate.machine_id], lambda: _print_maintenance_estimate(estimate, color))
+        return 0
+    if output == "table":
+        _print_maintenance_estimate(estimate, color)
+    count = len(estimate.affected_workspaces)
+    question = (f"Schedule {_window_kind(estimate.is_emergency)} maintenance '{estimate.reason}' on machine "
+                f"{args.machine_id} from {fmt.utc_time(estimate.start_time)} to {fmt.utc_time(estimate.end_time)}? "
+                f"{count} workspace(s) using it are emailed now.")
+    if not _confirm(args, fmt.clean(question)):
+        return 2
+    action = client.schedule_maintenance(args.machine_id, **kwargs)
+    _emit(output, action.raw, [str(action.maintenance_id)], lambda: _print_maintenance_action(action, color))
+    return 0
+
+
+def cmd_maintenance_update(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    kwargs = {key: value for key, value in (("reason", args.reason), ("description", args.description),
+                                            ("start", args.start), ("end", args.end)) if value is not None}
+    if not kwargs:
+        print("Error: nothing to change. Pass --reason, --description, --start or --end.", file=sys.stderr)
+        return 2
+    note = " The affected workspaces are emailed the new times." if "start" in kwargs or "end" in kwargs else ""
+    if not _confirm(args, f"Change maintenance window #{args.maintenance_id}?{note}"):
+        return 2
+    action = client.update_maintenance(args.maintenance_id, **kwargs)
+    _emit(output, action.raw, [str(action.maintenance_id)], lambda: _print_maintenance_action(action, color))
+    return 0
+
+
+def _maintenance_simple(method: str, question: str):
+    def handler(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+        if not _confirm(args, question.format(id=args.maintenance_id)):
+            return 2
+        action = getattr(client, method)(args.maintenance_id)
+        _emit(output, action.raw, [str(action.maintenance_id)], lambda: _print_maintenance_action(action, color))
+        return 0
+    return handler
+
+
+def cmd_maintenance_extend(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    if not _confirm(args, f"Extend maintenance window #{args.maintenance_id} by {args.hours:g} hour(s)? "
+                          "The affected workspaces are emailed."):
+        return 2
+    action = client.extend_maintenance(args.maintenance_id, hours=args.hours, reason=args.reason,
+                                       description=args.description or "")
+    _emit(output, action.raw, [str(action.maintenance_id)], lambda: _print_maintenance_action(action, color))
+    return 0
+
+
+def _print_listing(result: ListingResult, color: bool) -> None:
+    _kv([("machine", result.machine_id), ("listed", fmt.yes_no(result.listed)),
+         ("accepted", fmt.yes_no(result.accepted))])
+    if not result.listed:
+        print(fmt.paint("New pods aren't placed on it until you list it again.", "dim", color))
+
+
+def cmd_machine_list(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    # Listing only lets new pods in, so it doesn't ask (as in the console); the check gives the refusal first.
+    check = client.check_listing(args.machine_id)
+    if check.listed:
+        _emit(output, check.raw, [check.machine_id],
+              lambda: print(fmt.clean(f"Machine {check.machine_id or args.machine_id} is already listed.")))
+        return 0
+    if not check.listable:
+        why = ": ".join(part for part in (check.title, check.reason) if part) or "the server gave no reason"
+        print(fmt.clean(f"Error: machine {args.machine_id} can't be listed. {why}"), file=sys.stderr)
+        return 1
+    result = client.set_machine_listing(args.machine_id, True)
+    _emit(output, result.raw, [result.machine_id], lambda: _print_listing(result, color))
+    return 0
+
+
+def cmd_machine_unlist(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    machine = client.get_machine(args.machine_id)
+    clients = getattr(machine, "clients", None) or MachineClients()
+    running = sum(1 for p in clients.pods if p.status.lower() == "running")
+    question = (f"Unlist machine '{machine.name or args.machine_id}'? New pods can't be placed on it and stopped pods "
+                f"can't start on it again until you list it; the {running} running pod(s) keep running.")
+    if not _confirm(args, fmt.clean(question)):
+        return 2
+    result = client.set_machine_listing(args.machine_id, False)
+    _emit(output, result.raw, [result.machine_id], lambda: _print_listing(result, color))
+    return 0
+
+
+def cmd_machine_retry(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    # The console's Retry buttons don't ask either. A setup step the agent runs reboots the machine first.
+    result = client.retry_port_check(args.machine_id) if args.ports else client.retry_machine_setup(args.machine_id)
+    _emit(output, result.raw, [result.machine_id], lambda: _kv([
+        ("machine", result.machine_id or args.machine_id), ("check", result.check or ("ports" if args.ports else "setup")),
+        ("accepted", fmt.yes_no(result.accepted)), ("message", result.message or "-")]))
+    return 0
+
+
+def _print_machine_delete_check(check: MachineDeleteCheck, color: bool) -> None:
+    pods = f"{check.pod_count}" + (f" ({check.serving_replica_count} serverless replica(s))"
+                                   if check.serving_replica_count else "")
+    _kv([("machine", f"{check.name} ({check.machine_id})" if check.name else check.machine_id),
+         ("removal", "after a grace period" if check.mode == "grace_period" else "now"),
+         ("pods of others", pods), ("volumes of others", str(check.pv_count)),
+         ("workspaces", str(check.workspace_count)),
+         ("maintenance", f"{check.pending_maintenance_count} unfinished window(s), cancelled")])
+
+
+def _print_machine_deleted(deleted: MachineDeleted, color: bool) -> None:
+    pairs = [("machine", deleted.machine_id), ("accepted", fmt.yes_no(deleted.accepted)),
+             ("removal", "after a grace period" if deleted.mode == "grace_period" else "started")]
+    if deleted.grace_ends_at:
+        pairs.append(("grace ends", fmt.utc_time(deleted.grace_ends_at)))
+    if deleted.cancelled_maintenance_count:
+        pairs.append(("cancelled windows", str(deleted.cancelled_maintenance_count)))
+    _kv(pairs)
+
+
+def _confirm_typed(args: argparse.Namespace, expected: str) -> bool:
+    """Like _confirm, but the person types `expected` (the machine ID) instead of y — as the console asks."""
+    if getattr(args, "yes", False):
+        return True
+    if not sys.stdin.isatty():
+        print("Error: this command needs confirmation. Re-run with --yes to confirm.", file=sys.stderr)
+        return False
+    try:
+        sys.stdout.flush()
+    except OSError:
+        pass
+    print(f"Type the machine ID ({expected}) to remove it: ", end="", file=sys.stderr, flush=True)
+    if sys.stdin.readline().strip() == expected:
+        return True
+    print("Not removed: the ID didn't match.", file=sys.stderr)
+    return False
+
+
+def cmd_machine_delete(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    check = client.check_machine_delete(args.machine_id)
+    label = check.name or check.machine_id or args.machine_id
+    if check.already_deleting:
+        # Before any question: --yes can't get past this.
+        print(fmt.clean(f"Error: machine '{label}' is already being removed."), file=sys.stderr)
+        return 1
+    if output == "table":
+        _print_machine_delete_check(check, color)
+    if check.mode == "grace_period":
+        print(fmt.clean(f"{check.pod_count} pod(s) and {check.pv_count} volume(s) of other users are on this machine: a "
+                        f"{check.grace_hours}-hour grace period starts and their workspaces are emailed. After it, "
+                        "what is left is removed by force and data on local volumes is lost."), file=sys.stderr)
+    print("Keep the machine on and its agent running until the removal finishes. This can't be undone.",
+          file=sys.stderr)
+    if not _confirm_typed(args, check.machine_id or args.machine_id):
+        return 2
+    deleted = client.delete_machine(args.machine_id)
+    _emit(output, deleted.raw, [deleted.machine_id], lambda: _print_machine_deleted(deleted, color))
+    return 0
+
+
+def cmd_host_message_send(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    # "All" or " ALL " means every workspace too: send the server the lower-case "all" it expects.
+    to = "all" if args.to.strip().lower() == "all" else args.to
+    target = "every workspace using the machine now" if to == "all" else f"workspace {to}"
+    if not _confirm(args, fmt.clean(f"Send '{args.title}' from machine {args.machine_id} to {target}? "
+                                    "They are notified by email.")):
+        return 2
+    sent = client.send_host_message(args.machine_id, to=to, title=args.title, content=args.content or "")
+    _emit(output, sent.raw, [str(i) for i in sent.message_ids], lambda: _kv([
+        ("machine", sent.machine_id or args.machine_id), ("to", sent.to or to),
+        ("messages", ", ".join(str(i) for i in sent.message_ids) or "-"), ("accepted", fmt.yes_no(sent.accepted))]))
+    return 0
+
+
+def cmd_host_messages_read(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    # Only your own inbox flag changes, so it doesn't ask.
+    result = client.mark_host_messages_read(args.machine_id, args.message_ids)
+    _emit(output, result.raw, [str(result.marked)], lambda: _kv([
+        ("machine", result.machine_id or args.machine_id), ("marked read", str(result.marked))]))
+    return 0
+
+
+_CREDENTIAL_LABELS = {"ssh": "SSH login (a shell on the machine itself)",
+                      "ipmi": "IPMI login (out-of-band power and console)", "grafana": "Grafana dashboard login"}
+
+
+def cmd_machine_credentials(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    """Prints the login — does not connect for you."""
+    kind = "ssh" if args.ssh else "ipmi" if args.ipmi else "grafana"
+    print(fmt.clean(f"This prints machine {args.machine_id}'s {_CREDENTIAL_LABELS[kind]}, password included, and "
+                    "emails the account owner."), file=sys.stderr)
+    if not _confirm(args, f"Reveal the {kind} credentials of machine {args.machine_id}?"):
+        return 2
+    creds = client.reveal_machine_credentials(args.machine_id, kind)
+    ssh, ipmi, grafana = creds.ssh, creds.ipmi, creds.grafana
+    if ssh is not None:
+        ids = [ssh.command]
+    elif grafana is not None:
+        ids = [grafana.url]
+    else:
+        ids = [ipmi.username or ""] if ipmi is not None else []
+
+    def show() -> None:
+        if ssh is not None:
+            _kv([("command", ssh.command or "-"), ("host", ssh.host or "-"), ("port", str(ssh.port)),
+                 ("username", ssh.username or "-"), ("password", ssh.password or "-"),
+                 ("verified", fmt.yes_no(ssh.is_verified))])
+        elif ipmi is not None:
+            _kv([("username", ipmi.username or "-"), ("password", ipmi.password or "-"), ("status", ipmi.status or "-")])
+        elif grafana is not None:
+            _kv([("url", grafana.url or "-"), ("username", grafana.username or "-"),
+                 ("password", grafana.password or "-")])
+        print(fmt.paint("Keep it to yourself: don't paste it into files, commits or chats.", "dim", color))
+
+    _emit(output, creds.raw, ids, show)
+    return 0
+
+
+def cmd_host_install(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    """Prints the install command — does not run it for you."""
+    agent = "storage" if args.storage else "compute"
+    print("For about 10 minutes the install command registers machines to your account. Run it only on the machine "
+          "you mean to add, as root, and share it with no one. The account owner is emailed.", file=sys.stderr)
+    if not _confirm(args, f"Get an install command for a new {agent} machine?"):
+        return 2
+    install = client.issue_install_command(agent)
+
+    def show() -> None:
+        _kv([("agent", install.agent_type or agent),
+             ("expires", fmt.relative_time(install.expires_at) if install.expires_at else "-"),
+             ("command", install.command)])
+        print(fmt.paint("Run it as root on the new machine. It shows up in `meshive machines` once its agent "
+                        "connects.", "dim", color))
+
+    _emit(output, install.raw, [install.command], show)
+    return 0
+
+
+# =============================================================================
 # Parser
 # =============================================================================
 
@@ -1448,6 +1737,78 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("task_id"); p.add_argument("--tail", type=int, default=200, metavar="N")
     p.add_argument("--wait", type=float, default=None, metavar="SECONDS"); p.add_argument("--cursor", type=int, default=None)
 
+    # --- hosting ---
+    machine_help = "Machine ID. See ID column of `meshive machines`."
+    window_help = "Maintenance window ID. See ID column of `meshive maintenance <machine>`."
+    p = sub.add_parser("maintenance-schedule", parents=[common],
+                       help="Schedule a maintenance window on a machine (shows who is emailed first).")
+    p.add_argument("machine_id", help=machine_help)
+    p.add_argument("--reason", required=True, help="Why — the workspaces using the machine see it in their email.")
+    p.add_argument("--start", required=True, metavar="ISO",
+                   help="Start, ISO 8601 (e.g. 2026-11-20T09:00:00Z). Without an offset it is UTC. A regular window "
+                        "starts at least 48 hours ahead.")
+    p.add_argument("--end", required=True, metavar="ISO", help="End, ISO 8601.")
+    p.add_argument("--description", default=None, help="More detail for the workspaces.")
+    p.add_argument("--emergency", action="store_true",
+                   help="Emergency maintenance: can start sooner, but counts as downtime while a client's workload "
+                        "runs on the machine.")
+    p.add_argument("--estimate", action="store_true", help="Only run the checks and show who is emailed; schedule nothing.")
+    _yes(p)
+    p = sub.add_parser("maintenance-update", parents=[common], help="Change a maintenance window that hasn't started.")
+    p.add_argument("maintenance_id", type=int, help=window_help)
+    p.add_argument("--reason", default=None); p.add_argument("--description", default=None)
+    p.add_argument("--start", default=None, metavar="ISO"); p.add_argument("--end", default=None, metavar="ISO")
+    _yes(p)
+    for name, help_text in (("maintenance-end", "End a maintenance window now (billing resumes; the machine comes "
+                                                "back unlisted)."),
+                            ("maintenance-cancel", "Cancel a maintenance window that hasn't started.")):
+        p = sub.add_parser(name, parents=[common], help=help_text)
+        p.add_argument("maintenance_id", type=int, help=window_help)
+        _yes(p)
+    p = sub.add_parser("maintenance-extend", parents=[common], help="Make a maintenance window in progress longer.")
+    p.add_argument("maintenance_id", type=int, help=window_help)
+    p.add_argument("--hours", type=float, required=True, metavar="H", help="How many hours longer.")
+    p.add_argument("--reason", required=True, help="Why — the workspaces using the machine see it in their email.")
+    p.add_argument("--description", default=None)
+    _yes(p)
+    p = sub.add_parser("machine-list", parents=[common],
+                       help="List a machine so new pods can be placed on it (says why when it can't be).")
+    p.add_argument("machine_id", help=machine_help)
+    p = sub.add_parser("machine-unlist", parents=[common],
+                       help="Unlist a machine: no new pods are placed on it; running pods keep running.")
+    p.add_argument("machine_id", help=machine_help)
+    _yes(p)
+    p = sub.add_parser("machine-retry", parents=[common],
+                       help="Retry a machine's failed setup step (a step the agent runs reboots the machine first).")
+    p.add_argument("machine_id", help=machine_help)
+    p.add_argument("--ports", action="store_true", help="Check the machine's ports again instead.")
+    p = sub.add_parser("machine-delete", parents=[common],
+                       help="Remove a machine from Meshive (shows what runs on it first; asks for the machine ID).")
+    p.add_argument("machine_id", help=machine_help)
+    _yes(p)
+    p = sub.add_parser("host-message-send", parents=[common],
+                       help="Send a message to a workspace using your machine (they are emailed).")
+    p.add_argument("machine_id", help=machine_help)
+    p.add_argument("--to", required=True, metavar="WORKSPACE|all",
+                   help="A workspace ID from the Clients of `meshive machine <id>`, or all of them.")
+    p.add_argument("--title", required=True); p.add_argument("--content", default=None)
+    _yes(p)
+    p = sub.add_parser("host-messages-read", parents=[common], help="Mark incoming messages of a machine read.")
+    p.add_argument("machine_id", help=machine_help)
+    p.add_argument("message_ids", type=int, nargs="+", metavar="ID", help="Message IDs from `meshive host-messages`.")
+    p = sub.add_parser("machine-credentials", parents=[common],
+                       help="Print a machine's SSH, IPMI or Grafana login (the account owner is emailed).")
+    p.add_argument("machine_id", help=machine_help)
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--ssh", action="store_true", help="SSH login to the machine itself.")
+    g.add_argument("--ipmi", action="store_true", help="IPMI login (out-of-band power and console).")
+    g.add_argument("--grafana", action="store_true", help="Grafana dashboard login.")
+    _yes(p)
+    p = sub.add_parser("host-install", parents=[common],
+                       help="Print the command that adds a new machine to your account (valid about 10 minutes).")
+    p.add_argument("--storage", action="store_true", help="For a storage machine (default: a GPU or CPU machine).")
+    _yes(p)
+
 
 HANDLERS: dict[str, Handler] = {
     "workspace-create": cmd_workspace_create,
@@ -1481,4 +1842,21 @@ HANDLERS: dict[str, Handler] = {
     "task-stop": cmd_task_stop,
     "logs": cmd_logs,
     "task-logs": cmd_task_logs,
+    "maintenance-schedule": cmd_maintenance_schedule,
+    "maintenance-update": cmd_maintenance_update,
+    "maintenance-end": _maintenance_simple(
+        "end_maintenance", "End maintenance window #{id} now? The pods and volumes on the machine are billed again "
+                           "from now on, and the machine comes back unlisted."),
+    "maintenance-cancel": _maintenance_simple(
+        "cancel_maintenance", "Cancel maintenance window #{id}? It is removed for good, and workspaces that were "
+                              "notified don't get a cancellation email."),
+    "maintenance-extend": cmd_maintenance_extend,
+    "machine-list": cmd_machine_list,
+    "machine-unlist": cmd_machine_unlist,
+    "machine-retry": cmd_machine_retry,
+    "machine-delete": cmd_machine_delete,
+    "host-message-send": cmd_host_message_send,
+    "host-messages-read": cmd_host_messages_read,
+    "machine-credentials": cmd_machine_credentials,
+    "host-install": cmd_host_install,
 }

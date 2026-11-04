@@ -1695,7 +1695,8 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p = sub.add_parser("model-register", parents=[common], help="Register a Hugging Face model for serving (free; it downloads when deployed).")
     p.add_argument("workspace"); p.add_argument("repo", help="Hugging Face repo, e.g. Qwen/Qwen3-0.6B.")
     p.add_argument("--name", default=None, help="Display name (default: the repo name).")
-    p.add_argument("--framework", default=None, choices=["vllm", "sglang"])
+    p.add_argument("--framework", default=None, choices=["vllm"],
+                   help="Serving engine. Text models run on vllm, the default and the only choice.")
     p.add_argument("--hf-token", type=int, default=None, metavar="ID", help="Token ID from `meshive hf-tokens` (private repos).")
     p.add_argument("--context", type=int, default=None, metavar="TOKENS", help="Max context (default: detected).")
     p = sub.add_parser("model-delete", parents=[common], help="Delete a model registration (not while it is deployed).")

@@ -511,9 +511,12 @@ def storage_update_body(*, name: str | None = None, size_gb: int | None = None, 
 
 def model_body(huggingface_repo: str, *, hf_token_id: int | None = None, name: str | None = None,
                framework: str | None = None, context_length: int | None = None) -> dict[str, Any]:
-    """Body for detecting/registering a serving model. HF tokens are accepted only as the id of one saved in the workspace (the value is never sent)."""
-    if framework is not None and framework not in ("vllm", "sglang"):
-        raise ValueError("framework must be 'vllm' or 'sglang'")
+    """Body for detecting/registering a serving model. HF tokens are accepted only as the id of one saved in the workspace (the value is never sent).
+
+    Text models are served with vLLM. The server decides which engines it accepts and answers any other `framework`
+    with a 400 that says why, so only the type is checked here."""
+    if framework is not None:
+        framework = _require_str(framework, "framework")
     return _drop_none({
         "huggingfaceRepo": _require_str(huggingface_repo, "huggingface_repo").strip(),
         "hfTokenId": _optional_int(hf_token_id, "hf_token_id", minimum=0), "modelName": name or None,

@@ -510,11 +510,13 @@ def test_model_commands(capsys, non_tty):
     assert _last("detect_model")[2] == {"workspace": "ws", "hf_token_id": 4}
 
     # Registration costs nothing, so it proceeds without --yes (non-interactive)
-    assert cli.main(["model-register", "ws", "Qwen/Qwen3-0.6B", "--name", "qwen-small", "--framework", "sglang"]) == 0
+    assert cli.main(["model-register", "ws", "Qwen/Qwen3-0.6B", "--name", "qwen-small", "--framework", "vllm"]) == 0
     out = capsys.readouterr().out
     assert "Already registered: model #12" in out and "serving-deploy ws 12" in out
-    assert _last("register_model")[2] == {"workspace": "ws", "name": "qwen-small", "framework": "sglang",
+    assert _last("register_model")[2] == {"workspace": "ws", "name": "qwen-small", "framework": "vllm",
                                           "hf_token_id": None, "context_length": None}
+    with pytest.raises(SystemExit):              # text models run on vllm only
+        cli.main(["model-register", "ws", "Qwen/Qwen3-0.6B", "--framework", "sglang"])
 
     assert cli.main(["model-delete", "12"]) == 2                 # deleting needs confirmation
     assert cli.main(["model-delete", "12", "--yes"]) == 0

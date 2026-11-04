@@ -1593,7 +1593,10 @@ class Meshive(_BaseClient):
     def register_model(self, huggingface_repo: str, *, workspace: str, name: str | None = None,
                        framework: str | None = None, hf_token_id: int | None = None,
                        context_length: int | None = None, idempotency_key: str | None = None) -> ResourceAction:
-        """Register a serving model (201) — `id` is the registration id. No cost (the download happens at deploy). The same repo returns the existing registration."""
+        """Register a serving model (201) — `id` is the registration id. No cost (the download happens at deploy). The same repo returns the existing registration.
+
+        Text models are served with vLLM, so leave `framework` out or pass "vllm". The server refuses "sglang" with a
+        400 (`MeshiveAPIError`) that says so."""
         body = _write.model_body(huggingface_repo, hf_token_id=hf_token_id, name=name, framework=framework,
                                  context_length=context_length)
         try:

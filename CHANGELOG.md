@@ -90,6 +90,14 @@ console.
   a write ends with now carries them, as timeouts and API errors already did: pass them to `get_operation` to see
   whether it was applied. Which errors are resent hasn't changed; these still are not, since the server may have
   applied the write.
+- **`framework="sglang"` is no longer accepted.** Meshive serves text models with vLLM, and image and video models
+  with ComfyUI. `register_model(..., framework="sglang")` now gets a 400 from the server (`MeshiveAPIError`) that says
+  so; older SDK versions get the same answer. Leave `framework` out or pass `"vllm"`. Models you registered with
+  SGLang before stay registered.
+- **`meshive model-register --framework`** accepts only `vllm`, the default.
+- **The server checks `framework`.** The SDK no longer keeps its own list of engines: it only checks that
+  `framework` is a non-empty string (`ValueError` otherwise), and the server answers an engine it doesn't serve with a
+  400.
 
 ## v1.7.0
 

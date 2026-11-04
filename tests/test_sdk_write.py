@@ -442,14 +442,27 @@ def test_model_registration_methods():
 
     rec = Recorder((201, {"resource": "model", "id": "12", "workspace": "ws", "action": "register",
                           "result": {"title": "Already Registered", "registrationId": 12}}))
-    r = sync_client(rec).register_model("Qwen/Qwen3-0.6B", workspace="ws", name="qwen-small", framework="sglang",
+    r = sync_client(rec).register_model("Qwen/Qwen3-0.6B", workspace="ws", name="qwen-small", framework="vllm",
                                         context_length=8192)
     assert rec.last.method == "POST" and rec.last.headers["Idempotency-Key"]
     assert json.loads(rec.last.content) == {"huggingfaceRepo": "Qwen/Qwen3-0.6B", "modelName": "qwen-small",
-                                            "framework": "sglang", "contextLength": 8192}
+                                            "framework": "vllm", "contextLength": 8192}
     assert r.id == "12" and r.resource == "model"
     with pytest.raises(ValueError):
+        sync_client(rec).register_model("Qwen/Qwen3-0.6B", workspace="ws", framework=" ")
+
+    # The server decides which engines it serves and says why it refuses one, so the value goes out unchanged.
+    rec = Recorder((400, {"detail": {"title": "SGLang Not Offered",
+                                     "message": "SGLang is no longer offered for text models. Text models are served "
+                                                "with vLLM — omit framework or set framework='vllm'."}}))
+    with pytest.raises(MeshiveAPIError) as refused:
+        sync_client(rec).register_model("Qwen/Qwen3-0.6B", workspace="ws", framework="sglang")
+    assert json.loads(rec.last.content)["framework"] == "sglang"
+    assert refused.value.status_code == 400 and "vLLM" in str(refused.value)
+    rec = Recorder((400, {"detail": {"title": "Unsupported framework for LLM modality", "message": "Use 'vllm'."}}))
+    with pytest.raises(MeshiveAPIError):
         sync_client(rec).register_model("Qwen/Qwen3-0.6B", workspace="ws", framework="comfyui")
+    assert json.loads(rec.last.content)["framework"] == "comfyui"     # no local engine list
 
     rec = Recorder((200, {"resource": "model", "id": "12", "action": "delete", "result": {"title": "Success"}}))
     sync_client(rec).delete_model(12)

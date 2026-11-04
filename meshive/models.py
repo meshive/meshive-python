@@ -1076,7 +1076,7 @@ class ModelDetection:
     output: str | None = None      # text | image | video
     takes_image: bool = False      # whether it accepts image input (VLMs, ...)
     capability: str | None = None  # text_generation | embedding | text_to_image ...
-    framework: str | None = None   # vllm | sglang
+    framework: str | None = None   # vllm for text models
     detail: str | None = None      # reason for unsupported/failed
     architecture: str | None = None
     file_size_bytes: int | None = None

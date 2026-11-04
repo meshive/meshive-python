@@ -339,6 +339,34 @@ def test_generated_key_is_available_after_timeout_and_can_be_reused():
     assert seen == [key, key]
 
 
+# The other httpx errors a write can end with: the connection broke after the request may have reached the server
+# (as when the API restarts a worker mid-request), the answer could not be read, or the request could not be sent.
+CUT_OFF = [httpx.ReadError, httpx.WriteError, httpx.CloseError, httpx.RemoteProtocolError, httpx.LocalProtocolError,
+           httpx.ProxyError, httpx.UnsupportedProtocol, httpx.DecodingError]
+
+
+@pytest.mark.parametrize("failure", CUT_OFF)
+def test_a_write_cut_off_mid_request_is_not_resent_and_keeps_its_operation_identity(slept, failure):
+    seen = []
+
+    def cut_off(request):
+        seen.append(request.headers["Idempotency-Key"])
+        raise failure("Server disconnected without sending a response.", request=request)
+
+    async def run_async():
+        async with async_client(cut_off) as c:
+            await c.stop_task("task_1")
+
+    with pytest.raises(failure) as sync_err:
+        sync_client(cut_off).stop_task("task_1")
+    with pytest.raises(failure) as async_err:
+        asyncio.run(run_async())
+    assert len(seen) == 2 and slept == []           # each client sent it once
+    for err, key in zip((sync_err, async_err), seen):
+        assert (err.value.idempotency_key, err.value.operation_method, err.value.operation_path) == (
+            key, "POST", "/tasks/task_1/stop")
+
+
 def test_write_result_and_status_lookup_keep_operation_identity():
     rec = Recorder((202, {'podName': 'p', 'action': 'start'}))
     result = sync_client(rec).start_pod('p', 'ws', placement='any_node', allow_data_loss=True,
@@ -1279,6 +1307,56 @@ def test_create_pod_with_a_model_set_is_resent_when_no_connection_was_used(slept
 
     assert sync_client(flaky).create_pod("p", 457, workspace="ws", model_set="s").transaction_id == 6
     assert len(attempts) == 2 and slept == [0.5]
+
+
+def test_async_writes_are_resent_after_a_timeout_or_when_no_connection_was_used(slept):
+    stops, creates = [], []
+
+    def stop(request):
+        stops.append(request.headers["Idempotency-Key"])
+        if len(stops) == 1:
+            raise httpx.ReadTimeout("no answer", request=request)
+        if len(stops) == 2:
+            raise httpx.ConnectError("refused", request=request)
+        return httpx.Response(202, json={"podName": "p-0", "workspace": "ws", "action": "stop"})
+
+    def create(request):
+        creates.append(request.headers["Idempotency-Key"])
+        if len(creates) == 1:
+            raise httpx.PoolTimeout("no connection", request=request)
+        return httpx.Response(202, json={"name": "p", "workspace": "ws", "transactionId": 6, "estimate": ESTIMATE})
+
+    async def main():
+        async with async_client(stop) as c:
+            action = await c.stop_pod("p-0", "ws")
+        async with async_client(create) as c:
+            created = await c.create_pod("p", 457, workspace="ws", model_set="s")
+        return action, created
+
+    action, created = asyncio.run(main())
+    assert action.action == "stop" and len(stops) == 3 and len(set(stops)) == 1
+    assert created.transaction_id == 6 and len(creates) == 2 and len(set(creates)) == 1
+    assert slept == [0.5, 1.0, 0.5]
+
+
+def test_create_pod_with_a_model_set_cut_off_mid_request_is_not_resent_and_keeps_its_identity(slept):
+    seen = []
+
+    def cut_off(request):
+        seen.append(request.headers["Idempotency-Key"])
+        raise httpx.RemoteProtocolError("Server disconnected without sending a response.", request=request)
+
+    async def run_async():
+        async with async_client(cut_off) as c:
+            await c.create_pod("p", 457, workspace="ws", model_set="sdxl-basics")
+
+    with pytest.raises(httpx.RemoteProtocolError) as sync_err:
+        sync_client(cut_off).create_pod("p", 457, workspace="ws", model_set="sdxl-basics")
+    with pytest.raises(httpx.RemoteProtocolError) as async_err:
+        asyncio.run(run_async())
+    assert len(seen) == 2 and slept == []
+    for err, key in zip((sync_err, async_err), seen):
+        assert (err.value.idempotency_key, err.value.operation_method, err.value.operation_path) == (key, "POST", "/pods")
 
 
 def test_model_set_errors_come_back_as_they_are():

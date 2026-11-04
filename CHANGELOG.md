@@ -81,6 +81,16 @@ unlisting, removing a machine, sending a message, revealing credentials, getting
 `--yes`. `machine-list`, `machine-retry` and `host-messages-read` change only your own machine and don't ask, as in the
 console.
 
+### Changes
+
+- **A write cut off mid-request can be looked up like one that timed out.** When the connection broke after a write
+  was sent (`httpx.RemoteProtocolError` "Server disconnected without sending a response.", `httpx.ReadError`,
+  `httpx.WriteError`, ...) or its answer couldn't be decoded (`httpx.DecodingError`), the error came without
+  `idempotency_key`, `operation_method` and `operation_path`, so a generated key was lost. Every `httpx.RequestError`
+  a write ends with now carries them, as timeouts and API errors already did: pass them to `get_operation` to see
+  whether it was applied. Which errors are resent hasn't changed; these still are not, since the server may have
+  applied the write.
+
 ## v1.7.0
 
 Creating a client is much cheaper, and clients can share connections. Code written for 1.0 to 1.6 keeps working.

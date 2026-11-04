@@ -405,7 +405,7 @@ def _raise_for_status(status_code: int, payload: Any, headers: httpx.Headers) ->
 
 
 # --- Retries -----------------------------------------------------------------
-# Only transient failures (rate limit / gateway errors / dropped connections) are retried. Other 4xx
+# Only transient failures (rate limit / gateway errors / connections not made / timeouts) are retried. Other 4xx
 # give the same result on retry, so they raise immediately. GET is idempotent, and write requests resend the same
 # Idempotency-Key (the server replays the first response), so they can be retried without double creation.
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
@@ -433,6 +433,13 @@ def _may_resend(long_running: bool, *, exc: BaseException | None = None,
     if exc is not None:
         return isinstance(exc, _NOT_STARTED_EXCEPTIONS)
     return response is not None and response.status_code in _NOT_STARTED_STATUSES
+
+
+def _mark_operation(exc: BaseException, key: str, method: str, path: str) -> None:
+    """Attach a write's identity to the error it ended with, so its outcome can be looked up (get_operation)."""
+    exc.idempotency_key = key
+    exc.operation_method = method
+    exc.operation_path = path
 
 
 # Building an SSL context loads the whole CA bundle, which was most of the cost of creating a client. The context
@@ -705,19 +712,20 @@ class Meshive(_BaseClient):
             except _RETRY_EXCEPTIONS as exc:
                 delay = self._retry_delay(attempt) if _may_resend(long_running, exc=exc) else None
                 if delay is None:
-                    exc.idempotency_key = headers["Idempotency-Key"]
-                    exc.operation_method = method
-                    exc.operation_path = path
+                    _mark_operation(exc, headers["Idempotency-Key"], method, path)
                     raise
+            except httpx.RequestError as exc:
+                # Not resent: the connection broke after the request may have reached the server, the answer
+                # couldn't be read, or the request couldn't be sent. As after a timeout, look the outcome up.
+                _mark_operation(exc, headers["Idempotency-Key"], method, path)
+                raise
             else:
                 delay = self._retry_delay(attempt, response) if _may_resend(long_running, response=response) else None
                 if delay is None:
                     try:
                         data = self._process(response)
                     except Exception as exc:
-                        exc.idempotency_key = headers["Idempotency-Key"]
-                        exc.operation_method = method
-                        exc.operation_path = path
+                        _mark_operation(exc, headers["Idempotency-Key"], method, path)
                         raise
                     if isinstance(data, dict):
                         data = {**data, "idempotencyKey": headers["Idempotency-Key"],
@@ -2003,19 +2011,20 @@ class AsyncMeshive(_BaseClient):
             except _RETRY_EXCEPTIONS as exc:
                 delay = self._retry_delay(attempt) if _may_resend(long_running, exc=exc) else None
                 if delay is None:
-                    exc.idempotency_key = headers["Idempotency-Key"]
-                    exc.operation_method = method
-                    exc.operation_path = path
+                    _mark_operation(exc, headers["Idempotency-Key"], method, path)
                     raise
+            except httpx.RequestError as exc:
+                # Not resent: the connection broke after the request may have reached the server, the answer
+                # couldn't be read, or the request couldn't be sent. As after a timeout, look the outcome up.
+                _mark_operation(exc, headers["Idempotency-Key"], method, path)
+                raise
             else:
                 delay = self._retry_delay(attempt, response) if _may_resend(long_running, response=response) else None
                 if delay is None:
                     try:
                         data = self._process(response)
                     except Exception as exc:
-                        exc.idempotency_key = headers["Idempotency-Key"]
-                        exc.operation_method = method
-                        exc.operation_path = path
+                        _mark_operation(exc, headers["Idempotency-Key"], method, path)
                         raise
                     if isinstance(data, dict):
                         data = {**data, "idempotencyKey": headers["Idempotency-Key"],

@@ -12,6 +12,40 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## Unreleased
+
+Creating a client is much cheaper, and clients can share connections. Code written for 1.0 to 1.6 keeps working.
+
+### What's new
+
+- **Share connections between clients.** Code that creates many clients, such as a server with one per request and
+  API key, can create one transport and pass it to each:
+
+  ```python
+  transport = httpx.AsyncHTTPTransport()                         # once, at startup
+  async with AsyncMeshive(key, transport=transport) as client:   # per request
+      ...
+  await transport.aclose()                                       # at shutdown
+  ```
+
+  `Meshive` takes an `httpx.HTTPTransport` the same way. Only the connections are shared. Every client still sends
+  its own key and headers with each request, keeps its own cookies and applies its own `timeout`, so nothing one
+  client receives reaches another. `close()` and leaving a `with` block don't close the transport; you do. All the
+  clients wait for the same pool, so size it for them (`limits=httpx.Limits(...)`), and use an async transport from
+  one event loop only. Proxy and certificate settings come from the transport as well (`proxy=`, `verify=`):
+  `HTTPS_PROXY` and the other proxy variables aren't read for it.
+
+### Changes
+
+- **Creating a client is cheaper.** Each client used to build its own SSL context, which loads the whole CA bundle
+  and took a few milliseconds of CPU, most of the cost of a client. Clients now reuse one per thread, built the same
+  way, so the same certificates are trusted. It is built again when `SSL_CERT_FILE` or `SSL_CERT_DIR` changes or
+  `truststore.inject_into_ssl()` runs. Other changes to the CA files reach only threads that haven't created a client
+  yet.
+- **A long-running create is resent when no connection was free.** `create_pod` with a model set or a Hugging Face
+  token treated `httpx.PoolTimeout` like a timeout whose outcome is unknown. Nothing had been sent, so it is now
+  resent like a refused connection.
+
 ## v1.6.0
 
 You can now create, rename and delete workspaces from the SDK and CLI, and wait until a new one is ready to use. Code

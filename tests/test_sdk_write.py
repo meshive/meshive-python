@@ -1267,13 +1267,14 @@ def test_create_pod_with_a_model_set_is_resent_only_when_it_never_started(slept,
         assert len(rec.requests) == 1
 
 
-def test_create_pod_with_a_model_set_is_resent_when_the_connection_failed(slept):
+@pytest.mark.parametrize("failure", [httpx.ConnectError, httpx.PoolTimeout])   # nothing was sent either way
+def test_create_pod_with_a_model_set_is_resent_when_no_connection_was_used(slept, failure):
     attempts = []
 
     def flaky(request):
         attempts.append(request)
         if len(attempts) == 1:
-            raise httpx.ConnectError("refused", request=request)
+            raise failure("no connection", request=request)
         return httpx.Response(202, json={"name": "p", "workspace": "ws", "transactionId": 6, "estimate": ESTIMATE})
 
     assert sync_client(flaky).create_pod("p", 457, workspace="ws", model_set="s").transaction_id == 6

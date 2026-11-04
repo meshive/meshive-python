@@ -17,6 +17,8 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import ssl
+import threading
 import time
 import uuid
 import warnings
@@ -335,11 +337,11 @@ _MAX_RETRY_AFTER = 60.0
 
 # A long-running write (create_pod with a model set: the server fetches the set's files before it answers) waits up
 # to this long for the answer, and is resent automatically only when the server surely never started on it — the
-# connection was never made, or the request was refused with 429/503. After a timeout or a gateway error the first
-# request may still be running, and a resend with the same Idempotency-Key is refused with 409
-# 'Operation Outcome Unknown' until it ends.
+# connection was never made, no pooled connection came free in time (PoolTimeout, possible when clients share a
+# transport), or the request was refused with 429/503. After a timeout or a gateway error the first request may still
+# be running, and a resend with the same Idempotency-Key is refused with 409 'Operation Outcome Unknown' until it ends.
 LONG_RUNNING_READ_TIMEOUT = 900.0
-_NOT_STARTED_EXCEPTIONS = (httpx.ConnectError, httpx.ConnectTimeout)
+_NOT_STARTED_EXCEPTIONS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 _NOT_STARTED_STATUSES = frozenset({429, 503})
 
 
@@ -351,6 +353,22 @@ def _may_resend(long_running: bool, *, exc: BaseException | None = None,
     if exc is not None:
         return isinstance(exc, _NOT_STARTED_EXCEPTIONS)
     return response is not None and response.status_code in _NOT_STARTED_STATUSES
+
+
+# Building an SSL context loads the whole CA bundle, which was most of the cost of creating a client. The context
+# httpx would build for verify=True is kept per thread instead, so clients created on different threads get different
+# contexts (httpcore sets ALPN on the context at every connect). It is rebuilt when the variables httpx reads for it
+# change, or when ssl.SSLContext itself is replaced (truststore.inject_into_ssl()). The CA files are read only then.
+_SSL_ENV = ("SSL_CERT_FILE", "SSL_CERT_DIR", "SSLKEYLOGFILE")
+_ssl_contexts = threading.local()
+
+
+def _default_ssl_context() -> ssl.SSLContext:
+    key = (ssl.SSLContext, *(os.environ.get(name) for name in _SSL_ENV))
+    cached = getattr(_ssl_contexts, "entry", None)
+    if cached is None or cached[0] != key:
+        cached = _ssl_contexts.entry = (key, httpx.create_ssl_context(verify=True, trust_env=True))
+    return cached[1]
 
 
 class _BaseClient:
@@ -545,6 +563,12 @@ class Meshive(_BaseClient):
             print(ws.namespace_name)
 
     Used as a context manager (`with Meshive() as client:`), connections are cleaned up automatically.
+
+    Code that creates many clients (a server with one per request and API key) can let them share connections:
+    create one `transport = httpx.HTTPTransport()`, pass `transport=transport` to each client, and call
+    `transport.close()` when you shut down. Only the connections are shared: every client keeps its own key, headers,
+    cookies and timeout, but all of them wait for the same pool (size it with `httpx.HTTPTransport(limits=...)`).
+    close() leaves the transport open.
     """
 
     def __init__(
@@ -555,9 +579,15 @@ class Meshive(_BaseClient):
         timeout: float = 30.0,
         max_retries: int = 2,
         headers: dict[str, str] | None = None,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
         super().__init__(api_key, base_url=base_url, timeout=timeout, max_retries=max_retries, headers=headers)
-        self._client = httpx.Client(timeout=timeout)
+        # The httpx client is this instance's own either way, so cookies and default headers never cross instances.
+        self._owns_transport = transport is None
+        if transport is None:
+            self._client = httpx.Client(timeout=timeout, verify=_default_ssl_context())
+        else:
+            self._client = httpx.Client(timeout=timeout, transport=transport)
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         url = self._url(path)
@@ -1536,7 +1566,9 @@ class Meshive(_BaseClient):
         return Logs.from_dict(self._get(f"/tasks/{_path_segment(task_id, 'task_id')}/logs", params))
 
     def close(self) -> None:
-        self._client.close()
+        # Closing the httpx client would close its transport too, and a transport passed in belongs to the caller.
+        if self._owns_transport:
+            self._client.close()
 
     def __enter__(self) -> "Meshive":
         return self
@@ -1553,6 +1585,9 @@ class AsyncMeshive(_BaseClient):
         async with AsyncMeshive() as client:
             me = await client.me()
             pods = await client.list_pods("my-workspace")
+
+    Clients can share connections through one transport, as with Meshive: create `httpx.AsyncHTTPTransport()` once,
+    pass it to each client, use it from a single event loop, and `await transport.aclose()` when you shut down.
     """
 
     def __init__(
@@ -1563,9 +1598,15 @@ class AsyncMeshive(_BaseClient):
         timeout: float = 30.0,
         max_retries: int = 2,
         headers: dict[str, str] | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         super().__init__(api_key, base_url=base_url, timeout=timeout, max_retries=max_retries, headers=headers)
-        self._client = httpx.AsyncClient(timeout=timeout)
+        # The httpx client is this instance's own either way, so cookies and default headers never cross instances.
+        self._owns_transport = transport is None
+        if transport is None:
+            self._client = httpx.AsyncClient(timeout=timeout, verify=_default_ssl_context())
+        else:
+            self._client = httpx.AsyncClient(timeout=timeout, transport=transport)
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         url = self._url(path)
@@ -2457,7 +2498,9 @@ class AsyncMeshive(_BaseClient):
         return Logs.from_dict(await self._get(f"/tasks/{_path_segment(task_id, 'task_id')}/logs", params))
 
     async def close(self) -> None:
-        await self._client.aclose()
+        # Closing the httpx client would close its transport too, and a transport passed in belongs to the caller.
+        if self._owns_transport:
+            await self._client.aclose()
 
     async def __aenter__(self) -> "AsyncMeshive":
         return self

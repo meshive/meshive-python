@@ -103,6 +103,11 @@ with Meshive() as client:  # uses the key saved by `meshive login`, or MESHIVE_A
 as the exact numbers the server sent; `format_hourly` and `format_usd` round them the way the console
 shows them.
 
+A program that creates many clients, such as a server with one per API key, can let them share connections: create
+one `transport = httpx.AsyncHTTPTransport()` (or `httpx.HTTPTransport()` for `Meshive`) at startup and pass
+`transport=transport` to each client. Every client still sends only its own key. Closing a client leaves the
+transport open; close it yourself at shutdown.
+
 Errors are exceptions you can catch by kind. All of them derive from `MeshiveError`:
 
 ```python

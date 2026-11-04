@@ -12,7 +12,7 @@ Upgrade with:
 pip install -U meshive
 ```
 
-## Unreleased
+## v1.7.0
 
 Creating a client is much cheaper, and clients can share connections. Code written for 1.0 to 1.6 keeps working.
 
@@ -33,7 +33,8 @@ Creating a client is much cheaper, and clients can share connections. Code writt
   client receives reaches another. `close()` and leaving a `with` block don't close the transport; you do. All the
   clients wait for the same pool, so size it for them (`limits=httpx.Limits(...)`), and use an async transport from
   one event loop only. Proxy and certificate settings come from the transport as well (`proxy=`, `verify=`):
-  `HTTPS_PROXY` and the other proxy variables aren't read for it.
+  `HTTPS_PROXY` and the other proxy variables aren't read for it. With many requests in flight at once, separate
+  clients can use less CPU than one shared pool, so measure before you switch.
 
 ### Changes
 

@@ -41,6 +41,14 @@ written for 1.0 to 1.8 keeps working.
 
 - **`meshive task <id>` says `log: deleted …` where it said `outputs: deleted …`.** After its retention period only a
   task's log is deleted; its outputs stay in Assets. `Task.outputs_purged_at` is when the log was deleted.
+- **A write the server already answered says so.** When a write is sent with an `idempotency_key` the server has
+  already answered (a retry, or a key used again), the server returns its first answer and does nothing new. The
+  result used to look like a fresh success; it now has `replayed=True`: the write was done once, by the earlier
+  request. Every result of a write that takes `idempotency_key` has the field, except `connect_storage`, which
+  returns the storage's connection state (`ResourceAction`, `PodCreated`, `PodUpdated`, `StorageCreated`,
+  `StorageUpdated`, `WorkspaceCreated`, `WorkspaceUpdated`, `TaskSubmitted`, `AssetImported`, `WatchedFolders`,
+  `MaintenanceAction`, `ListingResult`, `RetryResult`, `MachineDeleted`, `MessageSent` and `MessagesRead`), and it is
+  `False` when this request did the write. To do it again as a new write, use a new key.
 
 ## v1.8.0
 

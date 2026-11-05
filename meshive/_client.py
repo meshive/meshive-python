@@ -442,6 +442,12 @@ def _mark_operation(exc: BaseException, key: str, method: str, path: str) -> Non
     exc.operation_path = path
 
 
+def _replayed(response: httpx.Response) -> bool:
+    """Whether the server answered a write with the stored answer to an earlier request with the same
+    Idempotency-Key (`Idempotent-Replayed: true`) instead of doing it again."""
+    return response.headers.get("Idempotent-Replayed", "").strip().lower() == "true"
+
+
 # Building an SSL context loads the whole CA bundle, which was most of the cost of creating a client. The context
 # httpx would build for verify=True is kept per thread instead, so clients created on different threads get different
 # contexts (httpcore sets ALPN on the context at every connect). It is rebuilt when the variables httpx reads for it
@@ -730,6 +736,8 @@ class Meshive(_BaseClient):
                     if isinstance(data, dict):
                         data = {**data, "idempotencyKey": headers["Idempotency-Key"],
                                 "operationMethod": method, "operationPath": path}
+                        if _replayed(response):
+                            data["replayed"] = True
                     return data
             time.sleep(delay)
             attempt += 1
@@ -2032,6 +2040,8 @@ class AsyncMeshive(_BaseClient):
                     if isinstance(data, dict):
                         data = {**data, "idempotencyKey": headers["Idempotency-Key"],
                                 "operationMethod": method, "operationPath": path}
+                        if _replayed(response):
+                            data["replayed"] = True
                     return data
             await asyncio.sleep(delay)
             attempt += 1

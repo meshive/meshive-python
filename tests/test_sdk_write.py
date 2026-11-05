@@ -25,6 +25,17 @@ from meshive import (
     WaitTimeoutError,
     WorkspaceCreated,
     WorkspaceEstimate,
+    AssetImported,
+    ListingResult,
+    MachineDeleted,
+    MaintenanceAction,
+    MessageSent,
+    MessagesRead,
+    PodUpdated,
+    RetryResult,
+    StorageUpdated,
+    WatchedFolders,
+    WorkspaceUpdated,
 )
 from meshive import _client, _write
 from tests.test_sdk import (_counting_handler, async_client, isolate_config_dir, slept,  # noqa: F401  (autouse fixtures)
@@ -375,6 +386,78 @@ def test_write_result_and_status_lookup_keep_operation_identity():
     assert result.raw['idempotencyKey'] == 'move-operation-0001' and result.raw['operationPath'] == '/pods/p/start'
     client = sync_client(Recorder((200, {'state': 'unknown'})))
     assert client.get_operation('move-operation-0001', method='POST', path='/pods/p/start')['state'] == 'unknown'
+
+
+def _answer(status, body, replayed_header=None):
+    """MockTransport handler: one fixed answer, optionally with the server's Idempotent-Replayed header."""
+    headers = {} if replayed_header is None else {"Idempotent-Replayed": replayed_header}
+    return lambda request: httpx.Response(status, json=body, headers=headers)
+
+
+@pytest.mark.parametrize("header", ["true", "TRUE", "True"])
+def test_a_replayed_write_says_so(header):
+    handler = _answer(202, {"podName": "p", "workspace": "ws", "action": "stop"}, header)
+    result = sync_client(handler).stop_pod("p", "ws", idempotency_key="stop-operation-0001")
+    assert result.replayed is True and result.raw["replayed"] is True
+    assert result.raw["idempotencyKey"] == "stop-operation-0001"
+
+    async def run():
+        async with async_client(handler) as c:
+            return await c.stop_pod("p", "ws", idempotency_key="stop-operation-0001")
+
+    assert asyncio.run(run()).replayed is True
+
+
+@pytest.mark.parametrize("header", [None, "false", ""])
+def test_a_fresh_write_is_not_marked_replayed(header):
+    handler = _answer(202, {"name": "p", "workspace": "ws", "transactionId": 3, "estimate": ESTIMATE}, header)
+    created = sync_client(handler).create_pod("p", 1, workspace="ws", gpu_model="RTX 3060")
+    assert created.replayed is False and "replayed" not in created.raw
+
+    async def run():
+        async with async_client(handler) as c:
+            return await c.create_pod("p", 1, workspace="ws", gpu_model="RTX 3060")
+
+    created = asyncio.run(run())
+    assert created.replayed is False and "replayed" not in created.raw
+
+
+def test_a_read_ignores_the_replayed_header():
+    handler = _answer(200, {"version": "3:ab", "editable": True, "roots": []}, "true")
+    folders = sync_client(handler).get_watched_folders("p-0", "ws")
+    assert folders.replayed is False and "replayed" not in folders.raw
+
+    async def run():
+        async with async_client(handler) as c:
+            return await c.get_watched_folders("p-0", "ws")
+
+    assert asyncio.run(run()).replayed is False
+
+
+@pytest.mark.parametrize("model", [ResourceAction, WorkspaceCreated, WorkspaceUpdated, PodCreated, PodUpdated,
+                                   StorageCreated, StorageUpdated, WatchedFolders, AssetImported, TaskSubmitted,
+                                   MaintenanceAction, ListingResult, RetryResult, MachineDeleted, MessageSent,
+                                   MessagesRead])
+def test_every_write_result_carries_replayed(model):
+    assert model.from_dict({"replayed": True}).replayed is True
+    assert model.from_dict({}).replayed is False
+
+
+@pytest.mark.parametrize("client_class", [Meshive, AsyncMeshive])
+def test_every_write_that_takes_an_idempotency_key_returns_replayed(client_class):
+    import dataclasses
+    import inspect
+
+    # connect_storage keeps polling until the storage is ready, so what it returns is a later read, not the write's answer.
+    checked = []
+    for name, fn in inspect.getmembers(client_class, inspect.isfunction):
+        if name.startswith("_") or name == "connect_storage":
+            continue
+        signature = inspect.signature(fn, eval_str=True)
+        if "idempotency_key" in signature.parameters:
+            assert "replayed" in {f.name for f in dataclasses.fields(signature.return_annotation)}, name
+            checked.append(name)
+    assert {"stop_pod", "create_pod", "submit_task", "delete_machine", "mark_host_messages_read"} <= set(checked)
 
 
 def test_async_data_loss_flag_and_error_key():

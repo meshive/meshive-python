@@ -252,6 +252,7 @@ class WatchedFolders:
     # editable_reason "no_sidecar" but the pod has storage: update_pod(enable_folder_saving=True) adds the uploader
     can_enable_saving: bool = False
     raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
 
     @property
     def revision(self) -> int | None:
@@ -272,7 +273,7 @@ class WatchedFolders:
                               include=list(r.get("include") or []), include_override=r.get("includeOverride"),
                               since=r.get("since"), blocked_reason=r.get("blockedReason"))
                 for r in roots if isinstance(r, dict)],
-            raw=d)
+            raw=d, replayed=bool(d.get("replayed", False)))
 
 
 @dataclass
@@ -1572,13 +1573,15 @@ class AssetImported:
     is_gated: bool = False        # the source can't be read without a token/key — a saved token is needed at startup too
     resolved_commit: str | None = None   # HF: the pinned commit (doesn't change after registration)
     raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
 
     @classmethod
     def from_dict(cls, d: dict) -> "AssetImported":
         return cls(asset_id=str(d.get("assetExternalId", "") or ""), name=str(d.get("name", "") or ""),
                    status=str(d.get("status", "") or ""), ingest_source=str(d.get("ingestSource", "") or ""),
                    file_count=_as_int(d.get("fileCount")), total_bytes=_as_int(d.get("totalBytes")),
-                   is_gated=bool(d.get("isGated", False)), resolved_commit=d.get("resolvedCommit"), raw=d)
+                   is_gated=bool(d.get("isGated", False)), resolved_commit=d.get("resolvedCommit"), raw=d,
+                   replayed=bool(d.get("replayed", False)))
 
 
 @dataclass
@@ -1693,12 +1696,13 @@ class PodCreated:
     pod_name: str | None = None
     accepted: bool = True
     raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
 
     @classmethod
     def from_dict(cls, d: dict) -> "PodCreated":
         return cls(name=d.get("name", ""), workspace=d.get("workspace", ""), transaction_id=d.get("transactionId"),
                    estimate=PodEstimate.from_dict(d.get("estimate") or {}), pod_name=d.get("podName"),
-                   accepted=bool(d.get("accepted", True)), raw=d)
+                   accepted=bool(d.get("accepted", True)), raw=d, replayed=bool(d.get("replayed", False)))
 
 
 @dataclass
@@ -1715,13 +1719,18 @@ class ResourceAction:
     # start_pod only: the placement the server used (same_node | any_node | wait_same_node | wait_any_node), which it
     # picks itself when none was given. None for other actions and from servers that don't report it.
     placement: str | None = None
+    # True when the server answered with its stored answer to an earlier request with the same idempotency_key
+    # instead of doing the write again: nothing new was done. The other results of writes that take an idempotency_key
+    # carry the same flag, except StorageConnection (connect_storage returns the storage's connection state).
+    replayed: bool = False
 
     @classmethod
     def from_dict(cls, d: dict, *, resource: str | None = None) -> "ResourceAction":
         placement = d.get("placement")
         return cls(resource=d.get("resource") or resource or "", id=str(d.get("id") or d.get("podName") or ""),
                    action=d.get("action", ""), workspace=d.get("workspace"), accepted=bool(d.get("accepted", True)),
-                   result=d.get("result"), raw=d, placement=str(placement) if placement else None)
+                   result=d.get("result"), raw=d, placement=str(placement) if placement else None,
+                   replayed=bool(d.get("replayed", False)))
 
 
 @dataclass
@@ -1755,11 +1764,13 @@ class StorageCreated:
     estimate: StorageEstimate
     pv_name: str | None = None
     raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
 
     @classmethod
     def from_dict(cls, d: dict) -> "StorageCreated":
         return cls(name=d.get("name", ""), workspace=d.get("workspace", ""), transaction_id=d.get("transactionId"),
-                   estimate=StorageEstimate.from_dict(d.get("estimate") or {}), pv_name=d.get("pvName"), raw=d)
+                   estimate=StorageEstimate.from_dict(d.get("estimate") or {}), pv_name=d.get("pvName"), raw=d,
+                   replayed=bool(d.get("replayed", False)))
 
 
 def _optional_bool(value: object) -> bool | None:
@@ -1808,12 +1819,14 @@ class StorageUpdated:
     transaction_id: int | str | None
     estimate: StorageUpdateEstimate
     raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
 
     @classmethod
     def from_dict(cls, d: dict) -> "StorageUpdated":
         return cls(pv_name=str(d.get("pvName", "") or ""), workspace=str(d.get("workspace", "") or ""),
                    accepted=bool(d.get("accepted", True)), transaction_id=d.get("transactionId"),
-                   estimate=StorageUpdateEstimate.from_dict(d.get("estimate") or {}), raw=d)
+                   estimate=StorageUpdateEstimate.from_dict(d.get("estimate") or {}), raw=d,
+                   replayed=bool(d.get("replayed", False)))
 
 
 @dataclass
@@ -2012,13 +2025,15 @@ class PodUpdated:
     renamed_only: bool | None
     estimate: PodUpdateEstimate
     raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
 
     @classmethod
     def from_dict(cls, d: dict) -> "PodUpdated":
         return cls(pod_name=str(d.get("podName", "") or ""), workspace=str(d.get("workspace", "") or ""),
                    accepted=bool(d.get("accepted", True)), transaction_id=d.get("transactionId"),
                    renamed_only=_optional_bool(d.get("renamedOnly")),
-                   estimate=PodUpdateEstimate.from_dict(d.get("estimate") or {}), raw=d)
+                   estimate=PodUpdateEstimate.from_dict(d.get("estimate") or {}), raw=d,
+                   replayed=bool(d.get("replayed", False)))
 
 
 @dataclass
@@ -2048,11 +2063,12 @@ class TaskSubmitted:
     task: Task
     estimate: TaskEstimate
     raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
 
     @classmethod
     def from_dict(cls, d: dict) -> "TaskSubmitted":
         return cls(task=Task.from_dict(d.get("task") or {}), estimate=TaskEstimate.from_dict(d.get("estimate") or {}),
-                   raw=d)
+                   raw=d, replayed=bool(d.get("replayed", False)))
 
 
 @dataclass
@@ -2081,12 +2097,13 @@ class WorkspaceCreated:
     transaction_id: int | str | None
     estimate: WorkspaceEstimate
     raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
 
     @classmethod
     def from_dict(cls, d: dict) -> "WorkspaceCreated":
         return cls(workspace=str(d.get("workspace", "") or ""), name=str(d.get("name", "") or ""),
                    transaction_id=d.get("transactionId"), estimate=WorkspaceEstimate.from_dict(d.get("estimate") or {}),
-                   raw=d)
+                   raw=d, replayed=bool(d.get("replayed", False)))
 
 
 @dataclass
@@ -2112,10 +2129,12 @@ class WorkspaceUpdated:
     workspace: str                 # the workspace ID (namespace name); a rename doesn't change it
     name: str
     raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
 
     @classmethod
     def from_dict(cls, d: dict) -> "WorkspaceUpdated":
-        return cls(workspace=str(d.get("workspace", "") or ""), name=str(d.get("name", "") or ""), raw=d)
+        return cls(workspace=str(d.get("workspace", "") or ""), name=str(d.get("name", "") or ""), raw=d,
+                   replayed=bool(d.get("replayed", False)))
 
 
 @dataclass
@@ -2393,13 +2412,15 @@ class MaintenanceAction:
     accepted: bool = True
     window: MaintenanceWindow | None = None
     raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
 
     @classmethod
     def from_dict(cls, d: dict) -> "MaintenanceAction":
         window = d.get("window")
         return cls(maintenance_id=_optional_int(d.get("maintenanceId")), machine_id=str(d.get("machineId", "") or ""),
                    action=str(d.get("action", "") or ""), accepted=bool(d.get("accepted", True)),
-                   window=MaintenanceWindow.from_dict(window) if isinstance(window, dict) else None, raw=d)
+                   window=MaintenanceWindow.from_dict(window) if isinstance(window, dict) else None, raw=d,
+                   replayed=bool(d.get("replayed", False)))
 
 
 @dataclass
@@ -2429,11 +2450,12 @@ class ListingResult:
     listed: bool
     accepted: bool = True
     raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
 
     @classmethod
     def from_dict(cls, d: dict) -> "ListingResult":
         return cls(machine_id=str(d.get("machineId", "") or ""), listed=bool(d.get("listed", False)),
-                   accepted=bool(d.get("accepted", True)), raw=d)
+                   accepted=bool(d.get("accepted", True)), raw=d, replayed=bool(d.get("replayed", False)))
 
 
 @dataclass
@@ -2445,11 +2467,13 @@ class RetryResult:
     accepted: bool = True
     message: str = ""
     raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
 
     @classmethod
     def from_dict(cls, d: dict) -> "RetryResult":
         return cls(machine_id=str(d.get("machineId", "") or ""), check=str(d.get("check", "") or ""),
-                   accepted=bool(d.get("accepted", True)), message=str(d.get("message", "") or ""), raw=d)
+                   accepted=bool(d.get("accepted", True)), message=str(d.get("message", "") or ""), raw=d,
+                   replayed=bool(d.get("replayed", False)))
 
 
 @dataclass
@@ -2496,13 +2520,15 @@ class MachineDeleted:
     pv_count: int = 0
     cancelled_maintenance_count: int = 0
     raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
 
     @classmethod
     def from_dict(cls, d: dict) -> "MachineDeleted":
         return cls(machine_id=str(d.get("machineId", "") or ""), mode=str(d.get("mode", "") or ""),
                    accepted=bool(d.get("accepted", True)), grace_ends_at=_parse_dt(d.get("graceEndsAt")),
                    pod_count=_as_int(d.get("podCount")), pv_count=_as_int(d.get("pvCount")),
-                   cancelled_maintenance_count=_as_int(d.get("cancelledMaintenanceCount")), raw=d)
+                   cancelled_maintenance_count=_as_int(d.get("cancelledMaintenanceCount")), raw=d,
+                   replayed=bool(d.get("replayed", False)))
 
 
 @dataclass
@@ -2583,12 +2609,13 @@ class MessageSent:
     message_ids: list[int] = field(default_factory=list)
     accepted: bool = True
     raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
 
     @classmethod
     def from_dict(cls, d: dict) -> "MessageSent":
         return cls(machine_id=str(d.get("machineId", "") or ""), to=str(d.get("to", "") or ""),
                    message_ids=[_as_int(i) for i in d.get("messageIds") or []],
-                   accepted=bool(d.get("accepted", True)), raw=d)
+                   accepted=bool(d.get("accepted", True)), raw=d, replayed=bool(d.get("replayed", False)))
 
 
 @dataclass
@@ -2598,10 +2625,12 @@ class MessagesRead:
     machine_id: str
     marked: int
     raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
 
     @classmethod
     def from_dict(cls, d: dict) -> "MessagesRead":
-        return cls(machine_id=str(d.get("machineId", "") or ""), marked=_as_int(d.get("marked")), raw=d)
+        return cls(machine_id=str(d.get("machineId", "") or ""), marked=_as_int(d.get("marked")), raw=d,
+                   replayed=bool(d.get("replayed", False)))
 
 
 @dataclass

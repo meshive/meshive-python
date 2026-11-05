@@ -2,7 +2,7 @@ import argparse
 import importlib
 from pathlib import Path
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -41,6 +41,7 @@ from meshive.models import (
     Task,
     TaskInputAsset,
     TaskOutputs,
+    TaskOutputsStatus,
     Template,
     Transaction,
     WhoAmI,
@@ -911,6 +912,158 @@ def test_task_single_output(capsys):
     assert "weights" in out and "/inputs/w" in out          # input asset table
     assert cli.main(["task", "task_a", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["scriptContent"] == "print(1)"
+
+
+# --- task outputs status (Task.outputs) -----------------------------------------------------------
+
+OUTPUTS_NOW = datetime(2026, 11, 5, 7, 0, tzinfo=UTC)
+_MIB = 1024 * 1024
+_KNOWN = {"filesSoFar": 48, "filesTotal": 126, "filesOverLimit": 0, "filesLimit": 2000, "bytesSaved": 43_201_331,
+          "bytesSoFar": 43_201_331, "bytesTotal": 113_874_534}
+_UNKNOWN = {"filesSoFar": 48, "filesTotal": None, "filesOverLimit": 0, "filesLimit": 200, "bytesSoFar": 43_201_331,
+            "bytesTotal": None}
+_OVER = {"filesSoFar": 1200, "filesTotal": 2431, "filesOverLimit": 431, "filesLimit": 2000, "bytesSaved": 900 * _MIB,
+         "bytesSoFar": 900 * _MIB, "bytesTotal": 1536 * _MIB}
+_PARTIAL = {"phase": "partially_saved", "assetExternalId": "asset_9c22", "assetName": "run outputs",
+            "filesSaved": 2000, "filesNotSaved": 431, "filesOverLimit": 431, "filesTotal": 2431, "filesLimit": 2000,
+            "bytesSaved": 1536 * _MIB}
+
+
+def _iso(seconds: int) -> str:
+    return (OUTPUTS_NOW + timedelta(seconds=seconds)).isoformat()
+
+
+@pytest.mark.parametrize("outputs, expected", [
+    ({"phase": "running", "filesLimit": 2000}, None),
+    ({"phase": "preparing", "filesLimit": 2000}, "preparing to save · scanning /outputs"),
+    ({"phase": "uploading", **_KNOWN}, "uploading · 48/126 files · 41.2 of 108.6 MiB"),
+    # The files over the limit aren't uploaded, so progress is out of the 2,000 that are.
+    ({"phase": "uploading", **_OVER},
+     "uploading · 1,200/2,000 files · 900.0 MiB of 1.50 GiB · 431 over the 2,000-file limit won't be saved"),
+    ({"phase": "uploading", **_UNKNOWN}, "uploading · 48 files so far · 41.2 MiB · total not known yet"),
+    ({"phase": "uploading", **_UNKNOWN, "filesSoFar": 0, "bytesSoFar": 0}, "uploading · total not known yet"),
+    ({"phase": "retrying", **_KNOWN, "attempts": 2, "nextAttemptAt": _iso(190)},
+     "retrying the upload · 48/126 files · 41.2 of 108.6 MiB · next try in 3 minutes"),
+    ({"phase": "retrying", **_UNKNOWN, "attempts": 2, "nextAttemptAt": _iso(-5)},
+     "retrying the upload · 48 files so far · 41.2 MiB · retrying now"),
+    ({"phase": "registering", **_KNOWN, "filesSoFar": 126, "bytesSaved": 113_874_534, "bytesSoFar": 113_874_534,
+      "expectedInAssetsAt": _iso(25)},
+     "adding to Assets · 126/126 files · 108.6 MiB · expected in a few seconds"),
+    ({"phase": "registering", **_UNKNOWN, "expectedInAssetsAt": _iso(150)},
+     "adding to Assets · 48 files · 41.2 MiB · expected in 2 minutes"),
+    ({"phase": "saved", "assetExternalId": "asset_9c21", "assetName": "run outputs", "filesSaved": 126,
+      "bytesSaved": 113_874_534, "filesNotSaved": 0},
+     "saved to Assets as run outputs (asset_9c21) · 126 files · 108.6 MiB"),
+    ({"phase": "saved", "assetExternalId": None, "assetName": None, "assetDeleted": True, "filesSaved": 126},
+     "saved to Assets, but the asset has since been deleted"),
+    (_PARTIAL, "partly saved to Assets as run outputs (asset_9c22) · 2,000 files · 1.50 GiB"),
+    ({"phase": "not_saved", "filesSaved": 0, "filesNotSaved": 126}, "not saved"),
+    ({"phase": "discarded", "assetExternalId": "asset_d", "assetName": "run", "filesSaved": 48},
+     "upload discarded · the files uploaded before that are in Assets as run (asset_d)"),
+    ({"phase": "discarded", "filesSaved": 0}, "upload discarded"),
+    ({"phase": "empty", "filesLimit": 2000}, "no output files"),
+    ({"phase": "archiving"}, "archiving"),           # a phase from a newer server, as the server wrote it
+])
+def test_task_outputs_line(outputs, expected):
+    assert cli._task_outputs_line(TaskOutputsStatus.from_dict(outputs), now=OUTPUTS_NOW) == expected
+
+
+@pytest.mark.parametrize("outputs, expected", [
+    (_PARTIAL, "Only 2,000 of 2,431 output files were saved — 431 were over the 2,000-file limit."),
+    # Some files also failed to upload: the limit isn't the whole reason, so it isn't named.
+    ({**_PARTIAL, "filesSaved": 1931, "filesNotSaved": 500}, "Only 1,931 of 2,431 output files were saved."),
+    ({"phase": "partially_saved", "filesSaved": 40, "filesNotSaved": 86, "filesOverLimit": 0},
+     "Only 40 of 126 output files were saved."),
+    # The server counted no missing file: nothing to say.
+    ({"phase": "partially_saved", "filesSaved": 126, "filesNotSaved": 0, "filesOverLimit": 0}, None),
+])
+def test_task_outputs_partial_note(outputs, expected):
+    assert cli._task_outputs_partial_note(TaskOutputsStatus.from_dict(outputs)) == expected
+
+
+def _task_with_outputs(task_id, outputs, **fields):
+    return Task.from_dict({"externalId": task_id, "name": "sdxl", "namespaceName": "ns", "status": "succeeded",
+                           "podName": "task-o", "image": "python:3.12", "gpuModel": "NVIDIA RTX 4090",
+                           "gpuCount": 1, "cpuCores": 6, "ramGb": 24, "pricePerHour": "1.0", "costSoFar": "0.5",
+                           "totalCost": "0.5", "provider": "partner-cloud", "outputUploadState": "uploading",
+                           "outputFilesDeclared": 126, "outputFilesCompleted": 48, "outputBytesDeclared": 4096,
+                           "outputBytesCompleted": 1024, **fields, "outputs": outputs})
+
+
+def test_task_shows_the_outputs_status(capsys, monkeypatch):
+    task = _task_with_outputs("task_o", {**_PARTIAL, "assetName": "run\x1b[31m outputs"})
+    monkeypatch.setattr(FakeClient, "get_task", lambda self, task_id: task)
+    assert cli.main(["task", "task_o"]) == 0
+    out = capsys.readouterr().out
+    assert "outputs:     partly saved to Assets as run[31m outputs (asset_9c22) · 2,000 files · 1.50 GiB\n" in out
+    assert "             Only 2,000 of 2,431 output files were saved — 431 were over the 2,000-file limit.\n" in out
+    assert "\x1b" not in out                                  # server text is cleaned
+    assert "48 of 126 files" not in out                       # the raw counters give way to the status
+    assert "partner" not in out and "provider" not in out   # where a task runs is never printed
+
+    cli._print_task(task, True)                               # with color: the partial note is yellow
+    assert "\033[33m             Only 2,000 of 2,431" in capsys.readouterr().out
+
+
+def test_task_outputs_status_for_unknown_total_and_failures(capsys, monkeypatch):
+    tasks = {
+        "task_u": _task_with_outputs("task_u", {"phase": "uploading", **_UNKNOWN}),
+        "task_n": _task_with_outputs("task_n", {"phase": "not_saved", "filesSaved": 0, "filesNotSaved": 126,
+                                                "lastError": "AccessDenied"}, outputUploadLastError="AccessDenied"),
+        "task_r": _task_with_outputs("task_r", {"phase": "running", "filesLimit": 2000}, status="running",
+                                     outputUploadState=None),
+    }
+    monkeypatch.setattr(FakeClient, "get_task", lambda self, task_id: tasks[task_id])
+    assert cli.main(["task", "task_u"]) == 0
+    assert "outputs:     uploading · 48 files so far · 41.2 MiB · total not known yet\n" in capsys.readouterr().out
+    assert cli.main(["task", "task_n"]) == 0
+    out = capsys.readouterr().out
+    assert "outputs:     not saved\n" in out and "upload error: AccessDenied" in out
+    assert cli.main(["task", "task_r"]) == 0
+    assert "outputs:" not in capsys.readouterr().out          # nothing to say while the task runs
+    cli._print_task(tasks["task_n"], True)
+    assert "\033[31moutputs:     not saved" in capsys.readouterr().out
+
+
+def test_task_with_a_deleted_log_keeps_its_saved_outputs(capsys, monkeypatch):
+    # outputsPurgedAt marks the task's log as deleted after its retention period; the outputs stay in Assets.
+    purged_at = (datetime.now(UTC) - timedelta(days=3, hours=1)).isoformat()
+    task = _task_with_outputs("task_p", {"phase": "saved", "assetExternalId": "asset_9c21", "assetName": "run outputs",
+                                         "filesSaved": 126, "bytesSaved": 113_874_534, "filesNotSaved": 0},
+                              outputUploadState="completed", outputsPurgedAt=purged_at)
+    monkeypatch.setattr(FakeClient, "get_task", lambda self, task_id: task)
+    assert cli.main(["task", "task_p"]) == 0
+    out = capsys.readouterr().out
+    assert "outputs:     saved to Assets as run outputs (asset_9c21) · 126 files · 108.6 MiB\n" in out
+    assert "log:         deleted 3 days ago\n" in out
+    assert out.count("outputs:") == 1                          # no "outputs: deleted" next to the saved line
+
+    old = Task.from_dict({**task.raw, "outputs": None})        # a server that predates the outputs status
+    monkeypatch.setattr(FakeClient, "get_task", lambda self, task_id: old)
+    assert cli.main(["task", "task_p"]) == 0
+    out = capsys.readouterr().out
+    assert "log:         deleted 3 days ago\n" in out and "outputs:     deleted" not in out
+
+
+def test_tasks_table_has_an_outputs_column_when_the_server_sends_it(capsys, monkeypatch):
+    assert cli.main(["tasks", "ns"]) == 0                     # FakeClient's tasks come from an older server
+    assert "OUTPUTS" not in capsys.readouterr().out
+
+    tasks = [_task_with_outputs("task_up", {"phase": "uploading", **_KNOWN}),
+             _task_with_outputs("task_unk", {"phase": "uploading", **_UNKNOWN}),
+             _task_with_outputs("task_reg", {"phase": "registering", **_KNOWN}),
+             _task_with_outputs("task_part", _PARTIAL),
+             _task_with_outputs("task_run", {"phase": "running"}, status="running"),
+             _task_with_outputs("task_old", None)]
+    monkeypatch.setattr(FakeClient, "list_tasks", lambda self, workspace, **kwargs: tasks)
+    assert cli.main(["tasks", "ns"]) == 0
+    header, *rows = capsys.readouterr().out.splitlines()
+    assert header.split()[:4] == ["NAME", "ID", "STATUS", "OUTPUTS"]
+    start = header.index("OUTPUTS")
+    end = header.index("GPU")
+    cells = {row.split()[1]: row[start:end].strip() for row in rows}
+    assert cells == {"task_up": "uploading 48/126", "task_unk": "uploading", "task_reg": "adding to Assets",
+                     "task_part": "partly saved 2,000/2,431", "task_run": "-", "task_old": "-"}
 
 
 # --- assets (Asset Hub) -------------------------------------------------------

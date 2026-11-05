@@ -1136,6 +1136,98 @@ class HfToken:
                    created_at=_parse_dt(d.get("createdAt")), used_by_asset_count=_as_int(d.get("usedByAssetCount")))
 
 
+# Task.outputs phases while the outputs are on their way into Assets.
+_TASK_OUTPUTS_SAVING_PHASES = frozenset({"preparing", "uploading", "retrying", "registering"})
+
+
+@dataclass
+class TaskOutputsStatus:
+    """`Task.outputs` — what happened to a task's output files, worked out by the server.
+
+    It is the state the console shows, so the SDK, the CLI and the console say the same thing. The `output_*` fields
+    on `Task` are the raw values it is worked out from.
+
+    `phase`:
+      - `running`: the task hasn't finished yet.
+      - `preparing`, `uploading`, `retrying` (the last attempt failed; the next one is at `next_attempt_at`),
+        `registering` (uploaded, being added to Assets, expected at `expected_in_assets_at`): being saved
+        (`saving` is True).
+      - `saved`: in Assets as `asset_name` (`asset_id`).
+      - `partially_saved`: in Assets, but `files_not_saved` files are missing: `files_over_limit` of them were over
+        the `files_limit`-file limit, and the rest didn't upload.
+      - `not_saved`: nothing was saved (see `last_error`).
+      - `discarded`: the upload was discarded on request. Files uploaded before that are in Assets when `asset_id`
+        is set.
+      - `empty`: there were no output files to save.
+
+    Every field is None when the server didn't send it. `files_total` counts the files over the limit too, so progress
+    is `files_so_far` of `files_to_upload`, while `bytes_total` already counts only the files that are uploaded.
+    `files_total` and `bytes_total` are None when the total isn't known yet.
+    """
+
+    phase: str | None = None
+    asset_id: str | None = None          # the asset the outputs were saved as; None once it is deleted
+    asset_name: str | None = None
+    asset_deleted: bool | None = None    # the outputs were saved, then the asset was deleted
+    files_saved: int | None = None
+    files_not_saved: int | None = None   # over the limit, plus files that didn't upload
+    files_so_far: int | None = None      # only while saving
+    files_total: int | None = None
+    files_over_limit: int | None = None
+    files_limit: int | None = None       # the file limit that applied to this task
+    bytes_saved: int | None = None
+    bytes_so_far: int | None = None      # only while saving
+    bytes_total: int | None = None
+    expected_in_assets_at: datetime | None = None
+    upload_started_at: datetime | None = None
+    upload_deadline_at: datetime | None = None
+    next_attempt_at: datetime | None = None
+    attempts: int | None = None
+    last_error: str | None = None
+    # When the server finished handling the outputs. Also set for `empty`, `not_saved` and `discarded`: use `phase`
+    # and `asset_id` to know whether anything is in Assets.
+    saved_at: datetime | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def saving(self) -> bool:
+        """True while the outputs are being saved (preparing, uploading, retrying or registering)."""
+        return self.phase in _TASK_OUTPUTS_SAVING_PHASES
+
+    @property
+    def files_to_upload(self) -> int | None:
+        """The files that are uploaded: `files_total` without the ones over the limit. None if the total isn't known."""
+        if self.files_total is None:
+            return None
+        return max(self.files_total - (self.files_over_limit or 0), 0)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TaskOutputsStatus":
+        return cls(
+            phase=_optional_str(d.get("phase")),
+            asset_id=_optional_str(d.get("assetExternalId")),
+            asset_name=_optional_str(d.get("assetName")),
+            asset_deleted=_optional_bool(d.get("assetDeleted")),
+            files_saved=_optional_int(d.get("filesSaved")),
+            files_not_saved=_optional_int(d.get("filesNotSaved")),
+            files_so_far=_optional_int(d.get("filesSoFar")),
+            files_total=_optional_int(d.get("filesTotal")),
+            files_over_limit=_optional_int(d.get("filesOverLimit")),
+            files_limit=_optional_int(d.get("filesLimit")),
+            bytes_saved=_optional_int(d.get("bytesSaved")),
+            bytes_so_far=_optional_int(d.get("bytesSoFar")),
+            bytes_total=_optional_int(d.get("bytesTotal")),
+            expected_in_assets_at=_parse_dt(d.get("expectedInAssetsAt")),
+            upload_started_at=_parse_dt(d.get("uploadStartedAt")),
+            upload_deadline_at=_parse_dt(d.get("uploadDeadlineAt")),
+            next_attempt_at=_parse_dt(d.get("nextAttemptAt")),
+            attempts=_optional_int(d.get("attempts")),
+            last_error=_optional_str(d.get("lastError")),
+            saved_at=_parse_dt(d.get("savedAt")),
+            raw=d,
+        )
+
+
 @dataclass
 class Task:
     """GET /v1/sdk/tasks[/{task_id}] item — a serverless task.
@@ -1174,16 +1266,23 @@ class Task:
     output_bytes_declared: int | None = None
     output_bytes_completed: int | None = None
     output_upload_last_error: str | None = None   # reason of the last upload failure (credential error, ...)
-    outputs_purged_at: datetime | None = None      # when the outputs were deleted
+    # When the task's log was deleted after its retention period. Despite the name the outputs are kept: they are
+    # in Assets (see `outputs`).
+    outputs_purged_at: datetime | None = None
     # Output filter: only files in /outputs matching these globs are uploaded. None = every file (or a server that
     # predates the filter).
     output_include: list[str] | None = None
+    # What happened to the output files, as the console shows it (see TaskOutputsStatus). None from a server that
+    # predates it; the raw output_* fields above are still there.
+    outputs: TaskOutputsStatus | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Task":
         exit_code = d.get("exitCode")
         include = d.get("outputInclude")
+        outputs = d.get("outputs")
         return cls(
+            outputs=TaskOutputsStatus.from_dict(outputs) if isinstance(outputs, dict) else None,
             failed_asset_id=d.get("failedAssetExternalId"),
             input_assets=[TaskInputAsset(asset_id=str(a.get("assetExternalId", "") or ""),
                                          name=str(a.get("name", "") or ""),

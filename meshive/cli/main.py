@@ -45,6 +45,7 @@ from ..models import (
     Storage,
     StressTestResult,
     Task,
+    TaskOutputsStatus,
     Template,
     Transaction,
     WhoAmI,
@@ -1156,20 +1157,184 @@ def _task_gpu(t: Task) -> str:
     return f"{t.gpu_count}x {t.gpu_model}" if t.gpu_count else t.gpu_model
 
 
+def _files(n: int) -> str:
+    return f"{fmt.count(n)} file{'' if n == 1 else 's'}"
+
+
+def _positive(value: int | None) -> bool:
+    return value is not None and value > 0
+
+
+def _ahead(dt: datetime | None, now: datetime) -> str | None:
+    """A time still ahead → 'in a few seconds' / 'in 3 minutes'. None if unknown or already past."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    seconds = (dt - now).total_seconds()
+    if seconds <= 0:
+        return None
+    return "in a few seconds" if seconds < 60 else fmt.relative_time(dt, now=now)
+
+
+def _outputs_total_known(o: TaskOutputsStatus) -> bool:
+    """The server knows how much will be uploaded. Some tasks don't report a total while they are saved."""
+    return _positive(o.files_total) or _positive(o.bytes_total)
+
+
+def _outputs_progress(o: TaskOutputsStatus) -> tuple[int, int] | None:
+    """(files so far, files to upload) when the total is known. Files over the limit aren't uploaded, so they aren't
+    in it."""
+    planned = o.files_to_upload
+    if o.files_so_far is None or planned is None or planned <= 0:
+        return None
+    return o.files_so_far, planned
+
+
+def _outputs_bytes_done(o: TaskOutputsStatus) -> int | None:
+    return o.bytes_saved if o.bytes_saved is not None else o.bytes_so_far
+
+
+def _outputs_known_parts(o: TaskOutputsStatus, *, bytes_of_total: bool = True) -> list[str | None]:
+    """'48/126 files', '41.2 of 108.6 MiB' — progress against a known total."""
+    progress = _outputs_progress(o)
+    done = _outputs_bytes_done(o)
+    if bytes_of_total and done is not None and _positive(o.bytes_total):
+        size = fmt.bytes_of(done, o.bytes_total)
+    else:
+        size = fmt.bytes_human(done) if _positive(done) else None
+    return [f"{fmt.count(progress[0])}/{_files(progress[1])}" if progress else None, size]
+
+
+def _outputs_unknown_parts(o: TaskOutputsStatus, *, so_far: bool = True) -> list[str | None]:
+    """'48 files so far', '41.2 MiB' — what has come in, when the total isn't known."""
+    done = o.bytes_so_far if o.bytes_so_far is not None else o.bytes_saved
+    files = f"{_files(o.files_so_far)}{' so far' if so_far else ''}" if _positive(o.files_so_far) else None
+    return [files, fmt.bytes_human(done) if _positive(done) else None]
+
+
+def _outputs_over_limit(o: TaskOutputsStatus) -> str | None:
+    """Said while saving, so it isn't news once the outputs are saved."""
+    if not _positive(o.files_over_limit):
+        return None
+    limit = f"{fmt.count(o.files_limit)}-file limit" if o.files_limit is not None else "file limit"
+    return f"{fmt.count(o.files_over_limit)} over the {limit} won't be saved"
+
+
+def _outputs_asset(o: TaskOutputsStatus) -> str:
+    """' as my-run (asset_abc)', or '' when the server didn't name the asset."""
+    if o.asset_name and o.asset_id:
+        return f" as {o.asset_name} ({o.asset_id})"
+    if o.asset_id or o.asset_name:
+        return f" as {o.asset_id or o.asset_name}"
+    return ""
+
+
+def _task_outputs_partial_note(o: TaskOutputsStatus) -> str | None:
+    """'Only 2,000 of 2,431 output files were saved — 431 were over the 2,000-file limit.' The limit is named only
+    when it is the whole reason. None when the server didn't count any missing file."""
+    saved = o.files_saved or 0
+    not_saved = o.files_not_saved or 0
+    if not_saved <= 0:
+        return None
+    note = f"Only {fmt.count(saved)} of {fmt.count(saved + not_saved)} output files were saved"
+    over = o.files_over_limit or 0
+    if over > 0 and over == not_saved and o.files_limit is not None:
+        return f"{note} — {fmt.count(over)} were over the {fmt.count(o.files_limit)}-file limit."
+    return f"{note}."
+
+
+def _task_outputs_line(o: TaskOutputsStatus, *, now: datetime | None = None) -> str | None:
+    """The task detail's outputs: line, in the console's words. None while the task runs."""
+    now = now or datetime.now(timezone.utc)
+    known = _outputs_total_known(o)
+    phase = o.phase
+    if phase == "preparing":
+        parts = ["preparing to save", "scanning /outputs"]
+    elif phase == "uploading":
+        if known:
+            parts = ["uploading", *_outputs_known_parts(o), _outputs_over_limit(o)]
+        else:
+            parts = ["uploading", *_outputs_unknown_parts(o), "total not known yet"]
+    elif phase == "retrying":
+        next_try = _ahead(o.next_attempt_at, now)
+        parts = ["retrying the upload", *(_outputs_known_parts(o) if known else _outputs_unknown_parts(o)),
+                 f"next try {next_try}" if next_try else ("retrying now" if o.next_attempt_at else None),
+                 _outputs_over_limit(o) if known else None]
+    elif phase == "registering":
+        expected = _ahead(o.expected_in_assets_at, now)
+        parts = ["adding to Assets",
+                 *(_outputs_known_parts(o, bytes_of_total=False) if known
+                   else _outputs_unknown_parts(o, so_far=False)),
+                 f"expected {expected}" if expected else None,
+                 _outputs_over_limit(o) if known else None]
+    elif phase in ("saved", "partially_saved"):
+        lead = "saved to Assets" if phase == "saved" else "partly saved to Assets"
+        if o.asset_deleted:
+            parts = [f"{lead}, but the asset has since been deleted"]
+        else:
+            parts = [lead + _outputs_asset(o),
+                     _files(o.files_saved) if _positive(o.files_saved) else None,
+                     fmt.bytes_human(o.bytes_saved) if _positive(o.bytes_saved) else None]
+    elif phase == "not_saved":
+        parts = ["not saved"]
+    elif phase == "discarded":
+        kept = _outputs_asset(o) if o.asset_id and not o.asset_deleted else ""
+        parts = ["upload discarded", f"the files uploaded before that are in Assets{kept}" if kept else None]
+    elif phase == "empty":
+        parts = ["no output files"]
+    elif phase and phase != "running":
+        parts = [phase]                 # a phase this version doesn't know yet
+    else:
+        return None
+    return " · ".join(p for p in parts if p)
+
+
+# The OUTPUTS column of `meshive tasks`: phase → (text, color).
+_TASK_OUTPUTS_CELLS = {
+    "preparing": ("preparing", "cyan"),
+    "uploading": ("uploading", "cyan"),
+    "retrying": ("retrying", "yellow"),
+    "registering": ("adding to Assets", "cyan"),
+    "saved": ("saved", "green"),
+    "partially_saved": ("partly saved", "yellow"),
+    "not_saved": ("not saved", "red"),
+    "discarded": ("discarded", "gray"),
+    "empty": ("no files", "dim"),
+}
+
+
+def _task_outputs_cell(o: TaskOutputsStatus | None) -> tuple[str, str | None]:
+    if o is None or not o.phase or o.phase == "running":
+        return "-", "dim"
+    text, color = _TASK_OUTPUTS_CELLS.get(o.phase, (o.phase, None))
+    progress = _outputs_progress(o) if _outputs_total_known(o) else None
+    if o.phase == "uploading" and progress:
+        text = f"uploading {fmt.count(progress[0])}/{fmt.count(progress[1])}"
+    elif o.phase == "partially_saved":
+        saved = o.files_saved or 0
+        text = f"partly saved {fmt.count(saved)}/{fmt.count(saved + (o.files_not_saved or 0))}"
+    return text, color
+
+
 def _print_tasks(tasks: list[Task], color: bool) -> None:
     if not tasks:
         print("No tasks.")
         return
+    # Servers that predate the outputs status don't send it: the table keeps its old columns then.
+    with_outputs = any(t.outputs is not None for t in tasks)
     rows = []
     colors = []
     for t in tasks:
-        rows.append([t.name or "-", t.task_id, fmt.status_cell(t.status), _task_gpu(t),
-                     fmt.money(t.cost_so_far), fmt.relative_time(t.created_at)])
-        colors.append([None, None, fmt.status_color(t.status), None, None, "dim"])
+        outputs, outputs_color = _task_outputs_cell(t.outputs)
+        rows.append([t.name or "-", t.task_id, fmt.status_cell(t.status), *([outputs] if with_outputs else []),
+                     _task_gpu(t), fmt.money(t.cost_so_far), fmt.relative_time(t.created_at)])
+        colors.append([None, None, fmt.status_color(t.status), *([outputs_color] if with_outputs else []),
+                       None, None, "dim"])
     fmt.render_table(
-        ["NAME", "ID", "STATUS", "GPU", "COST", "CREATED"],
+        ["NAME", "ID", "STATUS", *(["OUTPUTS"] if with_outputs else []), "GPU", "COST", "CREATED"],
         rows,
-        aligns=["l", "l", "l", "l", "r", "l"],
+        aligns=["l", "l", "l", *(["l"] if with_outputs else []), "l", "r", "l"],
         colors=colors,
         enabled=color,
     )
@@ -1199,7 +1364,16 @@ def _print_task(t: Task, color: bool) -> None:
         print(fmt.paint(fmt.clean(f"failure:     {t.failure_reason}"), "red", color))
     if t.failed_asset_id:
         print(fmt.paint(fmt.clean(f"failed on:   input asset {t.failed_asset_id}"), "red", color))
-    if t.output_upload_state and t.output_upload_state not in ("skipped", "discarded"):
+    if t.outputs is not None:
+        line = _task_outputs_line(t.outputs)
+        if line:
+            print(fmt.paint(fmt.clean(f"outputs:     {line}"), "red" if t.outputs.phase == "not_saved" else None,
+                            color))
+        note = _task_outputs_partial_note(t.outputs) if t.outputs.phase == "partially_saved" else None
+        if note:
+            print(fmt.paint(f"             {note}", "yellow", color))
+    elif t.output_upload_state and t.output_upload_state not in ("skipped", "discarded"):
+        # A server that predates the outputs status: show its raw upload counters.
         files = f"{t.output_files_completed or 0} of {t.output_files_declared or 0} files"
         size = f"{fmt.bytes_human(t.output_bytes_completed)} of {fmt.bytes_human(t.output_bytes_declared)}"
         print(f"outputs:     {fmt.clean(t.output_upload_state)}, {files}, {size}")
@@ -1208,7 +1382,8 @@ def _print_task(t: Task, color: bool) -> None:
     if t.output_upload_last_error:
         print(fmt.paint(fmt.clean(f"upload error: {t.output_upload_last_error}"), "red", color))
     if t.outputs_purged_at:
-        print(f"outputs:     deleted {fmt.relative_time(t.outputs_purged_at)}")
+        # Only the task's log is deleted after its retention period; the outputs stay in Assets.
+        print(f"log:         deleted {fmt.relative_time(t.outputs_purged_at)}")
     if t.input_assets:
         print()
         rows = [[a.name or "-", a.asset_id, a.target_dir or "-"] for a in t.input_assets]

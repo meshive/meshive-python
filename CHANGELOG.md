@@ -12,49 +12,12 @@ Upgrade with:
 pip install -U meshive
 ```
 
-## Unreleased
-
-You can now see whether a task's outputs were saved, and how far saving has got, as the console shows it. Code
-written for 1.0 to 1.8 keeps working.
-
-### What's new
-
-- **`Task.outputs`** is a `TaskOutputsStatus`: what happened to the files the task wrote to `/outputs`, worked out by
-  the server. Its `phase` is `running` until the task ends, then `preparing`, `uploading`, `retrying` or
-  `registering` (being added to Assets) while the files are saved (`saving` is `True`), and in the end `saved`,
-  `partially_saved`, `not_saved`, `discarded` or `empty`. While saving, progress is `files_so_far` of
-  `files_to_upload` files and `bytes_so_far` of `bytes_total` bytes. `files_total` also counts the files over the
-  task's file limit (`files_over_limit` of them, over `files_limit`), which aren't uploaded, so use `files_to_upload`
-  for progress. Some tasks don't report a total while they are saved: `files_total`, `bytes_total` and
-  `files_to_upload` are then `None`. Once saved, `asset_id` and `asset_name` name the asset. `partially_saved` means
-  `files_not_saved` files are missing; `last_error` says why an upload failed. `list_tasks`, `get_task` and
-  `submit_task` return it. From a server that predates it, `outputs` is `None`, and the `output_*` fields are still
-  there.
-- **`meshive task <id>`** shows it on the `outputs:` line: the progress while saving
-  (`uploading · 48/126 files · 41.2 of 108.6 MiB`, or
-  `uploading · 48 files so far · 41.2 MiB · total not known yet`), the asset once saved
-  (`saved to Assets as my-run (asset_...) · 126 files · 108.6 MiB`), and for a partial save how many files are
-  missing (`Only 2,000 of 2,431 output files were saved — 431 were over the 2,000-file limit.`). `meshive tasks` adds
-  an OUTPUTS column when the server sends the status.
-
-### Changes
-
-- **`meshive task <id>` says `log: deleted …` where it said `outputs: deleted …`.** After its retention period only a
-  task's log is deleted; its outputs stay in Assets. `Task.outputs_purged_at` is when the log was deleted.
-- **A write the server already answered says so.** When a write is sent with an `idempotency_key` the server has
-  already answered (a retry, or a key used again), the server returns its first answer and does nothing new. The
-  result used to look like a fresh success; it now has `replayed=True`: the write was done once, by the earlier
-  request. Every result of a write that takes `idempotency_key` has the field, except `connect_storage`, which
-  returns the storage's connection state (`ResourceAction`, `PodCreated`, `PodUpdated`, `StorageCreated`,
-  `StorageUpdated`, `WorkspaceCreated`, `WorkspaceUpdated`, `TaskSubmitted`, `AssetImported`, `WatchedFolders`,
-  `MaintenanceAction`, `ListingResult`, `RetryResult`, `MachineDeleted`, `MessageSent` and `MessagesRead`), and it is
-  `False` when this request did the write. To do it again as a new write, use a new key.
-
 ## v1.8.0
 
 Hosts can now run their machines from the SDK and CLI: maintenance windows, listing, setup retries, removal,
 messages with the workspaces that use a machine, and payouts. You can also see what your API keys did, with the
-result of each request. Code written for 1.0 to 1.7 keeps working.
+result of each request. Tasks also report whether their outputs were saved, and how far saving has got, as the console shows it.
+Code written for 1.0 to 1.7 keeps working.
 
 ### What's new
 
@@ -118,6 +81,23 @@ The CLI asks before anything that reaches other users or reveals a secret (sched
 unlisting, removing a machine, sending a message, revealing credentials, getting an install command) unless you pass
 `--yes`. `machine-list`, `machine-retry` and `host-messages-read` change only your own machine and don't ask, as in the
 console.
+- **`Task.outputs`** is a `TaskOutputsStatus`: what happened to the files the task wrote to `/outputs`, worked out by
+  the server. Its `phase` is `running` until the task ends, then `preparing`, `uploading`, `retrying` or
+  `registering` (being added to Assets) while the files are saved (`saving` is `True`), and in the end `saved`,
+  `partially_saved`, `not_saved`, `discarded` or `empty`. While saving, progress is `files_so_far` of
+  `files_to_upload` files and `bytes_so_far` of `bytes_total` bytes. `files_total` also counts the files over the
+  task's file limit (`files_over_limit` of them, over `files_limit`), which aren't uploaded, so use `files_to_upload`
+  for progress. Some tasks don't report a total while they are saved: `files_total`, `bytes_total` and
+  `files_to_upload` are then `None`. Once saved, `asset_id` and `asset_name` name the asset. `partially_saved` means
+  `files_not_saved` files are missing; `last_error` says why an upload failed. `list_tasks`, `get_task` and
+  `submit_task` return it. From a server that predates it, `outputs` is `None`, and the `output_*` fields are still
+  there.
+- **`meshive task <id>`** shows it on the `outputs:` line: the progress while saving
+  (`uploading · 48/126 files · 41.2 of 108.6 MiB`, or
+  `uploading · 48 files so far · 41.2 MiB · total not known yet`), the asset once saved
+  (`saved to Assets as my-run (asset_...) · 126 files · 108.6 MiB`), and for a partial save how many files are
+  missing (`Only 2,000 of 2,431 output files were saved — 431 were over the 2,000-file limit.`). `meshive tasks` adds
+  an OUTPUTS column when the server sends the status.
 
 ### Changes
 
@@ -136,6 +116,16 @@ console.
 - **The server checks `framework`.** The SDK no longer keeps its own list of engines: it only checks that
   `framework` is a non-empty string (`ValueError` otherwise), and the server answers an engine it doesn't serve with a
   400.
+- **`meshive task <id>` says `log: deleted …` where it said `outputs: deleted …`.** After its retention period only a
+  task's log is deleted; its outputs stay in Assets. `Task.outputs_purged_at` is when the log was deleted.
+- **A write the server already answered says so.** When a write is sent with an `idempotency_key` the server has
+  already answered (a retry, or a key used again), the server returns its first answer and does nothing new. The
+  result used to look like a fresh success; it now has `replayed=True`: the write was done once, by the earlier
+  request. Every result of a write that takes `idempotency_key` has the field, except `connect_storage`, which
+  returns the storage's connection state (`ResourceAction`, `PodCreated`, `PodUpdated`, `StorageCreated`,
+  `StorageUpdated`, `WorkspaceCreated`, `WorkspaceUpdated`, `TaskSubmitted`, `AssetImported`, `WatchedFolders`,
+  `MaintenanceAction`, `ListingResult`, `RetryResult`, `MachineDeleted`, `MessageSent` and `MessagesRead`), and it is
+  `False` when this request did the write. To do it again as a new write, use a new key.
 
 ## v1.7.0
 

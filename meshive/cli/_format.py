@@ -63,6 +63,10 @@ _STATUS_COLOR = {
     "node_not_ready": "red",    # machine state.name
     "agent_not_ready": "red",   # machine state.name
     "delete_machine": "red",    # machine state.name
+    "upcoming": "cyan",         # maintenance window (derived status)
+    "overdue": "yellow",
+    "in_progress": "yellow",
+    "done": "gray",
 }
 
 _STATUS_ICON = "●"  # ●
@@ -200,6 +204,21 @@ def bytes_human(value: float | int | None) -> str:
     return f"{int(amount)} B"  # pragma: no cover - unreachable
 
 
+def bytes_of(done: float | int | None, total: float | int | None) -> str:
+    """Progress in bytes → '41.2 of 108.6 MiB' (the unit is written once when both share it, as in the console),
+    '512.0 KiB of 1.2 MiB' otherwise."""
+    done_text, total_text = bytes_human(done), bytes_human(total)
+    done_number, _, done_unit = done_text.rpartition(" ")
+    if done_number and done_unit == total_text.rpartition(" ")[2]:
+        return f"{done_number} of {total_text}"
+    return f"{done_text} of {total_text}"
+
+
+def count(value: int) -> str:
+    """Integer with thousands separators → '2,431' (as the console writes file counts)."""
+    return f"{value:,}"
+
+
 def temperature(celsius: float | None) -> str:
     if celsius is None:
         return "-"
@@ -208,6 +227,15 @@ def temperature(celsius: float | None) -> str:
     except (TypeError, ValueError):
         return "-"
     return f"{value:.0f}°C" if math.isfinite(value) else "-"
+
+
+def utc_time(value: datetime | None) -> str:
+    """datetime → 'YYYY-MM-DD HH:MM UTC' (maintenance windows are set and emailed in UTC). None → '-'."""
+    if value is None:
+        return "-"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def date_str(value: date | None) -> str:

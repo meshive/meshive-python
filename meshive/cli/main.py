@@ -13,8 +13,11 @@ from . import _write as write_cli
 from .. import _config, _credentials
 from .._version import __version__
 from .._client import Meshive
-from ..exceptions import MeshiveError
+from ..exceptions import MeshiveError, NotFoundError
 from ..models import (
+    ACTIVITY_OUTCOMES,
+    ActivityEvent,
+    ActivityPage,
     ApiKey,
     Asset,
     AssetPage,
@@ -23,16 +26,26 @@ from ..models import (
     Credit,
     CreditHistoryEntry,
     Earnings,
+    DowntimeEvent,
     GpuAvailability,
+    HostMessage,
     Machine,
+    MachineClients,
+    MachineDetail,
     MachineMetrics,
+    MaintenanceWindow,
     Member,
     ModelSetList,
+    Payout,
+    PayoutAccount,
     Pod,
     PodMetrics,
+    ReadActivity,
     Serving,
     Storage,
+    StressTestResult,
     Task,
+    TaskOutputsStatus,
     Template,
     Transaction,
     WhoAmI,
@@ -88,11 +101,18 @@ def build_parser() -> argparse.ArgumentParser:
             "  meshive servings <workspace>   List serverless serving deployments\n"
             "  meshive credit                 Show your credit balance\n"
             "  meshive api-keys               List your API keys\n"
+            "  meshive activity               What your API keys did, with results (--reads: read counts)\n"
             "  meshive machines               List your machines (as a host)\n"
-            "  meshive machine <id>           Show a single machine\n"
+            "  meshive machine <id>           Show a machine: clients, maintenance, diagnostics\n"
+            "  meshive maintenance <machine>  List a machine's maintenance windows\n"
+            "  meshive host-messages          Messages from the workspaces using your machines\n"
             "  meshive earnings               Show your earnings (as a host)\n"
+            "  meshive payouts                Show your payout account and payouts (as a host)\n"
             "\n"
             "Write commands (need a key with the write scope; they ask for confirmation unless --yes):\n"
+            "  meshive workspace-create [name] [--estimate] [--wait]  (free; --wait returns once it is running)\n"
+            "  meshive workspace-update <ws> --name NAME [--estimate]  (rename it)\n"
+            "  meshive workspace-delete <ws> [--check]  (only an empty workspace; --check changes nothing)\n"
             "  meshive pod-create <ws> <name> --template ID --gpu MODEL [--model-set SLUG] [--hf-token ID] [--estimate]\n"
             "  meshive model-sets <ws> --template ID  (the SLUGs a template offers)\n"
             "  meshive pod-update <ws> <pod> --gpu MODEL [--estimate]\n"
@@ -102,6 +122,9 @@ def build_parser() -> argparse.ArgumentParser:
             "  meshive storage-connect <ws> <pv>  (SSH and SFTP access to a storage)\n"
             "  meshive task-submit <ws> <name> --script FILE --image IMG --cpu-preset micro-2c8g\n"
             "  meshive logs <ws> <pod>          meshive task-logs <task>\n"
+            "  meshive maintenance-schedule <machine> --reason R --start ISO --end ISO [--emergency]\n"
+            "  meshive machine-list|machine-unlist|machine-delete <machine>\n"
+            "  meshive host-message-send <machine> --to WORKSPACE|all --title T\n"
             "\n"
             "Run `meshive <command> --help` for filters and options.\n"
             "Scripting: `-o name` prints just the IDs, one per line (pipe into xargs).\n"
@@ -248,12 +271,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Filter by display name substring. Note: a label, not a unique key.",
     )
 
-    p_machine = sub.add_parser("machine", parents=[common], help="Show a single machine.")
+    p_machine = sub.add_parser("machine", parents=[common],
+                               help="Show a single machine with its clients (other users' pods and volumes on it), "
+                                    "maintenance and diagnostics.")
     p_machine.add_argument("machine_id", help="Machine ID. See ID column of `meshive machines`.")
 
     p_machine_metrics = sub.add_parser("machine-metrics", parents=[common],
                                        help="Show live metrics (CPU/RAM/GPU/disk/network) of a machine.")
     p_machine_metrics.add_argument("machine_id", help="Machine ID. See ID column of `meshive machines`.")
+
+    p_maintenance = sub.add_parser("maintenance", parents=[common],
+                                   help="List a machine's maintenance windows (upcoming, in progress and past).")
+    p_maintenance.add_argument("machine_id", help="Machine ID. See ID column of `meshive machines`.")
+
+    p_history = sub.add_parser("machine-history", parents=[common],
+                               help="Show a machine's downtime history, or its latest stress test.")
+    p_history.add_argument("machine_id", help="Machine ID. See ID column of `meshive machines`.")
+    p_history.add_argument("--stress-test", action="store_true",
+                           help="Show the latest stress test and its measurements instead of the downtime history.")
+    p_history.add_argument("--since", default=None, metavar="DATE",
+                           help="Start of the downtime window, YYYY-MM-DD (default: 90 days ago).")
+    p_history.add_argument("--until", default=None, metavar="DATE",
+                           help="End of the downtime window, YYYY-MM-DD (default: today).")
+
+    p_host_messages = sub.add_parser("host-messages", parents=[common],
+                                     help="List messages between you and the workspaces using your machines "
+                                          "(newest first; reading doesn't mark them read).")
+    p_host_messages.add_argument("--machine", default=None, metavar="ID", dest="machine_id",
+                                 help="Only this machine's messages.")
+    p_host_messages.add_argument("--unread", action="store_true",
+                                 help="Only incoming messages you haven't read.")
 
     p_earnings = sub.add_parser("earnings", parents=[common], help="Show your earnings (as a host).")
     p_earnings.add_argument("--since", default=None, metavar="DATE",
@@ -262,6 +309,13 @@ def build_parser() -> argparse.ArgumentParser:
                             help="End of the history window, YYYY-MM-DD (default: today).")
     p_earnings.add_argument("--days", type=int, default=7, metavar="N",
                             help="Show only the most recent N days of the daily table (default: 7; 0 = all).")
+
+    p_payouts = sub.add_parser("payouts", parents=[common],
+                               help="Show your payout account, what is waiting to be paid out, and past payouts.")
+    p_payouts.add_argument("--since", default=None, metavar="DATE",
+                           help="Start of the payout history, YYYY-MM-DD (default: 90 days ago).")
+    p_payouts.add_argument("--until", default=None, metavar="DATE",
+                           help="End of the payout history, YYYY-MM-DD (default: today).")
 
     # --- gpus / templates -----------------------------------------------------
     p_gpus = sub.add_parser("gpus", parents=[common],
@@ -370,6 +424,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("api-keys", parents=[common], aliases=["keys"],
                    help="List your API keys (prefixes only; the secret is never shown).")
+    p_activity = sub.add_parser("activity", parents=[common],
+                                help="Show what this account's API keys did, with results (newest first). Request "
+                                     "contents are never recorded; activity is kept for 180 days.")
+    p_activity.add_argument("--reads", action="store_true",
+                            help="Show read requests instead, counted per hour, key, source and resource.")
+    p_activity.add_argument("--key", type=int, default=None, metavar="ID", dest="key_id",
+                            help="Only this key's activity. See ID column of `meshive api-keys`.")
+    p_activity.add_argument("--outcome", type=str.lower, default=None, choices=ACTIVITY_OUTCOMES,
+                            help="Only requests with this result. Not with --reads.")
+    p_activity.add_argument("--action", default=None, metavar="ACTION",
+                            help="Only this action (e.g. pod.delete), or every action under a prefix that ends in "
+                                 "'.' (e.g. machine.). Not with --reads.")
+    p_activity.add_argument("--since", default=None, metavar="DATE",
+                            help="Start, YYYY-MM-DD (UTC) or an ISO 8601 time (default: 30 days before --until).")
+    p_activity.add_argument("--until", default=None, metavar="DATE",
+                            help="End, YYYY-MM-DD (UTC, that whole day included) or an ISO 8601 time (default: now). "
+                                 "One call covers at most 180 days.")
+    p_activity.add_argument("--limit", type=int, default=50, metavar="N", help="Rows to show, 1..200 (default: 50).")
+    p_activity.add_argument("--offset", type=int, default=0, metavar="N",
+                            help="Skip the newest N rows (default: 0).")
     sub.add_parser("credit", parents=[common],
                    help="Show your credit balance (`-o name` prints just the balance).")
 
@@ -719,7 +793,7 @@ def _print_machines(machines: list[Machine], color: bool) -> None:
     )
 
 
-def _print_machine(machine: Machine, color: bool) -> None:
+def _print_machine(machine: Machine, color: bool, windows: list[MaintenanceWindow] | None = None) -> None:
     print(f"name:      {fmt.clean(machine.name or '-')}")  # user label
     print(f"id:        {fmt.clean(machine.machine_id)}")   # lookup key
     print(f"type:      {fmt.clean(machine.machine_type or '-')}")
@@ -728,6 +802,188 @@ def _print_machine(machine: Machine, color: bool) -> None:
     print(f"earn/hr:   {fmt.money(machine.earning_hourly)}")
     print(f"uptime:    {fmt.percent(machine.uptime_rate)}")
     print(f"tier:      {machine.host_tier or '-'}")
+    if not isinstance(machine, MachineDetail):
+        return
+    if machine.platform_fee is not None:
+        until = (f" (promotional until {fmt.date_str(machine.promotional_fee_until.date())})"
+                 if machine.promotional_fee_until else "")
+        print(f"fee:       {fmt.percent(machine.platform_fee)}{until}")
+    if machine.unread_messages:
+        print(fmt.clean(f"messages:  {machine.unread_messages} unread "
+                        f"(meshive host-messages --machine {machine.machine_id} --unread)"))
+    _print_machine_clients(machine.clients, color)
+    if windows is not None:
+        _print_machine_maintenance(machine.machine_id, windows, color)
+    _print_machine_diagnostics(machine, color)
+
+
+def _gib_cell(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value:,.0f} GiB" if value >= 10 or value == int(value) else f"{value:.1f} GiB"
+
+
+def _print_machine_clients(clients: MachineClients, color: bool) -> None:
+    print()
+    print(fmt.paint("Clients (other users' workspaces on this machine)", "dim", color))
+    if not clients.pods and not clients.storages:
+        print("No pods or volumes of other users.")
+        return
+    if clients.pods:
+        rows = [[p.workspace or "-", p.pod_name or "-",
+                 "serverless" if p.category.upper() == "SERVING_SERVERLESS" else "pod", fmt.status_cell(p.status),
+                 str(p.gpu_request) if p.gpu_request else "-", fmt.money_hourly(p.price_per_hour)]
+                for p in clients.pods]
+        colors = [[None, None, None, fmt.status_color(p.status), None, None] for p in clients.pods]
+        fmt.render_table(["WORKSPACE", "POD", "KIND", "STATUS", "GPUS", "PRICE/HR"], rows,
+                         aligns=["l", "l", "l", "l", "r", "r"], colors=colors, enabled=color)
+    if clients.storages:
+        if clients.pods:
+            print()
+        rows = [[s.workspace or "-", s.pv_name or "-", s.storage_type or "-", fmt.status_cell(s.status),
+                 _gib_cell(s.capacity_gb), fmt.usage(s.usage_rate), fmt.money_hourly(s.price_per_hour)]
+                for s in clients.storages]
+        colors = [[None, None, None, fmt.status_color(s.status), None, None, None] for s in clients.storages]
+        fmt.render_table(["WORKSPACE", "STORAGE", "TYPE", "STATUS", "SIZE", "USED", "PRICE/HR"], rows,
+                         aligns=["l", "l", "l", "l", "r", "r", "r"], colors=colors, enabled=color)
+
+
+_OPEN_WINDOW_STATUSES = ("upcoming", "overdue", "in_progress")
+
+
+def _print_machine_maintenance(machine_id: str, windows: list[MaintenanceWindow], color: bool) -> None:
+    print()
+    print(fmt.paint("Maintenance", "dim", color))
+    current = [w for w in windows if w.status in _OPEN_WINDOW_STATUSES]
+    if current:
+        _print_maintenance(current, color)
+    else:
+        print("No upcoming maintenance.")
+    past = len(windows) - len(current)
+    if past:
+        print(fmt.paint(fmt.clean(f"{past} past window(s): meshive maintenance {machine_id}"), "dim", color))
+
+
+def _print_machine_diagnostics(machine: MachineDetail, color: bool) -> None:
+    state = machine.raw.get("state") or {}
+    pairs: list[tuple[str, str]] = []
+    stage, stage_state = state.get("stage"), state.get("stageState")
+    if stage:
+        pairs.append(("stage", f"{stage} ({stage_state})" if stage_state and stage_state != stage else str(stage)))
+    total, step = state.get("totalSetupStep"), state.get("setupStep")
+    if total and str(stage_state or "").upper() != "COMPLETED":
+        pairs.append(("setup step", f"{step}/{total}"))
+    if state.get("graceEndsAt"):
+        pairs.append(("grace ends", fmt.utc_time(_parse_dt(state.get("graceEndsAt")))))
+    if state.get("pendingReverifyReason"):
+        pairs.append(("re-verifying", str(state.get("pendingReverifyReason"))))
+    boot = machine.boot_report
+    errors: list[dict] = []
+    if boot is not None:
+        errors = [e for e in boot.get("bootErrors") or [] if isinstance(e, dict)]
+        booted = boot.get("isBootSuccessful", True) and not errors
+        pairs.append(("boot", "ok" if booted else f"{len(errors)} error(s)" if errors else "failed"))
+        unreachable = [f"{r.get('port')}/{r.get('protocol')}" for r in boot.get("portCheckResults") or []
+                       if isinstance(r, dict) and not r.get("reachable")]
+        if boot.get("isPortCheckPassed", True) and not unreachable:
+            pairs.append(("ports", "ok"))
+        else:
+            pairs.append(("ports", "unreachable: " + ", ".join(unreachable) if unreachable else "failed"))
+    if machine.network_warnings:
+        pairs.append(("network", ", ".join(str(w.get("code", "-")) for w in machine.network_warnings)))
+    if not pairs:
+        return
+    print()
+    print(fmt.paint("Diagnostics", "dim", color))
+    write_cli._kv(pairs)
+    for error in errors:
+        print(fmt.clean(f"  {error.get('step', '-')}: {error.get('message', '')}"))
+    if str(stage_state or "").upper() == "FAILED":
+        print(fmt.paint(fmt.clean(f"Setup failed. Retry it with `meshive machine-retry {machine.machine_id}`."),
+                        "yellow", color))
+
+
+def _print_maintenance(windows: list[MaintenanceWindow], color: bool) -> None:
+    if not windows:
+        print("No maintenance windows.")
+        return
+    rows = [[str(w.id), fmt.status_cell(w.status), "emergency" if w.is_emergency else "regular",
+             fmt.utc_time(w.start_time), fmt.utc_time(w.end_time), str(w.extend_count) if w.extend_count else "-",
+             w.reason or "-"] for w in windows]
+    colors = [[None, fmt.status_color(w.status), "yellow" if w.is_emergency else None, None, None, None, None]
+              for w in windows]
+    fmt.render_table(["ID", "STATUS", "TYPE", "START", "END", "EXTENDED", "REASON"], rows,
+                     aligns=["r", "l", "l", "l", "l", "r", "l"], colors=colors, enabled=color)
+    if any(w.status == "overdue" for w in windows):
+        print(fmt.paint("An overdue window starts on its own within about a minute.", "dim", color))
+
+
+def _print_downtime(events: list[DowntimeEvent], color: bool) -> None:
+    if not events:
+        print("No downtime in this period.")
+        return
+    fmt.render_table(["TIME", "EVENT", "DETAIL"],
+                     [[fmt.utc_time(e.timestamp), e.event or "-", e.detail or "-"] for e in events], enabled=color)
+
+
+_STRESS_LOG_LINES = 20
+
+
+def _print_stress_test(result: StressTestResult, color: bool) -> None:
+    if result.stage is None and result.status is None and not result.metrics:
+        print("No stress test on this machine.")
+        return
+    status = result.status or "-"
+    duration = (f"about {round(result.expected_duration_seconds / 60)} min"
+                if result.expected_duration_seconds else "-")
+    write_cli._kv([("stage", result.stage or "-"),
+                   ("status", fmt.paint(fmt.clean(fmt.status_cell(status)), fmt.status_color(status), color)),
+                   ("started", fmt.relative_time(result.started_at)), ("duration", duration),
+                   ("samples", str(len(result.metrics)))])
+    lines = (result.log or "").splitlines()[-_STRESS_LOG_LINES:]
+    if lines:
+        print()
+        print(fmt.paint("Log (last lines)", "dim", color))
+        for line in lines:
+            print(fmt.clean(line))
+
+
+def _print_host_messages(messages: list[HostMessage], color: bool) -> None:
+    if not messages:
+        print("No messages.")
+        return
+    for index, m in enumerate(messages):
+        if index:
+            print()
+        unread = m.direction == "in" and not m.is_read
+        head = (f"#{m.id}  {'from' if m.direction == 'in' else 'to'} {m.workspace or '-'}  machine {m.machine_id}  "
+                f"{fmt.relative_time(m.created_at)}{'  unread' if unread else ''}")
+        print(fmt.paint(fmt.clean(head), "yellow" if unread else "dim", color))
+        print(fmt.clean(m.title or "(no title)"))
+        for line in m.content.splitlines():
+            print("  " + fmt.clean(line))
+    if any(m.direction == "in" and not m.is_read for m in messages):
+        print()
+        print(fmt.paint("Mark them read: meshive host-messages-read <machine> ID...", "dim", color))
+
+
+def _print_payouts(account: PayoutAccount, payouts: list[Payout], color: bool) -> None:
+    if not account.has_account:
+        state = "not set up — set it up in the console (Earnings)"
+    elif account.is_fully_onboarded:
+        state = "ready"
+    else:
+        state = f"onboarding not finished ({account.account_status or 'pending'}) — finish it in the console (Earnings)"
+    write_cli._kv([("account", state), ("pending", fmt.money(account.pending_amount)),
+                   ("minimum", f"{fmt.money(account.minimum_payout)} (paid out automatically from this amount)")])
+    print()
+    if not payouts:
+        print("No payouts in this period.")
+        return
+    rows = [[fmt.date_str(p.settle_date), fmt.money(p.amount), fmt.yes_no(p.is_paid),
+             fmt.date_str(p.paid_date.date()) if p.paid_date else "-", p.payment_method or "-"] for p in payouts]
+    fmt.render_table(["SETTLED", "AMOUNT", "PAID", "PAID ON", "METHOD"], rows,
+                     aligns=["l", "r", "l", "l", "l"], enabled=color)
 
 
 def _print_earnings(e: Earnings, days: int, color: bool) -> None:
@@ -901,20 +1157,184 @@ def _task_gpu(t: Task) -> str:
     return f"{t.gpu_count}x {t.gpu_model}" if t.gpu_count else t.gpu_model
 
 
+def _files(n: int) -> str:
+    return f"{fmt.count(n)} file{'' if n == 1 else 's'}"
+
+
+def _positive(value: int | None) -> bool:
+    return value is not None and value > 0
+
+
+def _ahead(dt: datetime | None, now: datetime) -> str | None:
+    """A time still ahead → 'in a few seconds' / 'in 3 minutes'. None if unknown or already past."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    seconds = (dt - now).total_seconds()
+    if seconds <= 0:
+        return None
+    return "in a few seconds" if seconds < 60 else fmt.relative_time(dt, now=now)
+
+
+def _outputs_total_known(o: TaskOutputsStatus) -> bool:
+    """The server knows how much will be uploaded. Some tasks don't report a total while they are saved."""
+    return _positive(o.files_total) or _positive(o.bytes_total)
+
+
+def _outputs_progress(o: TaskOutputsStatus) -> tuple[int, int] | None:
+    """(files so far, files to upload) when the total is known. Files over the limit aren't uploaded, so they aren't
+    in it."""
+    planned = o.files_to_upload
+    if o.files_so_far is None or planned is None or planned <= 0:
+        return None
+    return o.files_so_far, planned
+
+
+def _outputs_bytes_done(o: TaskOutputsStatus) -> int | None:
+    return o.bytes_saved if o.bytes_saved is not None else o.bytes_so_far
+
+
+def _outputs_known_parts(o: TaskOutputsStatus, *, bytes_of_total: bool = True) -> list[str | None]:
+    """'48/126 files', '41.2 of 108.6 MiB' — progress against a known total."""
+    progress = _outputs_progress(o)
+    done = _outputs_bytes_done(o)
+    if bytes_of_total and done is not None and _positive(o.bytes_total):
+        size = fmt.bytes_of(done, o.bytes_total)
+    else:
+        size = fmt.bytes_human(done) if _positive(done) else None
+    return [f"{fmt.count(progress[0])}/{_files(progress[1])}" if progress else None, size]
+
+
+def _outputs_unknown_parts(o: TaskOutputsStatus, *, so_far: bool = True) -> list[str | None]:
+    """'48 files so far', '41.2 MiB' — what has come in, when the total isn't known."""
+    done = o.bytes_so_far if o.bytes_so_far is not None else o.bytes_saved
+    files = f"{_files(o.files_so_far)}{' so far' if so_far else ''}" if _positive(o.files_so_far) else None
+    return [files, fmt.bytes_human(done) if _positive(done) else None]
+
+
+def _outputs_over_limit(o: TaskOutputsStatus) -> str | None:
+    """Said while saving, so it isn't news once the outputs are saved."""
+    if not _positive(o.files_over_limit):
+        return None
+    limit = f"{fmt.count(o.files_limit)}-file limit" if o.files_limit is not None else "file limit"
+    return f"{fmt.count(o.files_over_limit)} over the {limit} won't be saved"
+
+
+def _outputs_asset(o: TaskOutputsStatus) -> str:
+    """' as my-run (asset_abc)', or '' when the server didn't name the asset."""
+    if o.asset_name and o.asset_id:
+        return f" as {o.asset_name} ({o.asset_id})"
+    if o.asset_id or o.asset_name:
+        return f" as {o.asset_id or o.asset_name}"
+    return ""
+
+
+def _task_outputs_partial_note(o: TaskOutputsStatus) -> str | None:
+    """'Only 2,000 of 2,431 output files were saved — 431 were over the 2,000-file limit.' The limit is named only
+    when it is the whole reason. None when the server didn't count any missing file."""
+    saved = o.files_saved or 0
+    not_saved = o.files_not_saved or 0
+    if not_saved <= 0:
+        return None
+    note = f"Only {fmt.count(saved)} of {fmt.count(saved + not_saved)} output files were saved"
+    over = o.files_over_limit or 0
+    if over > 0 and over == not_saved and o.files_limit is not None:
+        return f"{note} — {fmt.count(over)} were over the {fmt.count(o.files_limit)}-file limit."
+    return f"{note}."
+
+
+def _task_outputs_line(o: TaskOutputsStatus, *, now: datetime | None = None) -> str | None:
+    """The task detail's outputs: line, in the console's words. None while the task runs."""
+    now = now or datetime.now(timezone.utc)
+    known = _outputs_total_known(o)
+    phase = o.phase
+    if phase == "preparing":
+        parts = ["preparing to save", "scanning /outputs"]
+    elif phase == "uploading":
+        if known:
+            parts = ["uploading", *_outputs_known_parts(o), _outputs_over_limit(o)]
+        else:
+            parts = ["uploading", *_outputs_unknown_parts(o), "total not known yet"]
+    elif phase == "retrying":
+        next_try = _ahead(o.next_attempt_at, now)
+        parts = ["retrying the upload", *(_outputs_known_parts(o) if known else _outputs_unknown_parts(o)),
+                 f"next try {next_try}" if next_try else ("retrying now" if o.next_attempt_at else None),
+                 _outputs_over_limit(o) if known else None]
+    elif phase == "registering":
+        expected = _ahead(o.expected_in_assets_at, now)
+        parts = ["adding to Assets",
+                 *(_outputs_known_parts(o, bytes_of_total=False) if known
+                   else _outputs_unknown_parts(o, so_far=False)),
+                 f"expected {expected}" if expected else None,
+                 _outputs_over_limit(o) if known else None]
+    elif phase in ("saved", "partially_saved"):
+        lead = "saved to Assets" if phase == "saved" else "partly saved to Assets"
+        if o.asset_deleted:
+            parts = [f"{lead}, but the asset has since been deleted"]
+        else:
+            parts = [lead + _outputs_asset(o),
+                     _files(o.files_saved) if _positive(o.files_saved) else None,
+                     fmt.bytes_human(o.bytes_saved) if _positive(o.bytes_saved) else None]
+    elif phase == "not_saved":
+        parts = ["not saved"]
+    elif phase == "discarded":
+        kept = _outputs_asset(o) if o.asset_id and not o.asset_deleted else ""
+        parts = ["upload discarded", f"the files uploaded before that are in Assets{kept}" if kept else None]
+    elif phase == "empty":
+        parts = ["no output files"]
+    elif phase and phase != "running":
+        parts = [phase]                 # a phase this version doesn't know yet
+    else:
+        return None
+    return " · ".join(p for p in parts if p)
+
+
+# The OUTPUTS column of `meshive tasks`: phase → (text, color).
+_TASK_OUTPUTS_CELLS = {
+    "preparing": ("preparing", "cyan"),
+    "uploading": ("uploading", "cyan"),
+    "retrying": ("retrying", "yellow"),
+    "registering": ("adding to Assets", "cyan"),
+    "saved": ("saved", "green"),
+    "partially_saved": ("partly saved", "yellow"),
+    "not_saved": ("not saved", "red"),
+    "discarded": ("discarded", "gray"),
+    "empty": ("no files", "dim"),
+}
+
+
+def _task_outputs_cell(o: TaskOutputsStatus | None) -> tuple[str, str | None]:
+    if o is None or not o.phase or o.phase == "running":
+        return "-", "dim"
+    text, color = _TASK_OUTPUTS_CELLS.get(o.phase, (o.phase, None))
+    progress = _outputs_progress(o) if _outputs_total_known(o) else None
+    if o.phase == "uploading" and progress:
+        text = f"uploading {fmt.count(progress[0])}/{fmt.count(progress[1])}"
+    elif o.phase == "partially_saved":
+        saved = o.files_saved or 0
+        text = f"partly saved {fmt.count(saved)}/{fmt.count(saved + (o.files_not_saved or 0))}"
+    return text, color
+
+
 def _print_tasks(tasks: list[Task], color: bool) -> None:
     if not tasks:
         print("No tasks.")
         return
+    # Servers that predate the outputs status don't send it: the table keeps its old columns then.
+    with_outputs = any(t.outputs is not None for t in tasks)
     rows = []
     colors = []
     for t in tasks:
-        rows.append([t.name or "-", t.task_id, fmt.status_cell(t.status), _task_gpu(t),
-                     fmt.money(t.cost_so_far), fmt.relative_time(t.created_at)])
-        colors.append([None, None, fmt.status_color(t.status), None, None, "dim"])
+        outputs, outputs_color = _task_outputs_cell(t.outputs)
+        rows.append([t.name or "-", t.task_id, fmt.status_cell(t.status), *([outputs] if with_outputs else []),
+                     _task_gpu(t), fmt.money(t.cost_so_far), fmt.relative_time(t.created_at)])
+        colors.append([None, None, fmt.status_color(t.status), *([outputs_color] if with_outputs else []),
+                       None, None, "dim"])
     fmt.render_table(
-        ["NAME", "ID", "STATUS", "GPU", "COST", "CREATED"],
+        ["NAME", "ID", "STATUS", *(["OUTPUTS"] if with_outputs else []), "GPU", "COST", "CREATED"],
         rows,
-        aligns=["l", "l", "l", "l", "r", "l"],
+        aligns=["l", "l", "l", *(["l"] if with_outputs else []), "l", "r", "l"],
         colors=colors,
         enabled=color,
     )
@@ -944,14 +1364,26 @@ def _print_task(t: Task, color: bool) -> None:
         print(fmt.paint(fmt.clean(f"failure:     {t.failure_reason}"), "red", color))
     if t.failed_asset_id:
         print(fmt.paint(fmt.clean(f"failed on:   input asset {t.failed_asset_id}"), "red", color))
-    if t.output_upload_state and t.output_upload_state not in ("skipped", "discarded"):
+    if t.outputs is not None:
+        line = _task_outputs_line(t.outputs)
+        if line:
+            print(fmt.paint(fmt.clean(f"outputs:     {line}"), "red" if t.outputs.phase == "not_saved" else None,
+                            color))
+        note = _task_outputs_partial_note(t.outputs) if t.outputs.phase == "partially_saved" else None
+        if note:
+            print(fmt.paint(f"             {note}", "yellow", color))
+    elif t.output_upload_state and t.output_upload_state not in ("skipped", "discarded"):
+        # A server that predates the outputs status: show its raw upload counters.
         files = f"{t.output_files_completed or 0} of {t.output_files_declared or 0} files"
         size = f"{fmt.bytes_human(t.output_bytes_completed)} of {fmt.bytes_human(t.output_bytes_declared)}"
         print(f"outputs:     {fmt.clean(t.output_upload_state)}, {files}, {size}")
+    if t.output_include:
+        print(f"output filter: {fmt.clean(', '.join(t.output_include))}")
     if t.output_upload_last_error:
         print(fmt.paint(fmt.clean(f"upload error: {t.output_upload_last_error}"), "red", color))
     if t.outputs_purged_at:
-        print(f"outputs:     deleted {fmt.relative_time(t.outputs_purged_at)}")
+        # Only the task's log is deleted after its retention period; the outputs stay in Assets.
+        print(f"log:         deleted {fmt.relative_time(t.outputs_purged_at)}")
     if t.input_assets:
         print()
         rows = [[a.name or "-", a.asset_id, a.target_dir or "-"] for a in t.input_assets]
@@ -1074,6 +1506,67 @@ def _print_api_keys(keys: list[ApiKey], color: bool) -> None:
         colors=colors,
         enabled=color,
     )
+
+
+_OUTCOME_COLORS = {"accepted": "green", "refused": "yellow", "error": "red"}
+
+
+def _activity_key(key_name: str | None, key_prefix: str | None, key_id: int | None) -> str:
+    if key_name:
+        return key_name
+    if key_prefix:
+        return key_prefix
+    return f"#{key_id}" if key_id is not None else "-"
+
+
+def _activity_target(event: ActivityEvent) -> str:
+    """What the request was about, from its path: "pod my-pod in ws-1", "machine mac-1", "storage in ws-1"."""
+    target = event.resource_type or ""
+    if event.resource_id:
+        target = f"{target} {event.resource_id}".strip()
+    elif event.machine_id:
+        target = f"{target} on machine {event.machine_id}".strip()
+    if event.workspace:
+        target = f"{target} in {event.workspace}" if target else event.workspace
+    return target or "-"
+
+
+def _activity_result(event: ActivityEvent) -> str:
+    result = event.outcome or "-"
+    if event.outcome != "accepted":
+        detail = f"{event.status_code}" + (f" {event.error_title}" if event.error_title else "")
+        result = f"{result} ({detail})" if event.status_code else result
+    return f"{result}, replayed" if event.replayed else result
+
+
+def _print_activity_events(page: ActivityPage, offset: int, color: bool) -> None:
+    events: list[ActivityEvent] = page.items  # type: ignore[assignment]
+    if not events:
+        print("No API-key activity in this period.")
+        return
+    rows, colors = [], []
+    for e in events:
+        key = _activity_key(e.key_name, e.key_prefix, e.key_id) + (" (revoked)" if e.key_revoked else "")
+        rows.append([fmt.utc_time(e.created_at), key, e.source or "-", e.action or "-", _activity_target(e),
+                     _activity_result(e)])
+        colors.append(["dim", "gray" if e.key_revoked else None, None, None, None, _OUTCOME_COLORS.get(e.outcome)])
+    fmt.render_table(["TIME", "KEY", "SOURCE", "ACTION", "TARGET", "RESULT"], rows, colors=colors, enabled=color)
+    if page.total is not None and page.total > offset + len(events):
+        print()
+        print(fmt.paint(f"Showing {offset + 1}-{offset + len(events)} of {page.total}. Older ones: "
+                        f"--offset {offset + len(events)}, or narrow with --since/--until/--key/--outcome/--action.",
+                        "dim", color))
+
+
+def _print_activity_reads(page: ActivityPage, color: bool) -> None:
+    reads: list[ReadActivity] = page.items  # type: ignore[assignment]
+    if not reads:
+        print("No read requests in this period.")
+        return
+    rows = [[fmt.utc_time(r.hour), _activity_key(r.key_name, r.key_prefix, r.key_id), r.source or "-",
+             r.resource_type or "-", f"{r.count:,}"] for r in reads]
+    fmt.render_table(["HOUR", "KEY", "SOURCE", "RESOURCE", "COUNT"], rows, aligns=["l", "l", "l", "l", "r"],
+                     colors=[["dim", None, None, None, None] for _ in reads], enabled=color)
 
 
 def _print_credit(c: Credit, color: bool) -> None:
@@ -1297,7 +1790,46 @@ def _cmd_machines(client: Meshive, args: argparse.Namespace, output: str, color:
 
 def _cmd_machine(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     machine = client.get_machine(args.machine_id)
-    _emit(output, machine.raw, [machine.machine_id], lambda: _print_machine(machine, color))
+    windows = None
+    if output == "table" and isinstance(machine, MachineDetail):
+        try:
+            windows = client.list_maintenance(args.machine_id)
+        except NotFoundError:
+            windows = None      # a server older than the maintenance listing: the block is left out
+    _emit(output, machine.raw, [machine.machine_id], lambda: _print_machine(machine, color, windows))
+    return 0
+
+
+def _cmd_maintenance(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    windows = client.list_maintenance(args.machine_id)
+    _emit(output, [w.raw for w in windows], [str(w.id) for w in windows], lambda: _print_maintenance(windows, color))
+    return 0
+
+
+def _cmd_machine_history(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    if args.stress_test:
+        result = client.get_stress_test(args.machine_id)
+        _emit(output, result.raw, [result.status or ""], lambda: _print_stress_test(result, color))
+        return 0
+    events = client.get_downtime_history(args.machine_id, start_date=args.since, end_date=args.until)
+    _emit(output, [e.raw for e in events], [e.timestamp.isoformat() if e.timestamp else "" for e in events],
+          lambda: _print_downtime(events, color))
+    return 0
+
+
+def _cmd_host_messages(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    messages = client.list_host_messages(machine_id=args.machine_id, unread_only=args.unread)
+    _emit(output, [m.raw for m in messages], [str(m.id) for m in messages],
+          lambda: _print_host_messages(messages, color))
+    return 0
+
+
+def _cmd_payouts(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    account = client.get_payout_account()
+    payouts = client.list_payouts(start_date=args.since, end_date=args.until)
+    # Single-value resource: -o name prints only the amount waiting to be paid out, like `earnings`.
+    _emit(output, {"account": account.raw, "payouts": [p.raw for p in payouts]}, [f"{account.pending_amount:.2f}"],
+          lambda: _print_payouts(account, payouts, color))
     return 0
 
 
@@ -1455,6 +1987,19 @@ def _cmd_api_keys(client: Meshive, args: argparse.Namespace, output: str, color:
     return 0
 
 
+def _cmd_activity(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    kind = "reads" if args.reads else "events"
+    page = client.list_activity(kind=kind, key_id=args.key_id, outcome=args.outcome, action=args.action,
+                                since=args.since, until=args.until, limit=args.limit, offset=args.offset)
+    if kind == "reads":
+        ids = [r.hour.isoformat() if r.hour else "" for r in page.items]  # type: ignore[union-attr]
+        _emit(output, page.raw, ids, lambda: _print_activity_reads(page, color))
+    else:
+        _emit(output, page.raw, [str(e.id) for e in page.items],  # type: ignore[union-attr]
+              lambda: _print_activity_events(page, args.offset, color))
+    return 0
+
+
 def _cmd_credit(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     credit = client.get_credit()
     # Single-value resource: -o name prints only the balance number (directly comparable in scripts).
@@ -1485,7 +2030,11 @@ _HANDLERS: dict[str, Handler] = {
     "machines": _cmd_machines, "m": _cmd_machines,
     "machine": _cmd_machine,
     "machine-metrics": _cmd_machine_metrics,
+    "maintenance": _cmd_maintenance,
+    "machine-history": _cmd_machine_history,
+    "host-messages": _cmd_host_messages,
     "earnings": _cmd_earnings,
+    "payouts": _cmd_payouts,
     "gpus": _cmd_gpus,
     "cpus": _cmd_cpus,
     "templates": _cmd_templates,
@@ -1501,6 +2050,7 @@ _HANDLERS: dict[str, Handler] = {
     "task-outputs": _cmd_task_outputs,
     "asset-storage": _cmd_asset_storage,
     "api-keys": _cmd_api_keys, "keys": _cmd_api_keys,
+    "activity": _cmd_activity,
     "credit": _cmd_credit,
     "credit-history": _cmd_credit_history,
     **write_cli.HANDLERS,

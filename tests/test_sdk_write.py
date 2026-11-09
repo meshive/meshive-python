@@ -8,6 +8,7 @@ import pytest
 
 from meshive import (
     MeshiveAPIError,
+    MeshiveError,
     NotFoundError,
     PermissionDeniedError,
     PodCreationFailedError,
@@ -22,8 +23,23 @@ from meshive import (
     StorageCreated,
     TaskSubmitted,
     WaitTimeoutError,
+    WorkspaceCreated,
+    WorkspaceEstimate,
+    AssetImported,
+    ListingResult,
+    MachineDeleted,
+    MaintenanceAction,
+    MessageSent,
+    MessagesRead,
+    PodUpdated,
+    RetryResult,
+    StorageUpdated,
+    WatchedFolders,
+    WorkspaceUpdated,
 )
-from tests.test_sdk import async_client, isolate_config_dir, slept, sync_client  # noqa: F401  (autouse fixtures)
+from meshive import _client, _write
+from tests.test_sdk import (_counting_handler, async_client, isolate_config_dir, slept,  # noqa: F401  (autouse fixtures)
+                            sync_client)
 
 ESTIMATE = {"pricePerHourUsd": "0.068423", "breakdown": {"gpu": "0.068423"}, "resources": {"gpu_model": "RTX 3060"},
             "availability": {"available_gpus": 2}, "template": {"id": 457}, "volumes": [], "note": "Estimated"}
@@ -334,6 +350,34 @@ def test_generated_key_is_available_after_timeout_and_can_be_reused():
     assert seen == [key, key]
 
 
+# The other httpx errors a write can end with: the connection broke after the request may have reached the server
+# (as when the API restarts a worker mid-request), the answer could not be read, or the request could not be sent.
+CUT_OFF = [httpx.ReadError, httpx.WriteError, httpx.CloseError, httpx.RemoteProtocolError, httpx.LocalProtocolError,
+           httpx.ProxyError, httpx.UnsupportedProtocol, httpx.DecodingError]
+
+
+@pytest.mark.parametrize("failure", CUT_OFF)
+def test_a_write_cut_off_mid_request_is_not_resent_and_keeps_its_operation_identity(slept, failure):
+    seen = []
+
+    def cut_off(request):
+        seen.append(request.headers["Idempotency-Key"])
+        raise failure("Server disconnected without sending a response.", request=request)
+
+    async def run_async():
+        async with async_client(cut_off) as c:
+            await c.stop_task("task_1")
+
+    with pytest.raises(failure) as sync_err:
+        sync_client(cut_off).stop_task("task_1")
+    with pytest.raises(failure) as async_err:
+        asyncio.run(run_async())
+    assert len(seen) == 2 and slept == []           # each client sent it once
+    for err, key in zip((sync_err, async_err), seen):
+        assert (err.value.idempotency_key, err.value.operation_method, err.value.operation_path) == (
+            key, "POST", "/tasks/task_1/stop")
+
+
 def test_write_result_and_status_lookup_keep_operation_identity():
     rec = Recorder((202, {'podName': 'p', 'action': 'start'}))
     result = sync_client(rec).start_pod('p', 'ws', placement='any_node', allow_data_loss=True,
@@ -342,6 +386,78 @@ def test_write_result_and_status_lookup_keep_operation_identity():
     assert result.raw['idempotencyKey'] == 'move-operation-0001' and result.raw['operationPath'] == '/pods/p/start'
     client = sync_client(Recorder((200, {'state': 'unknown'})))
     assert client.get_operation('move-operation-0001', method='POST', path='/pods/p/start')['state'] == 'unknown'
+
+
+def _answer(status, body, replayed_header=None):
+    """MockTransport handler: one fixed answer, optionally with the server's Idempotent-Replayed header."""
+    headers = {} if replayed_header is None else {"Idempotent-Replayed": replayed_header}
+    return lambda request: httpx.Response(status, json=body, headers=headers)
+
+
+@pytest.mark.parametrize("header", ["true", "TRUE", "True"])
+def test_a_replayed_write_says_so(header):
+    handler = _answer(202, {"podName": "p", "workspace": "ws", "action": "stop"}, header)
+    result = sync_client(handler).stop_pod("p", "ws", idempotency_key="stop-operation-0001")
+    assert result.replayed is True and result.raw["replayed"] is True
+    assert result.raw["idempotencyKey"] == "stop-operation-0001"
+
+    async def run():
+        async with async_client(handler) as c:
+            return await c.stop_pod("p", "ws", idempotency_key="stop-operation-0001")
+
+    assert asyncio.run(run()).replayed is True
+
+
+@pytest.mark.parametrize("header", [None, "false", ""])
+def test_a_fresh_write_is_not_marked_replayed(header):
+    handler = _answer(202, {"name": "p", "workspace": "ws", "transactionId": 3, "estimate": ESTIMATE}, header)
+    created = sync_client(handler).create_pod("p", 1, workspace="ws", gpu_model="RTX 3060")
+    assert created.replayed is False and "replayed" not in created.raw
+
+    async def run():
+        async with async_client(handler) as c:
+            return await c.create_pod("p", 1, workspace="ws", gpu_model="RTX 3060")
+
+    created = asyncio.run(run())
+    assert created.replayed is False and "replayed" not in created.raw
+
+
+def test_a_read_ignores_the_replayed_header():
+    handler = _answer(200, {"version": "3:ab", "editable": True, "roots": []}, "true")
+    folders = sync_client(handler).get_watched_folders("p-0", "ws")
+    assert folders.replayed is False and "replayed" not in folders.raw
+
+    async def run():
+        async with async_client(handler) as c:
+            return await c.get_watched_folders("p-0", "ws")
+
+    assert asyncio.run(run()).replayed is False
+
+
+@pytest.mark.parametrize("model", [ResourceAction, WorkspaceCreated, WorkspaceUpdated, PodCreated, PodUpdated,
+                                   StorageCreated, StorageUpdated, WatchedFolders, AssetImported, TaskSubmitted,
+                                   MaintenanceAction, ListingResult, RetryResult, MachineDeleted, MessageSent,
+                                   MessagesRead])
+def test_every_write_result_carries_replayed(model):
+    assert model.from_dict({"replayed": True}).replayed is True
+    assert model.from_dict({}).replayed is False
+
+
+@pytest.mark.parametrize("client_class", [Meshive, AsyncMeshive])
+def test_every_write_that_takes_an_idempotency_key_returns_replayed(client_class):
+    import dataclasses
+    import inspect
+
+    # connect_storage keeps polling until the storage is ready, so what it returns is a later read, not the write's answer.
+    checked = []
+    for name, fn in inspect.getmembers(client_class, inspect.isfunction):
+        if name.startswith("_") or name == "connect_storage":
+            continue
+        signature = inspect.signature(fn, eval_str=True)
+        if "idempotency_key" in signature.parameters:
+            assert "replayed" in {f.name for f in dataclasses.fields(signature.return_annotation)}, name
+            checked.append(name)
+    assert {"stop_pod", "create_pod", "submit_task", "delete_machine", "mark_host_messages_read"} <= set(checked)
 
 
 def test_async_data_loss_flag_and_error_key():
@@ -409,14 +525,27 @@ def test_model_registration_methods():
 
     rec = Recorder((201, {"resource": "model", "id": "12", "workspace": "ws", "action": "register",
                           "result": {"title": "Already Registered", "registrationId": 12}}))
-    r = sync_client(rec).register_model("Qwen/Qwen3-0.6B", workspace="ws", name="qwen-small", framework="sglang",
+    r = sync_client(rec).register_model("Qwen/Qwen3-0.6B", workspace="ws", name="qwen-small", framework="vllm",
                                         context_length=8192)
     assert rec.last.method == "POST" and rec.last.headers["Idempotency-Key"]
     assert json.loads(rec.last.content) == {"huggingfaceRepo": "Qwen/Qwen3-0.6B", "modelName": "qwen-small",
-                                            "framework": "sglang", "contextLength": 8192}
+                                            "framework": "vllm", "contextLength": 8192}
     assert r.id == "12" and r.resource == "model"
     with pytest.raises(ValueError):
+        sync_client(rec).register_model("Qwen/Qwen3-0.6B", workspace="ws", framework=" ")
+
+    # The server decides which engines it serves and says why it refuses one, so the value goes out unchanged.
+    rec = Recorder((400, {"detail": {"title": "SGLang Not Offered",
+                                     "message": "SGLang is no longer offered for text models. Text models are served "
+                                                "with vLLM — omit framework or set framework='vllm'."}}))
+    with pytest.raises(MeshiveAPIError) as refused:
+        sync_client(rec).register_model("Qwen/Qwen3-0.6B", workspace="ws", framework="sglang")
+    assert json.loads(rec.last.content)["framework"] == "sglang"
+    assert refused.value.status_code == 400 and "vLLM" in str(refused.value)
+    rec = Recorder((400, {"detail": {"title": "Unsupported framework for LLM modality", "message": "Use 'vllm'."}}))
+    with pytest.raises(MeshiveAPIError):
         sync_client(rec).register_model("Qwen/Qwen3-0.6B", workspace="ws", framework="comfyui")
+    assert json.loads(rec.last.content)["framework"] == "comfyui"     # no local engine list
 
     rec = Recorder((200, {"resource": "model", "id": "12", "action": "delete", "result": {"title": "Success"}}))
     sync_client(rec).delete_model(12)
@@ -491,10 +620,17 @@ def test_pod_assets_and_watched_folders():
     assert body["watchedFolders"] == [{"path": "/workspace/later", "includeExisting": False, "enabled": False}]
     assert body["watchedTemplateFolders"] == {"/outputs": {"enabled": False},
                                               "/workspace/config": {"enabled": True, "include": ["*.yaml"]}}
+    # Moving the template's output folder (its $MESHIVE_OUTPUT_DIR and storage follow on the server)
+    rec = Recorder((202, {"name": "p", "workspace": "ws", "transactionId": 3, "estimate": {"pricePerHourUsd": "1"}}))
+    sync_client(rec).create_pod("p", 457, workspace="ws",
+                                watched_template_folders={"/workspace/output": {"path": "/workspace/results"}})
+    assert rec.body()["watchedTemplateFolders"] == {"/workspace/output": {"enabled": True,
+                                                                          "path": "/workspace/results"}}
     for bad in (dict(input_assets=[{"asset": "asset_b", "include_paths": ["unet/"]}]),
                 dict(input_assets=[{"asset": "asset_b", "strip_prefix": True}]),
                 dict(watched_template_folders=["/outputs"]),
-                dict(watched_template_folders={"/outputs": False})):
+                dict(watched_template_folders={"/outputs": False}),
+                dict(watched_template_folders={"/outputs": {"path": " "}})):
         with pytest.raises(ValueError):
             sync_client(Recorder()).create_pod("p", 457, workspace="ws", **bad)
     with pytest.raises(ValueError, match="unknown key.*include_paths.*paths"):
@@ -1255,17 +1391,68 @@ def test_create_pod_with_a_model_set_is_resent_only_when_it_never_started(slept,
         assert len(rec.requests) == 1
 
 
-def test_create_pod_with_a_model_set_is_resent_when_the_connection_failed(slept):
+@pytest.mark.parametrize("failure", [httpx.ConnectError, httpx.PoolTimeout])   # nothing was sent either way
+def test_create_pod_with_a_model_set_is_resent_when_no_connection_was_used(slept, failure):
     attempts = []
 
     def flaky(request):
         attempts.append(request)
         if len(attempts) == 1:
-            raise httpx.ConnectError("refused", request=request)
+            raise failure("no connection", request=request)
         return httpx.Response(202, json={"name": "p", "workspace": "ws", "transactionId": 6, "estimate": ESTIMATE})
 
     assert sync_client(flaky).create_pod("p", 457, workspace="ws", model_set="s").transaction_id == 6
     assert len(attempts) == 2 and slept == [0.5]
+
+
+def test_async_writes_are_resent_after_a_timeout_or_when_no_connection_was_used(slept):
+    stops, creates = [], []
+
+    def stop(request):
+        stops.append(request.headers["Idempotency-Key"])
+        if len(stops) == 1:
+            raise httpx.ReadTimeout("no answer", request=request)
+        if len(stops) == 2:
+            raise httpx.ConnectError("refused", request=request)
+        return httpx.Response(202, json={"podName": "p-0", "workspace": "ws", "action": "stop"})
+
+    def create(request):
+        creates.append(request.headers["Idempotency-Key"])
+        if len(creates) == 1:
+            raise httpx.PoolTimeout("no connection", request=request)
+        return httpx.Response(202, json={"name": "p", "workspace": "ws", "transactionId": 6, "estimate": ESTIMATE})
+
+    async def main():
+        async with async_client(stop) as c:
+            action = await c.stop_pod("p-0", "ws")
+        async with async_client(create) as c:
+            created = await c.create_pod("p", 457, workspace="ws", model_set="s")
+        return action, created
+
+    action, created = asyncio.run(main())
+    assert action.action == "stop" and len(stops) == 3 and len(set(stops)) == 1
+    assert created.transaction_id == 6 and len(creates) == 2 and len(set(creates)) == 1
+    assert slept == [0.5, 1.0, 0.5]
+
+
+def test_create_pod_with_a_model_set_cut_off_mid_request_is_not_resent_and_keeps_its_identity(slept):
+    seen = []
+
+    def cut_off(request):
+        seen.append(request.headers["Idempotency-Key"])
+        raise httpx.RemoteProtocolError("Server disconnected without sending a response.", request=request)
+
+    async def run_async():
+        async with async_client(cut_off) as c:
+            await c.create_pod("p", 457, workspace="ws", model_set="sdxl-basics")
+
+    with pytest.raises(httpx.RemoteProtocolError) as sync_err:
+        sync_client(cut_off).create_pod("p", 457, workspace="ws", model_set="sdxl-basics")
+    with pytest.raises(httpx.RemoteProtocolError) as async_err:
+        asyncio.run(run_async())
+    assert len(seen) == 2 and slept == []
+    for err, key in zip((sync_err, async_err), seen):
+        assert (err.value.idempotency_key, err.value.operation_method, err.value.operation_path) == (key, "POST", "/pods")
 
 
 def test_model_set_errors_come_back_as_they_are():
@@ -1363,6 +1550,23 @@ def test_update_pod_sends_only_what_is_given(kwargs, body):
     updated = sync_client(rec).update_pod("p-0", "ws", **kwargs)
     assert rec.body() == body
     assert updated.renamed_only is True and updated.transaction_id is None
+
+
+def test_enable_folder_saving_is_a_change_only_when_true():
+    rec = Recorder((202, {"podName": "p-0", "workspace": "ws", "accepted": True, "transactionId": 901,
+                          "renamedOnly": False, "estimate": POD_UPDATE_ESTIMATE}))
+    sync_client(rec).update_pod("p-0", "ws", enable_folder_saving=True)
+    assert rec.body() == {"enableFolderSaving": True}
+    with pytest.raises(ValueError):          # False asks for nothing — there is no change to send
+        sync_client(Recorder()).update_pod("p-0", "ws", enable_folder_saving=False)
+    with pytest.raises(ValueError):
+        sync_client(Recorder()).update_pod("p-0", "ws", enable_folder_saving="yes")
+
+
+def test_a_running_pods_template_folder_cannot_be_moved():
+    with pytest.raises(ValueError, match="can't be moved"):
+        sync_client(Recorder()).set_watched_folders("p-0", "ws", expected_version=1,
+                                                    template={"/outputs": {"path": "/data/out"}})
 
 
 def test_estimate_pod_update():
@@ -1503,3 +1707,541 @@ def test_async_create_pod_sends_the_hf_token():
 
     asyncio.run(main())
     assert rec.body()["hfTokenId"] == 4 and rec.last.extensions["timeout"]["read"] == 900.0
+
+
+# --- 1.5.0: task output filter -------------------------------------------------------------------------------
+
+TASK_ACCEPTED = {"externalId": "task_1", "name": "train", "namespaceName": "ws", "status": "queued"}
+TASK_ESTIMATE = {"pricePerHourUsd": None, "maxCostUsd": None, "maxDurationS": 3600, "resources": {}}
+
+
+def _task_rec(task: dict) -> Recorder:
+    return Recorder((202, {"task": task, "estimate": TASK_ESTIMATE}))
+
+
+def test_task_output_include_is_sent_as_a_list_only_when_given():
+    rec = _task_rec({**TASK_ACCEPTED, "outputInclude": ["*.safetensors", "samples/*.png"]})
+    c = sync_client(rec)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")             # the server kept the filter: no warning
+        submitted = c.submit_task("train", "print(1)", workspace="ws", image="img", cpu_preset="micro-2c8g",
+                                  output_include=["*.safetensors", "samples/*.png"])
+    assert rec.body()["outputInclude"] == ["*.safetensors", "samples/*.png"]
+    assert submitted.task.output_include == ["*.safetensors", "samples/*.png"]
+
+    rec = Recorder((200, TASK_ESTIMATE))
+    sync_client(rec).estimate_task("t", "print(1)", workspace="ws", image="img", cpu_preset="micro-2c8g",
+                                   output_include="checkpoints/")
+    assert rec.body()["outputInclude"] == ["checkpoints/"]           # one glob → a one-item list
+
+    for unused in (None, [], ()):
+        rec = Recorder((200, TASK_ESTIMATE))
+        sync_client(rec).estimate_task("t", "print(1)", workspace="ws", image="img", cpu_preset="micro-2c8g",
+                                       output_include=unused)
+        assert "outputInclude" not in rec.body()                     # not sent when unused: every file uploads
+    rec = _task_rec(TASK_ACCEPTED)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")             # nothing asked for, nothing to warn about
+        sync_client(rec).submit_task("t", "print(1)", workspace="ws", image="img", cpu_preset="micro-2c8g")
+    assert "outputInclude" not in rec.body()
+
+
+@pytest.mark.parametrize("bad", ["", " ", ["*.png", ""], [None], [3], 3, {"*.png": True}])
+def test_task_output_include_shape_is_checked_before_sending(bad):
+    rec = Recorder((200, TASK_ESTIMATE))
+    with pytest.raises(ValueError, match="output_include"):
+        sync_client(rec).estimate_task("t", "print(1)", workspace="ws", image="img", cpu_preset="micro-2c8g",
+                                       output_include=bad)
+    assert rec.requests == []
+
+
+def test_task_output_include_patterns_are_left_to_the_server():
+    # The pattern rules (leading /outputs, negation, limits) are the server's; the SDK sends what it is given.
+    rec = Recorder((200, TASK_ESTIMATE))
+    sync_client(rec).estimate_task("t", "print(1)", workspace="ws", image="img", cpu_preset="micro-2c8g",
+                                   output_include=["/outputs/a.png", "!b.png", "**/c"])
+    assert rec.body()["outputInclude"] == ["/outputs/a.png", "!b.png", "**/c"]
+
+
+def test_submit_task_warns_when_the_server_drops_the_output_filter():
+    rec = _task_rec(TASK_ACCEPTED)                 # an older server: no outputInclude on the task
+    with pytest.warns(RuntimeWarning, match="ignores output_include; every file in /outputs will be uploaded") as caught:
+        submitted = sync_client(rec).submit_task("t", "print(1)", workspace="ws", image="img",
+                                                 cpu_preset="micro-2c8g", output_include="*.png")
+    assert caught[0].filename == __file__          # points at the caller, not inside the SDK
+    assert "(task task_1 was submitted)" in str(caught[0].message)
+    assert submitted.task.task_id == "task_1" and submitted.task.output_include is None
+
+
+def test_submit_task_names_the_task_when_warnings_are_errors():
+    # Warnings turned into errors lose the return value, but the task already exists: the error must say which one.
+    rec = _task_rec(TASK_ACCEPTED)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(RuntimeWarning, match=r"\(task task_1 was submitted\)"):
+            sync_client(rec).submit_task("t", "print(1)", workspace="ws", image="img", cpu_preset="micro-2c8g",
+                                         output_include="*.png")
+    assert len(rec.requests) == 1                  # submitted once; nothing is retried behind the caller's back
+
+
+def test_async_task_methods_take_the_output_filter():
+    estimate = Recorder((200, TASK_ESTIMATE))
+    kept = _task_rec({**TASK_ACCEPTED, "outputInclude": ["*.png"]})
+    dropped = _task_rec(TASK_ACCEPTED)
+
+    async def run():
+        async with async_client(estimate) as c:
+            await c.estimate_task("t", "print(1)", workspace="ws", image="img", cpu_preset="micro-2c8g",
+                                  output_include=["*.png"])
+        async with async_client(kept) as c:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                first = await c.submit_task("t", "print(1)", workspace="ws", image="img", cpu_preset="micro-2c8g",
+                                            output_include="*.png")
+        async with async_client(dropped) as c:
+            with pytest.warns(RuntimeWarning, match="ignores output_include") as caught:
+                await c.submit_task("t", "print(1)", workspace="ws", image="img", cpu_preset="micro-2c8g",
+                                    output_include="*.png")
+        return first, caught
+
+    first, caught = asyncio.run(run())
+    assert estimate.body()["outputInclude"] == ["*.png"] and kept.body()["outputInclude"] == ["*.png"]
+    assert first.task.output_include == ["*.png"] and caught[0].filename == __file__
+
+
+# --- 1.6.0: workspaces ----------------------------------------------------------------------------------------
+
+WORKSPACE_ESTIMATE = {"name": None, "pricePerHourUsd": "0",
+                      "note": "A workspace costs nothing by itself. Pods, storage and tasks in it are billed as usual."}
+WORKSPACE_CREATED = {"workspace": "my-workspace-ab12", "name": "my-workspace-ab12", "accepted": True,
+                     "transactionId": 321, "estimate": WORKSPACE_ESTIMATE}
+
+
+def _listed(status, namespace="my-workspace-ab12", name=None):
+    return {"namespaceName": namespace, "workspaceName": name or namespace, "description": "", "memberCount": 1,
+            "status": status, "pricePerHour": "0", "resources": {"pod": 0, "storage": 0, "serverless": 0}}
+
+
+def _workspace_list(*items):
+    return httpx.Response(200, json=list(items))
+
+
+@pytest.fixture
+def clock(monkeypatch, slept):
+    """A clock that only moves when the code sleeps, so a wait can run to its deadline without waiting for real."""
+    now = [0.0]
+
+    def sleep(seconds):
+        slept.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr(_client.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(_client.time, "sleep", sleep)
+    return now
+
+
+def test_workspace_body_sends_a_name_only_when_given():
+    assert _write.workspace_body(None) == {}
+    assert _write.workspace_body("") == _write.workspace_body("   ") == {}     # the server generates one for blank too
+    assert _write.workspace_body("  research ") == {"name": "research"}
+    for bad in (3, ["a"]):
+        with pytest.raises(ValueError, match="name"):
+            _write.workspace_body(bad)
+
+
+def test_create_workspace_builds_request_and_parses():
+    rec = Recorder((202, {**WORKSPACE_CREATED, "name": "research", "estimate": {**WORKSPACE_ESTIMATE, "name": "research"}}))
+    created = sync_client(rec).create_workspace(" research ", idempotency_key="ws-key-0001")
+    assert isinstance(created, WorkspaceCreated)
+    assert rec.last.method == "POST" and rec.last.url.path == "/v1/sdk/workspaces" and not rec.last.url.params
+    assert rec.last.headers["Idempotency-Key"] == "ws-key-0001" and rec.body() == {"name": "research"}
+    assert (created.workspace, created.name, created.transaction_id) == ("my-workspace-ab12", "research", 321)
+    assert isinstance(created.estimate, WorkspaceEstimate) and created.estimate.name == "research"
+    assert created.estimate.price_per_hour == "0" and "costs nothing" in created.estimate.note
+    assert created.raw["workspace"] == "my-workspace-ab12"
+
+
+def test_create_workspace_without_a_name_sends_an_empty_body_and_a_generated_key(slept):
+    rec = Recorder((503, {"detail": {"title": "Scheduling Busy", "message": "busy"}}), (202, WORKSPACE_CREATED))
+    created = sync_client(rec).create_workspace()
+    assert created.workspace == "my-workspace-ab12" and created.estimate.name is None
+    assert [r.content for r in rec.requests] == [b"{}", b"{}"]
+    keys = {r.headers["Idempotency-Key"] for r in rec.requests}
+    assert len(keys) == 1 and keys != {""}                   # the retry resends the key, so it can't create twice
+
+
+def test_estimate_workspace_builds_request_and_creates_nothing():
+    rec = Recorder((200, {**WORKSPACE_ESTIMATE, "name": "research"}))
+    est = sync_client(rec).estimate_workspace(" research ")
+    assert isinstance(est, WorkspaceEstimate) and (est.name, est.price_per_hour) == ("research", "0")
+    assert rec.last.method == "POST" and rec.last.url.path == "/v1/sdk/workspaces/estimate"
+    assert not rec.last.url.params and rec.body() == {"name": "research"}
+    rec = Recorder((200, WORKSPACE_ESTIMATE))
+    est = sync_client(rec).estimate_workspace()
+    assert est.name is None and "billed as usual" in est.note and rec.body() == {}
+    with pytest.raises(TypeError):                           # nothing to replay: an estimate takes no idempotency key
+        sync_client(rec).estimate_workspace("x", idempotency_key="k")
+
+
+def test_workspace_name_shape_is_checked_before_sending():
+    rec = Recorder((202, WORKSPACE_CREATED))
+    for call in (lambda c: c.create_workspace(7), lambda c: c.estimate_workspace(["a"])):
+        with pytest.raises(ValueError, match="name"):
+            call(sync_client(rec))
+    assert rec.requests == []
+
+
+@pytest.mark.parametrize("answer", [(405, {"detail": "Method Not Allowed"}), (404, {"detail": "Not Found"})])
+def test_workspace_creation_on_an_older_server(answer):
+    for call in (lambda c: c.create_workspace("research"), lambda c: c.estimate_workspace("research")):
+        with pytest.raises(NotFoundError, match="does not support workspace creation"):
+            call(sync_client(Recorder(answer)))
+
+
+def test_workspace_creation_errors_from_the_server_pass_through(slept):
+    taken = {"detail": {"title": "Name Taken", "message": "You already have a workspace named research."}}
+    with pytest.raises(ConflictError) as err:
+        sync_client(Recorder((409, taken))).create_workspace("research")
+    assert err.value.title == "Name Taken" and "research" in err.value.message
+    with pytest.raises(PermissionDeniedError):               # a read-only key can't create, but can estimate
+        sync_client(Recorder((403, {"detail": {"title": "Forbidden", "message": "write scope"}}))).create_workspace()
+    with pytest.raises(NotFoundError) as err:                # a 404 that has a title is the server's answer, not an old server
+        sync_client(Recorder((404, {"detail": {"title": "Not Found", "message": "x"}}))).create_workspace()
+    assert err.value.title == "Not Found" and "does not support" not in str(err.value)
+    busy = (503, {"detail": {"title": "No Cluster Available", "message": "try later"}})
+    rec = Recorder(busy)
+    with pytest.raises(MeshiveAPIError) as err:
+        sync_client(rec, max_retries=1).create_workspace("research")
+    assert err.value.status_code == 503 and err.value.title == "No Cluster Available" and len(rec.requests) == 2
+
+
+def test_async_workspace_methods_mirror_sync():
+    created = Recorder((202, WORKSPACE_CREATED))
+    estimate = Recorder((200, {**WORKSPACE_ESTIMATE, "name": "research"}))
+    old = Recorder((405, {"detail": "Method Not Allowed"}))
+
+    async def main():
+        async with async_client(created) as c:
+            made = await c.create_workspace(idempotency_key="ws-key-0002")
+        async with async_client(estimate) as c:
+            est = await c.estimate_workspace("research")
+        async with async_client(old) as c:
+            with pytest.raises(NotFoundError, match="does not support workspace creation"):
+                await c.create_workspace("research")
+            with pytest.raises(NotFoundError, match="does not support workspace creation"):
+                await c.estimate_workspace()
+            with pytest.raises(ValueError, match="name"):
+                await c.create_workspace(7)
+        return made, est
+
+    made, est = asyncio.run(main())
+    assert made.workspace == "my-workspace-ab12" and created.last.url.path == "/v1/sdk/workspaces"
+    assert created.last.headers["Idempotency-Key"] == "ws-key-0002" and created.body() == {}
+    assert est.name == "research" and estimate.last.url.path == "/v1/sdk/workspaces/estimate"
+    assert len(old.requests) == 2                            # the malformed name never left the client
+
+
+# Renaming and deleting a workspace
+
+WS_ID = "ab12cd34ef567890"
+WS_UPDATE_ESTIMATE = {"workspace": WS_ID, "currentName": "research", "name": "research-2"}
+WS_UPDATED = {"workspace": WS_ID, "name": "research-2"}
+WS_DELETE_CHECK = {"workspace": WS_ID, "name": "research", "deletable": True, "blockers": {}}
+WS_DELETE_BLOCKED = {"workspace": WS_ID, "name": "research", "deletable": False,
+                     "blockers": {"assets": 3, "operations_in_progress": 1}}
+WS_DELETED = {"resource": "workspace", "id": WS_ID, "workspace": WS_ID, "action": "delete", "accepted": True,
+              "result": {"message": "Workspace deletion initiated"}}
+WS_NOT_EMPTY = {"detail": {"title": "Workspace Not Empty", "message": "It still holds 3 assets.",
+                           "blockers": {"assets": 3}}}
+
+
+def test_workspace_update_body_refuses_a_blank_name():
+    assert _write.workspace_update_body("  research-2 ") == {"name": "research-2"}
+    for bad in ("", "   ", None, 3, ["a"]):                  # never "let the server generate one": that would rename at random
+        with pytest.raises(ValueError, match="name"):
+            _write.workspace_update_body(bad)
+
+
+def test_update_workspace_builds_request_and_parses():
+    rec = Recorder((200, WS_UPDATED))
+    updated = sync_client(rec).update_workspace(WS_ID, name=" research-2 ", idempotency_key="ws-key-0003")
+    assert (updated.workspace, updated.name) == (WS_ID, "research-2") and updated.raw["workspace"] == WS_ID
+    assert rec.last.method == "PATCH" and rec.last.url.path == f"/v1/sdk/workspaces/{WS_ID}" and not rec.last.url.params
+    assert rec.last.headers["Idempotency-Key"] == "ws-key-0003" and rec.body() == {"name": "research-2"}
+
+
+def test_update_workspace_name_is_keyword_only():
+    client = sync_client(Recorder((200, WS_UPDATED)))
+    with pytest.raises(TypeError):
+        client.update_workspace(WS_ID, "research-2")
+    with pytest.raises(TypeError):
+        client.update_workspace(WS_ID)
+
+
+def test_estimate_workspace_update_builds_request_and_changes_nothing():
+    rec = Recorder((200, WS_UPDATE_ESTIMATE))
+    est = sync_client(rec).estimate_workspace_update(WS_ID, name="research-2")
+    assert (est.workspace, est.current_name, est.name) == (WS_ID, "research", "research-2")
+    assert rec.last.method == "POST" and rec.last.url.path == f"/v1/sdk/workspaces/{WS_ID}/estimate"
+    assert not rec.last.url.params and rec.body() == {"name": "research-2"}
+    with pytest.raises(TypeError):                           # nothing to replay: an estimate takes no idempotency key
+        sync_client(rec).estimate_workspace_update(WS_ID, name="x", idempotency_key="k")
+
+
+def test_check_workspace_delete_is_a_read():
+    rec = Recorder((200, WS_DELETE_BLOCKED))
+    check = sync_client(rec).check_workspace_delete(WS_ID)
+    assert rec.last.method == "GET" and rec.last.url.path == f"/v1/sdk/workspaces/{WS_ID}/delete-check"
+    assert "Idempotency-Key" not in rec.last.headers and rec.last.content == b""
+    assert check.deletable is False and check.blockers == {"assets": 3, "operations_in_progress": 1}
+    check = sync_client(Recorder((200, WS_DELETE_CHECK))).check_workspace_delete(WS_ID)
+    assert check.deletable is True and check.blockers == {} and (check.workspace, check.name) == (WS_ID, "research")
+
+
+def test_delete_workspace_builds_request_and_parses():
+    rec = Recorder((202, WS_DELETED))
+    action = sync_client(rec).delete_workspace(WS_ID, idempotency_key="ws-key-0004")
+    assert isinstance(action, ResourceAction)
+    assert (action.resource, action.id, action.workspace, action.action) == ("workspace", WS_ID, WS_ID, "delete")
+    assert action.accepted is True and action.result == {"message": "Workspace deletion initiated"}
+    assert rec.last.method == "DELETE" and rec.last.url.path == f"/v1/sdk/workspaces/{WS_ID}"
+    assert not rec.last.url.params and rec.last.content == b""          # never a force flag
+    assert rec.last.headers["Idempotency-Key"] == "ws-key-0004"
+    bare = sync_client(Recorder((202, {"id": WS_ID, "action": "delete"}))).delete_workspace(WS_ID)
+    assert bare.resource == "workspace"
+
+
+def test_delete_workspace_retry_resends_the_key(slept):
+    rec = Recorder((503, {"detail": {"title": "Scheduling Busy", "message": "busy"}}), (202, WS_DELETED))
+    action = sync_client(rec).delete_workspace(WS_ID)
+    assert action.id == WS_ID and len(rec.requests) == 2
+    keys = {r.headers["Idempotency-Key"] for r in rec.requests}
+    assert len(keys) == 1 and keys != {""}                   # a replay, not a second delete that finds nothing to delete
+
+
+def test_workspace_id_is_encoded_and_checked_before_sending():
+    rec = Recorder((200, WS_UPDATED))
+    client = sync_client(rec)
+    client.update_workspace("../me", name="x")
+    assert rec.last.url.raw_path == b"/v1/sdk/workspaces/..%2Fme"        # can't change the path structure
+    client.delete_workspace("a/b")
+    assert rec.last.url.raw_path == b"/v1/sdk/workspaces/a%2Fb"
+    client.estimate_workspace_update("a/b", name="x")
+    assert rec.last.url.raw_path == b"/v1/sdk/workspaces/a%2Fb/estimate"
+    client.check_workspace_delete("a/b")
+    assert rec.last.url.raw_path == b"/v1/sdk/workspaces/a%2Fb/delete-check"
+    sent = len(rec.requests)
+    for call in (lambda: client.update_workspace("", name="x"), lambda: client.update_workspace(" ", name="x"),
+                 lambda: client.update_workspace(WS_ID, name=""), lambda: client.update_workspace(WS_ID, name="  "),
+                 lambda: client.estimate_workspace_update("", name="x"), lambda: client.estimate_workspace_update(WS_ID, name=" "),
+                 lambda: client.check_workspace_delete(""), lambda: client.delete_workspace(" "),
+                 lambda: client.delete_workspace(None)):
+        with pytest.raises(ValueError):
+            call()
+    assert len(rec.requests) == sent
+
+
+@pytest.mark.parametrize("workspace", [".", ".."])
+def test_dot_segments_are_refused_before_sending(workspace):
+    # httpx collapses them, so /workspaces/./estimate would reach the estimate for creating a workspace.
+    rec = Recorder((200, WS_UPDATED))
+    client = sync_client(rec)
+    for call in (lambda: client.estimate_workspace_update(workspace, name="x"),
+                 lambda: client.update_workspace(workspace, name="x"),
+                 lambda: client.check_workspace_delete(workspace), lambda: client.delete_workspace(workspace)):
+        with pytest.raises(ValueError, match="workspace"):
+            call()
+    assert rec.requests == []
+
+
+@pytest.mark.parametrize("answer", [(405, {"detail": "Method Not Allowed"}), (404, {"detail": "Not Found"})])
+@pytest.mark.parametrize("call, feature", [
+    (lambda c: c.update_workspace(WS_ID, name="x"), "workspace renaming"),
+    (lambda c: c.estimate_workspace_update(WS_ID, name="x"), "workspace renaming"),
+    (lambda c: c.check_workspace_delete(WS_ID), "workspace deletion"),
+    (lambda c: c.delete_workspace(WS_ID), "workspace deletion"),
+])
+def test_workspace_rename_and_delete_on_an_older_server(answer, call, feature):
+    with pytest.raises(NotFoundError, match=f"does not support {feature}"):
+        call(sync_client(Recorder(answer)))
+
+
+def test_delete_workspace_not_empty_keeps_the_blockers():
+    with pytest.raises(ConflictError) as err:
+        sync_client(Recorder((409, WS_NOT_EMPTY))).delete_workspace(WS_ID)
+    assert err.value.title == "Workspace Not Empty" and "3 assets" in err.value.message
+    assert err.value.raw["detail"]["blockers"] == {"assets": 3}
+
+
+def test_workspace_rename_and_delete_errors_from_the_server_pass_through():
+    taken = {"detail": {"title": "Name Taken", "message": "You already have a workspace named research."}}
+    missing = {"detail": {"title": "Workspace Not Found", "message": "No such workspace."}}
+    for call in (lambda c: c.update_workspace(WS_ID, name="research"), lambda c: c.estimate_workspace_update(WS_ID, name="research")):
+        with pytest.raises(ConflictError) as err:
+            call(sync_client(Recorder((409, taken))))
+        assert err.value.title == "Name Taken"
+    for call in (lambda c: c.update_workspace(WS_ID, name="x"), lambda c: c.estimate_workspace_update(WS_ID, name="x"),
+                 lambda c: c.check_workspace_delete(WS_ID), lambda c: c.delete_workspace(WS_ID)):
+        with pytest.raises(NotFoundError) as err:            # a 404 that has a title is the server's answer, not an old server
+            call(sync_client(Recorder((404, missing))))
+        assert err.value.title == "Workspace Not Found" and "does not support" not in str(err.value)
+        with pytest.raises(PermissionDeniedError):           # a viewer can't change a workspace
+            call(sync_client(Recorder((403, {"detail": {"title": "Forbidden", "message": "Not an admin"}}))))
+
+
+def test_async_workspace_rename_and_delete_mirror_sync():
+    updated = Recorder((200, WS_UPDATED))
+    estimate = Recorder((200, WS_UPDATE_ESTIMATE))
+    check = Recorder((200, WS_DELETE_BLOCKED))
+    deleted = Recorder((202, {"id": WS_ID, "action": "delete"}))
+    old = Recorder((405, {"detail": "Method Not Allowed"}))
+    not_empty = Recorder((409, WS_NOT_EMPTY))
+
+    async def main():
+        async with async_client(updated) as c:
+            renamed = await c.update_workspace(WS_ID, name=" research-2 ", idempotency_key="ws-key-0005")
+        async with async_client(estimate) as c:
+            est = await c.estimate_workspace_update(WS_ID, name="research-2")
+        async with async_client(check) as c:
+            result = await c.check_workspace_delete(WS_ID)
+        async with async_client(deleted) as c:
+            action = await c.delete_workspace(WS_ID, idempotency_key="ws-key-0006")
+        async with async_client(not_empty) as c:
+            with pytest.raises(ConflictError) as err:
+                await c.delete_workspace(WS_ID)
+            assert err.value.raw["detail"]["blockers"] == {"assets": 3}
+        async with async_client(old) as c:
+            with pytest.raises(NotFoundError, match="does not support workspace renaming"):
+                await c.update_workspace(WS_ID, name="x")
+            with pytest.raises(NotFoundError, match="does not support workspace renaming"):
+                await c.estimate_workspace_update(WS_ID, name="x")
+            with pytest.raises(NotFoundError, match="does not support workspace deletion"):
+                await c.check_workspace_delete(WS_ID)
+            with pytest.raises(NotFoundError, match="does not support workspace deletion"):
+                await c.delete_workspace(WS_ID)
+            with pytest.raises(ValueError, match="name"):
+                await c.update_workspace(WS_ID, name=" ")
+            with pytest.raises(ValueError, match="workspace"):
+                await c.delete_workspace("")
+        return renamed, est, result, action
+
+    renamed, est, result, action = asyncio.run(main())
+    assert renamed.name == "research-2" and updated.last.method == "PATCH"
+    assert updated.last.url.path == f"/v1/sdk/workspaces/{WS_ID}" and updated.body() == {"name": "research-2"}
+    assert updated.last.headers["Idempotency-Key"] == "ws-key-0005"
+    assert est.current_name == "research" and estimate.last.method == "POST"
+    assert estimate.last.url.path == f"/v1/sdk/workspaces/{WS_ID}/estimate" and estimate.body() == {"name": "research-2"}
+    assert result.blockers == {"assets": 3, "operations_in_progress": 1} and check.last.method == "GET"
+    assert check.last.url.path == f"/v1/sdk/workspaces/{WS_ID}/delete-check"
+    assert "Idempotency-Key" not in check.last.headers
+    assert action.resource == "workspace" and action.id == WS_ID and deleted.last.method == "DELETE"
+    assert deleted.last.url.path == f"/v1/sdk/workspaces/{WS_ID}" and not deleted.last.url.params
+    assert deleted.last.headers["Idempotency-Key"] == "ws-key-0006"
+    assert len(old.requests) == 4                            # the malformed arguments never left the client
+
+
+# wait_for_workspace
+
+def test_wait_for_workspace_returns_when_running(slept):
+    handler, calls = _counting_handler([_workspace_list(_listed("running", name="Research"))])
+    ws = sync_client(handler).wait_for_workspace("my-workspace-ab12")
+    assert ws.status == "running" and ws.namespace_name == "my-workspace-ab12" and ws.workspace_name == "Research"
+    assert calls["n"] == 1 and slept == []
+
+
+def test_wait_for_workspace_polls_through_creating(slept):
+    handler, calls = _counting_handler([_workspace_list(_listed("creating")), _workspace_list(_listed("creating")),
+                                        _workspace_list(_listed("running"))])
+    assert sync_client(handler).wait_for_workspace("my-workspace-ab12", interval=2.0).status == "running"
+    assert calls["n"] == 3 and slept == [2.0, 2.0]
+
+
+def test_wait_for_workspace_matches_the_id_not_the_display_name(slept):
+    other = _listed("running", namespace="other-ns", name="my-workspace-ab12")     # someone's display name equals our id
+    handler, calls = _counting_handler([_workspace_list(other, _listed("creating", name="Other name")),
+                                        _workspace_list(other, _listed("running", name="Other name"))])
+    ws = sync_client(handler).wait_for_workspace("my-workspace-ab12")
+    assert ws.namespace_name == "my-workspace-ab12" and calls["n"] == 2
+
+
+def test_wait_for_workspace_stops_at_once_on_error(slept):
+    handler, calls = _counting_handler([_workspace_list(_listed("creating")), _workspace_list(_listed("error"))])
+    with pytest.raises(MeshiveError, match="my-workspace-ab12 reached status 'error'") as err:
+        sync_client(handler).wait_for_workspace("my-workspace-ab12")
+    assert not isinstance(err.value, WaitTimeoutError) and calls["n"] == 2 and slept == [3.0]
+
+
+def test_wait_for_workspace_waits_for_one_that_is_not_listed_yet(slept):
+    # The list can lag a moment behind the create: the workspace is missing, then creating, then running.
+    handler, calls = _counting_handler([_workspace_list(_listed("running", namespace="elsewhere")), _workspace_list(),
+                                        _workspace_list(_listed("creating")), _workspace_list(_listed("running"))])
+    assert sync_client(handler).wait_for_workspace("my-workspace-ab12").status == "running"
+    assert calls["n"] == 4 and slept == [3.0, 3.0, 3.0]
+
+
+def test_wait_for_workspace_waits_through_a_terminated_blip(slept):
+    handler, calls = _counting_handler([_workspace_list(_listed("creating")), _workspace_list(_listed("terminated")),
+                                        _workspace_list(_listed("running"))])
+    assert sync_client(handler).wait_for_workspace("my-workspace-ab12").status == "running"
+    assert calls["n"] == 3 and slept == [3.0, 3.0]
+
+
+@pytest.mark.parametrize("statuses, last", [
+    ([_listed("creating")], "creating"),
+    ([_listed("creating"), _listed("terminated")], "terminated"),
+    ([_listed("TERMINATED")], "TERMINATED"),
+])
+def test_wait_for_workspace_times_out_naming_the_last_status(clock, statuses, last):
+    handler, calls = _counting_handler([_workspace_list(s) for s in statuses])
+    with pytest.raises(WaitTimeoutError) as err:
+        sync_client(handler).wait_for_workspace("my-workspace-ab12", timeout=10, interval=4)
+    message = str(err.value)
+    assert "my-workspace-ab12" in message and f"last status: {last})" in message
+    assert "'terminated' means its setup failed" in message and isinstance(err.value, TimeoutError)
+    assert calls["n"] == 4 and clock[0] == 10                # polls at 0, 4, 8, 10 and gives up at the deadline
+
+
+def test_wait_for_workspace_times_out_when_it_never_shows_up(clock):
+    handler, calls = _counting_handler([_workspace_list(_listed("running", namespace="elsewhere"))])
+    with pytest.raises(WaitTimeoutError, match=r"workspace my-workspace-ab12 .*not in the workspace list"):
+        sync_client(handler).wait_for_workspace("my-workspace-ab12", timeout=6, interval=3)
+    assert calls["n"] == 3
+
+
+def test_wait_for_workspace_remembers_the_last_status_it_saw(clock):
+    handler, _ = _counting_handler([_workspace_list(_listed("creating")), _workspace_list()])
+    with pytest.raises(WaitTimeoutError, match="last status: creating"):
+        sync_client(handler).wait_for_workspace("my-workspace-ab12", timeout=6, interval=3)
+
+
+def test_wait_for_workspace_checks_its_argument_first(slept):
+    handler, calls = _counting_handler([_workspace_list(_listed("running"))])
+    for bad in ("", "  ", None):
+        with pytest.raises(ValueError, match="workspace"):
+            sync_client(handler).wait_for_workspace(bad)
+    assert calls["n"] == 0
+
+
+def test_async_wait_for_workspace(slept):
+    states = [_workspace_list(), _workspace_list(_listed("creating")), _workspace_list(_listed("terminated")),
+              _workspace_list(_listed("running"))]
+    handler, calls = _counting_handler(states)
+    failing, failing_calls = _counting_handler([_workspace_list(_listed("creating")), _workspace_list(_listed("error"))])
+    late, _ = _counting_handler([_workspace_list(_listed("creating"))])
+
+    async def run():
+        async with async_client(handler) as c:
+            ws = await c.wait_for_workspace("my-workspace-ab12", interval=1.5)
+        async with async_client(failing) as c:
+            with pytest.raises(MeshiveError, match="status 'error'") as err:
+                await c.wait_for_workspace("my-workspace-ab12")
+        async with async_client(late) as c:
+            with pytest.raises(WaitTimeoutError, match="last status: creating"):
+                await c.wait_for_workspace("my-workspace-ab12", timeout=0.0)
+            with pytest.raises(ValueError, match="workspace"):
+                await c.wait_for_workspace(" ")
+        return ws, err.value
+
+    ws, error = asyncio.run(run())
+    assert ws.status == "running" and calls["n"] == 4 and slept == [1.5, 1.5, 1.5, 3.0]
+    assert not isinstance(error, WaitTimeoutError) and failing_calls["n"] == 2

@@ -4,11 +4,12 @@ Both clients share the request building and response parsing logic (_build_heade
 only the transport differs (httpx.Client vs httpx.AsyncClient).
 
 Authentication: Meshive API key, `Authorization: Bearer meshive_...`. Reads, estimates, logs and downloads need the
-read scope; creating, changing or deleting pods, storage, servings, tasks, model registrations and asset imports, and
-SSH access, need the write scope.
-Read surface: account (me/api-keys/credit/earnings), workspaces (list/detail/members), pods (list/single/metrics,
-transactions), storage, machines (list/single/metrics), GPU and CPU availability, templates and their model sets,
-serverless (servings/tasks), assets (Asset Hub).
+read scope; creating, changing or deleting workspaces, pods, storage, servings, tasks, model registrations and asset
+imports, SSH access, and changes to hosted machines (maintenance, listing, setup retries, removal, messages, machine
+credentials, install commands) need the write scope.
+Read surface: account (me/api-keys/credit/earnings/payouts, the API-key activity log), workspaces (list/detail/members), pods (list/single/metrics,
+transactions), storage, machines (list/detail/metrics, maintenance windows, downtime and stress tests, host messages),
+GPU and CPU availability, templates and their model sets, serverless (servings/tasks), assets (Asset Hub).
 Retries are safe for both: GETs are idempotent, and writes resend the same Idempotency-Key, so the
 server replays the first response instead of creating twice.
 """
@@ -17,10 +18,14 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import re
+import ssl
+import threading
 import time
 import uuid
+import warnings
 from collections.abc import Iterable
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -45,6 +50,8 @@ from .exceptions import (
     WaitTimeoutError,
 )
 from .models import (
+    ACTIVITY_OUTCOMES,
+    ActivityPage,
     ApiKey,
     Asset,
     AssetDownload,
@@ -59,9 +66,27 @@ from .models import (
     Earnings,
     GpuAvailability,
     HfToken,
+    HostMessage,
+    InstallCommand,
+    ListingCheck,
+    ListingResult,
     Logs,
     Machine,
+    MachineCredentials,
+    MachineDeleteCheck,
+    MachineDeleted,
+    MachineDetail,
     MachineMetrics,
+    MaintenanceAction,
+    MaintenanceEstimate,
+    MaintenanceWindow,
+    MessagesRead,
+    MessageSent,
+    DowntimeEvent,
+    Payout,
+    PayoutAccount,
+    RetryResult,
+    StressTestResult,
     Member,
     ModelDetection,
     ModelSetList,
@@ -89,7 +114,12 @@ from .models import (
     Template,
     WhoAmI,
     Workspace,
+    WorkspaceCreated,
+    WorkspaceDeleteCheck,
     WorkspaceDetail,
+    WorkspaceEstimate,
+    WorkspaceUpdated,
+    WorkspaceUpdateEstimate,
 )
 
 
@@ -109,6 +139,18 @@ def _not_supported(err: MeshiveAPIError, what: str) -> MeshiveAPIError:
         return err
     return NotFoundError(404, f"This Meshive API server does not support {what} yet (it predates this SDK "
                               "release). Use the console for now.", raw=err.raw)
+
+
+def _check_output_include(body: dict[str, Any], submitted: TaskSubmitted) -> TaskSubmitted:
+    """A server older than the output filter accepts the request and drops outputInclude, so the task uploads every file
+    in /outputs. A server that keeps the filter echoes outputInclude on the task, so a missing key means it was dropped.
+    The task has been submitted either way; this only warns. The message names the task, so a caller that turns warnings
+    into errors still knows which task it got (resubmitting would run a second one)."""
+    if body.get("outputInclude") and "outputInclude" not in submitted.task.raw:
+        # stacklevel 3 points at the code that called submit_task (_check_output_include → submit_task → caller).
+        warnings.warn("this server ignores output_include; every file in /outputs will be uploaded "
+                      f"(task {submitted.task.task_id} was submitted)", RuntimeWarning, stacklevel=3)
+    return submitted
 
 
 def _download_target(dest: str | os.PathLike[str], rel: str) -> Path:
@@ -132,9 +174,12 @@ def _incomplete(download: AssetDownload) -> MeshiveError:
 
 def _path_segment(value: str, name: str) -> str:
     """Encode a URL path segment. Percent-encodes so values containing `/`, `?`, `#`, ... can't change the path structure
-    (`../me` → a different endpoint) or inject a query."""
+    (`../me` → a different endpoint) or inject a query. `.` and `..` have nothing to encode and httpx collapses them, so
+    they are refused."""
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
+    if value in (".", ".."):
+        raise ValueError(f"{name} must not be '.' or '..'")
     return quote(value, safe="")
 
 
@@ -247,6 +292,64 @@ def _tasks_params(workspace: str, status: str | Iterable[str] | None,
     return params
 
 
+_ACTIVITY_KINDS = ("events", "reads")
+_DATE_ONLY = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _activity_bound(value: date | datetime | str, name: str, *, end: bool) -> str:
+    """since/until of the activity log: a date (UTC; until includes that whole day) or a time.
+
+    A time is sent in UTC (one without an offset is UTC). A time of exactly midnight is sent as a date, so older
+    servers, which read such a time as a date, read the same bound: `since` is that day, and `until` is the day
+    before (an `until` date includes that whole day)."""
+    if isinstance(value, str) and value.strip():
+        text = value.strip()
+        try:
+            if _DATE_ONLY.fullmatch(text):
+                value = date.fromisoformat(text)
+            else:
+                value = datetime.fromisoformat(text.replace("Z", "+00:00").replace("z", "+00:00"))
+        except ValueError:
+            raise ValueError(f"{name} must be a date, a datetime, or an ISO 8601 string") from None
+    if isinstance(value, datetime):
+        moment = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+        if moment.time() == datetime.min.time():
+            return (moment.date() - timedelta(days=1) if end else moment.date()).isoformat()
+        return moment.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    raise ValueError(f"{name} must be a date, a datetime, or an ISO 8601 string")
+
+
+def _activity_params(kind: str, key_id: int | str | None, outcome: str | None, action: str | None,
+                     since: date | datetime | str | None, until: date | datetime | str | None, limit: int,
+                     offset: int) -> dict[str, Any]:
+    if kind not in _ACTIVITY_KINDS:
+        raise ValueError(f"kind must be one of {', '.join(_ACTIVITY_KINDS)}")
+    if kind == "reads" and (outcome is not None or action is not None):
+        raise ValueError('outcome and action filter kind="events" only; reads are hourly counts without them')
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+        raise ValueError("limit must be an integer between 1 and 200")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("offset must be a non-negative integer")
+    params: dict[str, Any] = {"kind": kind, "limit": limit, "offset": offset}
+    if key_id is not None:
+        params["keyId"] = _int_segment(key_id, "key_id")
+    if outcome is not None:
+        value = outcome.strip().lower() if isinstance(outcome, str) else ""
+        if value not in ACTIVITY_OUTCOMES:
+            raise ValueError(f"outcome must be one of {', '.join(ACTIVITY_OUTCOMES)}")
+        params["outcome"] = value
+    if action is not None:
+        # One action ("pod.delete"), or every action under a prefix that ends in "." ("machine."). The server matches.
+        params["action"] = _write._require_str(action, "action")
+    if since is not None:
+        params["since"] = _activity_bound(since, "since", end=False)
+    if until is not None:
+        params["until"] = _activity_bound(until, "until", end=True)
+    return params
+
+
 # Cap on the exception message — even if a proxy/gateway returns a huge HTML page, exception messages
 # and logs don't blow up. The full original is available as MeshiveAPIError.raw.
 _MAX_ERROR_MESSAGE_LEN = 2000
@@ -302,7 +405,7 @@ def _raise_for_status(status_code: int, payload: Any, headers: httpx.Headers) ->
 
 
 # --- Retries -----------------------------------------------------------------
-# Only transient failures (rate limit / gateway errors / dropped connections) are retried. Other 4xx
+# Only transient failures (rate limit / gateway errors / connections not made / timeouts) are retried. Other 4xx
 # give the same result on retry, so they raise immediately. GET is idempotent, and write requests resend the same
 # Idempotency-Key (the server replays the first response), so they can be retried without double creation.
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
@@ -314,11 +417,11 @@ _MAX_RETRY_AFTER = 60.0
 
 # A long-running write (create_pod with a model set: the server fetches the set's files before it answers) waits up
 # to this long for the answer, and is resent automatically only when the server surely never started on it — the
-# connection was never made, or the request was refused with 429/503. After a timeout or a gateway error the first
-# request may still be running, and a resend with the same Idempotency-Key is refused with 409
-# 'Operation Outcome Unknown' until it ends.
+# connection was never made, no pooled connection came free in time (PoolTimeout, possible when clients share a
+# transport), or the request was refused with 429/503. After a timeout or a gateway error the first request may still
+# be running, and a resend with the same Idempotency-Key is refused with 409 'Operation Outcome Unknown' until it ends.
 LONG_RUNNING_READ_TIMEOUT = 900.0
-_NOT_STARTED_EXCEPTIONS = (httpx.ConnectError, httpx.ConnectTimeout)
+_NOT_STARTED_EXCEPTIONS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 _NOT_STARTED_STATUSES = frozenset({429, 503})
 
 
@@ -330,6 +433,35 @@ def _may_resend(long_running: bool, *, exc: BaseException | None = None,
     if exc is not None:
         return isinstance(exc, _NOT_STARTED_EXCEPTIONS)
     return response is not None and response.status_code in _NOT_STARTED_STATUSES
+
+
+def _mark_operation(exc: BaseException, key: str, method: str, path: str) -> None:
+    """Attach a write's identity to the error it ended with, so its outcome can be looked up (get_operation)."""
+    exc.idempotency_key = key
+    exc.operation_method = method
+    exc.operation_path = path
+
+
+def _replayed(response: httpx.Response) -> bool:
+    """Whether the server answered a write with the stored answer to an earlier request with the same
+    Idempotency-Key (`Idempotent-Replayed: true`) instead of doing it again."""
+    return response.headers.get("Idempotent-Replayed", "").strip().lower() == "true"
+
+
+# Building an SSL context loads the whole CA bundle, which was most of the cost of creating a client. The context
+# httpx would build for verify=True is kept per thread instead, so clients created on different threads get different
+# contexts (httpcore sets ALPN on the context at every connect). It is rebuilt when the variables httpx reads for it
+# change, or when ssl.SSLContext itself is replaced (truststore.inject_into_ssl()). The CA files are read only then.
+_SSL_ENV = ("SSL_CERT_FILE", "SSL_CERT_DIR", "SSLKEYLOGFILE")
+_ssl_contexts = threading.local()
+
+
+def _default_ssl_context() -> ssl.SSLContext:
+    key = (ssl.SSLContext, *(os.environ.get(name) for name in _SSL_ENV))
+    cached = getattr(_ssl_contexts, "entry", None)
+    if cached is None or cached[0] != key:
+        cached = _ssl_contexts.entry = (key, httpx.create_ssl_context(verify=True, trust_env=True))
+    return cached[1]
 
 
 class _BaseClient:
@@ -444,6 +576,31 @@ def _new_pod_expired(deadline: float, name: str, timeout: float) -> None:
         raise WaitTimeoutError(f"Pod {name!r} did not appear within {timeout:g}s.")
 
 
+# --- Shared wait_for_workspace decisions -------------------------------------------
+# `running` is the only status that means pods and tasks are accepted. `error` can't recover, so it ends the wait at
+# once. Nothing else does: the list can lag a moment behind a create, so a new workspace may be missing from it at
+# first, and `terminated` can show for a poll before `running`. Those keep polling until the deadline.
+
+def _find_workspace(workspaces: list[Workspace], namespace: str) -> Workspace | None:
+    return next((w for w in workspaces if w.namespace_name == namespace), None)
+
+
+def _workspace_running(workspace: Workspace, namespace: str) -> bool:
+    status = workspace.status.lower()
+    if status == "error":
+        raise MeshiveError(f"Workspace {namespace} reached status 'error' while waiting for it to be running.")
+    return status == "running"
+
+
+def _workspace_wait_expired(deadline: float, namespace: str, last: str) -> None:
+    if time.monotonic() < deadline:
+        return
+    raise WaitTimeoutError(
+        f"Timed out waiting for workspace {namespace} to be running "
+        f"(last status: {last or 'not in the workspace list'}). A status of 'terminated' means its setup failed."
+    )
+
+
 # --- Shared connect_storage decisions ------------------------------------------
 
 def _connection_ready(connection: StorageConnection, pv_name: str) -> bool:
@@ -499,6 +656,12 @@ class Meshive(_BaseClient):
             print(ws.namespace_name)
 
     Used as a context manager (`with Meshive() as client:`), connections are cleaned up automatically.
+
+    Code that creates many clients (a server with one per request and API key) can let them share connections:
+    create one `transport = httpx.HTTPTransport()`, pass `transport=transport` to each client, and call
+    `transport.close()` when you shut down. Only the connections are shared: every client keeps its own key, headers,
+    cookies and timeout, but all of them wait for the same pool (size it with `httpx.HTTPTransport(limits=...)`).
+    close() leaves the transport open.
     """
 
     def __init__(
@@ -509,9 +672,15 @@ class Meshive(_BaseClient):
         timeout: float = 30.0,
         max_retries: int = 2,
         headers: dict[str, str] | None = None,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
         super().__init__(api_key, base_url=base_url, timeout=timeout, max_retries=max_retries, headers=headers)
-        self._client = httpx.Client(timeout=timeout)
+        # The httpx client is this instance's own either way, so cookies and default headers never cross instances.
+        self._owns_transport = transport is None
+        if transport is None:
+            self._client = httpx.Client(timeout=timeout, verify=_default_ssl_context())
+        else:
+            self._client = httpx.Client(timeout=timeout, transport=transport)
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         url = self._url(path)
@@ -549,23 +718,26 @@ class Meshive(_BaseClient):
             except _RETRY_EXCEPTIONS as exc:
                 delay = self._retry_delay(attempt) if _may_resend(long_running, exc=exc) else None
                 if delay is None:
-                    exc.idempotency_key = headers["Idempotency-Key"]
-                    exc.operation_method = method
-                    exc.operation_path = path
+                    _mark_operation(exc, headers["Idempotency-Key"], method, path)
                     raise
+            except httpx.RequestError as exc:
+                # Not resent: the connection broke after the request may have reached the server, the answer
+                # couldn't be read, or the request couldn't be sent. As after a timeout, look the outcome up.
+                _mark_operation(exc, headers["Idempotency-Key"], method, path)
+                raise
             else:
                 delay = self._retry_delay(attempt, response) if _may_resend(long_running, response=response) else None
                 if delay is None:
                     try:
                         data = self._process(response)
                     except Exception as exc:
-                        exc.idempotency_key = headers["Idempotency-Key"]
-                        exc.operation_method = method
-                        exc.operation_path = path
+                        _mark_operation(exc, headers["Idempotency-Key"], method, path)
                         raise
                     if isinstance(data, dict):
                         data = {**data, "idempotencyKey": headers["Idempotency-Key"],
                                 "operationMethod": method, "operationPath": path}
+                        if _replayed(response):
+                            data["replayed"] = True
                     return data
             time.sleep(delay)
             attempt += 1
@@ -597,9 +769,11 @@ class Meshive(_BaseClient):
         """Machines registered as a host (GET /machines). No workspace needed (the host owns them directly)."""
         return [Machine.from_dict(d) for d in self._get("/machines")]
 
-    def get_machine(self, machine_id: str) -> Machine:
-        """A single machine (GET /machines/{machine_id})."""
-        return Machine.from_dict(self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}"))
+    def get_machine(self, machine_id: str) -> MachineDetail:
+        """A single machine with what the console's machine view shows (GET /machines/{machine_id}): the other users'
+        pods and volumes on it (`clients`), the maintenance summary, diagnostics and the platform fee. A MachineDetail
+        is a Machine, so code written for earlier releases keeps working."""
+        return MachineDetail.from_dict(self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}"))
 
     def wait_for_pod(
         self,
@@ -680,6 +854,31 @@ class Meshive(_BaseClient):
             _new_pod_expired(deadline, name, timeout)
             time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
 
+    def wait_for_workspace(self, workspace: str, *, timeout: float = 180.0, interval: float = 3.0) -> Workspace:
+        """Poll until the workspace is `running` and return it as listed at that point.
+
+            created = client.create_workspace("research")
+            workspace = client.wait_for_workspace(created.workspace)
+
+        A new workspace is `creating` while it is set up, and pods and tasks are refused until it is `running`. It is
+        found by `workspace` (the ID, not the display name) in list_workspaces(). A workspace missing from the list,
+        or listed as `terminated`, is waited for like `creating`: the list can lag a moment behind a create, and
+        `terminated` can show for a poll before `running`. Status `error` raises MeshiveError at once. When the time
+        runs out, WaitTimeoutError names the last status seen; a workspace that is still `terminated` then failed to
+        set up.
+        """
+        namespace = _query_value(workspace, "workspace")
+        deadline = time.monotonic() + timeout
+        last = ""
+        while True:
+            found = _find_workspace(self.list_workspaces(), namespace)
+            if found is not None:
+                if _workspace_running(found, namespace):
+                    return found
+                last = found.status
+            _workspace_wait_expired(deadline, namespace, last)
+            time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+
     # --- Read surface: workspaces, storage, metrics, account, templates, serverless, assets ---
 
     def get_workspace(self, workspace: str) -> WorkspaceDetail:
@@ -751,6 +950,27 @@ class Meshive(_BaseClient):
     def list_api_keys(self) -> list[ApiKey]:
         """My active API keys — prefixes only, no plaintext (GET /api-keys)."""
         return [ApiKey.from_dict(d) for d in self._get("/api-keys")]
+
+    def list_activity(self, *, kind: str = "events", key_id: int | str | None = None, outcome: str | None = None,
+                      action: str | None = None, since: date | datetime | str | None = None,
+                      until: date | datetime | str | None = None, limit: int = 50, offset: int = 0) -> ActivityPage:
+        """What this account's API keys did, newest first (GET /activity) — every key of the account, this one
+        included; the console shows the same under Account → API keys → Activity.
+
+        kind="events" lists the requests that change something, run a check or estimate, or reveal a login or an
+        install command, one ActivityEvent each, with its result; `total` counts them all for paging with offset.
+        kind="reads" lists read requests as hourly counts (ReadActivity), and `total` is None. Request contents are
+        never recorded. key_id keeps one key's (the ID column of list_api_keys). For events, outcome keeps one result
+        ("accepted", "refused" or "error"), and action keeps one action ("pod.delete") or every action under a prefix
+        ending in "." ("machine." for every machine action); passing either with kind="reads" is a ValueError. since
+        and until are dates (UTC; until includes that whole day) or datetimes; the default is the last 30 days, and
+        one call covers at most 180 days, which is also how long activity is kept. limit is 1..200."""
+        params = _activity_params(kind, key_id, outcome, action, since, until, limit, offset)
+        try:
+            data = self._get("/activity", params=params)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "the activity log") from None
+        return ActivityPage.from_dict(data, kind=kind)
 
     def get_credit(self) -> Credit:
         """Credit balance + auto top-up settings (GET /credit)."""
@@ -872,6 +1092,86 @@ class Meshive(_BaseClient):
             raise
         return target
 
+    # --- Writes: workspaces ------------------------------------------------------------
+
+    def estimate_workspace(self, name: str | None = None) -> WorkspaceEstimate:
+        """Check a workspace name and show what creating it would cost (nothing) — creates nothing (read scope is
+        enough). Same argument as create_workspace; a name that is already taken is a ConflictError ('Name Taken')."""
+        body = _write.workspace_body(name)
+        try:
+            data = self._send("POST", "/workspaces/estimate", json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace creation") from None
+        return WorkspaceEstimate.from_dict(data)
+
+    def create_workspace(self, name: str | None = None, *, idempotency_key: str | None = None) -> WorkspaceCreated:
+        """Create a workspace (202 accepted). A workspace costs nothing by itself; the pods, storage and tasks in it are
+        billed as usual. Without a name the server generates one (like `my-workspace-ab12`); a name must be unique
+        among your workspaces, and a taken one is a ConflictError ('Name Taken').
+
+        The workspace is set up in the background: `created.workspace` is its ID, and its status is `creating` until it
+        is `running`. Pods and tasks are refused until then, and storage and serving can fail if used earlier, so call
+        wait_for_workspace(created.workspace) before creating anything in it. API keys act across your whole account,
+        so the key that created the workspace can use it.
+        """
+        body = _write.workspace_body(name)
+        try:
+            data = self._send("POST", "/workspaces", json=body, idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace creation") from None
+        return WorkspaceCreated.from_dict(data)
+
+    def estimate_workspace_update(self, workspace: str, *, name: str) -> WorkspaceUpdateEstimate:
+        """Check a new name for a workspace and show it next to the current one — changes nothing (read scope is
+        enough, but the admin or billing role is still needed). Same arguments as update_workspace; a name that is
+        already taken is a ConflictError ('Name Taken')."""
+        body = _write.workspace_update_body(name)
+        try:
+            data = self._send("POST", f"/workspaces/{_path_segment(workspace, 'workspace')}/estimate", json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace renaming") from None
+        return WorkspaceUpdateEstimate.from_dict(data)
+
+    def update_workspace(self, workspace: str, *, name: str, idempotency_key: str | None = None) -> WorkspaceUpdated:
+        """Rename a workspace (admin or billing role). Its ID stays the same, so whatever uses the ID keeps working, and
+        every member sees the new name. A name is up to 63 characters and must be unique among your workspaces: a taken
+        one is a ConflictError ('Name Taken'). Renaming to the current name changes nothing and succeeds.
+
+        The rename is applied at once. `updated.name` is the confirmed name; the workspace list can take a moment to
+        show it, so keep using the ID rather than the name right after."""
+        body = _write.workspace_update_body(name)
+        try:
+            data = self._send("PATCH", f"/workspaces/{_path_segment(workspace, 'workspace')}", json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace renaming") from None
+        return WorkspaceUpdated.from_dict(data)
+
+    def check_workspace_delete(self, workspace: str) -> WorkspaceDeleteCheck:
+        """Whether delete_workspace would go through, and if not, what is still in the workspace — changes nothing (read
+        scope is enough, but the admin or billing role is still needed). `check.deletable` is True for an empty
+        workspace; `check.blockers` counts what is left, by kind."""
+        try:
+            data = self._get(f"/workspaces/{_path_segment(workspace, 'workspace')}/delete-check")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace deletion") from None
+        return WorkspaceDeleteCheck.from_dict(data)
+
+    def delete_workspace(self, workspace: str, *, idempotency_key: str | None = None) -> ResourceAction:
+        """Delete an empty workspace (202 accepted; admin or billing role). This can't be undone. A workspace that still
+        holds anything is refused with ConflictError('Workspace Not Empty', raw["detail"]["blockers"]); see
+        check_workspace_delete for what counts. A person can still delete it in the console, which removes what's in it
+        for good.
+
+        The deletion runs in the background: the workspace leaves your list within a moment, and its name stays taken
+        for a while."""
+        try:
+            data = self._send("DELETE", f"/workspaces/{_path_segment(workspace, 'workspace')}",
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace deletion") from None
+        return ResourceAction.from_dict(data, resource="workspace")
+
     # --- Writes: pods (write scope) ---------------------------------------------------
 
     def estimate_pod(self, name: str, template_id: int, *, workspace: str, gpu_model: str | None = None,
@@ -926,8 +1226,11 @@ class Meshive(_BaseClient):
         with paths, strip_prefix "" keeps their folder structure — the console's Keep structure — and leaving it out
         strips the folder they share). watched_folders are folders whose new files are uploaded as assets ("path" or
         {"path", "include", "include_existing", "enabled"}); watched_template_folders sets the template's own watched
-        folders from the start, as the console's create screen does: {"/outputs": {"enabled": False}} turns one off and
-        {"/outputs": {"include": ["*.png"]}} changes its patterns (get_watched_folders lists them on a running pod).
+        folders from the start, as the console's create screen does: {"/outputs": {"enabled": False}} turns one off,
+        {"/outputs": {"include": ["*.png"]}} changes its patterns and {"/outputs": {"path": "/workspace/results"}} moves
+        an output folder — $MESHIVE_OUTPUT_DIR and its storage follow (get_watched_folders lists them on a running pod).
+        Templates without an output folder (for example NIM or vLLM) take watched_folders too, as long as the pod has
+        storage to hold them.
         Pass the result's transaction_id to wait_for_new_pod to learn right away if the creation fails.
         model_set starts the pod with one of the template's model sets (a slug from list_model_sets; one per pod). The
         server fetches the set's files before it answers, which can take minutes, so this request waits up to
@@ -1001,7 +1304,8 @@ class Meshive(_BaseClient):
                             command: str | None = None, volumes: Any = None, local_volumes: Any = None,
                             detach_storages: Iterable[str] | None = None, allow_node_migration: bool | None = None,
                             allow_data_loss: bool | None = None, drop_watched_folders: Iterable[str] | None = None,
-                            max_price_per_hour: Any = None) -> PodUpdateEstimate:
+                            max_price_per_hour: Any = None,
+                            enable_folder_saving: bool | None = None) -> PodUpdateEstimate:
         """What update_pod would change, whether a running pod restarts, and the new hourly price — changes nothing
         (read scope is enough). Same arguments as update_pod."""
         body = _write.pod_update_body(
@@ -1010,7 +1314,8 @@ class Meshive(_BaseClient):
             remove_env=remove_env, ports=ports, template_ports=template_ports, remove_ports=remove_ports,
             command=command, volumes=volumes, local_volumes=local_volumes, detach_storages=detach_storages,
             allow_node_migration=allow_node_migration, allow_data_loss=allow_data_loss,
-            drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour)
+            drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour,
+            enable_folder_saving=enable_folder_saving)
         try:
             data = self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/estimate",
                               params={"workspace": _query_value(workspace, "workspace")}, json=body)
@@ -1027,7 +1332,7 @@ class Meshive(_BaseClient):
                    command: str | None = None, volumes: Any = None, local_volumes: Any = None,
                    detach_storages: Iterable[str] | None = None, allow_node_migration: bool | None = None,
                    allow_data_loss: bool | None = None, drop_watched_folders: Iterable[str] | None = None,
-                   max_price_per_hour: Any = None,
+                   max_price_per_hour: Any = None, enable_folder_saving: bool | None = None,
                    idempotency_key: str | None = None) -> PodUpdated:
         """Change a pod as the console's edit screen does (202 accepted). Only what you pass changes.
 
@@ -1038,6 +1343,8 @@ class Meshive(_BaseClient):
         command replaces the command ("" goes back to the template's). volumes attaches existing storage — network
         storage, or local storage on the pod's current machine — local_volumes creates new local storage there, and
         detach_storages detaches storage by pv_name (its data stays). max_price_per_hour caps the new hourly price.
+        enable_folder_saving=True adds the uploader to a pod made before every pod with storage got one, so you can
+        watch folders on it (get_watched_folders says editable_reason "no_sidecar"); it needs storage on the pod.
 
         Most changes restart a running pod; estimate_pod_update says so before you commit. A rename alone is applied
         in place without a restart (renamed_only, no transaction_id). Follow the change with
@@ -1058,7 +1365,8 @@ class Meshive(_BaseClient):
             remove_env=remove_env, ports=ports, template_ports=template_ports, remove_ports=remove_ports,
             command=command, volumes=volumes, local_volumes=local_volumes, detach_storages=detach_storages,
             allow_node_migration=allow_node_migration, allow_data_loss=allow_data_loss,
-            drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour)
+            drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour,
+            enable_folder_saving=enable_folder_saving)
         try:
             data = self._send("PATCH", f"/pods/{_path_segment(pod_name, 'pod_name')}",
                               params={"workspace": _query_value(workspace, "workspace")}, json=body,
@@ -1293,7 +1601,10 @@ class Meshive(_BaseClient):
     def register_model(self, huggingface_repo: str, *, workspace: str, name: str | None = None,
                        framework: str | None = None, hf_token_id: int | None = None,
                        context_length: int | None = None, idempotency_key: str | None = None) -> ResourceAction:
-        """Register a serving model (201) — `id` is the registration id. No cost (the download happens at deploy). The same repo returns the existing registration."""
+        """Register a serving model (201) — `id` is the registration id. No cost (the download happens at deploy). The same repo returns the existing registration.
+
+        Text models are served with vLLM, so leave `framework` out or pass "vllm". The server refuses "sglang" with a
+        400 (`MeshiveAPIError`) that says so."""
         body = _write.model_body(huggingface_repo, hf_token_id=hf_token_id, name=name, framework=framework,
                                  context_length=context_length)
         try:
@@ -1320,11 +1631,13 @@ class Meshive(_BaseClient):
                       args: Iterable[str] | None = None, gpu_model: str | None = None, gpu_count: int | None = None,
                       gpu_vram_gb: int | None = None, cpu_preset: str | None = None, max_duration: int = 3600,
                       webhook_url: str | None = None, input_assets: Any = None,
-                      max_price_per_hour: Any = None) -> TaskEstimate:
+                      max_price_per_hour: Any = None,
+                      output_include: str | Iterable[str] | None = None) -> TaskEstimate:
         body = _write.task_body(name, script, image=image, template_id=template_id, requirements=requirements, env=env,
                                 secret_keys=secret_keys, args=args, gpu_model=gpu_model, gpu_count=gpu_count,
                                 gpu_vram_gb=gpu_vram_gb, cpu_preset=cpu_preset, max_duration=max_duration,
-                                webhook_url=webhook_url, input_assets=input_assets, max_price_per_hour=max_price_per_hour)
+                                webhook_url=webhook_url, input_assets=input_assets, max_price_per_hour=max_price_per_hour,
+                                output_include=output_include)
         return TaskEstimate.from_dict(self._send("POST", "/tasks/estimate",
                                                   params={"workspace": _query_value(workspace, "workspace")}, json=body))
 
@@ -1334,18 +1647,285 @@ class Meshive(_BaseClient):
                     args: Iterable[str] | None = None, gpu_model: str | None = None, gpu_count: int | None = None,
                     gpu_vram_gb: int | None = None, cpu_preset: str | None = None, max_duration: int = 3600,
                     webhook_url: str | None = None, input_assets: Any = None, max_price_per_hour: Any = None,
+                    output_include: str | Iterable[str] | None = None,
                     idempotency_key: str | None = None) -> TaskSubmitted:
-        """Submit a one-shot task (202). To get logs, use print(..., flush=True) in the script (mind buffering)."""
+        """Submit a one-shot task (202). To get logs, use print(..., flush=True) in the script (mind buffering).
+
+        output_include uploads only the files in /outputs that match these globs (paths relative to /outputs,
+        case-sensitive): "*.safetensors" matches at any depth, "samples/*.png" only in that folder, and "checkpoints/"
+        every folder named checkpoints, at any depth, with everything in it. Omitted, every file is uploaded. Files
+        left out still use the /outputs disk while the task runs (counting toward the disk charge where /outputs is
+        billed as a volume), and are discarded when it ends. The returned task's output_include echoes
+        the filter; a server that predates the filter ignores it, and a RuntimeWarning says so.
+        """
         body = _write.task_body(name, script, image=image, template_id=template_id, requirements=requirements, env=env,
                                 secret_keys=secret_keys, args=args, gpu_model=gpu_model, gpu_count=gpu_count,
                                 gpu_vram_gb=gpu_vram_gb, cpu_preset=cpu_preset, max_duration=max_duration,
-                                webhook_url=webhook_url, input_assets=input_assets, max_price_per_hour=max_price_per_hour)
-        return TaskSubmitted.from_dict(self._send("POST", "/tasks", params={"workspace": _query_value(workspace, "workspace")},
-                                                   json=body, idempotency_key=idempotency_key))
+                                webhook_url=webhook_url, input_assets=input_assets, max_price_per_hour=max_price_per_hour,
+                                output_include=output_include)
+        return _check_output_include(body, TaskSubmitted.from_dict(self._send(
+            "POST", "/tasks", params={"workspace": _query_value(workspace, "workspace")}, json=body,
+            idempotency_key=idempotency_key)))
 
     def stop_task(self, task_id: str, *, idempotency_key: str | None = None) -> ResourceAction:
         data = self._send("POST", f"/tasks/{_path_segment(task_id, 'task_id')}/stop", idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="task")
+
+    # --- Hosting: maintenance windows --------------------------------------------------
+    # Machines you host. Reads need the read scope; everything that changes a machine, sends a message or reveals a
+    # secret needs the write scope. A machine that isn't yours is a NotFoundError, as for a missing one.
+
+    def list_maintenance(self, machine_id: str) -> list[MaintenanceWindow]:
+        """A machine's maintenance windows, newest first (GET /machines/{machine_id}/maintenance) — upcoming, in
+        progress and past ones, each with its `status`."""
+        try:
+            data = self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}/maintenance")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine maintenance") from None
+        return [MaintenanceWindow.from_dict(d) for d in data]
+
+    def estimate_maintenance(self, machine_id: str, *, reason: str, start: datetime | str, end: datetime | str,
+                             description: str = "", emergency: bool = False) -> MaintenanceEstimate:
+        """What schedule_maintenance would do — the same checks, the notice it gives, the workspaces it would email and
+        its effect on uptime. Creates nothing and emails no one (read scope is enough). Same arguments as
+        schedule_maintenance."""
+        body = _write.maintenance_body(reason=reason, start=start, end=end, description=description,
+                                       emergency=emergency)
+        try:
+            data = self._send("POST", f"/machines/{_path_segment(machine_id, 'machine_id')}/maintenance/estimate",
+                              json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine maintenance") from None
+        return MaintenanceEstimate.from_dict(data)
+
+    def schedule_maintenance(self, machine_id: str, *, reason: str, start: datetime | str, end: datetime | str,
+                             description: str = "", emergency: bool = False,
+                             idempotency_key: str | None = None) -> MaintenanceAction:
+        """Schedule a maintenance window on a machine (201), as the console's Maintenance tab does. start and end are
+        datetimes or ISO 8601 strings; a time without an offset is UTC.
+
+        The workspaces with a pod or volume on the machine are emailed at once. The window starts on its own at its
+        start time, within about a minute. While it is open their pods and volumes there aren't billed, and the
+        machine earns nothing from them. A regular window must start at least 48 hours ahead (400 'Insufficient
+        Notice Period') and doesn't affect your uptime. emergency=True can start sooner, but counts as downtime while
+        a client's workload runs on the machine — don't switch to it just to get past the notice. A window that
+        overlaps another is a ConflictError ('Overlapping Maintenance Window'). Check with estimate_maintenance
+        first."""
+        body = _write.maintenance_body(reason=reason, start=start, end=end, description=description,
+                                       emergency=emergency)
+        try:
+            data = self._send("POST", f"/machines/{_path_segment(machine_id, 'machine_id')}/maintenance", json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine maintenance") from None
+        return MaintenanceAction.from_dict(data)
+
+    def update_maintenance(self, maintenance_id: int | str, *, reason: str | None = None,
+                           description: str | None = None, start: datetime | str | None = None,
+                           end: datetime | str | None = None, idempotency_key: str | None = None) -> MaintenanceAction:
+        """Change a window that hasn't started (only what you pass changes). When its times change, the affected
+        workspaces are emailed the new times, and a regular window still needs 48 hours' notice unless it only moves
+        later. A window in progress can't be edited — extend or end it instead."""
+        body = _write.maintenance_update_body(reason=reason, description=description, start=start, end=end)
+        try:
+            data = self._send("PATCH", f"/maintenance/{_int_segment(maintenance_id, 'maintenance_id')}", json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine maintenance") from None
+        return MaintenanceAction.from_dict(data)
+
+    def cancel_maintenance(self, maintenance_id: int | str, *, idempotency_key: str | None = None) -> MaintenanceAction:
+        """Cancel a window that hasn't started. It is removed for good, and workspaces that were notified don't get a
+        cancellation email."""
+        return self._maintenance_call("DELETE", maintenance_id, "", idempotency_key)
+
+    def end_maintenance(self, maintenance_id: int | str, *, idempotency_key: str | None = None) -> MaintenanceAction:
+        """End a window now. The pods and volumes on the machine are billed again from now on, and the machine comes
+        back unlisted: list it again with set_machine_listing(machine_id, True) when the work is done."""
+        return self._maintenance_call("POST", maintenance_id, "/end", idempotency_key)
+
+    def extend_maintenance(self, maintenance_id: int | str, *, hours: float, reason: str, description: str = "",
+                           idempotency_key: str | None = None) -> MaintenanceAction:
+        """Make a window longer by `hours` (more than 0). The affected workspaces are emailed with the reason."""
+        body = _write.maintenance_extend_body(hours=hours, reason=reason, description=description)
+        return self._maintenance_call("POST", maintenance_id, "/extend", idempotency_key, body)
+
+    def _maintenance_call(self, method: str, maintenance_id: int | str, suffix: str, idempotency_key: str | None,
+                          body: dict[str, Any] | None = None) -> MaintenanceAction:
+        path = f"/maintenance/{_int_segment(maintenance_id, 'maintenance_id')}{suffix}"
+        try:
+            data = self._send(method, path, json=body, idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine maintenance") from None
+        return MaintenanceAction.from_dict(data)
+
+    # --- Hosting: listing, setup retries, removal ------------------------------------------
+
+    def check_listing(self, machine_id: str) -> ListingCheck:
+        """Whether listing the machine (set_machine_listing with listed=True) would go through, and if not, why (the
+        console's refusal). Changes nothing."""
+        try:
+            data = self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}/listing-check")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine listing") from None
+        return ListingCheck.from_dict(data)
+
+    def set_machine_listing(self, machine_id: str, listed: bool, *,
+                            idempotency_key: str | None = None) -> ListingResult:
+        """List (listed=True) or unlist (listed=False) a machine. A listed machine can get new pods. An unlisted one
+        gets no new pods, and stopped pods can't start on it again until it is listed; pods running on it keep
+        running. Listing is refused with the console's reason when the machine can't be listed (prices, hardware,
+        ports, boot, state) — check_listing shows that reason first. listed must be a bool."""
+        return self._listing_call(_write.listing_method(listed), machine_id, idempotency_key)
+
+    def _listing_call(self, method: str, machine_id: str, idempotency_key: str | None) -> ListingResult:
+        try:
+            data = self._send(method, f"/machines/{_path_segment(machine_id, 'machine_id')}/listing",
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine listing") from None
+        return ListingResult.from_dict(data)
+
+    def retry_machine_setup(self, machine_id: str, *, idempotency_key: str | None = None) -> RetryResult:
+        """Retry a machine's failed setup step (202), as the console's Retry does. A step the agent runs reboots the
+        machine first. A machine that isn't in a setup stage, or whose step can't be retried, is refused."""
+        try:
+            data = self._send("POST", f"/machines/{_path_segment(machine_id, 'machine_id')}/setup/retry",
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine setup retries") from None
+        return RetryResult.from_dict(data)
+
+    def retry_port_check(self, machine_id: str) -> RetryResult:
+        """Check a machine's ports again (202). There is a short cooldown between checks; a retry inside it is refused
+        with 400 'Too Many Requests'."""
+        try:
+            data = self._send("POST", f"/machines/{_path_segment(machine_id, 'machine_id')}/port-check/retry")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine setup retries") from None
+        return RetryResult.from_dict(data)
+
+    def check_machine_delete(self, machine_id: str) -> MachineDeleteCheck:
+        """What delete_machine would do: removed at once, or after a grace period because other users' pods or volumes
+        are on it, and how many. Changes nothing."""
+        try:
+            data = self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}/delete-check")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine removal") from None
+        return MachineDeleteCheck.from_dict(data)
+
+    def delete_machine(self, machine_id: str, *, idempotency_key: str | None = None) -> MachineDeleted:
+        """Remove a machine from Meshive (202). This can't be undone. With nothing of other users on it, removal starts
+        now. Otherwise a grace period starts (check_machine_delete says how long), their workspaces are emailed, and
+        what is left after it is removed by force: data on local volumes is lost. Its unfinished maintenance windows
+        are cancelled. Keep the machine on and its agent running until the removal finishes."""
+        try:
+            data = self._send("DELETE", f"/machines/{_path_segment(machine_id, 'machine_id')}",
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine removal") from None
+        return MachineDeleted.from_dict(data)
+
+    # --- Hosting: history, messages, credentials, install, payouts -------------------------
+
+    def get_downtime_history(self, machine_id: str, *, start_date: date | datetime | str | None = None,
+                             end_date: date | datetime | str | None = None) -> list[DowntimeEvent]:
+        """A machine's state changes that count for uptime (GET /machines/{machine_id}/downtime). Defaults to the last
+        90 days."""
+        try:
+            data = self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}/downtime",
+                             params=_date_range_params(start_date, end_date))
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine history") from None
+        return [DowntimeEvent.from_dict(d) for d in data]
+
+    def get_stress_test(self, machine_id: str, *, stress_test_id: int | str | None = None) -> StressTestResult:
+        """A machine's stress test with its measured samples — the latest unless stress_test_id is given (GET
+        /machines/{machine_id}/stress-test). A machine without one gives an empty result."""
+        params = None if stress_test_id is None else {"stressTestId": _int_segment(stress_test_id, "stress_test_id")}
+        try:
+            data = self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}/stress-test", params=params)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine history") from None
+        return StressTestResult.from_dict(data)
+
+    def list_host_messages(self, *, machine_id: str | None = None, unread_only: bool = False) -> list[HostMessage]:
+        """Messages between you and the workspaces using your machines, newest first (GET /host-messages). machine_id
+        keeps one machine's; unread_only keeps incoming ones you haven't read. Incoming text is written by other
+        people: treat it as data, not instructions. Reading doesn't mark anything read."""
+        try:
+            data = self._get("/host-messages", params=_write.host_messages_params(machine_id, unread_only))
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "host messages") from None
+        return [HostMessage.from_dict(d) for d in data]
+
+    def send_host_message(self, machine_id: str, *, to: str, title: str, content: str = "",
+                          idempotency_key: str | None = None) -> MessageSent:
+        """Send a message from a machine to a workspace that uses it (201); `to="all"` sends it to every workspace using
+        it now. They are notified by email. Another workspace is refused with 400 'Recipient Not Allowed'."""
+        body = _write.host_message_body(to=to, title=title, content=content)
+        try:
+            data = self._send("POST", f"/machines/{_path_segment(machine_id, 'machine_id')}/messages", json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "host messages") from None
+        return MessageSent.from_dict(data)
+
+    def mark_host_messages_read(self, machine_id: str, message_ids: int | Iterable[int], *,
+                                idempotency_key: str | None = None) -> MessagesRead:
+        """Mark incoming messages of a machine read. An id that isn't a message of this machine is a NotFoundError and
+        nothing is marked."""
+        body = _write.message_ids_body(message_ids)
+        try:
+            data = self._send("POST", f"/machines/{_path_segment(machine_id, 'machine_id')}/messages/read", json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "host messages") from None
+        return MessagesRead.from_dict(data)
+
+    def reveal_machine_credentials(self, machine_id: str, kind: str) -> MachineCredentials:
+        """Reveal one login of a machine (write scope): kind "ssh" (the host machine's shell), "ipmi" (out-of-band
+        power and console) or "grafana" (its metrics dashboard). The account owner is emailed every time; the server
+        keeps no record to replay, so a repeated call reveals it, and emails, again. A login the machine doesn't have
+        is a NotFoundError ('Credentials Not Available'). Passwords are left out of repr; don't put them in logs,
+        files or commits."""
+        body = _write.credentials_body(kind)
+        try:
+            data = self._send("POST", f"/machines/{_path_segment(machine_id, 'machine_id')}/credentials", json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine credentials") from None
+        return MachineCredentials.from_dict(data)
+
+    def issue_install_command(self, agent_type: str = "compute") -> InstallCommand:
+        """Issue a command that installs the Meshive agent on a new machine and registers it to your account, as the
+        console's Add machine shows it (write scope). agent_type is "compute" (GPU or CPU) or "storage". It works for
+        about 10 minutes, and whoever has it can register machines to your account until then: run it only on the
+        machine you mean to add, as root, and share it with no one. The account owner is emailed each time; every call
+        issues a new command. The machine shows up in list_machines once its agent connects."""
+        body = _write.install_command_body(agent_type)
+        try:
+            data = self._send("POST", "/host/install-command", json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "host install commands") from None
+        return InstallCommand.from_dict(data)
+
+    def get_payout_account(self) -> PayoutAccount:
+        """Your payout account's status and the earnings waiting to be paid out (GET /payouts/account). Setting up the
+        account is done in the console."""
+        try:
+            data = self._get("/payouts/account")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "payouts") from None
+        return PayoutAccount.from_dict(data)
+
+    def list_payouts(self, *, start_date: date | datetime | str | None = None,
+                     end_date: date | datetime | str | None = None) -> list[Payout]:
+        """Payouts of your host earnings (GET /payouts). Defaults to the last 90 days."""
+        try:
+            data = self._get("/payouts", params=_date_range_params(start_date, end_date))
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "payouts") from None
+        return [Payout.from_dict(d) for d in data]
 
     # --- Logs (read scope) -----------------------------------------------------------
 
@@ -1364,7 +1944,9 @@ class Meshive(_BaseClient):
         return Logs.from_dict(self._get(f"/tasks/{_path_segment(task_id, 'task_id')}/logs", params))
 
     def close(self) -> None:
-        self._client.close()
+        # Closing the httpx client would close its transport too, and a transport passed in belongs to the caller.
+        if self._owns_transport:
+            self._client.close()
 
     def __enter__(self) -> "Meshive":
         return self
@@ -1381,6 +1963,9 @@ class AsyncMeshive(_BaseClient):
         async with AsyncMeshive() as client:
             me = await client.me()
             pods = await client.list_pods("my-workspace")
+
+    Clients can share connections through one transport, as with Meshive: create `httpx.AsyncHTTPTransport()` once,
+    pass it to each client, use it from a single event loop, and `await transport.aclose()` when you shut down.
     """
 
     def __init__(
@@ -1391,9 +1976,15 @@ class AsyncMeshive(_BaseClient):
         timeout: float = 30.0,
         max_retries: int = 2,
         headers: dict[str, str] | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         super().__init__(api_key, base_url=base_url, timeout=timeout, max_retries=max_retries, headers=headers)
-        self._client = httpx.AsyncClient(timeout=timeout)
+        # The httpx client is this instance's own either way, so cookies and default headers never cross instances.
+        self._owns_transport = transport is None
+        if transport is None:
+            self._client = httpx.AsyncClient(timeout=timeout, verify=_default_ssl_context())
+        else:
+            self._client = httpx.AsyncClient(timeout=timeout, transport=transport)
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         url = self._url(path)
@@ -1431,23 +2022,26 @@ class AsyncMeshive(_BaseClient):
             except _RETRY_EXCEPTIONS as exc:
                 delay = self._retry_delay(attempt) if _may_resend(long_running, exc=exc) else None
                 if delay is None:
-                    exc.idempotency_key = headers["Idempotency-Key"]
-                    exc.operation_method = method
-                    exc.operation_path = path
+                    _mark_operation(exc, headers["Idempotency-Key"], method, path)
                     raise
+            except httpx.RequestError as exc:
+                # Not resent: the connection broke after the request may have reached the server, the answer
+                # couldn't be read, or the request couldn't be sent. As after a timeout, look the outcome up.
+                _mark_operation(exc, headers["Idempotency-Key"], method, path)
+                raise
             else:
                 delay = self._retry_delay(attempt, response) if _may_resend(long_running, response=response) else None
                 if delay is None:
                     try:
                         data = self._process(response)
                     except Exception as exc:
-                        exc.idempotency_key = headers["Idempotency-Key"]
-                        exc.operation_method = method
-                        exc.operation_path = path
+                        _mark_operation(exc, headers["Idempotency-Key"], method, path)
                         raise
                     if isinstance(data, dict):
                         data = {**data, "idempotencyKey": headers["Idempotency-Key"],
                                 "operationMethod": method, "operationPath": path}
+                        if _replayed(response):
+                            data["replayed"] = True
                     return data
             await asyncio.sleep(delay)
             attempt += 1
@@ -1480,9 +2074,9 @@ class AsyncMeshive(_BaseClient):
         """Machines registered as a host (GET /machines). No workspace needed (the host owns them directly)."""
         return [Machine.from_dict(d) for d in await self._get("/machines")]
 
-    async def get_machine(self, machine_id: str) -> Machine:
-        """A single machine (GET /machines/{machine_id})."""
-        return Machine.from_dict(await self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}"))
+    async def get_machine(self, machine_id: str) -> MachineDetail:
+        """A single machine with its clients, maintenance summary and diagnostics (GET /machines/{machine_id})."""
+        return MachineDetail.from_dict(await self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}"))
 
     async def wait_for_pod(
         self,
@@ -1544,6 +2138,20 @@ class AsyncMeshive(_BaseClient):
                                                 watch=watch)
             await self._check_creation(watch, workspace)
             _new_pod_expired(deadline, name, timeout)
+            await asyncio.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+
+    async def wait_for_workspace(self, workspace: str, *, timeout: float = 180.0, interval: float = 3.0) -> Workspace:
+        """Poll until the workspace is `running` (same rules as the sync wait_for_workspace)."""
+        namespace = _query_value(workspace, "workspace")
+        deadline = time.monotonic() + timeout
+        last = ""
+        while True:
+            found = _find_workspace(await self.list_workspaces(), namespace)
+            if found is not None:
+                if _workspace_running(found, namespace):
+                    return found
+                last = found.status
+            _workspace_wait_expired(deadline, namespace, last)
             await asyncio.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
 
     # --- Read surface (same rules as the sync client) ---------------------------
@@ -1612,6 +2220,18 @@ class AsyncMeshive(_BaseClient):
     async def list_api_keys(self) -> list[ApiKey]:
         """My active API keys — prefixes only, no plaintext (GET /api-keys)."""
         return [ApiKey.from_dict(d) for d in await self._get("/api-keys")]
+
+    async def list_activity(self, *, kind: str = "events", key_id: int | str | None = None,
+                            outcome: str | None = None, action: str | None = None,
+                            since: date | datetime | str | None = None, until: date | datetime | str | None = None,
+                            limit: int = 50, offset: int = 0) -> ActivityPage:
+        """What this account's API keys did, newest first (GET /activity). Same contract as the sync client."""
+        params = _activity_params(kind, key_id, outcome, action, since, until, limit, offset)
+        try:
+            data = await self._get("/activity", params=params)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "the activity log") from None
+        return ActivityPage.from_dict(data, kind=kind)
 
     async def get_credit(self) -> Credit:
         """Credit balance + auto top-up settings (GET /credit)."""
@@ -1735,6 +2355,67 @@ class AsyncMeshive(_BaseClient):
             raise
         return target
 
+    # --- Writes: workspaces ------------------------------------------------------------
+
+    async def estimate_workspace(self, name: str | None = None) -> WorkspaceEstimate:
+        """Check a workspace name — creates nothing (read scope is enough). Same contract as the sync client."""
+        body = _write.workspace_body(name)
+        try:
+            data = await self._send("POST", "/workspaces/estimate", json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace creation") from None
+        return WorkspaceEstimate.from_dict(data)
+
+    async def create_workspace(self, name: str | None = None, *,
+                               idempotency_key: str | None = None) -> WorkspaceCreated:
+        """Create a workspace (202 accepted). Same contract as the sync client: it is set up in the background, so
+        call wait_for_workspace(created.workspace) before creating anything in it."""
+        body = _write.workspace_body(name)
+        try:
+            data = await self._send("POST", "/workspaces", json=body, idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace creation") from None
+        return WorkspaceCreated.from_dict(data)
+
+    async def estimate_workspace_update(self, workspace: str, *, name: str) -> WorkspaceUpdateEstimate:
+        """Check a new name for a workspace — changes nothing (read scope is enough). Same contract as the sync client."""
+        body = _write.workspace_update_body(name)
+        try:
+            data = await self._send("POST", f"/workspaces/{_path_segment(workspace, 'workspace')}/estimate", json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace renaming") from None
+        return WorkspaceUpdateEstimate.from_dict(data)
+
+    async def update_workspace(self, workspace: str, *, name: str,
+                               idempotency_key: str | None = None) -> WorkspaceUpdated:
+        """Rename a workspace (PATCH /workspaces/{namespace}). Same contract as the sync client."""
+        body = _write.workspace_update_body(name)
+        try:
+            data = await self._send("PATCH", f"/workspaces/{_path_segment(workspace, 'workspace')}", json=body,
+                                    idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace renaming") from None
+        return WorkspaceUpdated.from_dict(data)
+
+    async def check_workspace_delete(self, workspace: str) -> WorkspaceDeleteCheck:
+        """Whether delete_workspace would go through — changes nothing (read scope is enough). Same contract as the sync
+        client."""
+        try:
+            data = await self._get(f"/workspaces/{_path_segment(workspace, 'workspace')}/delete-check")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace deletion") from None
+        return WorkspaceDeleteCheck.from_dict(data)
+
+    async def delete_workspace(self, workspace: str, *, idempotency_key: str | None = None) -> ResourceAction:
+        """Delete an empty workspace (202 accepted). This can't be undone. Same contract as the sync client: a workspace
+        that still holds anything is a ConflictError ('Workspace Not Empty')."""
+        try:
+            data = await self._send("DELETE", f"/workspaces/{_path_segment(workspace, 'workspace')}",
+                                    idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace deletion") from None
+        return ResourceAction.from_dict(data, resource="workspace")
+
     # --- Writes: pods (write scope) ---------------------------------------------------
 
     async def estimate_pod(self, name: str, template_id: int, *, workspace: str, gpu_model: str | None = None,
@@ -1789,8 +2470,11 @@ class AsyncMeshive(_BaseClient):
         with paths, strip_prefix "" keeps their folder structure — the console's Keep structure — and leaving it out
         strips the folder they share). watched_folders are folders whose new files are uploaded as assets ("path" or
         {"path", "include", "include_existing", "enabled"}); watched_template_folders sets the template's own watched
-        folders from the start, as the console's create screen does: {"/outputs": {"enabled": False}} turns one off and
-        {"/outputs": {"include": ["*.png"]}} changes its patterns (get_watched_folders lists them on a running pod).
+        folders from the start, as the console's create screen does: {"/outputs": {"enabled": False}} turns one off,
+        {"/outputs": {"include": ["*.png"]}} changes its patterns and {"/outputs": {"path": "/workspace/results"}} moves
+        an output folder — $MESHIVE_OUTPUT_DIR and its storage follow (get_watched_folders lists them on a running pod).
+        Templates without an output folder (for example NIM or vLLM) take watched_folders too, as long as the pod has
+        storage to hold them.
         Pass the result's transaction_id to wait_for_new_pod to learn right away if the creation fails.
         model_set starts the pod with one of the template's model sets (a slug from list_model_sets; one per pod). The
         server fetches the set's files before it answers, which can take minutes, so this request waits up to
@@ -1864,7 +2548,8 @@ class AsyncMeshive(_BaseClient):
                                   command: str | None = None, volumes: Any = None, local_volumes: Any = None,
                                   detach_storages: Iterable[str] | None = None, allow_node_migration: bool | None = None,
                                   allow_data_loss: bool | None = None, drop_watched_folders: Iterable[str] | None = None,
-                                  max_price_per_hour: Any = None) -> PodUpdateEstimate:
+                                  max_price_per_hour: Any = None,
+                                  enable_folder_saving: bool | None = None) -> PodUpdateEstimate:
         """What update_pod would change and cost (POST /pods/{pod}/estimate). Same contract as the sync client."""
         body = _write.pod_update_body(
             name=name, template_id=template_id, rental_type=rental_type, gpu_model=gpu_model, gpu_vram_gb=gpu_vram_gb,
@@ -1872,7 +2557,8 @@ class AsyncMeshive(_BaseClient):
             remove_env=remove_env, ports=ports, template_ports=template_ports, remove_ports=remove_ports,
             command=command, volumes=volumes, local_volumes=local_volumes, detach_storages=detach_storages,
             allow_node_migration=allow_node_migration, allow_data_loss=allow_data_loss,
-            drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour)
+            drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour,
+            enable_folder_saving=enable_folder_saving)
         try:
             data = await self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/estimate",
                               params={"workspace": _query_value(workspace, "workspace")}, json=body)
@@ -1889,7 +2575,7 @@ class AsyncMeshive(_BaseClient):
                          command: str | None = None, volumes: Any = None, local_volumes: Any = None,
                          detach_storages: Iterable[str] | None = None, allow_node_migration: bool | None = None,
                          allow_data_loss: bool | None = None, drop_watched_folders: Iterable[str] | None = None,
-                         max_price_per_hour: Any = None,
+                         max_price_per_hour: Any = None, enable_folder_saving: bool | None = None,
                          idempotency_key: str | None = None) -> PodUpdated:
         """Change a pod (PATCH /pods/{pod}, 202). Same contract as the sync client."""
         body = _write.pod_update_body(
@@ -1898,7 +2584,8 @@ class AsyncMeshive(_BaseClient):
             remove_env=remove_env, ports=ports, template_ports=template_ports, remove_ports=remove_ports,
             command=command, volumes=volumes, local_volumes=local_volumes, detach_storages=detach_storages,
             allow_node_migration=allow_node_migration, allow_data_loss=allow_data_loss,
-            drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour)
+            drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour,
+            enable_folder_saving=enable_folder_saving)
         try:
             data = await self._send("PATCH", f"/pods/{_path_segment(pod_name, 'pod_name')}",
                               params={"workspace": _query_value(workspace, "workspace")}, json=body,
@@ -2147,11 +2834,13 @@ class AsyncMeshive(_BaseClient):
                       args: Iterable[str] | None = None, gpu_model: str | None = None, gpu_count: int | None = None,
                       gpu_vram_gb: int | None = None, cpu_preset: str | None = None, max_duration: int = 3600,
                       webhook_url: str | None = None, input_assets: Any = None,
-                      max_price_per_hour: Any = None) -> TaskEstimate:
+                      max_price_per_hour: Any = None,
+                      output_include: str | Iterable[str] | None = None) -> TaskEstimate:
         body = _write.task_body(name, script, image=image, template_id=template_id, requirements=requirements, env=env,
                                 secret_keys=secret_keys, args=args, gpu_model=gpu_model, gpu_count=gpu_count,
                                 gpu_vram_gb=gpu_vram_gb, cpu_preset=cpu_preset, max_duration=max_duration,
-                                webhook_url=webhook_url, input_assets=input_assets, max_price_per_hour=max_price_per_hour)
+                                webhook_url=webhook_url, input_assets=input_assets, max_price_per_hour=max_price_per_hour,
+                                output_include=output_include)
         return TaskEstimate.from_dict(await self._send("POST", "/tasks/estimate",
                                                   params={"workspace": _query_value(workspace, "workspace")}, json=body))
 
@@ -2161,18 +2850,259 @@ class AsyncMeshive(_BaseClient):
                     args: Iterable[str] | None = None, gpu_model: str | None = None, gpu_count: int | None = None,
                     gpu_vram_gb: int | None = None, cpu_preset: str | None = None, max_duration: int = 3600,
                     webhook_url: str | None = None, input_assets: Any = None, max_price_per_hour: Any = None,
+                    output_include: str | Iterable[str] | None = None,
                     idempotency_key: str | None = None) -> TaskSubmitted:
-        """Submit a one-shot task (202). To get logs, use print(..., flush=True) in the script (mind buffering)."""
+        """Submit a one-shot task (202). To get logs, use print(..., flush=True) in the script (mind buffering).
+
+        output_include uploads only the files in /outputs that match these globs (paths relative to /outputs,
+        case-sensitive): "*.safetensors" matches at any depth, "samples/*.png" only in that folder, and "checkpoints/"
+        every folder named checkpoints, at any depth, with everything in it. Omitted, every file is uploaded. Files
+        left out still use the /outputs disk while the task runs (counting toward the disk charge where /outputs is
+        billed as a volume), and are discarded when it ends. The returned task's output_include echoes
+        the filter; a server that predates the filter ignores it, and a RuntimeWarning says so.
+        """
         body = _write.task_body(name, script, image=image, template_id=template_id, requirements=requirements, env=env,
                                 secret_keys=secret_keys, args=args, gpu_model=gpu_model, gpu_count=gpu_count,
                                 gpu_vram_gb=gpu_vram_gb, cpu_preset=cpu_preset, max_duration=max_duration,
-                                webhook_url=webhook_url, input_assets=input_assets, max_price_per_hour=max_price_per_hour)
-        return TaskSubmitted.from_dict(await self._send("POST", "/tasks", params={"workspace": _query_value(workspace, "workspace")},
-                                                   json=body, idempotency_key=idempotency_key))
+                                webhook_url=webhook_url, input_assets=input_assets, max_price_per_hour=max_price_per_hour,
+                                output_include=output_include)
+        return _check_output_include(body, TaskSubmitted.from_dict(await self._send(
+            "POST", "/tasks", params={"workspace": _query_value(workspace, "workspace")}, json=body,
+            idempotency_key=idempotency_key)))
 
     async def stop_task(self, task_id: str, *, idempotency_key: str | None = None) -> ResourceAction:
         data = await self._send("POST", f"/tasks/{_path_segment(task_id, 'task_id')}/stop", idempotency_key=idempotency_key)
         return ResourceAction.from_dict(data, resource="task")
+
+    # --- Hosting: maintenance windows --------------------------------------------------
+    # Machines you host. Reads need the read scope; everything that changes a machine, sends a message or reveals a
+    # secret needs the write scope. A machine that isn't yours is a NotFoundError, as for a missing one.
+
+    async def list_maintenance(self, machine_id: str) -> list[MaintenanceWindow]:
+        """A machine's maintenance windows, newest first, each with its status (GET /machines/{machine_id}/maintenance).
+        Same contract as the sync client."""
+        try:
+            data = await self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}/maintenance")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine maintenance") from None
+        return [MaintenanceWindow.from_dict(d) for d in data]
+
+    async def estimate_maintenance(self, machine_id: str, *, reason: str, start: datetime | str, end: datetime | str,
+                             description: str = "", emergency: bool = False) -> MaintenanceEstimate:
+        """What schedule_maintenance would do — the same checks, the notice it gives, the workspaces it would email
+        and its effect on uptime. Same contract as the sync client."""
+        body = _write.maintenance_body(reason=reason, start=start, end=end, description=description,
+                                       emergency=emergency)
+        try:
+            data = await self._send("POST", f"/machines/{_path_segment(machine_id, 'machine_id')}/maintenance/estimate",
+                              json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine maintenance") from None
+        return MaintenanceEstimate.from_dict(data)
+
+    async def schedule_maintenance(self, machine_id: str, *, reason: str, start: datetime | str, end: datetime | str,
+                             description: str = "", emergency: bool = False,
+                             idempotency_key: str | None = None) -> MaintenanceAction:
+        """Schedule a maintenance window on a machine (201), as the console's Maintenance tab does. Same contract as
+        the sync client."""
+        body = _write.maintenance_body(reason=reason, start=start, end=end, description=description,
+                                       emergency=emergency)
+        try:
+            data = await self._send("POST", f"/machines/{_path_segment(machine_id, 'machine_id')}/maintenance", json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine maintenance") from None
+        return MaintenanceAction.from_dict(data)
+
+    async def update_maintenance(self, maintenance_id: int | str, *, reason: str | None = None,
+                           description: str | None = None, start: datetime | str | None = None,
+                           end: datetime | str | None = None, idempotency_key: str | None = None) -> MaintenanceAction:
+        """Change a window that hasn't started (only what you pass changes). Same contract as the sync client."""
+        body = _write.maintenance_update_body(reason=reason, description=description, start=start, end=end)
+        try:
+            data = await self._send("PATCH", f"/maintenance/{_int_segment(maintenance_id, 'maintenance_id')}", json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine maintenance") from None
+        return MaintenanceAction.from_dict(data)
+
+    async def cancel_maintenance(self, maintenance_id: int | str, *, idempotency_key: str | None = None) -> MaintenanceAction:
+        """Cancel a window that hasn't started. Same contract as the sync client."""
+        return await self._maintenance_call("DELETE", maintenance_id, "", idempotency_key)
+
+    async def end_maintenance(self, maintenance_id: int | str, *, idempotency_key: str | None = None) -> MaintenanceAction:
+        """End a window now. Same contract as the sync client."""
+        return await self._maintenance_call("POST", maintenance_id, "/end", idempotency_key)
+
+    async def extend_maintenance(self, maintenance_id: int | str, *, hours: float, reason: str, description: str = "",
+                           idempotency_key: str | None = None) -> MaintenanceAction:
+        """Make a window longer by `hours` (more than 0). Same contract as the sync client."""
+        body = _write.maintenance_extend_body(hours=hours, reason=reason, description=description)
+        return await self._maintenance_call("POST", maintenance_id, "/extend", idempotency_key, body)
+
+    async def _maintenance_call(self, method: str, maintenance_id: int | str, suffix: str, idempotency_key: str | None,
+                          body: dict[str, Any] | None = None) -> MaintenanceAction:
+        path = f"/maintenance/{_int_segment(maintenance_id, 'maintenance_id')}{suffix}"
+        try:
+            data = await self._send(method, path, json=body, idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine maintenance") from None
+        return MaintenanceAction.from_dict(data)
+
+    # --- Hosting: listing, setup retries, removal ------------------------------------------
+
+    async def check_listing(self, machine_id: str) -> ListingCheck:
+        """Whether listing the machine (set_machine_listing with listed=True) would go through, and if not, why (the
+        console's refusal). Same contract as the sync client."""
+        try:
+            data = await self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}/listing-check")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine listing") from None
+        return ListingCheck.from_dict(data)
+
+    async def set_machine_listing(self, machine_id: str, listed: bool, *,
+                                  idempotency_key: str | None = None) -> ListingResult:
+        """List (listed=True) or unlist (listed=False) a machine. An unlisted machine gets no new pods; pods running
+        on it keep running. Same contract as the sync client."""
+        return await self._listing_call(_write.listing_method(listed), machine_id, idempotency_key)
+
+    async def _listing_call(self, method: str, machine_id: str, idempotency_key: str | None) -> ListingResult:
+        try:
+            data = await self._send(method, f"/machines/{_path_segment(machine_id, 'machine_id')}/listing",
+                                    idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine listing") from None
+        return ListingResult.from_dict(data)
+
+    async def retry_machine_setup(self, machine_id: str, *, idempotency_key: str | None = None) -> RetryResult:
+        """Retry a machine's failed setup step (202), as the console's Retry does. Same contract as the sync client."""
+        try:
+            data = await self._send("POST", f"/machines/{_path_segment(machine_id, 'machine_id')}/setup/retry",
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine setup retries") from None
+        return RetryResult.from_dict(data)
+
+    async def retry_port_check(self, machine_id: str) -> RetryResult:
+        """Check a machine's ports again (202). Same contract as the sync client."""
+        try:
+            data = await self._send("POST", f"/machines/{_path_segment(machine_id, 'machine_id')}/port-check/retry")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine setup retries") from None
+        return RetryResult.from_dict(data)
+
+    async def check_machine_delete(self, machine_id: str) -> MachineDeleteCheck:
+        """What delete_machine would do: removed at once, or after a grace period because other users' pods or volumes
+        are on it, and how many. Same contract as the sync client."""
+        try:
+            data = await self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}/delete-check")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine removal") from None
+        return MachineDeleteCheck.from_dict(data)
+
+    async def delete_machine(self, machine_id: str, *, idempotency_key: str | None = None) -> MachineDeleted:
+        """Remove a machine from Meshive (202). This can't be undone. Same contract as the sync client."""
+        try:
+            data = await self._send("DELETE", f"/machines/{_path_segment(machine_id, 'machine_id')}",
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine removal") from None
+        return MachineDeleted.from_dict(data)
+
+    # --- Hosting: history, messages, credentials, install, payouts -------------------------
+
+    async def get_downtime_history(self, machine_id: str, *, start_date: date | datetime | str | None = None,
+                             end_date: date | datetime | str | None = None) -> list[DowntimeEvent]:
+        """A machine's state changes that count for uptime (GET /machines/{machine_id}/downtime). Same contract as the
+        sync client."""
+        try:
+            data = await self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}/downtime",
+                             params=_date_range_params(start_date, end_date))
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine history") from None
+        return [DowntimeEvent.from_dict(d) for d in data]
+
+    async def get_stress_test(self, machine_id: str, *, stress_test_id: int | str | None = None) -> StressTestResult:
+        """A machine's stress test with its measured samples — the latest unless stress_test_id is given (GET
+        /machines/{machine_id}/stress-test). Same contract as the sync client."""
+        params = None if stress_test_id is None else {"stressTestId": _int_segment(stress_test_id, "stress_test_id")}
+        try:
+            data = await self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}/stress-test", params=params)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine history") from None
+        return StressTestResult.from_dict(data)
+
+    async def list_host_messages(self, *, machine_id: str | None = None, unread_only: bool = False) -> list[HostMessage]:
+        """Messages between you and the workspaces using your machines, newest first (GET /host-messages). Same
+        contract as the sync client."""
+        try:
+            data = await self._get("/host-messages", params=_write.host_messages_params(machine_id, unread_only))
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "host messages") from None
+        return [HostMessage.from_dict(d) for d in data]
+
+    async def send_host_message(self, machine_id: str, *, to: str, title: str, content: str = "",
+                          idempotency_key: str | None = None) -> MessageSent:
+        """Send a message from a machine to a workspace that uses it, or to="all" (201). They are notified by email.
+        Same contract as the sync client."""
+        body = _write.host_message_body(to=to, title=title, content=content)
+        try:
+            data = await self._send("POST", f"/machines/{_path_segment(machine_id, 'machine_id')}/messages", json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "host messages") from None
+        return MessageSent.from_dict(data)
+
+    async def mark_host_messages_read(self, machine_id: str, message_ids: int | Iterable[int], *,
+                                idempotency_key: str | None = None) -> MessagesRead:
+        """Mark incoming messages of a machine read. Same contract as the sync client."""
+        body = _write.message_ids_body(message_ids)
+        try:
+            data = await self._send("POST", f"/machines/{_path_segment(machine_id, 'machine_id')}/messages/read", json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "host messages") from None
+        return MessagesRead.from_dict(data)
+
+    async def reveal_machine_credentials(self, machine_id: str, kind: str) -> MachineCredentials:
+        """Reveal one login of a machine, kind "ssh", "ipmi" or "grafana" (write scope). The account owner is emailed
+        every time. Same contract as the sync client."""
+        body = _write.credentials_body(kind)
+        try:
+            data = await self._send("POST", f"/machines/{_path_segment(machine_id, 'machine_id')}/credentials",
+                                    json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "machine credentials") from None
+        return MachineCredentials.from_dict(data)
+
+    async def issue_install_command(self, agent_type: str = "compute") -> InstallCommand:
+        """Issue a command that installs the Meshive agent on a new machine and registers it to your account (write
+        scope). It works for about 10 minutes: run it only on the machine you mean to add, and share it with no one.
+        The account owner is emailed each time. Same contract as the sync client."""
+        body = _write.install_command_body(agent_type)
+        try:
+            data = await self._send("POST", "/host/install-command", json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "host install commands") from None
+        return InstallCommand.from_dict(data)
+
+    async def get_payout_account(self) -> PayoutAccount:
+        """Your payout account's status and the earnings waiting to be paid out (GET /payouts/account). Same contract
+        as the sync client."""
+        try:
+            data = await self._get("/payouts/account")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "payouts") from None
+        return PayoutAccount.from_dict(data)
+
+    async def list_payouts(self, *, start_date: date | datetime | str | None = None,
+                     end_date: date | datetime | str | None = None) -> list[Payout]:
+        """Payouts of your host earnings (GET /payouts). Same contract as the sync client."""
+        try:
+            data = await self._get("/payouts", params=_date_range_params(start_date, end_date))
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "payouts") from None
+        return [Payout.from_dict(d) for d in data]
 
     # --- Logs (read scope) -----------------------------------------------------------
 
@@ -2191,7 +3121,9 @@ class AsyncMeshive(_BaseClient):
         return Logs.from_dict(await self._get(f"/tasks/{_path_segment(task_id, 'task_id')}/logs", params))
 
     async def close(self) -> None:
-        await self._client.aclose()
+        # Closing the httpx client would close its transport too, and a transport passed in belongs to the caller.
+        if self._owns_transport:
+            await self._client.aclose()
 
     async def __aenter__(self) -> "AsyncMeshive":
         return self

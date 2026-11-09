@@ -10,6 +10,7 @@ from meshive import (
     Asset,
     Pod,
     Task,
+    TaskOutputsStatus,
     Transaction,
     Workspace,
     AsyncMeshive,
@@ -243,6 +244,149 @@ def test_task_detail_fields():
     # List responses (no such fields) are None/empty list — not 0
     bare = Task.from_dict({"externalId": "task_2"})
     assert bare.output_files_declared is None and bare.input_assets == []
+
+
+def test_task_output_filter():
+    assert Task.from_dict({"externalId": "t", "outputInclude": ["*.png", "samples/"]}).output_include == ["*.png",
+                                                                                                         "samples/"]
+    assert Task.from_dict({"externalId": "t", "outputInclude": None}).output_include is None     # every file
+    assert Task.from_dict({"externalId": "t"}).output_include is None      # a server that predates the filter
+
+
+# --- Task.outputs: the server-derived outputs status --------------------------------------------
+TASK_OUTPUTS_UPLOADING = {
+    "phase": "uploading", "assetExternalId": None, "assetName": None, "assetDeleted": False,
+    "filesSaved": 1200, "filesNotSaved": 431, "filesSoFar": 1200, "filesTotal": 2431, "filesOverLimit": 431,
+    "bytesSaved": 1024, "bytesSoFar": 1024, "bytesTotal": 4096, "expectedInAssetsAt": None,
+    "uploadStartedAt": "2026-11-05T07:00:00Z", "uploadDeadlineAt": "2026-11-08T07:00:00Z", "nextAttemptAt": None,
+    "attempts": 1, "filesLimit": 2000, "lastError": None, "savedAt": None,
+}
+
+
+def test_task_outputs_status_parses_the_server_object():
+    t = Task.from_dict({**TASK, "status": "succeeded", "outputs": TASK_OUTPUTS_UPLOADING})
+    o = t.outputs
+    assert isinstance(o, TaskOutputsStatus)
+    assert o.phase == "uploading" and o.saving is True
+    assert (o.files_so_far, o.files_total, o.files_over_limit, o.files_limit) == (1200, 2431, 431, 2000)
+    # filesTotal counts the files over the limit too; they aren't uploaded, so progress is out of 2,000
+    assert o.files_to_upload == 2000
+    assert (o.bytes_saved, o.bytes_so_far, o.bytes_total) == (1024, 1024, 4096)
+    assert (o.files_saved, o.files_not_saved, o.attempts) == (1200, 431, 1)
+    assert o.asset_id is None and o.asset_name is None and o.asset_deleted is False
+    assert o.upload_started_at.year == 2026 and o.upload_started_at.tzinfo is not None
+    assert o.upload_deadline_at.day == 8 and o.next_attempt_at is None and o.saved_at is None
+    assert o.raw == TASK_OUTPUTS_UPLOADING
+    assert t.raw["outputs"] is TASK_OUTPUTS_UPLOADING
+
+
+def test_task_outputs_status_saved_asset():
+    o = Task.from_dict({**TASK, "status": "succeeded", "outputs": {
+        "phase": "saved", "assetExternalId": "asset_9c21", "assetName": "run outputs", "assetDeleted": False,
+        "filesSaved": 126, "filesNotSaved": 0, "filesOverLimit": 0, "filesTotal": 126, "bytesSaved": 4096,
+        "filesLimit": 2000, "savedAt": "2026-11-05T07:03:00Z", "attempts": 1}}).outputs
+    assert o.phase == "saved" and o.saving is False
+    assert (o.asset_id, o.asset_name, o.files_saved, o.bytes_saved) == ("asset_9c21", "run outputs", 126, 4096)
+    assert o.saved_at.minute == 3 and o.files_to_upload == 126
+
+
+@pytest.mark.parametrize("phase, saving", [
+    ("running", False), ("preparing", True), ("uploading", True), ("retrying", True), ("registering", True),
+    ("saved", False), ("partially_saved", False), ("not_saved", False), ("discarded", False), ("empty", False),
+    ("a_phase_from_a_newer_server", False),
+])
+def test_task_outputs_status_saving_phases(phase, saving):
+    assert TaskOutputsStatus.from_dict({"phase": phase}).saving is saving
+
+
+def test_task_outputs_status_tolerates_unknown_and_missing_keys():
+    # A newer server may add keys: they are ignored here and kept in .raw.
+    o = TaskOutputsStatus.from_dict({**TASK_OUTPUTS_UPLOADING, "someNewField": {"x": 1}, "phase": "uploading"})
+    assert o.phase == "uploading" and o.raw["someNewField"] == {"x": 1}
+    t = Task.from_dict({**TASK, "someNewTaskField": [1, 2], "outputs": {**TASK_OUTPUTS_UPLOADING, "extra": True}})
+    assert t.task_id == "task_abc" and t.outputs.files_to_upload == 2000
+    # A key the server didn't send is None, not a made-up 0 or False.
+    bare = TaskOutputsStatus.from_dict({})
+    assert dataclasses.astuple(bare)[:-1] == (None,) * (len(dataclasses.fields(bare)) - 1)
+    assert bare.saving is False and bare.files_to_upload is None
+    # The total isn't known yet for some tasks: no denominator.
+    unknown = TaskOutputsStatus.from_dict({"phase": "uploading", "filesSoFar": 48, "filesTotal": None,
+                                           "bytesSoFar": 1024, "bytesTotal": None, "filesOverLimit": 0})
+    assert unknown.files_to_upload is None and unknown.bytes_total is None and unknown.files_so_far == 48
+
+
+def test_task_without_outputs_from_an_older_server():
+    t = Task.from_dict({**TASK, "outputUploadState": "uploading", "outputFilesDeclared": 4,
+                        "outputFilesCompleted": 1})
+    assert t.outputs is None
+    assert (t.output_upload_state, t.output_files_declared, t.output_files_completed) == ("uploading", 4, 1)
+    assert Task.from_dict({**TASK, "outputs": None}).outputs is None
+    assert Task.from_dict({**TASK, "outputs": "saved"}).outputs is None        # not an object: ignored
+
+
+def test_get_list_and_submit_task_carry_outputs():
+    seen = {}
+    detail = {**TASK, "status": "succeeded", "scriptContent": "print(1)", "outputs": TASK_OUTPUTS_UPLOADING}
+    assert sync_client(_capture(detail, seen)).get_task("task_abc").outputs.phase == "uploading"
+    assert sync_client(_capture([detail, TASK], seen)).list_tasks("team-ns")[0].outputs.files_to_upload == 2000
+
+    async def run():
+        async with async_client(_capture(detail, seen)) as client:
+            one = await client.get_task("task_abc")
+        async with async_client(_capture([TASK], seen)) as client:
+            many = await client.list_tasks("team-ns")
+        return one, many
+
+    one, many = asyncio.run(run())
+    assert one.outputs.phase == "uploading" and many[0].outputs is None
+    from meshive import TaskSubmitted
+
+    submitted = TaskSubmitted.from_dict({"task": {**TASK, "outputs": {"phase": "running", "filesLimit": 2000}},
+                                         "estimate": {}})
+    assert submitted.task.outputs.phase == "running" and submitted.task.outputs.files_limit == 2000
+
+
+def test_workspace_estimate_and_created_models():
+    import meshive
+
+    est =meshive.WorkspaceEstimate.from_dict({"name": "research", "pricePerHourUsd": "0", "note": "Free."})
+    assert (est.name, est.price_per_hour, est.note) == ("research", "0", "Free.") and est.raw["name"] == "research"
+    bare = meshive.WorkspaceEstimate.from_dict({})              # tolerant of fields the server didn't send
+    assert (bare.name, bare.price_per_hour, bare.note) == (None, "0", "")
+    created = meshive.WorkspaceCreated.from_dict({"workspace": "my-workspace-ab12", "name": "Research",
+                                                  "transactionId": 321, "estimate": {"pricePerHourUsd": "0"}})
+    assert (created.workspace, created.name, created.transaction_id) == ("my-workspace-ab12", "Research", 321)
+    assert created.estimate.price_per_hour == "0" and created.estimate.name is None
+    empty = meshive.WorkspaceCreated.from_dict({})
+    assert (empty.workspace, empty.name, empty.transaction_id) == ("", "", None) and empty.estimate.note == ""
+    assert {"WorkspaceEstimate", "WorkspaceCreated"} <= set(meshive.__all__)
+
+
+def test_workspace_update_and_delete_check_models():
+    import meshive
+
+    est = meshive.WorkspaceUpdateEstimate.from_dict({"workspace": "ab12cd34ef567890", "currentName": "old", "name": "new"})
+    assert (est.workspace, est.current_name, est.name) == ("ab12cd34ef567890", "old", "new") and est.raw["name"] == "new"
+    bare = meshive.WorkspaceUpdateEstimate.from_dict({})        # tolerant of fields the server didn't send
+    assert (bare.workspace, bare.current_name, bare.name) == ("", "", "")
+
+    updated = meshive.WorkspaceUpdated.from_dict({"workspace": "ab12cd34ef567890", "name": "new"})
+    assert (updated.workspace, updated.name) == ("ab12cd34ef567890", "new") and updated.raw["workspace"]
+    empty = meshive.WorkspaceUpdated.from_dict({})
+    assert (empty.workspace, empty.name) == ("", "")
+
+    clear = meshive.WorkspaceDeleteCheck.from_dict({"workspace": "ab12cd34ef567890", "name": "lab", "deletable": True,
+                                                    "blockers": {}})
+    assert clear.deletable is True and clear.blockers == {} and (clear.workspace, clear.name) == ("ab12cd34ef567890", "lab")
+    blocked = meshive.WorkspaceDeleteCheck.from_dict({"workspace": "x", "name": "lab", "deletable": False,
+                                                      "blockers": {"assets": 3, "task_outputs": "2"}})
+    assert blocked.deletable is False and blocked.blockers == {"assets": 3, "task_outputs": 2}
+    assert blocked.raw["blockers"]["task_outputs"] == "2"       # raw keeps the payload as it came
+    unknown = meshive.WorkspaceDeleteCheck.from_dict({"blockers": None})
+    # A response without the field isn't a promise that the workspace is empty: falsy, so callers don't go ahead.
+    assert unknown.deletable is None and not unknown.deletable and unknown.blockers == {}
+
+    assert {"WorkspaceUpdateEstimate", "WorkspaceUpdated", "WorkspaceDeleteCheck"} <= set(meshive.__all__)
 
 
 def test_list_machines_parses():
@@ -1065,6 +1209,16 @@ def test_format_bytes_human_uses_binary_labels():
     assert fmt.bytes_human(3 * 1024 ** 4) == "3.00 TiB"
     # A 20.69 GB (decimal) file is 19.27 GiB — numbers divided by 1024 get 1024-based labels.
     assert fmt.bytes_human(20_690_000_000) == "19.27 GiB"
+
+
+def test_format_bytes_of_writes_a_shared_unit_once():
+    from meshive.cli import _format as fmt
+
+    assert fmt.bytes_of(43_201_331, 113_874_534) == "41.2 of 108.6 MiB"
+    assert fmt.bytes_of(524_288, 1_258_291) == "512.0 KiB of 1.2 MiB"
+    assert fmt.bytes_of(0, 4096) == "0 B of 4.0 KiB"
+    assert fmt.bytes_of(None, 4096) == "- of 4.0 KiB"
+    assert fmt.count(2431) == "2,431" and fmt.count(7) == "7"
 
 
 # --- Display helpers: same amounts as the web console -------------------------------------------

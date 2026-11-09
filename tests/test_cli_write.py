@@ -8,10 +8,11 @@ import pytest
 
 
 cli = importlib.import_module("meshive.cli.main")  # cli.__init__ exposes the main function, which shadows the submodule
-from meshive import Meshive, WaitTimeoutError
+from meshive import ConflictError, Meshive, MeshiveError, NotFoundError, WaitTimeoutError
 from meshive.models import (Pod, Logs, PodCreated, PodEstimate, ResourceAction, Serving, StorageCreated, StorageEstimate,
                             TaskEstimate, TaskSubmitted, ModelDetection, ServingModel, AssetImported, WatchedFolders, SshAccess,
-                            Transaction)
+                            Transaction, Workspace, WorkspaceCreated, WorkspaceDeleteCheck, WorkspaceEstimate,
+                            WorkspaceUpdated, WorkspaceUpdateEstimate)
 
 ESTIMATE = {"pricePerHourUsd": "0.068423", "breakdown": {"gpu": "0.068423"},
             "resources": {"gpu_model": "RTX 3060", "vram_gb": 12, "gpu_count": 1, "vcpu": 4, "ram_gb": 12, "disk_gb": 25,
@@ -19,6 +20,8 @@ ESTIMATE = {"pricePerHourUsd": "0.068423", "breakdown": {"gpu": "0.068423"},
             "availability": {"available_gpus": 2}, "template": {"id": 457, "name": "VSCode"}, "volumes": [], "note": "Estimated"}
 STORAGE_ESTIMATE = {"pricePerHourUsd": "0.000097", "pricePerGbMonthUsd": "0.07", "storageType": "nfs", "maxSizeGb": 305}
 TASK_ESTIMATE = {"pricePerHourUsd": None, "maxCostUsd": None, "maxDurationS": 3600, "resources": {}, "note": "CPU"}
+WORKSPACE_ESTIMATE = {"name": None, "pricePerHourUsd": "0",
+                      "note": "A workspace costs nothing by itself. Pods, storage and tasks in it are billed as usual."}
 TASK = {"externalId": "task_1", "name": "train", "namespaceName": "ws", "status": "queued", "podName": "task-1",
         "image": "img", "gpuModel": None, "gpuCount": 0, "cpuCores": 2, "ramGb": 8, "pricePerHour": "0",
         "costSoFar": "0", "totalCost": "0"}
@@ -129,12 +132,45 @@ class FakeClient:
     def ssh_access(self, *a, **kw):
         self._rec("ssh_access", *a, **kw)
         return SshAccess.from_dict({"password": "pw-123", "sshUrl": "ssh -p 2222 root@m.example",
-                                    "sshWebUrl": "https://m.example/?password=x", "expiredAt": 4_000_000_000})
+                                    "sshWebUrl": "https://m.example/", "expiredAt": 4_000_000_000})
 
     def import_asset(self, *a, **kw):
         self.calls.append(("import_asset", a, kw))
         return AssetImported.from_dict({"assetExternalId": "asset_abc", "name": "llama", "status": "active",
                                         "ingestSource": "hf_import", "fileCount": 4, "totalBytes": 2048, "isGated": True})
+
+    def estimate_workspace(self, *a, **kw):
+        self._rec("estimate_workspace", *a, **kw)
+        return WorkspaceEstimate.from_dict({**WORKSPACE_ESTIMATE, "name": a[0]})
+
+    def create_workspace(self, *a, **kw):
+        self._rec("create_workspace", *a, **kw)
+        name = a[0] if a and a[0] else "my-workspace-ab12"      # the server generates a name when none is given
+        return WorkspaceCreated.from_dict({"workspace": "my-workspace-ab12", "name": name, "accepted": True,
+                                           "transactionId": 321, "estimate": {**WORKSPACE_ESTIMATE, "name": a[0]}})
+
+    def wait_for_workspace(self, *a, **kw):
+        self._rec("wait_for_workspace", *a, **kw)
+        return Workspace.from_dict({"namespaceName": a[0], "workspaceName": a[0], "status": "running"})
+
+    def estimate_workspace_update(self, *a, **kw):
+        self.calls.append(("estimate_workspace_update", a, kw))   # kw has name=, which collides with _rec's positional argument
+        return WorkspaceUpdateEstimate.from_dict({"workspace": a[0], "currentName": "research", "name": kw["name"]})
+
+    def update_workspace(self, *a, **kw):
+        self.calls.append(("update_workspace", a, kw))
+        return WorkspaceUpdated.from_dict({"workspace": a[0], "name": kw["name"]})
+
+    DELETE_CHECK = {"name": "research", "deletable": True, "blockers": {}}
+
+    def check_workspace_delete(self, *a, **kw):
+        self._rec("check_workspace_delete", *a, **kw)
+        return WorkspaceDeleteCheck.from_dict({"workspace": a[0], **self.DELETE_CHECK})
+
+    def delete_workspace(self, *a, **kw):
+        self._rec("delete_workspace", *a, **kw)
+        return ResourceAction.from_dict({"id": a[0], "workspace": a[0], "action": "delete",
+                                         "result": {"message": "Workspace deletion initiated"}}, resource="workspace")
 
     def close(self):
         pass
@@ -408,6 +444,8 @@ class _CtrlC(_Tty):
     (["pod-start", "ws", "p-0", "--any-node"], "y\ny\n"),        # billing restarts + data-loss consent, two questions
     (["serving-scale", "42", "--max-replicas", "4"], "y\n"),
     (["serving-resume", "42"], "y\n"),
+    (["workspace-update", "ws", "--name", "new"], "y\n"),
+    (["workspace-delete", "ws"], "y\n"),
 ])
 def test_confirm_question_goes_to_stderr(capsys, monkeypatch, argv, answers):
     """Confirmation prompts go to stderr — when answering in a terminal while stdout goes to a file or pipe (`-o json > out.json`, `| jq`),
@@ -472,11 +510,13 @@ def test_model_commands(capsys, non_tty):
     assert _last("detect_model")[2] == {"workspace": "ws", "hf_token_id": 4}
 
     # Registration costs nothing, so it proceeds without --yes (non-interactive)
-    assert cli.main(["model-register", "ws", "Qwen/Qwen3-0.6B", "--name", "qwen-small", "--framework", "sglang"]) == 0
+    assert cli.main(["model-register", "ws", "Qwen/Qwen3-0.6B", "--name", "qwen-small", "--framework", "vllm"]) == 0
     out = capsys.readouterr().out
     assert "Already registered: model #12" in out and "serving-deploy ws 12" in out
-    assert _last("register_model")[2] == {"workspace": "ws", "name": "qwen-small", "framework": "sglang",
+    assert _last("register_model")[2] == {"workspace": "ws", "name": "qwen-small", "framework": "vllm",
                                           "hf_token_id": None, "context_length": None}
+    with pytest.raises(SystemExit):              # text models run on vllm only
+        cli.main(["model-register", "ws", "Qwen/Qwen3-0.6B", "--framework", "sglang"])
 
     assert cli.main(["model-delete", "12"]) == 2                 # deleting needs confirmation
     assert cli.main(["model-delete", "12", "--yes"]) == 0
@@ -505,6 +545,28 @@ def test_pod_create_watch_off_turns_template_folders_off():
     assert _last("estimate_pod")[2]["watched_template_folders"] == {"/outputs": {"enabled": False}}
 
 
+def test_pod_create_watch_move_moves_a_template_output_folder():
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--estimate",
+                     "--watch-move", "/workspace/output=/workspace/results", "--watch-off", "/outputs"]) == 0
+    assert _last("estimate_pod")[2]["watched_template_folders"] == {
+        "/outputs": {"enabled": False}, "/workspace/output": {"path": "/workspace/results"}}
+
+
+def test_pod_create_watch_move_needs_both_paths(capsys):
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--estimate",
+                     "--watch-move", "/workspace/output"]) != 0
+    assert "TEMPLATE_PATH=NEW_PATH" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("can_enable, hint", [(True, "--enable-folder-saving"), (False, "attach storage")])
+def test_pod_watch_on_a_pod_without_the_uploader_says_what_to_do(capsys, monkeypatch, can_enable, hint):
+    monkeypatch.setattr(FakeClient, "WATCHED", {"version": "0:1", "editable": False, "editableReason": "no_sidecar",
+                                                "roots": [], "canEnableSaving": can_enable})
+    assert cli.main(["pod-watch", "ws", "p-0", "--add", "/workspace/out", "--yes"]) == 1
+    assert hint in capsys.readouterr().err
+    assert not any(c[0] == "set_watched_folders" for c in FakeClient.instances[-1].calls)
+
+
 def test_pod_watch_shows_and_rewrites_with_the_version(capsys, non_tty):
     assert cli.main(["pod-watch", "ws", "p-0"]) == 0
     out = capsys.readouterr().out
@@ -531,6 +593,7 @@ def test_ssh_prints_the_command_and_password_only(capsys):
     assert cli.main(["ssh", "ws", "p-0"]) == 0
     out = capsys.readouterr().out
     assert "ssh -p 2222 root@m.example" in out and "pw-123" in out and "in " in out   # expiry is a time in the future
+    assert "Browser terminal" not in out and "https://m.example" not in out    # only the console can open that page
     assert _last("ssh_access")[1] == ("p-0", "ws")
     assert cli.main(["ssh", "ws", "p-0", "-o", "name"]) == 0
     assert capsys.readouterr().out.strip() == "ssh -p 2222 root@m.example"
@@ -851,6 +914,7 @@ def test_storage_connect_prints_the_ssh_command(capsys, monkeypatch):
     assert cli.main(["storage-connect", "ws", "pv-1"]) == 0
     out = capsys.readouterr().out
     assert "ssh -p 2222 gateway@m.example" in out and "pw-123" in out and "pv-1-access-0" in out
+    assert "Browser terminal" not in out
     assert "locks again automatically in about 30 min" in out
     assert _last("connect_storage")[1:] == (("pv-1", "ws"), {"wait": True, "timeout": 300.0})
     assert cli.main(["storage-connect", "ws", "pv-1", "-o", "name"]) == 0
@@ -1006,6 +1070,11 @@ def test_pod_update_sends_only_the_flags_given(capsys, edit_client):
     assert _last("update_pod")[2] == {"gpu_model": "RTX 4090"}
 
 
+def test_pod_update_enable_folder_saving(capsys, edit_client):
+    assert cli.main(["pod-update", "ws", "p-0", "--enable-folder-saving", "--yes"]) == 0
+    assert _last("update_pod")[2] == {"enable_folder_saving": True}
+
+
 def test_pod_update_estimate(capsys, edit_client):
     assert cli.main(["pod-update", "ws", "p-0", "--gpu", "RTX 4090", "--estimate"]) == 0
     out = capsys.readouterr().out
@@ -1124,3 +1193,342 @@ def test_model_sets_point_gated_sets_at_the_license(capsys, monkeypatch):
     assert "doesn't take a model set" in out
     assert "flux3-klein is gated on Hugging Face" in out and "https://huggingface.co/org/gated" in out
     assert "--hf-token ID" in out
+
+
+# --- 1.5.0: task output filter -------------------------------------------------------------------------------
+
+TASK_ARGV = ["task-submit", "ws", "t", "--script-text", "print(1)", "--image", "img", "--cpu-preset", "micro-2c8g", "--yes"]
+
+
+def test_task_submit_output_include(capsys, monkeypatch):
+    def submit_task(self, *a, **kw):                                # a server that keeps the filter echoes it
+        self.calls.append(("submit_task", a, kw))
+        return TaskSubmitted.from_dict({"task": {**TASK, "outputInclude": kw["output_include"]}, "estimate": {}})
+
+    monkeypatch.setattr(FakeClient, "submit_task", submit_task)
+    patterns = ["*.safetensors", "samples/*.png,b.png"]          # repeatable; a comma is part of the pattern
+    assert cli.main(TASK_ARGV + ["--output-include", "*.safetensors", "--output-include", "samples/*.png,b.png"]) == 0
+    assert _last("estimate_task")[2]["output_include"] == patterns
+    assert _last("submit_task")[2]["output_include"] == patterns
+    captured = capsys.readouterr()
+    assert "output filter: *.safetensors, samples/*.png,b.png" in captured.out and "Warning" not in captured.err
+
+    assert cli.main(TASK_ARGV) == 0                                 # not given: every file, nothing printed
+    assert _last("estimate_task")[2]["output_include"] is None and _last("submit_task")[2]["output_include"] is None
+    assert "output filter" not in capsys.readouterr().out
+
+
+def test_task_submit_says_when_the_server_ignores_the_output_filter(capsys, monkeypatch):
+    from meshive._client import _check_output_include
+
+    def submit_task(self, *a, **kw):                                # an older server: the task has no outputInclude
+        self.calls.append(("submit_task", a, kw))
+        return _check_output_include({"outputInclude": kw["output_include"]},
+                                     TaskSubmitted.from_dict({"task": TASK, "estimate": {}}))
+
+    monkeypatch.setattr(FakeClient, "submit_task", submit_task)
+    assert cli.main(TASK_ARGV + ["--output-include", "*.png"]) == 0
+    captured = capsys.readouterr()
+    assert ("Warning: this server ignores output_include; every file in /outputs will be uploaded "
+            "(task task_1 was submitted)") in captured.err
+    assert "task_1" in captured.out and "output filter" not in captured.out
+
+
+def test_task_submit_help_shows_the_output_filter(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["task-submit", "--help"])
+    out = capsys.readouterr().out
+    assert "--output-include GLOB" in out and "/outputs" in out
+
+
+# --- 1.6.0: workspace-create ---------------------------------------------------------------------------------
+
+def test_workspace_create_needs_no_confirmation(capsys, non_tty):
+    assert cli.main(["workspace-create"]) == 0
+    out = capsys.readouterr().out
+    assert "accepted:" in out and "yes" in out and "my-workspace-ab12" in out and "321" in out
+    assert "workspace id:" in out and "transaction:" in out
+    assert "Setting up in the background" in out and "meshive workspaces" in out
+    assert "--wait" not in out                                        # rerunning with it would create a second one
+    assert _last("create_workspace")[1:] == ((None,), {})            # no name: the server generates one
+    assert [c[0] for c in FakeClient.instances[-1].calls] == ["create_workspace"]    # no estimate first, nothing waited for
+
+
+def test_workspace_create_passes_the_name_and_prints_the_id_for_scripts(capsys):
+    assert cli.main(["workspace-create", "research", "-o", "name"]) == 0
+    assert capsys.readouterr().out == "my-workspace-ab12\n"
+    assert _last("create_workspace")[1:] == (("research",), {})
+    assert cli.main(["workspace-create", "research", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["workspace"] == "my-workspace-ab12" and payload["transactionId"] == 321
+    assert cli.main(["workspace-create", "research"]) == 0
+    assert "research" in capsys.readouterr().out
+
+
+def test_workspace_create_estimate_creates_nothing(capsys, non_tty):
+    assert cli.main(["workspace-create", "research", "--estimate"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("estimate:") and "$0.000/hr" in out and "research" in out
+    assert "costs nothing by itself" in out and "billed as usual" in out
+    assert _last("estimate_workspace")[1:] == (("research",), {})
+    assert [c[0] for c in FakeClient.instances[-1].calls] == ["estimate_workspace"]
+
+    assert cli.main(["workspace-create", "--estimate"]) == 0                 # no name: the server picks one
+    assert "(generated when created)" in capsys.readouterr().out
+    assert cli.main(["workspace-create", "research", "--estimate", "-o", "name"]) == 0
+    assert capsys.readouterr().out == "0.000\n"                              # the hourly estimate, like the other commands
+    assert cli.main(["workspace-create", "research", "--estimate", "-o", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["pricePerHourUsd"] == "0"
+    assert cli.main(["workspace-create", "research", "--estimate", "--wait"]) == 0     # nothing created, nothing to wait for
+    assert all(c[0] not in ("create_workspace", "wait_for_workspace") for i in FakeClient.instances for c in i.calls)
+
+
+def test_workspace_create_wait_prints_after_the_workspace_is_running(capsys, non_tty):
+    assert cli.main(["workspace-create", "research", "--wait"]) == 0
+    out = capsys.readouterr().out
+    assert "status:" in out and "running" in out and "Running: you can create pods, storage and tasks in it." in out
+    assert "Setting up" not in out
+    calls = FakeClient.instances[-1].calls
+    assert [c[0] for c in calls] == ["create_workspace", "wait_for_workspace"]
+    assert calls[1][1:] == (("my-workspace-ab12",), {"timeout": 180.0})       # the id, not the display name
+    assert cli.main(["workspace-create", "--wait", "--wait-timeout", "30", "-o", "name"]) == 0
+    assert capsys.readouterr().out == "my-workspace-ab12\n"
+    assert _last("wait_for_workspace")[2] == {"timeout": 30.0}
+
+
+@pytest.mark.parametrize("error, message", [
+    (WaitTimeoutError("Timed out waiting for workspace my-workspace-ab12 to be running (last status: creating). "
+                      "A status of 'terminated' means its setup failed."), "my-workspace-ab12 to be running"),
+    (MeshiveError("Workspace my-workspace-ab12 reached status 'error' while waiting for it to be running."),
+     "reached status 'error'"),
+])
+def test_workspace_create_wait_failures_exit_1(capsys, monkeypatch, error, message):
+    monkeypatch.setattr(FakeClient, "wait_for_workspace", _fake("wait_for_workspace", error), raising=False)
+    assert cli.main(["workspace-create", "research", "--wait"]) == 1
+    captured = capsys.readouterr()
+    assert message in captured.err and "Error:" in captured.err and captured.out == ""
+    assert _last("create_workspace")[1] == ("research",)              # it was created; stderr already has its ID
+    assert captured.err.startswith("Workspace ") and " accepted; waiting" in captured.err
+
+
+def test_workspace_create_on_an_older_server(capsys, monkeypatch):
+    error = NotFoundError(404, "This Meshive API server does not support workspace creation yet.")
+    monkeypatch.setattr(FakeClient, "create_workspace", _fake("create_workspace", error), raising=False)
+    assert cli.main(["workspace-create", "research"]) == 1
+    assert "does not support workspace creation" in capsys.readouterr().err
+
+
+def test_workspace_create_help_and_epilog(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["workspace-create", "--help"])
+    out = " ".join(capsys.readouterr().out.split())             # help text is wrapped to the terminal width
+    assert all(text in out for text in ("[name]", "--estimate", "--wait", "--wait-timeout SECONDS", "63 characters",
+                                        "one is generated", "until the workspace is running"))
+    with pytest.raises(SystemExit):
+        cli.main(["--help"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "meshive workspace-create [name] [--estimate] [--wait]" in out
+    assert "Create a workspace (free by itself; pods, storage and tasks in it are billed as usual)." in out
+
+
+# --- 1.6.0: workspace-update, workspace-delete -----------------------------------------------------------------
+
+WS_ID = "ab12cd34ef567890"
+BLOCKED = {"name": "research", "deletable": False, "blockers": {"assets": 3, "operations_in_progress": 1}}
+
+
+def _called(*names):
+    return [c[0] for c in FakeClient.instances[-1].calls if c[0] in names]
+
+
+def test_workspace_update_estimate_changes_nothing(capsys, non_tty):
+    assert cli.main(["workspace-update", WS_ID, "--name", "research-2", "--estimate"]) == 0
+    out = capsys.readouterr().out
+    assert "current name:" in out and "research" in out and "new name:" in out and "research-2" in out and WS_ID in out
+    assert _last("estimate_workspace_update")[1:] == ((WS_ID,), {"name": "research-2"})
+    assert _called("update_workspace") == []
+    assert cli.main(["workspace-update", WS_ID, "--name", "research-2", "--estimate", "-o", "name"]) == 0
+    assert capsys.readouterr().out == f"{WS_ID}\n"
+    assert _called("update_workspace") == []
+    assert cli.main(["workspace-update", WS_ID, "--name", "research-2", "--estimate", "-o", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["currentName"] == "research"
+    assert _called("update_workspace") == []
+
+
+def test_workspace_update_confirms_before_renaming(capsys, non_tty):
+    assert cli.main(["workspace-update", WS_ID, "--name", "research-2"]) == 2
+    captured = capsys.readouterr()
+    assert "Error: this command needs confirmation. Re-run with --yes to confirm." in captured.err
+    assert "research-2" in captured.out                                          # the summary came first
+    assert _called("estimate_workspace_update", "update_workspace") == ["estimate_workspace_update"]
+
+    assert cli.main(["workspace-update", WS_ID, "--name", "research-2", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "workspace id:" in out and WS_ID in out and "name:" in out and "research-2" in out
+    assert _called("estimate_workspace_update", "update_workspace") == ["estimate_workspace_update", "update_workspace"]
+    assert _last("update_workspace")[1:] == ((WS_ID,), {"name": "research-2"})
+
+
+def test_workspace_update_prints_the_id_for_scripts(capsys):
+    assert cli.main(["workspace-update", WS_ID, "--name", "research-2", "--yes", "-o", "name"]) == 0
+    assert capsys.readouterr().out == f"{WS_ID}\n"
+    assert cli.main(["workspace-update", WS_ID, "--name", "research-2", "--yes", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"workspace": WS_ID, "name": "research-2"}
+
+
+def test_workspace_update_question_names_both_and_is_cleaned(capsys, monkeypatch):
+    """Names are server text, and the question is printed outside _kv, so it has to clean them itself."""
+    monkeypatch.setattr(FakeClient, "estimate_workspace_update", _fake("estimate_workspace_update", WorkspaceUpdateEstimate.from_dict(
+        {"workspace": WS_ID, "currentName": "\x1b[31mold", "name": "new"})), raising=False)
+    monkeypatch.setattr("sys.stdin", _Tty("n\n"))
+    assert cli.main(["workspace-update", WS_ID, "--name", "new"]) == 2
+    err = capsys.readouterr().err
+    assert "Rename workspace '[31mold' to 'new'?" in err and "\x1b" not in err
+    assert _called("update_workspace") == []
+
+
+def test_workspace_update_refused_estimate_renames_nothing(capsys, monkeypatch):
+    conflict = ConflictError(409, "You already have a workspace named research.", title="Name Taken")
+    monkeypatch.setattr(FakeClient, "estimate_workspace_update", _fake("estimate_workspace_update", conflict), raising=False)
+    assert cli.main(["workspace-update", WS_ID, "--name", "research", "--yes"]) == 1
+    assert "already have a workspace" in capsys.readouterr().err
+    assert _called("update_workspace") == []
+
+
+def test_workspace_update_blank_name_is_a_usage_error(capsys, monkeypatch):
+    monkeypatch.setattr(FakeClient, "estimate_workspace_update",
+                        _fake("estimate_workspace_update", ValueError("name must be a non-empty string")), raising=False)
+    assert cli.main(["workspace-update", WS_ID, "--name", " ", "--yes"]) == 2
+    assert "name must be a non-empty string" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as exit_:
+        cli.main(["workspace-update", WS_ID, "--yes"])                  # --name is required: there is nothing else to change
+    assert exit_.value.code == 2
+
+
+def test_workspace_delete_check_when_empty(capsys, non_tty):
+    assert cli.main(["workspace-delete", WS_ID, "--check"]) == 0
+    out = capsys.readouterr().out
+    assert WS_ID in out and "research" in out and "can delete:" in out and "yes" in out and "Still in it" not in out
+    assert _called("check_workspace_delete", "delete_workspace") == ["check_workspace_delete"]
+    assert _last("check_workspace_delete")[1:] == ((WS_ID,), {})
+    assert cli.main(["workspace-delete", WS_ID, "--check", "-o", "name"]) == 0
+    assert capsys.readouterr().out == f"{WS_ID}\n"
+    assert cli.main(["workspace-delete", WS_ID, "--check", "-o", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["deletable"] is True
+
+
+def test_workspace_delete_check_when_blocked_exits_1(capsys, monkeypatch, non_tty):
+    monkeypatch.setattr(FakeClient, "DELETE_CHECK", BLOCKED)
+    assert cli.main(["workspace-delete", WS_ID, "--check", "--yes"]) == 1      # --yes doesn't turn a check into a delete
+    out = capsys.readouterr().out
+    assert "can delete:" in out and "no" in out and "assets: 3" in out and "operations in progress: 1" in out
+    assert _called("delete_workspace") == []
+    assert cli.main(["workspace-delete", WS_ID, "--check", "-o", "json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["deletable"] is False and payload["blockers"]["assets"] == 3
+    assert cli.main(["workspace-delete", WS_ID, "--check", "-o", "name"]) == 1
+    assert capsys.readouterr().out == f"{WS_ID}\n"
+
+
+@pytest.mark.parametrize("flags", [[], ["--yes"], ["-o", "json"], ["-o", "name", "--yes"]])
+def test_workspace_delete_blocked_stops_without_asking(capsys, monkeypatch, flags):
+    monkeypatch.setattr(FakeClient, "DELETE_CHECK", BLOCKED)
+    stdin = _Tty("y\n")
+    monkeypatch.setattr("sys.stdin", stdin)
+    assert cli.main(["workspace-delete", WS_ID, *flags]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""                                     # nothing a script could take for a result
+    assert "research" in captured.err and "assets: 3" in captured.err and "operations in progress: 1" in captured.err
+    assert "clear on their own" in captured.err and "Clear the others first" in captured.err
+    assert "in the console" in captured.err and "Delete everything" not in captured.err and "[y/N]" not in captured.err
+    assert stdin.tell() == 0                                      # the answer was never read
+    assert _called("check_workspace_delete", "delete_workspace") == ["check_workspace_delete"]
+
+
+@pytest.mark.parametrize("blockers, waits, clears", [
+    ({"operations_in_progress": 1}, True, False),                 # just created: there is nothing to clear
+    ({"task_outputs": 1}, True, False),
+    ({"pending_payouts": 2}, True, False),                        # deleting in the console would lose them
+    ({"storages": 1}, False, True),                               # a network volume stays until it is deleted
+    ({"a_new_kind": 1}, False, True),                             # the server may add kinds
+])
+def test_workspace_delete_hint_fits_what_is_left(capsys, monkeypatch, blockers, waits, clears):
+    monkeypatch.setattr(FakeClient, "DELETE_CHECK", {"name": "research", "deletable": False, "blockers": blockers})
+    assert cli.main(["workspace-delete", WS_ID, "--yes"]) == 1
+    err = capsys.readouterr().err
+    assert "can't be deleted yet" in err
+    assert ("clear on their own" in err) is waits and ("loses them" in err) is waits
+    assert ("Clear these first" in err) is clears and ("removes what's in it for good" in err) is clears
+    assert _called("delete_workspace") == []
+
+
+def test_workspace_delete_without_deletable_in_the_answer_is_blocked(capsys, monkeypatch):
+    monkeypatch.setattr(FakeClient, "DELETE_CHECK", {"name": "research"})
+    assert cli.main(["workspace-delete", WS_ID, "--yes"]) == 1
+    assert _called("delete_workspace") == []
+
+
+def test_workspace_delete_confirms_after_the_check(capsys, non_tty):
+    assert cli.main(["workspace-delete", WS_ID]) == 2
+    assert "--yes" in capsys.readouterr().err
+    assert _called("check_workspace_delete", "delete_workspace") == ["check_workspace_delete"]
+
+    assert cli.main(["workspace-delete", WS_ID, "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert f"workspace: {WS_ID}" in out and "action:" in out and "delete" in out and "accepted:" in out
+    assert "Deleting in the background" in out and "within a moment" in out and "name stays taken for a while" in out
+    assert _called("check_workspace_delete", "delete_workspace") == ["check_workspace_delete", "delete_workspace"]
+    assert _last("delete_workspace")[1:] == ((WS_ID,), {})        # never a force option
+
+
+def test_workspace_delete_prints_the_id_for_scripts(capsys):
+    assert cli.main(["workspace-delete", WS_ID, "--yes", "-o", "name"]) == 0
+    assert capsys.readouterr().out == f"{WS_ID}\n"
+    assert cli.main(["workspace-delete", WS_ID, "--yes", "-o", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["action"] == "delete" and payload["id"] == WS_ID
+
+
+def test_workspace_delete_question_names_it_and_is_cleaned(capsys, monkeypatch):
+    monkeypatch.setattr(FakeClient, "DELETE_CHECK", {"name": "\x1b[31mlab", "deletable": True, "blockers": {}})
+    monkeypatch.setattr("sys.stdin", _Tty("n\n"))
+    assert cli.main(["workspace-delete", WS_ID]) == 2
+    err = capsys.readouterr().err
+    assert f"Delete workspace '[31mlab' ({WS_ID})? This can't be undone." in err and "\x1b" not in err
+    assert _called("delete_workspace") == []
+
+
+def test_workspace_delete_refused_by_the_server_after_a_clean_check(capsys, monkeypatch):
+    """Something can land in the workspace between the check and the delete; the server's refusal is what counts."""
+    refused = ConflictError(409, "It still holds 1 pod.", title="Workspace Not Empty")
+    monkeypatch.setattr(FakeClient, "delete_workspace", _fake("delete_workspace", refused), raising=False)
+    assert cli.main(["workspace-delete", WS_ID, "--yes"]) == 1
+    captured = capsys.readouterr()
+    assert "It still holds 1 pod." in captured.err and captured.out == ""
+
+
+@pytest.mark.parametrize("argv", [["workspace-update", WS_ID, "--name", "x"], ["workspace-delete", WS_ID]])
+def test_workspace_rename_and_delete_on_an_older_server(capsys, monkeypatch, argv):
+    error = NotFoundError(404, "This Meshive API server does not support this yet.")
+    for method in ("estimate_workspace_update", "check_workspace_delete"):
+        monkeypatch.setattr(FakeClient, method, _fake(method, error), raising=False)
+    assert cli.main(argv) == 1
+    assert "does not support" in capsys.readouterr().err
+    assert _called("update_workspace", "delete_workspace") == []
+
+
+def test_workspace_update_and_delete_help_and_epilog(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["workspace-update", "--help"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert all(text in out for text in ("--name NAME", "--estimate", "--yes", "63 characters"))
+    with pytest.raises(SystemExit):
+        cli.main(["workspace-delete", "--help"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert all(text in out for text in ("--check", "--yes", "exit 0 if it can, 1 if not"))
+    assert "force" not in out
+    with pytest.raises(SystemExit):
+        cli.main(["--help"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "meshive workspace-update <ws> --name NAME [--estimate]" in out
+    assert "meshive workspace-delete <ws> [--check]" in out

@@ -8,8 +8,10 @@ the server's own. Prices are sent as strings whether given as Decimal, float or 
 """
 from __future__ import annotations
 
+import math
 import warnings
 from collections.abc import Iterable, Mapping
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import urlparse
@@ -182,6 +184,21 @@ def _drop_none(body: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in body.items() if v is not None}
 
 
+# --- Workspaces ---------------------------------------------------------------
+
+def workspace_body(name: str | None) -> dict[str, Any]:
+    """No name or a blank one → an empty body (the server generates one, as it does for a blank name). Which names are
+    allowed (length, characters, already taken) is the server's rule, so a name is only checked for being text."""
+    if name is None or (isinstance(name, str) and not name.strip()):
+        return {}
+    return {"name": _require_str(name, "name")}
+
+
+def workspace_update_body(name: str) -> dict[str, Any]:
+    """Renaming needs a name: unlike workspace_body, a blank one is refused rather than left for the server to generate."""
+    return {"name": _require_str(name, "name")}
+
+
 # --- Pods ---------------------------------------------------------------------
 
 def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: int, gpu_vram_gb: int | None,
@@ -232,7 +249,8 @@ def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: i
         "inputAssets": _pod_input_assets(input_assets) or None,
         "watchedFolders": _watched_folders(watched_folders) or None,
         # The template's own watched folders, as the console's create screen sets them: {path: {"enabled", "include"}}.
-        "watchedTemplateFolders": _template_folders(watched_template_folders, "watched_template_folders") or None,
+        "watchedTemplateFolders": _template_folders(watched_template_folders, "watched_template_folders",
+                                                    allow_path=True) or None,
         "harvestDestination": _harvest_destination(harvest_destination),
         # One model set per pod (list_model_sets → slug). Omitted = none.
         "modelSet": model_set.strip() if isinstance(model_set, str) and model_set.strip() else None,
@@ -260,7 +278,7 @@ def _flag(value: Any, name: str) -> bool | None:
 # Pod edit fields that are a change. The rest of the body (consents, the price cap) only qualifies a change.
 _POD_UPDATE_CHANGES = ("name", "templateId", "rentalType", "gpuModel", "gpuVramGb", "gpuCount", "vcpu", "ramGb",
                        "cpuLine", "env", "secretKeys", "removeEnv", "ports", "templatePorts", "removePorts", "command",
-                       "volumes", "localVolumes", "detachStorages")
+                       "volumes", "localVolumes", "detachStorages", "enableFolderSaving")
 
 
 def pod_update_body(*, name: str | None = None, template_id: int | None = None, rental_type: str | None = None,
@@ -272,7 +290,7 @@ def pod_update_body(*, name: str | None = None, template_id: int | None = None, 
                     local_volumes: Any = None, detach_storages: str | Iterable[str] | None = None,
                     allow_node_migration: bool | None = None, allow_data_loss: bool | None = None,
                     drop_watched_folders: str | Iterable[str] | None = None,
-                    max_price_per_hour: Any = None) -> dict[str, Any]:
+                    max_price_per_hour: Any = None, enable_folder_saving: bool | None = None) -> dict[str, Any]:
     """PATCH /pods/{pod} (and its estimate) body — only what is given is sent, so the rest of the pod stays as it is.
     command="" is sent (it means "back to the template's command"). Which changes the pod allows is the server's call."""
     if template_id is not None and (isinstance(template_id, bool) or not isinstance(template_id, int) or template_id < 0):
@@ -308,6 +326,8 @@ def pod_update_body(*, name: str | None = None, template_id: int | None = None, 
         "allowDataLoss": _flag(allow_data_loss, "allow_data_loss"),
         "dropWatchedFolders": _strings(drop_watched_folders, "drop_watched_folders"),
         "maxPricePerHourUsd": _price(max_price_per_hour, "max_price_per_hour"),
+        # Only True asks for something; False is the same as not passing it.
+        "enableFolderSaving": True if _flag(enable_folder_saving, "enable_folder_saving") else None,
     })
     if not any(key in body for key in _POD_UPDATE_CHANGES):
         raise ValueError("pass at least one change, such as name, gpu_model, env, ports or volumes")
@@ -388,9 +408,10 @@ def watched_folders_body(expected_version: int, template: Mapping[str, Any] | No
             "user": _watched_folders(user)}
 
 
-def _template_folders(template: Mapping[str, Any] | None, name: str) -> dict[str, Any]:
+def _template_folders(template: Mapping[str, Any] | None, name: str, *, allow_path: bool = False) -> dict[str, Any]:
     """The template's watched folders by path — {path: {"enabled": bool, "include": [globs] or None}}. include None
-    keeps the template's patterns."""
+    keeps the template's patterns. When creating a pod (allow_path), "path" moves an output folder to another path;
+    a running pod's template folders can't be moved."""
     if template is None:
         return {}
     if not isinstance(template, Mapping):
@@ -400,9 +421,14 @@ def _template_folders(template: Mapping[str, Any] | None, name: str) -> dict[str
         toggle = {} if toggle is None else toggle
         if not isinstance(toggle, Mapping):     # {path: False} would otherwise read as "on"
             raise ValueError(f"{name}[{path!r}] must be a mapping like {{'enabled': False}}")
+        moved = toggle.get("path")
+        if moved is not None and not allow_path:
+            raise ValueError(f"{name}[{path!r}]: a running pod's template folder can't be moved — turn it off and "
+                             "add a folder of yours instead")
         toggles[_require_str(path, f"{name} path")] = _drop_none({
             "enabled": bool(toggle.get("enabled", True)),
-            "include": list(toggle["include"]) if toggle.get("include") is not None else None})
+            "include": list(toggle["include"]) if toggle.get("include") is not None else None,
+            "path": None if moved is None else _require_str(moved, f"{name}[{path!r}].path")})
     return toggles
 
 
@@ -485,9 +511,12 @@ def storage_update_body(*, name: str | None = None, size_gb: int | None = None, 
 
 def model_body(huggingface_repo: str, *, hf_token_id: int | None = None, name: str | None = None,
                framework: str | None = None, context_length: int | None = None) -> dict[str, Any]:
-    """Body for detecting/registering a serving model. HF tokens are accepted only as the id of one saved in the workspace (the value is never sent)."""
-    if framework is not None and framework not in ("vllm", "sglang"):
-        raise ValueError("framework must be 'vllm' or 'sglang'")
+    """Body for detecting/registering a serving model. HF tokens are accepted only as the id of one saved in the workspace (the value is never sent).
+
+    Text models are served with vLLM. The server decides which engines it accepts and answers any other `framework`
+    with a 400 that says why, so only the type is checked here."""
+    if framework is not None:
+        framework = _require_str(framework, "framework")
     return _drop_none({
         "huggingfaceRepo": _require_str(huggingface_repo, "huggingface_repo").strip(),
         "hfTokenId": _optional_int(hf_token_id, "hf_token_id", minimum=0), "modelName": name or None,
@@ -561,10 +590,19 @@ def serving_scale_body(*, min_replicas: int | None, max_replicas: int | None, au
 
 # --- Tasks --------------------------------------------------------------------
 
+def _output_include(values: Any) -> list[str] | None:
+    """Output filter — one glob or a list of globs, relative to /outputs. None or empty → None (not sent: every file is
+    uploaded). Only the shape is checked; which patterns are valid is the server's rule."""
+    if values is not None and (isinstance(values, Mapping) or not isinstance(values, (str, Iterable))):
+        raise ValueError("output_include must be a glob or a list of globs, e.g. ['*.safetensors', 'samples/*.png']")
+    return _strings(values, "output_include")
+
+
 def task_body(name: str, script: str, *, image: str | None, template_id: int | None, requirements: str | None,
               env: Mapping[str, Any] | None, secret_keys: Iterable[str] | None, args: Iterable[str] | None,
               gpu_model: str | None, gpu_count: int | None, gpu_vram_gb: int | None, cpu_preset: str | None,
-              max_duration: int, webhook_url: str | None, input_assets: Any, max_price_per_hour: Any) -> dict[str, Any]:
+              max_duration: int, webhook_url: str | None, input_assets: Any, max_price_per_hour: Any,
+              output_include: str | Iterable[str] | None = None) -> dict[str, Any]:
     script_text = script if isinstance(script, str) else ""
     if not script_text.strip():
         raise ValueError("script must be a non-empty string (Python source)")
@@ -601,7 +639,116 @@ def task_body(name: str, script: str, *, image: str | None, template_id: int | N
         "gpuVramGb": _optional_int(gpu_vram_gb, "gpu_vram_gb"), "cpuPreset": cpu_preset or None,
         "maxDurationS": max_duration, "webhookUrl": webhook_url or None, "inputAssets": assets,
         "maxPricePerHourUsd": _price(max_price_per_hour, "max_price_per_hour"),
+        # Only files in /outputs matching these globs are uploaded. Omitted = every file (the body is unchanged).
+        "outputInclude": _output_include(output_include),
     })
+
+
+# --- Host machines ----------------------------------------------------------------
+
+# The kinds of machine login reveal_machine_credentials can reveal, and the agents issue_install_command installs.
+MACHINE_CREDENTIAL_KINDS = ("ssh", "ipmi", "grafana")
+AGENT_TYPES = ("compute", "storage")
+
+
+def listing_method(listed: Any) -> str:
+    """set_machine_listing: POST …/listing lists the machine, DELETE unlists it. Only a real bool is taken, so a string
+    such as "false" can't list a machine by accident."""
+    if not isinstance(listed, bool):
+        raise ValueError("listed must be an explicit boolean (True to list the machine, False to unlist it)")
+    return "POST" if listed else "DELETE"
+
+
+def _when(value: Any, name: str) -> str:
+    """A maintenance time — a datetime or an ISO 8601 string. Whether it is valid and far enough ahead is the server's
+    call; a time without an offset is read as UTC there."""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    raise ValueError(f"{name} must be a datetime or an ISO 8601 string, e.g. 2026-11-20T09:00:00Z")
+
+
+def _text(value: Any, name: str) -> str:
+    """Optional free text (a description, a message body): any string, "" included."""
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    return value
+
+
+def maintenance_body(*, reason: str, start: Any, end: Any, description: str = "",
+                     emergency: bool = False) -> dict[str, Any]:
+    """POST …/maintenance (and its estimate) body. A reason is required, as in the console. The 48-hour notice for a
+    regular window, overlaps and the machine's state are the server's checks."""
+    if not isinstance(emergency, bool):
+        raise ValueError("emergency must be an explicit boolean")   # an emergency window counts as downtime
+    return {"reason": _require_str(reason, "reason"), "description": _text(description, "description"),
+            "startTime": _when(start, "start"), "endTime": _when(end, "end"), "isEmergency": emergency}
+
+
+def maintenance_update_body(*, reason: str | None = None, description: str | None = None, start: Any = None,
+                            end: Any = None) -> dict[str, Any]:
+    """PATCH /maintenance/{id} body — only what is given is sent; the rest of the window stays as it is."""
+    body = _drop_none({
+        "reason": None if reason is None else _require_str(reason, "reason"),
+        "description": None if description is None else _text(description, "description"),
+        "startTime": None if start is None else _when(start, "start"),
+        "endTime": None if end is None else _when(end, "end"),
+    })
+    if not body:
+        raise ValueError("pass at least one of reason, description, start, end")
+    return body
+
+
+def maintenance_extend_body(*, hours: Any, reason: str, description: str = "") -> dict[str, Any]:
+    """POST /maintenance/{id}/extend body. The upper limit on hours is the server's."""
+    if isinstance(hours, bool) or not isinstance(hours, (int, float, Decimal)):
+        raise ValueError("hours must be a number of hours greater than 0")
+    amount = float(hours)
+    if not math.isfinite(amount) or amount <= 0:
+        raise ValueError("hours must be a number of hours greater than 0")
+    return {"hours": amount, "reason": _require_str(reason, "reason"), "description": _text(description, "description")}
+
+
+def host_message_body(*, to: str, title: str, content: str = "") -> dict[str, Any]:
+    """POST …/messages body. to is a workspace ID or "all"; who may be sent to and the length limits are the server's."""
+    return {"to": _require_str(to, "to"), "title": _require_str(title, "title"), "content": _text(content, "content")}
+
+
+def message_ids_body(message_ids: Any) -> dict[str, Any]:
+    """POST …/messages/read body. How many ids one request takes is the server's rule."""
+    items = [message_ids] if isinstance(message_ids, (int, str)) else list(message_ids or [])
+    ids = []
+    for item in items:
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise ValueError("message_ids must be message ids (non-negative integers)")
+        ids.append(item)
+    if not ids:
+        raise ValueError("pass at least one message id")
+    return {"messageIds": ids}
+
+
+def credentials_body(kind: str) -> dict[str, Any]:
+    value = kind.strip().lower() if isinstance(kind, str) else ""
+    if value not in MACHINE_CREDENTIAL_KINDS:
+        raise ValueError(f"kind must be one of {', '.join(MACHINE_CREDENTIAL_KINDS)}")
+    return {"kind": value}
+
+
+def install_command_body(agent_type: str) -> dict[str, Any]:
+    value = agent_type.strip().lower() if isinstance(agent_type, str) else ""
+    if value not in AGENT_TYPES:
+        raise ValueError(f"agent_type must be one of {', '.join(AGENT_TYPES)}")
+    return {"agentType": value}
+
+
+def host_messages_params(machine_id: str | None, unread_only: bool) -> dict[str, Any]:
+    if not isinstance(unread_only, bool):
+        raise ValueError("unread_only must be an explicit boolean")
+    params: dict[str, Any] = {"unreadOnly": unread_only}
+    if machine_id is not None:
+        params["machineId"] = _require_str(machine_id, "machine_id")
+    return params
 
 
 # --- Logs ---------------------------------------------------------------------

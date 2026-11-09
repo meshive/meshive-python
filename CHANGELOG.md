@@ -12,6 +12,246 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## v1.8.0
+
+Hosts can now run their machines from the SDK and CLI: maintenance windows, listing, setup retries, removal,
+messages with the workspaces that use a machine, and payouts. You can also see what your API keys did, with the
+result of each request. Tasks also report whether their outputs were saved, and how far saving has got, as the console shows it.
+Code written for 1.0 to 1.7 keeps working.
+
+### What's new
+
+- **See who uses a machine.** `get_machine` returns a `MachineDetail`, which is a `Machine` with the other users'
+  pods and volumes on it (`clients`), the maintenance summary, boot and network diagnostics, and the platform fee.
+  `meshive machine <id>` prints them as Clients, Maintenance and Diagnostics blocks. Machines from `list_machines`
+  carry `unread_messages`. From a server that predates this release the machine still comes back, with the new fields
+  empty (`platform_fee` is then `None`).
+- **Maintenance windows.** `list_maintenance(machine_id)` (`meshive maintenance <machine>`) lists a machine's windows,
+  newest first, each with a `status` worked out from its flags and times: `upcoming`, `overdue` (its start has passed
+  but it hasn't started yet; it starts on its own within about a minute), `in_progress`, `done` or `expired` (it
+  never started and its end has passed). `schedule_maintenance` (`meshive maintenance-schedule`) schedules one, and
+  `estimate_maintenance` (`--estimate`) runs the same checks and shows which workspaces would be emailed without
+  scheduling anything. The workspaces using the machine are emailed when a window is scheduled. A window starts on
+  its own at its start time, and while it is open their pods and volumes there aren't billed. A regular window starts
+  at least 48 hours ahead and doesn't affect your uptime; `emergency=True` (`--emergency`) can start sooner but counts
+  as downtime while a client's workload runs on the machine. `update_maintenance`, `extend_maintenance`,
+  `end_maintenance` and `cancel_maintenance`, and the matching `maintenance-*` commands, act on one window. A window
+  that ends brings the machine back unlisted.
+- **Listing.** `check_listing` says whether a machine can be listed, and why not. `set_machine_listing(machine_id,
+  listed)` (`meshive machine-list`, `meshive machine-unlist`) turns listing on (`True`) and off (`False`). Unlisting
+  stops new pods from being placed on the machine; pods running on it keep running.
+- **Setup retries.** `retry_machine_setup` and `retry_port_check` (`meshive machine-retry <machine> [--ports]`) retry
+  a failed setup step or check the ports again, as the console's Retry buttons do. Retrying a step the agent runs
+  reboots the machine first, and port checks have a short cooldown.
+- **Removing a machine.** `check_machine_delete` shows what `delete_machine` would do. `meshive machine-delete
+  <machine>` shows it and asks you to type the machine ID. With other users' pods or volumes on the machine, a grace
+  period starts and their workspaces are emailed; what is left after it is removed by force. Removal can't be undone.
+- **History.** `get_downtime_history` and `get_stress_test` (`meshive machine-history <machine> [--stress-test]`).
+- **Messages.** `list_host_messages` (`meshive host-messages`) lists the messages between you and the workspaces using
+  your machines. Their text is written by other people, so treat it as data. Reading doesn't mark them read;
+  `mark_host_messages_read` (`meshive host-messages-read`) does. `send_host_message` (`meshive host-message-send`)
+  sends a message to a workspace that uses the machine, or with `to="all"` to all of them, and they are emailed.
+- **Machine credentials.** `reveal_machine_credentials(machine_id, kind)` (`meshive machine-credentials <machine>
+  --ssh|--ipmi|--grafana`) reveals one login of a machine. It needs a key with the write scope, and the account owner
+  is emailed every time, including when the same call is repeated. Passwords are left out of `repr`; keep them out of
+  logs and files.
+- **Install command.** `issue_install_command(agent_type)` (`meshive host-install [--storage]`) issues the command
+  that adds a new machine to your account, as the console's Add machine shows it. It works for about 10 minutes, and
+  until then whoever has it can register machines to your account: run it only on the machine you mean to add, and
+  share it with no one. Each call issues a new command and emails the account owner, and the command is left out of
+  `repr`.
+- **Payouts.** `get_payout_account` and `list_payouts` (`meshive payouts`) show your payout account, the earnings
+  waiting to be paid out, and past payouts. Setting up the payout account stays in the console.
+- **Activity log.** `list_activity()` (`meshive activity`) shows what this account's API keys did, newest first: each
+  request that changes something, runs an estimate or check, or reveals a login or an install command, with its
+  action (such as `pod.stop` or `machine.maintenance.schedule`), the key and client that sent it, what it was about
+  and its result (`accepted`, `refused` with the reason, or `error`). `kind="reads"` (`--reads`) shows read requests
+  as hourly counts. Filter by key (`key_id`, `--key`) and time (`since`, `until`; the last 30 days by default, at
+  most 180 days per call), and page with `limit` and `offset`. Requests can also be filtered by result (`outcome`,
+  `--outcome`: `accepted`, `refused` or `error`) and by action (`action`, `--action`): one action such as
+  `pod.delete`, or every action under a prefix that ends in `.`, such as `machine.`. Request contents are never
+  recorded, and activity is kept for 180 days. The console shows the same under Account → API keys → Activity, where you can also revoke a key.
+  It returns an `ActivityPage` of `ActivityEvent` or `ReadActivity` items.
+
+Every new method is on `AsyncMeshive` too. Reads, estimates, checks and the activity log need the read scope; the rest
+needs the write scope. A machine that isn't yours is a `NotFoundError`, like a missing one, and a server that predates
+a method answers with `NotFoundError` ("does not support … yet").
+
+The CLI asks before anything that reaches other users or reveals a secret (scheduling or changing maintenance,
+unlisting, removing a machine, sending a message, revealing credentials, getting an install command) unless you pass
+`--yes`. `machine-list`, `machine-retry` and `host-messages-read` change only your own machine and don't ask, as in the
+console.
+- **`Task.outputs`** is a `TaskOutputsStatus`: what happened to the files the task wrote to `/outputs`, worked out by
+  the server. Its `phase` is `running` until the task ends, then `preparing`, `uploading`, `retrying` or
+  `registering` (being added to Assets) while the files are saved (`saving` is `True`), and in the end `saved`,
+  `partially_saved`, `not_saved`, `discarded` or `empty`. While saving, progress is `files_so_far` of
+  `files_to_upload` files and `bytes_so_far` of `bytes_total` bytes. `files_total` also counts the files over the
+  task's file limit (`files_over_limit` of them, over `files_limit`), which aren't uploaded, so use `files_to_upload`
+  for progress. Some tasks don't report a total while they are saved: `files_total`, `bytes_total` and
+  `files_to_upload` are then `None`. Once saved, `asset_id` and `asset_name` name the asset. `partially_saved` means
+  `files_not_saved` files are missing; `last_error` says why an upload failed. `list_tasks`, `get_task` and
+  `submit_task` return it. From a server that predates it, `outputs` is `None`, and the `output_*` fields are still
+  there.
+- **`meshive task <id>`** shows it on the `outputs:` line: the progress while saving
+  (`uploading · 48/126 files · 41.2 of 108.6 MiB`, or
+  `uploading · 48 files so far · 41.2 MiB · total not known yet`), the asset once saved
+  (`saved to Assets as my-run (asset_...) · 126 files · 108.6 MiB`), and for a partial save how many files are
+  missing (`Only 2,000 of 2,431 output files were saved — 431 were over the 2,000-file limit.`). `meshive tasks` adds
+  an OUTPUTS column when the server sends the status.
+
+### Changes
+
+- **A write cut off mid-request can be looked up like one that timed out.** When the connection broke after a write
+  was sent (`httpx.RemoteProtocolError` "Server disconnected without sending a response.", `httpx.ReadError`,
+  `httpx.WriteError`, ...) or its answer couldn't be decoded (`httpx.DecodingError`), the error came without
+  `idempotency_key`, `operation_method` and `operation_path`, so a generated key was lost. Every `httpx.RequestError`
+  a write ends with now carries them, as timeouts and API errors already did: pass them to `get_operation` to see
+  whether it was applied. Which errors are resent hasn't changed; these still are not, since the server may have
+  applied the write.
+- **`framework="sglang"` is no longer accepted.** Meshive serves text models with vLLM, and image and video models
+  with ComfyUI. `register_model(..., framework="sglang")` now gets a 400 from the server (`MeshiveAPIError`) that says
+  so; older SDK versions get the same answer. Leave `framework` out or pass `"vllm"`. Models you registered with
+  SGLang before stay registered.
+- **`meshive model-register --framework`** accepts only `vllm`, the default.
+- **The server checks `framework`.** The SDK no longer keeps its own list of engines: it only checks that
+  `framework` is a non-empty string (`ValueError` otherwise), and the server answers an engine it doesn't serve with a
+  400.
+- **`meshive task <id>` says `log: deleted …` where it said `outputs: deleted …`.** After its retention period only a
+  task's log is deleted; its outputs stay in Assets. `Task.outputs_purged_at` is when the log was deleted.
+- **A write the server already answered says so.** When a write is sent with an `idempotency_key` the server has
+  already answered (a retry, or a key used again), the server returns its first answer and does nothing new. The
+  result used to look like a fresh success; it now has `replayed=True`: the write was done once, by the earlier
+  request. Every result of a write that takes `idempotency_key` has the field, except `connect_storage`, which
+  returns the storage's connection state (`ResourceAction`, `PodCreated`, `PodUpdated`, `StorageCreated`,
+  `StorageUpdated`, `WorkspaceCreated`, `WorkspaceUpdated`, `TaskSubmitted`, `AssetImported`, `WatchedFolders`,
+  `MaintenanceAction`, `ListingResult`, `RetryResult`, `MachineDeleted`, `MessageSent` and `MessagesRead`), and it is
+  `False` when this request did the write. To do it again as a new write, use a new key.
+
+## v1.7.0
+
+Creating a client is much cheaper, and clients can share connections. Code written for 1.0 to 1.6 keeps working.
+
+### What's new
+
+- **Share connections between clients.** Code that creates many clients, such as a server with one per request and
+  API key, can create one transport and pass it to each:
+
+  ```python
+  transport = httpx.AsyncHTTPTransport()                         # once, at startup
+  async with AsyncMeshive(key, transport=transport) as client:   # per request
+      ...
+  await transport.aclose()                                       # at shutdown
+  ```
+
+  `Meshive` takes an `httpx.HTTPTransport` the same way. Only the connections are shared. Every client still sends
+  its own key and headers with each request, keeps its own cookies and applies its own `timeout`, so nothing one
+  client receives reaches another. `close()` and leaving a `with` block don't close the transport; you do. All the
+  clients wait for the same pool, so size it for them (`limits=httpx.Limits(...)`), and use an async transport from
+  one event loop only. Proxy and certificate settings come from the transport as well (`proxy=`, `verify=`):
+  `HTTPS_PROXY` and the other proxy variables aren't read for it. With many requests in flight at once, separate
+  clients can use less CPU than one shared pool, so measure before you switch.
+
+### Changes
+
+- **Creating a client is cheaper.** Each client used to build its own SSL context, which loads the whole CA bundle
+  and took a few milliseconds of CPU, most of the cost of a client. Clients now reuse one per thread, built the same
+  way, so the same certificates are trusted. It is built again when `SSL_CERT_FILE` or `SSL_CERT_DIR` changes or
+  `truststore.inject_into_ssl()` runs. Other changes to the CA files reach only threads that haven't created a client
+  yet.
+- **A long-running create is resent when no connection was free.** `create_pod` with a model set or a Hugging Face
+  token treated `httpx.PoolTimeout` like a timeout whose outcome is unknown. Nothing had been sent, so it is now
+  resent like a refused connection.
+
+## v1.6.0
+
+You can now create, rename and delete workspaces from the SDK and CLI, and wait until a new one is ready to use. Code
+written for 1.0 to 1.5 keeps working.
+
+### What's new
+
+- **Create a workspace.** `create_workspace("research")` and `meshive workspace-create research` create an empty
+  workspace and return its ID (`created.workspace`) at once. A workspace costs nothing by itself; the pods, storage
+  and tasks in it are billed as usual, so the command doesn't ask for confirmation. Leave the name out and the server
+  generates one (like `my-workspace-ab12`). A name is up to 63 characters and must be unique among your workspaces: a
+  taken one raises `ConflictError` ("Name Taken"). API keys work across your whole account, so the key that created
+  the workspace can use it once it is running. `estimate_workspace` and `meshive workspace-create --estimate` check
+  the name and create nothing; a read-only key can run them. `AsyncMeshive` has the same methods.
+- **Wait until it is running.** A new workspace is `creating` while it is set up, and pods and tasks are refused
+  until it is `running`. Storage and serving don't check, so they can fail if you use them earlier.
+  `wait_for_workspace(created.workspace)` and `meshive workspace-create --wait` poll until the workspace is
+  `running` (up to 180 seconds by default; `--wait-timeout SECONDS` on the command line). Status `error` raises
+  `MeshiveError` at once. A workspace that isn't in your workspace list yet, or is listed as `terminated`, is waited
+  for like `creating`, because the list can lag a moment behind a create. If the time runs out, `WaitTimeoutError`
+  names the workspace and the last status seen; a workspace that is still `terminated` then failed to set up.
+- **Rename a workspace.** `update_workspace(workspace, name="research-2")` and
+  `meshive workspace-update <workspace> --name research-2` change its name. The ID stays the same, so whatever uses it
+  keeps working, and every member sees the new name. The admin and billing roles can rename; a viewer gets
+  `PermissionDeniedError`. The rules for a new name are the ones for a new workspace, a taken name raises
+  `ConflictError` ("Name Taken"), and a blank one raises `ValueError`. `estimate_workspace_update` and
+  `meshive workspace-update --estimate` show the current and new name and change nothing; a read-only key can run
+  them, with the same roles. The command asks before renaming unless you pass `--yes`.
+- **Delete an empty workspace.** `delete_workspace(workspace)` and `meshive workspace-delete <workspace>` delete a
+  workspace that holds nothing, which can't be undone. The same admin and billing roles can do this. Anything still in
+  it refuses the delete with `ConflictError` ("Workspace Not Empty"), and `err.raw["detail"]["blockers"]` counts what
+  is left: pods, storage, servings, tasks (finished ones too), task outputs still being saved, assets, custom templates
+  and models, credentials, webhooks, inference keys, other members, open invitations, payouts still pending and
+  operations in progress. `check_workspace_delete(workspace)` and `meshive workspace-delete <workspace> --check` show
+  the same list and delete nothing; a read-only key can run them, with the same roles, and `--check` exits 1 if the
+  workspace can't be deleted. A person can still delete a workspace that holds things in the console, which removes
+  what's in it for good. The deletion runs in the background: the workspace leaves your list within a moment, and its
+  name stays taken for a while.
+- **Older servers.** A server that predates this release answers with `NotFoundError`, saying it doesn't support
+  workspace creation, renaming or deletion yet.
+
+### Changes
+
+- **`meshive ssh` and `meshive storage-connect` no longer print a browser terminal link.** The browser terminal now
+  gets its login from the console, so the link can't connect on its own. Open it from the console with **Connect →
+  Open Web Terminal**. Both commands still print the ssh command and the one-time password. `SshAccess.web_url` is
+  still there, but it no longer connects by itself.
+
+## v1.5.0
+
+A task can now keep only some of the files it writes to `/outputs`, as the console's submit form does: the rest are
+not uploaded and don't become part of the task's output asset. Code written for 1.0 to 1.4 keeps working.
+
+### What's new
+
+- **Output filter for tasks.** `submit_task(..., output_include=["*.safetensors", "samples/*.png"])` and
+  `meshive task-submit ... --output-include '*.safetensors' --output-include 'samples/*.png'` upload only the files
+  in `/outputs` that match. Patterns are relative to `/outputs` and case-sensitive: `*.png` matches at any depth and
+  `samples/*.png` only from `/outputs` (a slash anchors a pattern; a trailing one doesn't). A trailing slash takes
+  whole folders: `checkpoints/` matches every folder named `checkpoints`, at any depth, with everything in it.
+  Leaving it out uploads every file, as before. `estimate_task` takes the same argument, and the server explains a
+  pattern it can't use. Files left out still use the `/outputs` disk while the task runs and are discarded when it
+  ends. If no file matches, the task still succeeds and creates no output asset.
+- **See a task's filter.** `Task.output_include` lists its patterns (`None` = every file), and `meshive task` prints
+  them as `output filter:`. A server that predates the filter accepts the task and uploads every file;
+  `submit_task` then issues a `RuntimeWarning` that names the task (it is submitted either way), and
+  `meshive task-submit` prints a warning.
+
+## v1.4.0
+
+Pods made from templates without an output folder (for example NIM or vLLM) can now save files from your own folders,
+and a template's output folder can be moved when you create a pod. Code written for 1.0 to 1.3 keeps working.
+
+### What's new
+
+- **Folders on any pod with storage.** `create_pod(..., watched_folders=[...])` and `meshive pod-create --watch PATH`
+  work on templates that don't declare an output folder, as long as the pod has storage to hold the folders (a
+  volume, or local storage). `set_watched_folders` / `meshive pod-watch --add` add them to a running pod without a
+  restart.
+- **Move the template's output folder.** `watched_template_folders={"/workspace/output": {"path": "/workspace/results"}}`
+  or `meshive pod-create --watch-move /workspace/output=/workspace/results` puts the template's output folder
+  somewhere else. `$MESHIVE_OUTPUT_DIR` and the folder's storage follow. Only output folders move; a running pod's
+  template folders can't be moved (turn one off and add a folder of yours instead).
+- **Turn on folder saving for an older pod.** Pods made before this release on such templates have no uploader:
+  `get_watched_folders` reports `editable_reason == "no_sidecar"`, and `WatchedFolders.can_enable_saving` is true
+  when the pod has storage for folders. `update_pod(..., enable_folder_saving=True)` or
+  `meshive pod-update --enable-folder-saving` adds it (a running pod restarts once). A pod that already has the
+  uploader, or has no storage for folders, is refused before anything restarts. `meshive pod-watch --add` on such
+  a pod says which of the two to do first.
+
 ## v1.3.0
 
 Quick Deploy model sets that are gated on Hugging Face can now be deployed from the SDK and CLI, with your own

@@ -35,8 +35,8 @@ one of them stops installing after its removal date. Environments where it is al
 
 ## Quickstart
 
-**1. Get an API key.** In the [console](https://console.meshive.ai), open your workspace's
-**Settings → API keys**. Pick **Read & write** so you can create pods.
+**1. Get an API key.** In the [console](https://console.meshive.ai), open
+**Account → API keys**. Pick **Read & write** so you can create pods.
 
 **2. Log in.**
 
@@ -103,6 +103,11 @@ with Meshive() as client:  # uses the key saved by `meshive login`, or MESHIVE_A
 as the exact numbers the server sent; `format_hourly` and `format_usd` round them the way the console
 shows them.
 
+A program that creates many clients, such as a server with one per API key, can let them share connections: create
+one `transport = httpx.AsyncHTTPTransport()` (or `httpx.HTTPTransport()` for `Meshive`) at startup and pass
+`transport=transport` to each client. Every client still sends only its own key. Closing a client leaves the
+transport open; close it yourself at shutdown.
+
 Errors are exceptions you can catch by kind. All of them derive from `MeshiveError`:
 
 ```python
@@ -123,7 +128,7 @@ except WaitTimeoutError:
 | `PermissionDeniedError` | 403: the key is **Read only**, or your workspace role can't make changes. |
 | `NotFoundError` | 404: no such pod, task, asset, ... |
 | `InsufficientCreditError` | 402: not enough credit to create or start something. |
-| `ConflictError` | 409: no capacity, a name already taken, a price above your cap, storage still in use, ... `err.title` says which. |
+| `ConflictError` | 409: no capacity, a name already taken, a price above your cap, storage still in use, a workspace that isn't empty, ... `err.title` says which. |
 | `RateLimitError` | 429 after the automatic retries. `err.retry_after` says how long to wait. |
 | `WaitTimeoutError` | A `wait_for_*` call ran out of time. Also a built-in `TimeoutError`. |
 | `PodCreationFailedError` | The platform couldn't create the pod and cleaned it up; the message says why. |
@@ -132,6 +137,8 @@ except WaitTimeoutError:
 
 | To... | Run |
 | --- | --- |
+| Create a workspace (free by itself) and wait until it is running | `meshive workspace-create <name> --wait` |
+| Rename a workspace, or delete an empty one | `meshive workspace-update <workspace> --name <name>`, `meshive workspace-delete <workspace>` |
 | Run a script on a GPU and collect the results | `meshive task-submit <workspace> train --script train.py --image python:3.12-slim --gpu "RTX 3060"` |
 | Serve a Hugging Face model behind an API | `meshive model-register <workspace> Qwen/Qwen3-0.6B`, then `meshive serving-deploy` |
 | Bring in a model or dataset from Hugging Face, CivitAI or a URL | `meshive asset-import <workspace> <repo or URL>` |
@@ -143,7 +150,10 @@ except WaitTimeoutError:
 | See why a pod is still starting | `meshive transactions <workspace>` |
 | Watch a pod's usage and logs | `meshive pod-metrics <workspace> <pod>`, `meshive logs <workspace> <pod>` |
 | Check your credit and spending | `meshive credit`, `meshive workspace <workspace>` |
-| Host your own machines and see earnings | `meshive machines`, `meshive earnings` |
+| See what your API keys (and agents using them) did, with results | `meshive activity`, `meshive activity --reads` |
+| Host your own machines and see earnings | `meshive machines`, `meshive earnings`, `meshive payouts` |
+| Schedule maintenance on a hosted machine, list or unlist it for rent, or remove it | `meshive maintenance-schedule <machine> ...`, `meshive machine-list <machine>`, `meshive machine-unlist <machine>`, `meshive machine-delete <machine>` |
+| Read and answer messages from the workspaces using your machines | `meshive host-messages`, `meshive host-message-send <machine> --to <workspace>` |
 
 Every command has `--help`. The [CLI reference](https://docs.meshive.ai/sdk-cli/cli/) lists them all.
 
@@ -178,12 +188,12 @@ The API key is looked up in this order: the `--api-key` option (or `Meshive(api_
 | You see | What to do |
 | --- | --- |
 | An error about a missing API key | Run `meshive login`, or set `MESHIVE_API_KEY`. |
-| `401` / `AuthenticationError` | The key is wrong or has expired. Create a new one under **Settings → API keys** and log in again. |
+| `401` / `AuthenticationError` | The key is wrong or has expired. Create a new one under **Account → API keys** and log in again. |
 | `403` / `PermissionDeniedError` when creating or deleting | The key is **Read only**, or your role in that workspace is viewer. Use a **Read & write** key. |
 | `402` / `InsufficientCreditError` | Top up credit in the [console](https://console.meshive.ai). |
 | `409` with "No Capacity" | That GPU is sold out right now. `meshive gpus` shows what is available. |
 | A pod stays `creating` for minutes | `meshive transactions <workspace>` shows the current step, such as an image download and its progress. |
-| A script stops with exit code `2` | A command that spends credit wanted confirmation. Add `--yes`, or check with `--estimate` first. |
+| A script stops with exit code `2` | A command needed confirmation. Add `--yes`, or check first with `--estimate` (`--check` for `workspace-delete`). |
 | "could not reach the Meshive API" | Check your network, and `MESHIVE_BASE_URL` if you set it. |
 
 ### Exit codes
@@ -191,7 +201,7 @@ The API key is looked up in this order: the `--api-key` option (or `Meshive(api_
 | Code | Meaning |
 | --- | --- |
 | `0` | Success. |
-| `1` | The API returned an error, the key is missing or invalid, or the API couldn't be reached. |
+| `1` | The API returned an error, the key is missing or invalid, the API couldn't be reached, or `workspace-delete` found the workspace isn't empty. |
 | `2` | Bad arguments, or a command needed confirmation and didn't get it (no terminal and no `--yes`, or you answered no). |
 | `130` | Interrupted with Ctrl-C. |
 

@@ -1,6 +1,8 @@
 """CLI write commands: workspace-create/update/delete, pod-create/update/stop/start/restart/delete, storage-create/update/connect/delete,
 serving-deploy/scale/pause/resume/delete, task-submit/stop, logs, task-logs.
 Also models, hf-tokens, model-detect, model-register, model-delete (model registration for serving), asset-import, civitai-keys.
+Pods: pod-exec runs a command in a running pod (pod-exec-status reads a background one); asset-upload uploads a
+local file or folder as an asset.
 Hosting: maintenance-schedule/update/end/extend/cancel, machine-list/unlist/retry/delete, host-message-send,
 host-messages-read, machine-credentials, host-install.
 
@@ -22,6 +24,7 @@ import argparse
 import json
 import shlex
 import sys
+import time
 import warnings
 from pathlib import Path
 from typing import Any, Callable
@@ -1086,6 +1089,94 @@ def cmd_asset_import(client: Meshive, args: argparse.Namespace, output: str, col
     return 0
 
 
+def _command_text(parts: list[str]) -> str:
+    """One argument is used as written (so pipes and quotes stay); several are quoted and joined like a shell would."""
+    if parts and parts[0] == "--":
+        parts = parts[1:]
+    if not parts:
+        raise ValueError("give the command to run, e.g. meshive pod-exec WORKSPACE POD -- nvidia-smi")
+    return parts[0] if len(parts) == 1 else shlex.join(parts)
+
+
+def _exec_options(args: argparse.Namespace) -> tuple[str, bool, int]:
+    """The command and its options. argparse hands everything after the pod name to the command (REMAINDER), so
+    --background and --max-seconds written there, before `--`, are taken out here."""
+    parts, background, seconds = list(args.cmd), args.background, args.max_seconds
+    while parts and parts[0] != "--":
+        if parts[0] == "--background":
+            background = True
+            parts.pop(0)
+        elif parts[0] == "--max-seconds" and len(parts) > 1:
+            seconds = int(parts[1])
+            del parts[:2]
+        elif parts[0].startswith("--max-seconds="):
+            seconds = int(parts[0].split("=", 1)[1])
+            parts.pop(0)
+        else:
+            break
+    return _command_text(parts), background, seconds
+
+
+def cmd_pod_exec(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    """Run a command in a running pod. Exits with the command's exit code (124 when it timed out)."""
+    command, background, seconds = _exec_options(args)
+    args.max_seconds = seconds
+    result = client.run_command(args.pod_name, args.workspace, command, timeout=seconds, background=background)
+    if result.mode == "background":
+        def show() -> None:
+            _kv([("run", result.run_id or "-"), ("output", result.log_path or "-")])
+            print(fmt.paint(f"Started in the background. Check it with `meshive pod-exec-status {args.workspace} "
+                            f"{args.pod_name} {result.run_id}`.", "dim", color))
+        _emit(output, result.raw, [result.run_id or ""], show)
+        return 0
+
+    def show_run() -> None:
+        if result.stdout:
+            sys.stdout.write(result.stdout if result.stdout.endswith("\n") else result.stdout + "\n")
+        if result.stderr:
+            sys.stderr.write(result.stderr if result.stderr.endswith("\n") else result.stderr + "\n")
+        if result.truncated:
+            print("[output cut at 64 KiB]", file=sys.stderr)
+        if result.timed_out:
+            print(f"[stopped after {args.max_seconds}s - use --background for longer work]", file=sys.stderr)
+    _emit(output, result.raw, [result.stdout], show_run)
+    if result.timed_out:
+        return 124
+    return result.exit_code if result.exit_code is not None else 1
+
+
+def cmd_pod_exec_status(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    """Show a background command. --wait checks every few seconds until it ends, then exits with its exit code."""
+    run = client.get_command_run(args.pod_name, args.workspace, args.run_id, tail=args.tail)
+    while args.wait and not run.finished:
+        time.sleep(args.interval)
+        run = client.get_command_run(args.pod_name, args.workspace, args.run_id, tail=args.tail)
+
+    def show() -> None:
+        state = run.state + (f" (exit {run.exit_code})" if run.exit_code is not None else "")
+        _kv([("run", run.run_id), ("state", state), ("output", f"{run.log_path} ({fmt.bytes_human(run.log_bytes)})")])
+        if run.output:
+            print(run.output)
+    _emit(output, run.raw, [run.state], show)
+    if run.state == "exited":
+        return run.exit_code or 0
+    return 1 if run.state in ("lost", "unknown") else 0
+
+
+def cmd_asset_upload(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    # Like an upload in the console: no confirmation. Storage is billed per GiB-month (meshive asset-storage).
+    a = client.upload_asset(args.path, workspace=args.workspace, name=args.name, asset_type=args.type)
+
+    def show() -> None:
+        _kv([("asset", f"{a.name} ({a.asset_id})"), ("status", a.status),
+             ("files", f"{a.file_count} ({fmt.bytes_human(a.total_size_bytes)})")])
+        if a.skipped_empty_files:
+            print(fmt.paint(f"Skipped {a.skipped_empty_files} empty file(s).", "dim", color))
+        print(fmt.paint("Uploaded. Use the asset id as an input asset of a pod or task.", "dim", color))
+    _emit(output, a.raw, [a.asset_id], show)
+    return 0
+
+
 def cmd_civitai_keys(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     keys = client.list_civitai_keys(args.workspace)
 
@@ -1602,6 +1693,19 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     # --- storages ---
     p = sub.add_parser("ssh", parents=[common], help="Print a one-time SSH command and password for a pod (read & write key).")
     p.add_argument("workspace"); p.add_argument("pod_name")
+    p = sub.add_parser("pod-exec", parents=[common],
+                       help="Run a command in a running pod (read & write key). Exits with the command's exit code.")
+    p.add_argument("workspace"); p.add_argument("pod_name")
+    p.add_argument("cmd", nargs=argparse.REMAINDER, metavar="COMMAND",
+                   help="The command, after --. One quoted argument keeps pipes and redirects: -- 'ls /work | head'.")
+    p.add_argument("--max-seconds", type=int, default=20, metavar="N", help="Stop it after N seconds (1..25).")
+    p.add_argument("--background", action="store_true",
+                   help="Start it detached and print a run id (for renders, training and other long work).")
+    p = sub.add_parser("pod-exec-status", parents=[common], help="Show a background command started with pod-exec.")
+    p.add_argument("workspace"); p.add_argument("pod_name"); p.add_argument("run_id")
+    p.add_argument("--tail", type=int, default=100, metavar="N", help="Last N lines of its output (1..1000).")
+    p.add_argument("--wait", action="store_true", help="Keep checking until it ends; exit with its exit code.")
+    p.add_argument("--interval", type=float, default=10.0, metavar="SECONDS", help="Seconds between checks with --wait.")
     p = sub.add_parser("pod-watch", parents=[common],
                        help="Show or change a running pod's watched folders (new files become assets; no restart).")
     p.add_argument("workspace"); p.add_argument("pod_name")
@@ -1670,6 +1774,11 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p = sub.add_parser("serving-delete", parents=[common], help="Delete a serving."); p.add_argument("serving_id", type=int); _yes(p)
 
     # --- asset import ---
+    p = sub.add_parser("asset-upload", parents=[common],
+                       help="Upload a local file or folder as a new asset (storage is billed; big files go in parts).")
+    p.add_argument("workspace"); p.add_argument("path", help="A file, or a folder to upload with everything in it.")
+    p.add_argument("--name", default=None, help="Asset name (default: the file or folder name).")
+    p.add_argument("--type", default=None, choices=["dataset", "model", "adapter", "checkpoint", "config", "file"])
     p = sub.add_parser("asset-import", parents=[common],
                        help="Link a Hugging Face repo, CivitAI model or file URL as an asset (no copy, no storage charge).")
     p.add_argument("workspace")
@@ -1823,6 +1932,8 @@ HANDLERS: dict[str, Handler] = {
     "pod-delete": _pod_action("delete_pod", True, "Delete pod {pod}?"),
     "pod-watch": cmd_pod_watch,
     "ssh": cmd_ssh,
+    "pod-exec": cmd_pod_exec,
+    "pod-exec-status": cmd_pod_exec_status,
     "storage-create": cmd_storage_create,
     "storage-delete": cmd_storage_delete,
     "storage-update": cmd_storage_update,
@@ -1834,6 +1945,7 @@ HANDLERS: dict[str, Handler] = {
     "serving-delete": _serving_simple("delete_serving", "Delete serving #{id}?"),
     "models": cmd_models,
     "asset-import": cmd_asset_import,
+    "asset-upload": cmd_asset_upload,
     "civitai-keys": cmd_civitai_keys,
     "hf-tokens": cmd_hf_tokens,
     "model-detect": cmd_model_detect,

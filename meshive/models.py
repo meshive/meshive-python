@@ -296,6 +296,132 @@ class SshAccess:
 
 
 @dataclass
+class CommandResult:
+    """POST /v1/sdk/pods/{pod}/exec response — a command run in a pod's main container.
+
+    A command run in the foreground has `exit_code` (None if it was cut off), `stdout`, `stderr` (together at most 64
+    KiB; `truncated` says more was printed) and `timed_out`. A background command (`mode` "background") has only
+    `run_id` and `log_path`: read it with get_command_run."""
+
+    pod_name: str
+    workspace: str
+    mode: str                       # run | background
+    exit_code: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    truncated: bool = False
+    timed_out: bool = False
+    duration_ms: int | None = None
+    run_id: str | None = None
+    log_path: str | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CommandResult":
+        duration = d.get("durationMs")
+        return cls(pod_name=str(d.get("podName", "") or ""), workspace=str(d.get("workspace", "") or ""),
+                   mode=str(d.get("mode", "run") or "run"),
+                   exit_code=None if d.get("exitCode") is None else _as_int(d.get("exitCode")),
+                   stdout=str(d.get("stdout", "") or ""), stderr=str(d.get("stderr", "") or ""),
+                   truncated=bool(d.get("truncated", False)), timed_out=bool(d.get("timedOut", False)),
+                   duration_ms=None if duration is None else _as_int(duration),
+                   run_id=d.get("runId"), log_path=d.get("logPath"), raw=d)
+
+
+@dataclass
+class CommandRun:
+    """GET /v1/sdk/pods/{pod}/exec/{run_id} response — a background command: `state` running | exited | lost
+    (stopped without an exit code, e.g. killed) | unknown, the exit code once it exited, and the end of its output.
+    A pod restart loses its runs."""
+
+    pod_name: str
+    workspace: str
+    run_id: str
+    state: str
+    exit_code: int | None = None
+    output: str = ""
+    truncated: bool = False
+    log_bytes: int = 0
+    log_path: str = ""
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def finished(self) -> bool:
+        return self.state in ("exited", "lost")
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CommandRun":
+        return cls(pod_name=str(d.get("podName", "") or ""), workspace=str(d.get("workspace", "") or ""),
+                   run_id=str(d.get("runId", "") or ""), state=str(d.get("state", "unknown") or "unknown"),
+                   exit_code=None if d.get("exitCode") is None else _as_int(d.get("exitCode")),
+                   output=str(d.get("output", "") or ""), truncated=bool(d.get("truncated", False)),
+                   log_bytes=_as_int(d.get("logBytes")), log_path=str(d.get("logPath", "") or ""), raw=d)
+
+
+@dataclass
+class UploadTarget:
+    """One file of an upload session. `mode` "single": PUT the whole file to `url` (with its exact size as
+    Content-Length). "multipart": get part URLs with asset_upload_part_urls and PUT `part_size_bytes` pieces."""
+
+    file_id: int
+    relative_path: str
+    mode: str
+    url: str | None = field(default=None, repr=False)
+    part_size_bytes: int | None = None
+    part_count: int | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "UploadTarget":
+        size = d.get("partSizeBytes")
+        count = d.get("partCount")
+        return cls(file_id=_as_int(d.get("fileId")), relative_path=str(d.get("relativePath", "") or ""),
+                   mode=str(d.get("mode", "") or ""), url=d.get("url"),
+                   part_size_bytes=None if size is None else _as_int(size),
+                   part_count=None if count is None else _as_int(count))
+
+
+@dataclass
+class UploadSession:
+    """POST /v1/sdk/assets/uploads response — a new asset waiting for its files. The upload URLs expire after
+    `presign_expires_in` seconds (ask again with asset_upload_part_urls); the session itself stays open until
+    `expires_at`."""
+
+    upload_id: str                  # the new asset's id (asset_...)
+    name: str
+    files: list[UploadTarget]
+    presign_expires_in: int = 0
+    expires_at: datetime | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "UploadSession":
+        return cls(upload_id=str(d.get("uploadId", "") or ""), name=str(d.get("name", "") or ""),
+                   files=[UploadTarget.from_dict(f) for f in d.get("files") or []],
+                   presign_expires_in=_as_int(d.get("presignExpiresIn")),
+                   expires_at=_parse_dt(d.get("uploadExpiresAt")), raw=d)
+
+
+@dataclass
+class UploadedAsset:
+    """POST /v1/sdk/assets/uploads/{id}/complete response — the uploaded asset, `status` "ready" when done."""
+
+    asset_id: str
+    name: str
+    status: str
+    total_size_bytes: int
+    file_count: int
+    content_hash: str | None = None
+    skipped_empty_files: int = 0    # upload_asset of a folder: empty files left out (the server takes none)
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "UploadedAsset":
+        return cls(asset_id=str(d.get("assetExternalId", "") or ""), name=str(d.get("name", "") or ""),
+                   status=str(d.get("status", "") or ""), total_size_bytes=_as_int(d.get("totalSizeBytes")),
+                   file_count=_as_int(d.get("fileCount")), content_hash=d.get("contentHash"), raw=d)
+
+
+@dataclass
 class Machine:
     """GET /v1/sdk/machines item — a machine registered by a host (get_machine returns a MachineDetail).
 

@@ -12,6 +12,27 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## Unreleased
+
+You can run commands in a running pod and upload files from your computer to Asset Hub, without SSH or the console.
+
+### What's new
+
+- **Run a command in a pod.** `run_command(pod, workspace, command)` runs it with `sh -c` in the pod's main container
+  and returns its exit code, stdout and stderr (`CommandResult`, 64 KiB of output at most). It waits up to `timeout`
+  seconds (1 to 25). For longer work pass `background=True`: it returns a `run_id` at once, and
+  `get_command_run(pod, workspace, run_id)` returns a `CommandRun` with its state (running, exited or lost), exit code
+  and the end of its output. A run is lost when the pod restarts. It needs a read & write key, like `ssh_access`.
+  Calling it again runs the command again, so a failed call is resent only when the server surely never ran it.
+- **Upload files to Asset Hub.** `upload_asset(path, workspace=...)` uploads a file, or a folder with everything in it,
+  as a new asset and returns an `UploadedAsset`. Files over 200 MiB go up in parts. If it fails, the upload is
+  cancelled. Symbolic links in a folder are skipped. The steps are also available on their own, on both clients:
+  `start_asset_upload`, `asset_upload_part_urls`, `complete_asset_upload` and `abort_asset_upload`. Upload links are
+  sent without your API key.
+- **CLI.** `meshive pod-exec <workspace> <pod> -- <command>` prints the command's output and exits with its exit code
+  (124 when it was stopped at `--max-seconds`). `--background` starts it detached; `meshive pod-exec-status
+  <workspace> <pod> <run-id> --wait` follows it. `meshive asset-upload <workspace> <path>` uploads a file or folder.
+
 ## v1.8.0
 
 Hosts can now run their machines from the SDK and CLI: maintenance windows, listing, setup retries, removal,

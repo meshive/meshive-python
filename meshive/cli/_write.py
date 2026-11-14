@@ -1112,6 +1112,11 @@ def _exec_options(args: argparse.Namespace) -> tuple[str, bool, int]:
         elif parts[0].startswith("--max-seconds="):
             seconds = int(parts[0].split("=", 1)[1])
             parts.pop(0)
+        elif parts[0].startswith("-") and "--" in parts:
+            # Any other option before `--` (-o, --json, --base-url, --api-key, --timeout) would otherwise be sent to
+            # the pod as part of the command, and the client is already set up without it.
+            raise ValueError(f"put {parts[0]} before the workspace (meshive pod-exec {parts[0]} ... WORKSPACE POD -- "
+                             "COMMAND); only --background and --max-seconds may follow the pod name")
         else:
             break
     return _command_text(parts), background, seconds
@@ -1136,7 +1141,8 @@ def cmd_pod_exec(client: Meshive, args: argparse.Namespace, output: str, color: 
         if result.stderr:
             sys.stderr.write(result.stderr if result.stderr.endswith("\n") else result.stderr + "\n")
         if result.truncated:
-            print("[output cut at 64 KiB]", file=sys.stderr)
+            print("[output cut at 64 KiB, so its exit code wasn't read - send big output to a file in the pod and "
+                  "read parts of it, or use --background]", file=sys.stderr)
         if result.timed_out:
             print(f"[stopped after {args.max_seconds}s - use --background for longer work]", file=sys.stderr)
     _emit(output, result.raw, [result.stdout], show_run)

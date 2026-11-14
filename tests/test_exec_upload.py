@@ -303,6 +303,26 @@ def test_cli_pod_exec_passes_output_through_and_exits_with_its_code(fake_cli, ca
     assert fake_cli.last.calls[0] == ("run_command", "p-0", "ws", "ls '/work/my dir'", 9, False)
 
 
+@pytest.mark.parametrize("option", [["-o", "json"], ["--json"], ["--base-url", "https://example.invalid"],
+                                    ["--timeout", "5"]])
+def test_cli_pod_exec_refuses_global_options_after_the_pod(fake_cli, capsys, option):
+    assert cli.main(["pod-exec", "ws", "p-0", *option, "--", "echo", "hi"]) == 2
+    assert "before the workspace" in capsys.readouterr().err
+    assert fake_cli.last.calls == []                     # nothing was sent
+
+
+def test_cli_pod_exec_takes_global_options_before_the_workspace(fake_cli, capsys):
+    assert cli.main(["pod-exec", "-o", "json", "ws", "p-0", "--", "echo", "hi"]) == 3
+    assert json.loads(capsys.readouterr().out)["exitCode"] == 3
+    assert fake_cli.last.calls[0][3] == "echo hi"
+
+
+def test_cli_pod_exec_command_without_separator_may_start_with_a_dash(fake_cli, capsys):
+    # No `--`: everything after the pod name is the command, as written.
+    assert cli.main(["pod-exec", "ws", "p-0", "ls", "-la"]) == 3
+    assert fake_cli.last.calls[0][3] == "ls -la"
+
+
 def test_cli_pod_exec_timeout_exits_124(fake_cli, capsys):
     assert cli.main(["pod-exec", "ws", "p-0", "--", "sleep 99"]) == 124
     assert "--background" in capsys.readouterr().err

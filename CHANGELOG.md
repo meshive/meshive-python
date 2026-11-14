@@ -20,6 +20,12 @@ answers with an error that says so.
 
 ### What's new
 
+- **Resource display names.** Pods expose their template name and attached storage names through
+  `template_id`, `template_name` and `linked_storages` (`PodStorage`). Storage exposes attached Pod names through
+  `linked_pod_details` (`StoragePod`); `linked_pods` retains the original lookup keys. CLI Pod and storage details
+  print these names, and `pods --all` shows workspace names.
+- **Workspace owners.** `Workspace.owner_emails` lists the current billing members. The CLI workspaces table
+  shows owners alongside your role, so workspaces with the same name can be distinguished.
 - **Run a command in a pod.** `run_command(pod, workspace, command)` runs it with `sh -c` in the pod's main container
   and returns its exit code, stdout and stderr (`CommandResult`, 64 KiB of output at most). It waits up to `timeout`
   seconds (1 to 25). For longer work pass `background=True`: it returns a `run_id` at once, and

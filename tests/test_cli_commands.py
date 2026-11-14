@@ -337,6 +337,20 @@ def test_workspaces_output(capsys):
 
 
 
+def test_workspaces_show_all_billing_owners_and_unknown_fallback(capsys):
+    workspaces = [
+        Workspace.from_dict({"namespaceName": "ns-a", "workspaceName": "Team", "memberRole": "billing",
+                             "ownerEmails": ["a@example.com", "b@example.com"]}),
+        Workspace.from_dict({"namespaceName": "ns-b", "workspaceName": "Team", "memberRole": "viewer"}),
+    ]
+    cli._print_workspaces(workspaces, False)
+    out = capsys.readouterr().out
+    assert "OWNER" in out and "ROLE" in out
+    assert "a@example.com, b@example.com" in out and "billing" in out
+    assert "unknown" in out and "viewer" in out
+    assert "ns-a" in out and "ns-b" in out
+
+
 def test_pods_output(capsys):
     assert cli.main(["pods", "team-ns"]) == 0
     out = capsys.readouterr().out
@@ -409,7 +423,8 @@ def test_pods_all_aggregates_across_workspaces(capsys):
     out = capsys.readouterr().out
     assert "WORKSPACE" in out                          # extra column in --all mode
     assert "pod-run" in out and "pod-other" in out     # from ns and ns2
-    assert "ns2" in out                                # workspace shown
+    assert "Team" in out and "Team2" in out            # workspace display names shown
+    assert "ns2" not in out                             # internal workspace key stays out of this column
 
 
 def test_pods_all_respects_filters(capsys):
@@ -437,6 +452,28 @@ def test_pods_single_workspace_has_no_workspace_column(capsys):
 def test_pod_json_output(capsys):
     assert cli.main(["pod", "team-ns", "pod-1", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == {"podName": "pod-1"}
+
+
+def test_pod_details_show_template_and_storage_names(capsys):
+    pod = Pod.from_dict({
+        "podName": "pod-1", "userAlias": "trainer", "workspaceName": "Team",
+        "template": {"id": 42, "name": "Jupyter"},
+        "linkedStorages": [{"pvName": "pv-internal", "userAlias": "datasets", "mountPath": "/data", "capacity": 10240, "storageType": "nfs"}],
+    })
+    cli._print_pod(pod, False)
+    out = capsys.readouterr().out
+    assert "Team" in out and "Jupyter" in out and "datasets" in out and "/data" in out and "10 GiB" in out
+    assert "pv-internal" not in out
+
+
+def test_storage_details_use_linked_pod_labels_and_keep_missing_name_fallback(capsys):
+    storage = Storage.from_dict({
+        "linkedPod": [{"podName": "pod-internal", "userAlias": "trainer"}, {"podName": "pod-legacy"}],
+    })
+    cli._print_storage(storage, False)
+    out = capsys.readouterr().out
+    assert "trainer, pod-legacy" in out
+    assert "pod-internal" not in out
 
 
 def test_pod_connect_info_hides_secrets_by_default(capsys):

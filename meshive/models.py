@@ -1,7 +1,7 @@
 """SDK response dataclasses.
 
 Server responses are camelCase (JSON), so from_dict reads camelCase keys.
-Deeply nested fields (a pod's machine/template/request, ...) aren't typed one by one;
+Deeply nested fields (a pod's machine/request, ...) aren't typed one by one;
 the original dict is kept in `.raw` → the SDK doesn't break when the backend adds fields.
 """
 from __future__ import annotations
@@ -84,6 +84,8 @@ class Workspace:
     # The key owner's role in this workspace — admin | billing | viewer. Writes are 403 for viewer.
     # For display, not authorization (the server checks again on every write). None if the server doesn't know.
     member_role: str | None = None
+    # Current billing members. A billing-role transfer changes this display information; [] means no owner is known.
+    owner_emails: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict) -> "Workspace":
@@ -98,6 +100,7 @@ class Workspace:
             created_at=_parse_dt(d.get("createdAt")),
             updated_at=_parse_dt(d.get("updatedAt")),
             member_role=d.get("memberRole"),
+            owner_emails=list(d.get("ownerEmails") or []),
             raw=d,
         )
 
@@ -146,11 +149,32 @@ class ConnectCredential:
 
 
 @dataclass
+class PodStorage:
+    """A volume mounted by a Pod. Capacity is in MiB; names are display data."""
+
+    pv_name: str
+    user_alias: str
+    mount_path: str
+    capacity: int
+    storage_type: str
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PodStorage":
+        return cls(
+            pv_name=str(d.get("pvName", "") or ""),
+            user_alias=str(d.get("userAlias", "") or ""),
+            mount_path=str(d.get("mountPath", "") or ""),
+            capacity=_as_int(d.get("capacity")),
+            storage_type=str(d.get("storageType", "") or ""),
+        )
+
+
+@dataclass
 class Pod:
     """GET /v1/sdk/pods[/{name}] item.
 
     Types the commonly used top-level scalars and connection info (endpoints, connect_credentials).
-    The remaining nested structures (machine/template/request/linkedStorages, ...) are in `.raw`.
+    The remaining nested structures (machine/template configuration/request, ...) are in `.raw`.
     Values the server didn't send are None (older servers) — don't read them as False/0.
     """
 
@@ -184,6 +208,10 @@ class Pod:
     container_running_at: datetime | None = None  # when the connect Pod's container became Running
     # Set when the pod is terminated because creating it failed (the platform cleans it up), not because it was deleted.
     creation_failure_reason: str | None = None
+    template_id: int | None = None
+    template_name: str | None = None
+    linked_storages: list[PodStorage] = field(default_factory=list)
+    workspace_name: str | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Pod":
@@ -221,6 +249,10 @@ class Pod:
             stop_reason_at=_parse_dt(d.get("stopReasonAt")),
             container_running_at=_parse_dt(d.get("containerRunningAt")),
             creation_failure_reason=(d.get("creationFailure") or {}).get("reason"),
+            template_id=_as_int(template["id"]) if template.get("id") is not None else None,
+            template_name=template.get("name"),
+            linked_storages=[PodStorage.from_dict(s) for s in d.get("linkedStorages") or [] if isinstance(s, dict)],
+            workspace_name=d.get("workspaceName"),
             raw=d,
         )
 
@@ -698,6 +730,25 @@ class Transaction:
 
 
 @dataclass
+class StoragePod:
+    """A Pod attached to a storage volume, with its display name and mount path."""
+
+    pod_name: str
+    user_alias: str
+    mount_path: str
+    is_downloader: bool = False
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "StoragePod":
+        return cls(
+            pod_name=str(d.get("podName", "") or ""),
+            user_alias=str(d.get("userAlias", "") or ""),
+            mount_path=str(d.get("mountPath", "") or ""),
+            is_downloader=bool(d.get("isDownloader", False)),
+        )
+
+
+@dataclass
 class Storage:
     """GET /v1/sdk/storages[/{storage_name}] item — a workspace volume (PV).
 
@@ -713,11 +764,12 @@ class Storage:
     available_size: float
     usage_rate: float          # 0.0~1.0
     price_per_hour: str
-    linked_pods: list[str] = field(default_factory=list)   # names of attached pods
+    linked_pods: list[str] = field(default_factory=list)   # lookup keys of attached pods (retained for compatibility)
     is_maintenance: bool = False
     encrypted: bool = False
     created_at: datetime | None = None
     raw: dict = field(default_factory=dict, repr=False)
+    linked_pod_details: list[StoragePod] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict) -> "Storage":
@@ -732,6 +784,7 @@ class Storage:
             usage_rate=_as_float(d.get("usageRate")),
             price_per_hour=str(d.get("pricePerHour", "0")),
             linked_pods=[p.get("podName", "") for p in d.get("linkedPod") or [] if isinstance(p, dict)],
+            linked_pod_details=[StoragePod.from_dict(p) for p in d.get("linkedPod") or [] if isinstance(p, dict)],
             is_maintenance=bool(d.get("isMaintenance", False)),
             encrypted=bool(d.get("encrypted", False)),
             created_at=_parse_dt(d.get("createdAt")),

@@ -85,6 +85,7 @@ def test_background_and_status():
     client = sync_client(router)
     started = client.run_command("p-0", "ws", "blender -b s.blend -a", background=True)
     assert started.mode == "background" and started.run_id == "run_0123456789ab" and started.exit_code is None
+    assert started.stop_command is None              # an older server sends none
     run = client.get_command_run("p-0", "ws", started.run_id, tail=20)
     assert isinstance(run, CommandRun) and run.finished and run.output == "done"
     assert router.requests[1].url.params["tail"] == "20"
@@ -275,7 +276,8 @@ class FakeCli:
         self.calls.append(("run_command", pod, ws, command, timeout, background))
         if background:
             return CommandResult.from_dict({"podName": pod, "workspace": ws, "mode": "background",
-                                            "runId": "run_0123456789ab", "logPath": "/tmp/x.log"})
+                                            "runId": "run_0123456789ab", "logPath": "/tmp/x.log",
+                                            "stopCommand": "kill -- -1234"})
         return CommandResult.from_dict({**RUN, "timedOut": command == "sleep 99"})
 
     def get_command_run(self, pod, ws, run_id, *, tail):
@@ -330,7 +332,8 @@ def test_cli_pod_exec_timeout_exits_124(fake_cli, capsys):
 
 def test_cli_pod_exec_background_and_status(fake_cli, capsys):
     assert cli.main(["pod-exec", "ws", "p-0", "--background", "--", "blender -b s.blend -a"]) == 0
-    assert "run_0123456789ab" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "run_0123456789ab" in out and "To stop it: meshive pod-exec ws p-0 -- 'kill -- -1234'" in out
     assert fake_cli.last.calls[0][-1] is True
     assert cli.main(["pod-exec-status", "ws", "p-0", "run_0123456789ab"]) == 4
     assert "bye" in capsys.readouterr().out

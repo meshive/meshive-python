@@ -1132,6 +1132,9 @@ def cmd_pod_exec(client: Meshive, args: argparse.Namespace, output: str, color: 
             _kv([("run", result.run_id or "-"), ("output", result.log_path or "-")])
             print(fmt.paint(f"Started in the background. Check it with `meshive pod-exec-status {args.workspace} "
                             f"{args.pod_name} {result.run_id}`.", "dim", color))
+            if result.stop_command:
+                print(fmt.paint(f"To stop it: meshive pod-exec {args.workspace} {args.pod_name} -- "
+                                f"{shlex.quote(result.stop_command)}", "dim", color))
         _emit(output, result.raw, [result.run_id or ""], show)
         return 0
 
@@ -1163,6 +1166,9 @@ def cmd_pod_exec_status(client: Meshive, args: argparse.Namespace, output: str, 
         _kv([("run", run.run_id), ("state", state), ("output", f"{run.log_path} ({fmt.bytes_human(run.log_bytes)})")])
         if run.output:
             print(run.output)
+        if run.state == "running" and run.stop_command:
+            print(fmt.paint(f"To stop it: meshive pod-exec {args.workspace} {args.pod_name} -- "
+                            f"{shlex.quote(run.stop_command)}", "dim", color))
     _emit(output, run.raw, [run.state], show)
     if run.state == "exited":
         return run.exit_code or 0

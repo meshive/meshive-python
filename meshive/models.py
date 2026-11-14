@@ -314,6 +314,7 @@ class CommandResult:
     duration_ms: int | None = None
     run_id: str | None = None
     log_path: str | None = None
+    stop_command: str | None = None   # background: run it with run_command to stop the run and what it started
     raw: dict = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -325,7 +326,7 @@ class CommandResult:
                    stdout=str(d.get("stdout", "") or ""), stderr=str(d.get("stderr", "") or ""),
                    truncated=bool(d.get("truncated", False)), timed_out=bool(d.get("timedOut", False)),
                    duration_ms=None if duration is None else _as_int(duration),
-                   run_id=d.get("runId"), log_path=d.get("logPath"), raw=d)
+                   run_id=d.get("runId"), log_path=d.get("logPath"), stop_command=d.get("stopCommand"), raw=d)
 
 
 @dataclass
@@ -343,6 +344,7 @@ class CommandRun:
     truncated: bool = False
     log_bytes: int = 0
     log_path: str = ""
+    stop_command: str | None = None   # while running: run it with run_command to stop the run
     raw: dict = field(default_factory=dict, repr=False)
 
     @property
@@ -355,7 +357,8 @@ class CommandRun:
                    run_id=str(d.get("runId", "") or ""), state=str(d.get("state", "unknown") or "unknown"),
                    exit_code=None if d.get("exitCode") is None else _as_int(d.get("exitCode")),
                    output=str(d.get("output", "") or ""), truncated=bool(d.get("truncated", False)),
-                   log_bytes=_as_int(d.get("logBytes")), log_path=str(d.get("logPath", "") or ""), raw=d)
+                   log_bytes=_as_int(d.get("logBytes")), log_path=str(d.get("logPath", "") or ""),
+                   stop_command=d.get("stopCommand"), raw=d)
 
 
 @dataclass

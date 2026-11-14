@@ -29,6 +29,9 @@ You can run commands in a running pod and upload files from your computer to Ass
   cancelled. Symbolic links in a folder are skipped. The steps are also available on their own, on both clients:
   `start_asset_upload`, `asset_upload_part_urls`, `complete_asset_upload` and `abort_asset_upload`. Upload links are
   sent without your API key.
+- **Stop a background run.** A background `CommandResult`, and a `CommandRun` while it is running, carry
+  `stop_command`: run it with `run_command` to stop the run and everything it started (the run then ends as exited
+  with code 143). The CLI prints it as a ready `meshive pod-exec` line.
 - **CLI.** `meshive pod-exec <workspace> <pod> -- <command>` prints the command's output and exits with its exit code
   (124 when it was stopped at `--max-seconds`). `--background` starts it detached; `meshive pod-exec-status
   <workspace> <pod> <run-id> --wait` follows it. `meshive asset-upload <workspace> <path>` uploads a file or folder.

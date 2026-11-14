@@ -12,9 +12,11 @@ Upgrade with:
 pip install -U meshive
 ```
 
-## Unreleased
+## v1.9.0
 
 You can run commands in a running pod and upload files from your computer to Asset Hub, without SSH or the console.
+Code written for 1.0 to 1.8 keeps working. The new calls need a Meshive API server that has them; an older server
+answers with an error that says so.
 
 ### What's new
 

@@ -152,6 +152,7 @@ except WaitTimeoutError:
 | Lock or unlock a pod's public port | `meshive pod-lock <workspace> <pod> <port>`, `meshive pod-unlock <workspace> <pod> <port>` |
 | Give a program access to a locked port | `meshive pod-key-create <workspace> <pod> <port> --name ci`, then send `Authorization: Bearer <key>` |
 | List, roll or revoke a port's access keys | `meshive pod-keys <workspace> <pod> <port>`, `meshive pod-key-roll ...`, `meshive pod-key-revoke ...` |
+| Use a locked port from an app that only takes an address | `meshive forward <workspace> <pod> <port>` with the key in `MESHIVE_ACCESS_KEY`, then point the app at `http://127.0.0.1:<port>` |
 | Grow or rename storage, or SSH into it | `meshive storage-update <workspace> <storage> --size 100`, `meshive storage-connect <workspace> <storage>` |
 | Start a pod with a ready-made set of models | `meshive model-sets <workspace> --template <template-id>`, then `meshive pod-create ... --model-set <slug>` |
 | See why a pod is still starting | `meshive transactions <workspace>` |
@@ -175,6 +176,13 @@ Every command has `--help`. The [CLI reference](https://docs.meshive.ai/sdk-cli/
   lets in only workspace members signed in to the console, and programs that send one of the port's access keys
   (`meshive pod-key-create`). Pass `--no-lock` (`lock_public_ports=False`) to create them open to anyone with the
   URL, as before 1.10. Ports that are public already keep the lock they have.
+  An access key starts with `mshv_`. Send a pod's URL only that key, never your Meshive account API key
+  (`meshive_...`).
+- **Apps that can't send a key.** `meshive forward <workspace> <pod> <port>` listens on `http://127.0.0.1:<port>`
+  on your computer and passes every request on to the locked port with the access key added, WebSockets included.
+  The key is read from the `MESHIVE_ACCESS_KEY` environment variable or from `--key-file`, never from the command
+  line. It answers only on 127.0.0.1 and refuses requests made by web pages on other sites; programs on your
+  computer reach the port through it without a key, so stop it (Ctrl+C) when you are done.
 - **IDs and names.** Lists show the NAME you chose and an ID. Commands take the ID.
 - **Scripting.** `-o json` prints the full response and `-o name` prints only IDs, one per line.
 - **Retries are safe.** Rate limits and network errors are retried automatically. Every create or change carries an

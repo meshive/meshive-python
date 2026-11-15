@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import httpx
 
 from . import _format as fmt
+from . import _forward as forward_cli
 from . import _write as write_cli
 from .. import _config, _credentials
 from .._version import __version__
@@ -122,6 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  meshive storage-connect <ws> <pv>  (SSH and SFTP access to a storage)\n"
             "  meshive task-submit <ws> <name> --script FILE --image IMG --cpu-preset micro-2c8g\n"
             "  meshive logs <ws> <pod>          meshive task-logs <task>\n"
+            "  meshive forward <ws> <pod> <port>  (a locked port at http://127.0.0.1:<port>; key in MESHIVE_ACCESS_KEY)\n"
             "  meshive maintenance-schedule <machine> --reason R --start ISO --end ISO [--emergency]\n"
             "  meshive machine-list|machine-unlist|machine-delete <machine>\n"
             "  meshive host-message-send <machine> --to WORKSPACE|all --title T\n"
@@ -421,6 +423,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- account --------------------------------------------------------------
     write_cli.add_parsers(sub, common)
+    forward_cli.add_parser(sub, common)
 
     sub.add_parser("api-keys", parents=[common], aliases=["keys"],
                    help="List your API keys (prefixes only; the secret is never shown).")
@@ -2070,6 +2073,7 @@ _HANDLERS: dict[str, Handler] = {
     "credit": _cmd_credit,
     "credit-history": _cmd_credit_history,
     **write_cli.HANDLERS,
+    "forward": forward_cli.cmd_forward,
 }
 
 

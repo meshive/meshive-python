@@ -73,6 +73,15 @@ calls need a Meshive API server that has them; an older server answers with an e
   and `meshive pod-key-revoke KEY_ID`. `pod-key-create` prints the value once (`-o name` prints only the value).
   Unlocking, rolling and revoking ask first; `pod-create` and `pod-update` say which ports would be locked and which
   open before they ask. Both take `--no-lock`, `--lock-port` and `--unlock-port`.
+- **`meshive forward` for apps that can't send a key.** `meshive forward <workspace> <pod> <port>` listens on
+  `http://127.0.0.1:<port>` and passes every request on to the port's public address with the access key added
+  (as `X-Meshive-Key`; your app's own `Authorization` is left alone). Point an app that only takes an address at
+  it: a ComfyUI client, a browser, a library with no way to set a header. WebSockets, streamed answers and uploads
+  go through. The key is read from the `MESHIVE_ACCESS_KEY` environment variable or from `--key-file`, never from
+  the command line, and a port that isn't locked needs none. It answers only on 127.0.0.1 and refuses requests
+  made by web pages on other sites (`--allow-origin` names a page that may use it), but programs on your computer
+  reach the port through it without a key. `--listen PORT` picks another local port and `-v` prints one line per
+  request. It runs until Ctrl+C and uses only the Python standard library.
 - **Permissions.** Locking, unlocking, creating, rolling and revoking need a read & write key from a workspace
   admin or billing member. Listing keys works with a read-only key.
 

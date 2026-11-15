@@ -13,7 +13,7 @@ the [README](README.md).
 | `meshive/exceptions.py` | `MeshiveError` and its subclasses, one per kind of HTTP error. |
 | `meshive/formatting.py` | `format_hourly` / `format_usd`: amounts rounded the same way the web console rounds them. |
 | `meshive/_config.py`, `meshive/_credentials.py` | API key and base URL resolution, and the credentials file written by `meshive login`. |
-| `meshive/cli/` | The `meshive` command: `main.py` (parser and read commands), `_write.py` (write commands), `_format.py` (tables, colors, units). |
+| `meshive/cli/` | The `meshive` command: `main.py` (parser and read commands), `_write.py` (write commands), `_format.py` (tables, colors, units), `_forward.py` (`meshive forward`, the local forwarder for locked ports; standard library only). |
 | `scripts/release-notes.sh` | Prints one version's section of `CHANGELOG.md` for the GitHub Release. |
 
 ## Setup and tests
@@ -26,6 +26,11 @@ python -m pytest
 
 The tests use `httpx.MockTransport` and a fake client, so they need no network and no API key. CI runs them on
 Python 3.10 to 3.13 and runs `pip-audit`.
+
+`tests/test_forward.py` is the exception to "no sockets": it starts the forwarder and a stand-in for a pod port's
+public address on 127.0.0.1 and talks to them over real connections. The stand-in uses the test-only certificate
+in `tests/data/` (its key protects nothing). On a computer where an antivirus inspects TLS, even on 127.0.0.1, the
+stand-in is reached without TLS and the few tests about the certificate are skipped.
 
 ## Conventions
 
@@ -48,6 +53,10 @@ Python 3.10 to 3.13 and runs `pip-audit`.
 - **CLI writes confirm first.** A command that spends credit or deletes something shows an estimate or a summary and
   asks, unless `--yes` is given. Without a terminal to ask on, it exits with code 2.
 - **Server text is cleaned.** The CLI strips control characters from server-provided strings before printing them.
+- **The forwarder is strict, because it lends out a key.** `meshive forward` adds an access key to whatever it
+  passes on, so it answers only requests addressed to its own loopback name, refuses what a page on another site
+  can make a browser send, verifies the endpoint's certificate, and refuses any request two servers could read
+  differently instead of guessing. The key comes from the environment or a file, and never appears in a message.
 
 ## Compatibility with the API
 

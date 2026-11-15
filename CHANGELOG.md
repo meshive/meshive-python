@@ -12,6 +12,70 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## v1.10.0
+
+A pod's public ports can be locked, and from this release new pods are created with them locked. A locked port lets
+in only workspace members signed in to the console, and programs that send one of the port's access keys. Code
+written for 1.0 to 1.9 keeps running, but read "Changed" below: the public ports it creates are now locked. The new
+calls need a Meshive API server that has them; an older server answers with an error that says so.
+
+### Changed
+
+- **New pods get locked public ports.** `create_pod` and `meshive pod-create` now create every port that is exposed
+  over HTTPS locked: the ports you open with `ports`, and the ports the template opens (those follow the template
+  author's choice when there is one). Until 1.9 they were open to anyone with the URL. A script that creates a pod
+  and then calls its public URL without a key now gets `401`: create an access key for the port and send it (see
+  below), or keep the old behavior:
+  - `create_pod(..., lock_public_ports=False)` or `meshive pod-create ... --no-lock` creates every public port open;
+  - `ports=[{"port": 8888, "locked": False}]`, a `template_ports` item with `"locked": False`, or
+    `--unlock-port 8888` leaves one port open.
+
+- **Ports an update newly makes public are locked too.** `update_pod` and `meshive pod-update` lock a new public
+  port (`ports`), a port the pod keeps internal that the update exposes (`template_ports` with `"external": True`)
+  and, when the pod moves to another template, the public ports that template adds. `lock_public_ports=False`,
+  `"locked": False` on the port, `--no-lock` or `--unlock-port` leave them open, as above.
+- **Ports that are public already are never touched.** Pods that exist keep their ports as they are, and an update
+  leaves the lock of a port that is public already alone, whether it is locked or was unlocked on purpose. Only
+  naming the port changes it: `"locked"` on its `template_ports` item, `--lock-port` / `--unlock-port`, or
+  `set_port_lock`. An update that makes no port public sends no lock value and makes no extra request.
+- **Extra read requests.** `create_pod` and `estimate_pod` read the template first, so that each port it exposes is
+  sent with a lock value, and check that the server can lock ports before they send a lock: one or two reads per
+  call. `update_pod` and `estimate_pod_update` read the pod when the change exposes a port or moves the pod to
+  another template (to tell which ports are public already), the new template in the latter case, and make the
+  same check before they send a lock: up to three reads, none for a change that makes nothing public.
+- **A port is never opened by mistake.** When the server can't lock ports, because the platform has locking
+  turned off or the server predates it, `create_pod`, `estimate_pod`, `update_pod` and `estimate_pod_update` raise
+  `EndpointLockUnavailableError` (a `ConflictError`) and nothing is created or changed. The message says how to go
+  ahead with open ports. The SDK does not retry with open ports by itself.
+
+### What's new
+
+- **Lock state on pods.** `PodEndpoint.locked` says whether an exposed port is locked, `access` is `"internal"`,
+  `"locked"` or `"unlocked"`, and `access_key_count` counts the keys that work now. `meshive pod` shows an ACCESS
+  column. `PodEstimate.port_locks` and `PodCreated.port_locks` list the lock each exposed port is created with
+  (`PodUpdateEstimate.port_locks` and `PodUpdated.port_locks` list what an update sends), and
+  `wait_for_new_pod(..., port_locks=created.port_locks)` checks the new pod against it (`PortNotLockedError` if a
+  port that should be locked is open).
+- **Lock or unlock a port.** `set_port_lock(pod, workspace, port, True)` locks an exposed port and `False` unlocks
+  it, without restarting the pod. Unlocking keeps the port's access keys; they work again when it is locked again.
+- **Access keys for programs.** `create_access_key(pod, workspace, port, name)` returns an `AccessKeyCreated`
+  whose `access_key` is the key's value. It is returned this once and can't be read again. Programs send it as
+  `Authorization: Bearer <key>`, or as `X-Meshive-Key: <key>` when the app uses `Authorization` itself. A key lasts
+  90 days by default (`expires_in_days` 30, 90 or 365, or 0 for a key that never expires). `list_access_keys` lists a
+  port's keys by name and first characters, never their values. `roll_access_key` replaces a key's value and keeps
+  the old one working for `overlap_seconds` (an hour by default) so clients can be moved; `revoke_access_key` stops
+  a key within seconds. A connection that is already open stays open until it closes. The value is left out of
+  `repr` and of `.raw`.
+- **Creating and rolling a key are not resent.** Each call issues a new value, so after a timeout the SDK does not
+  send the request again; check `list_access_keys` first.
+- **CLI.** `meshive pod-lock` and `meshive pod-unlock <workspace> <pod> <port>`; `meshive pod-keys`,
+  `meshive pod-key-create --name NAME [--expires DAYS|never]`, `meshive pod-key-roll KEY_ID [--overlap now|1h|24h|7d]`
+  and `meshive pod-key-revoke KEY_ID`. `pod-key-create` prints the value once (`-o name` prints only the value).
+  Unlocking, rolling and revoking ask first; `pod-create` and `pod-update` say which ports would be locked and which
+  open before they ask. Both take `--no-lock`, `--lock-port` and `--unlock-port`.
+- **Permissions.** Locking, unlocking, creating, rolling and revoking need a read & write key from a workspace
+  admin or billing member. Listing keys works with a read-only key.
+
 ## v1.9.0
 
 You can run commands in a running pod and upload files from your computer to Asset Hub, without SSH or the console.

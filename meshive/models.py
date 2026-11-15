@@ -117,12 +117,25 @@ class PodEndpoint:
     is_external: bool
     # Same rule as the console: readinessState (preparing|ready|interrupted) if present, otherwise ready|preparing from isReady.
     readiness: str
+    # Whether the exposed port is locked: only workspace members' browsers and the port's access keys get through.
+    # None from servers that don't report it (they have no locks, so the port is open).
+    locked: bool | None = None
+    lock_decided_at: datetime | None = None   # when someone last chose locked or unlocked; None = never chosen
+    access_key_count: int | None = None       # access keys that work now (list_access_keys); None if not reported
+
+    @property
+    def access(self) -> str:
+        """internal (reachable only inside the workspace), locked, or unlocked (anyone with the URL gets through)."""
+        if not self.is_external:
+            return "internal"
+        return "locked" if self.locked else "unlocked"
 
     @classmethod
     def from_dict(cls, d: dict) -> "PodEndpoint":
         state = d.get("readinessState")
         if state not in ("preparing", "ready", "interrupted"):
             state = "ready" if d.get("isReady") else "preparing"
+        locked, key_count = d.get("isLocked"), d.get("accessKeyCount")
         return cls(
             name=str(d.get("userAlias", "") or ""),
             port=_as_int(d.get("containerPort")),
@@ -131,6 +144,9 @@ class PodEndpoint:
             internal_url=d.get("internalUrl") or None,
             is_external=bool(d.get("isExternal", False)),
             readiness=state,
+            locked=locked if isinstance(locked, bool) else None,
+            lock_decided_at=_parse_dt(d.get("lockDecidedAt")),
+            access_key_count=key_count if isinstance(key_count, int) and not isinstance(key_count, bool) else None,
         )
 
 
@@ -325,6 +341,73 @@ class SshAccess:
                    web_url=str(d.get("sshWebUrl", "") or ""),
                    expires_at=None if expired is None else datetime.fromtimestamp(_as_int(expired), tz=timezone.utc),
                    raw=d)
+
+
+@dataclass
+class PortLock:
+    """PATCH /v1/sdk/pods/{pod}/ports/{port}/lock response — the lock the port now has."""
+
+    port: int
+    locked: bool
+    raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PortLock":
+        return cls(port=_as_int(d.get("port")), locked=bool(d.get("locked", False)), raw=d,
+                   replayed=bool(d.get("replayed", False)))
+
+
+@dataclass
+class AccessKey:
+    """An access key of a locked port (GET /v1/sdk/pods/{pod}/ports/{port}/keys item). Programs send the key's value as
+    `Authorization: Bearer <key>`, or as `X-Meshive-Key: <key>` when the app uses Authorization itself.
+
+    The value is shown once, when the key is created or rolled (AccessKeyCreated); afterwards only `prefix`, its first
+    characters, tells keys apart."""
+
+    id: int
+    name: str
+    prefix: str                    # e.g. "mshv_Xc4dbbbb"
+    port: int | None = None
+    port_name: str = ""
+    pod_name: str | None = None
+    created_by: str | None = None  # who issued this value: the creator, or whoever rolled it last
+    created_at: datetime | None = None    # when the key was first created; a roll keeps it
+    issued_at: datetime | None = None     # when this value was issued (the creation, or the last roll)
+    expires_at: datetime | None = None    # None = never expires
+    # After a roll: until when the previous value still works. None when no previous value works.
+    previous_value_valid_until: datetime | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def _parse(cls, d: dict) -> dict:
+        port = d.get("containerPort")
+        return dict(
+            id=_as_int(d.get("id")), name=str(d.get("keyName", "") or ""), prefix=str(d.get("keyPrefix", "") or ""),
+            port=_as_int(port) if port is not None else None, port_name=str(d.get("portAlias", "") or ""),
+            pod_name=d.get("podName"), created_by=d.get("createdBy"), created_at=_parse_dt(d.get("createdAt")),
+            issued_at=_parse_dt(d.get("issuedAt")), expires_at=_parse_dt(d.get("expiresAt")),
+            previous_value_valid_until=_parse_dt(d.get("previousValueValidUntil")),
+            # The value never goes into raw, so printing or logging raw can't leak it.
+            raw={k: v for k, v in d.items() if k != "accessKey"})
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AccessKey":
+        return cls(**cls._parse(d))
+
+
+@dataclass
+class AccessKeyCreated(AccessKey):
+    """Response of create_access_key and roll_access_key: the key, with its value in `access_key`. The value is in this
+    response only and can't be read again, so store it now. It is left out of repr and of `raw`; don't print it to
+    logs or save it in files that are shared."""
+
+    access_key: str = field(default="", repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AccessKeyCreated":
+        return cls(**cls._parse(d), access_key=str(d.get("accessKey", "") or ""))
 
 
 @dataclass
@@ -1855,6 +1938,8 @@ class PodEstimate:
     # The model set the pod starts with: {"slug", "name", "file_count", "total_size_bytes", "min_vram_gb",
     # "min_vram_estimated"}. None without one, and from servers that don't report it.
     model_set: dict | None = None
+    # {port: locked} — the lock value this request sends for each exposed port (worked out by the SDK, not the server).
+    port_locks: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict) -> "PodEstimate":
@@ -1879,6 +1964,9 @@ class PodCreated:
     accepted: bool = True
     raw: dict = field(default_factory=dict, repr=False)
     replayed: bool = False         # see ResourceAction.replayed
+    # {port: locked} — the lock value the request sent for each exposed port (worked out by the SDK, not the server).
+    # Pass it to wait_for_new_pod(port_locks=...) to have the new pod's ports checked against it.
+    port_locks: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict) -> "PodCreated":
@@ -2184,6 +2272,8 @@ class PodUpdateEstimate:
     volumes: list = field(default_factory=list)
     note: str = ""
     raw: dict = field(default_factory=dict, repr=False)
+    # {port: locked} — the lock value this request sends, for the ports it sends one for (worked out by the SDK).
+    port_locks: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict) -> "PodUpdateEstimate":
@@ -2208,6 +2298,8 @@ class PodUpdated:
     estimate: PodUpdateEstimate
     raw: dict = field(default_factory=dict, repr=False)
     replayed: bool = False         # see ResourceAction.replayed
+    # {port: locked} — the lock value the request sent, for the ports it sent one for (worked out by the SDK).
+    port_locks: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict) -> "PodUpdated":

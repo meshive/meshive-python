@@ -94,7 +94,7 @@ with Meshive() as client:  # uses the key saved by `meshive login`, or MESHIVE_A
 
     pod = client.wait_for_new_pod("my-first-pod", workspace, until="running")
     for endpoint in pod.endpoints:
-        print(endpoint.name, endpoint.external_url)
+        print(endpoint.name, endpoint.external_url, endpoint.access)   # locked: members and access keys only
 
     client.stop_pod(pod.pod_name, workspace)
 ```
@@ -129,9 +129,11 @@ except WaitTimeoutError:
 | `NotFoundError` | 404: no such pod, task, asset, ... |
 | `InsufficientCreditError` | 402: not enough credit to create or start something. |
 | `ConflictError` | 409: no capacity, a name already taken, a price above your cap, storage still in use, a workspace that isn't empty, ... `err.title` says which. |
+| `EndpointLockUnavailableError` | A pod was to be created or changed with a locked port, and the server can't lock ports right now. Nothing was created or changed. A `ConflictError`. |
 | `RateLimitError` | 429 after the automatic retries. `err.retry_after` says how long to wait. |
 | `WaitTimeoutError` | A `wait_for_*` call ran out of time. Also a built-in `TimeoutError`. |
 | `PodCreationFailedError` | The platform couldn't create the pod and cleaned it up; the message says why. |
+| `PortNotLockedError` | `wait_for_new_pod(port_locks=...)` found a port open that was created to be locked. |
 
 ## What else you can do
 
@@ -147,6 +149,9 @@ except WaitTimeoutError:
 | Run a command in a running pod (add `--background` for long work) | `meshive pod-exec <workspace> <pod> -- nvidia-smi` |
 | Upload a file or folder from your computer as an asset | `meshive asset-upload <workspace> ./my-data` |
 | Change a pod's GPU, ports, environment or storage | `meshive pod-update <workspace> <pod> --gpu "RTX 4090"` |
+| Lock or unlock a pod's public port | `meshive pod-lock <workspace> <pod> <port>`, `meshive pod-unlock <workspace> <pod> <port>` |
+| Give a program access to a locked port | `meshive pod-key-create <workspace> <pod> <port> --name ci`, then send `Authorization: Bearer <key>` |
+| List, roll or revoke a port's access keys | `meshive pod-keys <workspace> <pod> <port>`, `meshive pod-key-roll ...`, `meshive pod-key-revoke ...` |
 | Grow or rename storage, or SSH into it | `meshive storage-update <workspace> <storage> --size 100`, `meshive storage-connect <workspace> <storage>` |
 | Start a pod with a ready-made set of models | `meshive model-sets <workspace> --template <template-id>`, then `meshive pod-create ... --model-set <slug>` |
 | See why a pod is still starting | `meshive transactions <workspace>` |
@@ -166,6 +171,10 @@ Every command has `--help`. The [CLI reference](https://docs.meshive.ai/sdk-cli/
   question in scripts.
 - **Two kinds of keys.** A **Read only** key can see everything. A **Read & write** key is needed to create,
   change or delete, and it expires (after 30 days by default).
+- **Public ports are created locked.** A port that is newly exposed over HTTPS, on a new pod or by `pod-update`,
+  lets in only workspace members signed in to the console, and programs that send one of the port's access keys
+  (`meshive pod-key-create`). Pass `--no-lock` (`lock_public_ports=False`) to create them open to anyone with the
+  URL, as before 1.10. Ports that are public already keep the lock they have.
 - **IDs and names.** Lists show the NAME you chose and an ID. Commands take the ID.
 - **Scripting.** `-o json` prints the full response and `-o name` prints only IDs, one per line.
 - **Retries are safe.** Rate limits and network errors are retried automatically. Every create or change carries an

@@ -35,7 +35,14 @@ Python 3.10 to 3.13 and runs `pip-audit`.
 - **Check the shape, leave the rules to the server.** Missing or mistyped arguments raise `ValueError` before any
   request goes out. Which values are allowed (sizes, counts, placements, storage types) is the server's call, so the
   SDK never refuses a value the server accepts; the server's error explains what is allowed.
-- **Writes are safe to retry.** Every write sends an `Idempotency-Key`, and automatic retries reuse it.
+- **Writes are safe to retry.** Every write sends an `Idempotency-Key`, and automatic retries reuse it. The few
+  writes the server does not deduplicate (running a command, issuing an access key) are resent only when the server
+  surely never started on them.
+- **Secrets stay out of `repr`.** A password, install command or key value is a field with `repr=False`. An access
+  key's value is also left out of `.raw`, so printing or logging the payload can't leak it.
+- **Public ports are locked unless the caller says otherwise.** `create_pod` sends a lock value for every exposed
+  port, and `update_pod` for every port the change newly makes public; both refuse to send a lock to a server that
+  would drop it. A port that is public already gets a lock value only when the caller names it.
 - **Amounts and units match the console.** Use `formatting` for money. Sizes are 1024-based (GiB, MiB); GPU VRAM
   keeps the usual GB label.
 - **CLI writes confirm first.** A command that spends credit or deletes something shows an estimate or a summary and

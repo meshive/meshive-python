@@ -681,10 +681,12 @@ def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
                          aligns=["l", "l", "r", "l"], enabled=color)
     if pod.endpoints:
         print()
-        rows = [[e.name or "-", str(e.port), e.external_url or e.internal_url or "-", e.readiness]
-                for e in pod.endpoints]
-        colors = [[None, None, None, "green" if e.readiness == "ready" else "yellow"] for e in pod.endpoints]
-        fmt.render_table(["ENDPOINT", "PORT", "URL", "STATE"], rows, aligns=["l", "r", "l", "l"],
+        # ACCESS: Internal (inside the workspace only), Locked (members' browsers and access keys) or Unlocked
+        # (anyone with the URL). A server that doesn't report locks has none, so its exposed ports are Unlocked.
+        rows = [[e.name or "-", str(e.port), e.access.capitalize(), e.external_url or e.internal_url or "-",
+                 e.readiness] for e in pod.endpoints]
+        colors = [[None, None, None, None, "green" if e.readiness == "ready" else "yellow"] for e in pod.endpoints]
+        fmt.render_table(["ENDPOINT", "PORT", "ACCESS", "URL", "STATE"], rows, aligns=["l", "r", "l", "l", "l"],
                          colors=colors, enabled=color)
     if pod.connect_credentials:
         print()

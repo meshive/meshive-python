@@ -5,13 +5,14 @@ only the transport differs (httpx.Client vs httpx.AsyncClient).
 
 Authentication: Meshive API key, `Authorization: Bearer meshive_...`. Reads, estimates, logs and downloads need the
 read scope; creating, changing or deleting workspaces, pods, storage, servings, tasks, model registrations and asset
-imports, SSH access, and changes to hosted machines (maintenance, listing, setup retries, removal, messages, machine
-credentials, install commands) need the write scope.
+imports, SSH access, port locks and access keys (listing keys is a read), and changes to hosted machines (maintenance,
+listing, setup retries, removal, messages, machine credentials, install commands) need the write scope.
 Read surface: account (me/api-keys/credit/earnings/payouts, the API-key activity log), workspaces (list/detail/members), pods (list/single/metrics,
 transactions), storage, machines (list/detail/metrics, maintenance windows, downtime and stress tests, host messages),
 GPU and CPU availability, templates and their model sets, serverless (servings/tasks), assets (Asset Hub).
 Retries are safe for both: GETs are idempotent, and writes resend the same Idempotency-Key, so the
-server replays the first response instead of creating twice.
+server replays the first response instead of creating twice. The writes the server does not deduplicate (running a
+command, issuing an access key) are resent only when the server surely never started on them.
 """
 from __future__ import annotations
 
@@ -39,18 +40,23 @@ from .exceptions import (
     AuthenticationError,
     ConfigurationError,
     ConflictError,
+    EndpointLockUnavailableError,
     InsufficientCreditError,
     MeshiveAPIError,
     MeshiveError,
     NotFoundError,
     PermissionDeniedError,
     PodCreationFailedError,
+    PortNotLockedError,
     RateLimitError,
     StorageConnectionError,
     WaitTimeoutError,
 )
 from .models import (
     ACTIVITY_OUTCOMES,
+    AccessKey,
+    AccessKeyCreated,
+    PortLock,
     CommandResult,
     CommandRun,
     UploadSession,
@@ -408,6 +414,78 @@ def _raise_for_status(status_code: int, payload: Any, headers: httpx.Headers) ->
     raise MeshiveAPIError(status_code, message, **common)
 
 
+# --- Port locks and access keys (shared by both clients) ------------------------------------------------
+
+_LOCK_DISABLED_CODE = "endpoint_lock_disabled"
+# What to do when the server can't lock: said in terms of the call that was refused.
+_LOCK_WAY_OUT = {
+    "create": "To create the pod with its public ports open, pass lock_public_ports=False (or locked=False on a "
+              "port). Otherwise try again later.",
+    "update": "To make the change with those ports open, pass lock_public_ports=False (or locked=False on a "
+              "port). Otherwise try again later.",
+}
+
+
+def _error_code(err: MeshiveAPIError) -> str | None:
+    detail = err.raw.get("detail") if isinstance(err.raw, dict) else None
+    code = detail.get("code") if isinstance(detail, dict) else None
+    return code if isinstance(code, str) else None
+
+
+def _lock_refused(err: MeshiveAPIError, action: str) -> MeshiveAPIError:
+    """The server's 409 for a pod request that locks a port while the platform has locking turned off, as an
+    EndpointLockUnavailableError that says how to go ahead. Nothing was created or changed, and the request is never
+    resent with the ports open. Any other error comes back as it is."""
+    if err.status_code != 409 or _error_code(err) != _LOCK_DISABLED_CODE:
+        return err
+    refused = EndpointLockUnavailableError(
+        f"Ports can't be locked on this Meshive server right now (locking is turned off), so nothing was "
+        f"{'created' if action == 'create' else 'changed'}. {_LOCK_WAY_OUT[action]}",
+        reason="disabled", title=err.title, raw=err.raw)
+    for name in ("idempotency_key", "operation_method", "operation_path"):
+        if hasattr(err, name):
+            setattr(refused, name, getattr(err, name))
+    return refused
+
+
+def _locks_supported(capabilities: Any) -> bool:
+    """Whether the server knows port locks at all: its capabilities carry pods.endpointLock (true or false). A server
+    without the key predates locks and would drop `locked` from a request without a word, creating the port open."""
+    pods = capabilities.get("pods") if isinstance(capabilities, dict) else None
+    return isinstance(pods, dict) and "endpointLock" in pods
+
+
+def _lock_unsupported(action: str) -> EndpointLockUnavailableError:
+    return EndpointLockUnavailableError(
+        "This Meshive API server does not support locking ports yet (it predates this SDK release) and would "
+        f"open them to anyone with the URL, so nothing was sent. {_LOCK_WAY_OUT[action]}", reason="unsupported")
+
+
+def _port_route_error(err: MeshiveAPIError) -> MeshiveAPIError:
+    """Errors of the port lock and access key routes, made understandable: an older server without the routes, and
+    a server where the platform has locking turned off (it then refuses to lock a port and to create or roll a key,
+    while unlocking, listing and revoking still work)."""
+    if err.status_code == 404 and _error_code(err) == _LOCK_DISABLED_CODE:
+        return NotFoundError(404, "Port locking is turned off on this Meshive server right now, so ports can't be "
+                                  "locked and access keys can't be created or rolled. Try again later.",
+                             title=err.title, raw=err.raw)
+    return _not_supported(err, "port locks and access keys")
+
+
+def _unlocked_ports(pod: Pod, port_locks: Any) -> list[int]:
+    """The ports that were created to be locked (port_locks[port] is True) and that the pod exposes without the lock.
+    A port the pod doesn't list, or keeps internal, isn't reachable from outside and isn't counted."""
+    wanted = {port for port, locked in dict(port_locks or {}).items() if locked is True}
+    return sorted(e.port for e in pod.endpoints if e.port in wanted and e.is_external and e.locked is not True)
+
+
+def _check_port_locks(pod: Pod, port_locks: Any) -> Pod:
+    ports = _unlocked_ports(pod, port_locks)
+    if ports:
+        raise PortNotLockedError(pod, ports)
+    return pod
+
+
 # --- Commands in a pod and file uploads (shared by both clients) ---------------------------------------
 
 COMMAND_MAX_TIMEOUT = 25        # seconds a foreground command may run (the server's limit)
@@ -555,10 +633,12 @@ _NOT_STARTED_EXCEPTIONS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolT
 _NOT_STARTED_STATUSES = frozenset({429, 503})
 
 
-def _may_resend(long_running: bool, *, exc: BaseException | None = None,
+def _may_resend(only_if_not_started: bool, *, exc: BaseException | None = None,
                 response: httpx.Response | None = None) -> bool:
-    """Whether a failed attempt may be resent at all (the retry budget and backoff are decided separately)."""
-    if not long_running:
+    """Whether a failed attempt may be resent at all (the retry budget and backoff are decided separately).
+    only_if_not_started: the write may not be repeated once the server has started on it — a long-running request,
+    or one the server doesn't deduplicate (a new access key) — so it is resent only when it surely never started."""
+    if not only_if_not_started:
         return True
     if exc is not None:
         return isinstance(exc, _NOT_STARTED_EXCEPTIONS)
@@ -616,8 +696,8 @@ class _BaseClient:
     def base_url(self) -> str:
         return self._base_url
 
-    def _url(self, path: str) -> str:
-        return f"{self._base_url}{_config.API_PREFIX}{path}"
+    def _url(self, path: str, prefix: str = _config.API_PREFIX) -> str:
+        return f"{self._base_url}{prefix}{path}"
 
     def _build_headers(self) -> dict[str, str]:
         if not self._api_key:
@@ -812,8 +892,8 @@ class Meshive(_BaseClient):
         else:
             self._client = httpx.Client(timeout=timeout, transport=transport)
 
-    def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        url = self._url(path)
+    def _get(self, path: str, params: dict[str, Any] | None = None, *, prefix: str = _config.API_PREFIX) -> Any:
+        url = self._url(path, prefix)
         headers = self._build_headers()
         attempt = 0
         while True:
@@ -832,10 +912,12 @@ class Meshive(_BaseClient):
 
     def _send(self, method: str, path: str, *, params: dict[str, Any] | None = None,
               json: dict[str, Any] | None = None, idempotency_key: str | None = None,
-              long_running: bool = False) -> Any:
+              long_running: bool = False, once: bool = False) -> Any:
         """Write request. Sent with an Idempotency-Key, so on retry the server replays the first response (no double creation).
         long_running: a request the server may work on for minutes — a long read timeout, and resent only when the
-        server surely never started on it (see LONG_RUNNING_READ_TIMEOUT)."""
+        server surely never started on it (see LONG_RUNNING_READ_TIMEOUT).
+        once: a write the server does not deduplicate (its answer holds a secret, so it isn't stored for a replay) —
+        the usual timeout, but like long_running it is resent only when the server surely never started on it."""
         url = self._url(path)
         headers = self._build_headers()
         headers["Idempotency-Key"] = idempotency_key or str(uuid.uuid4())
@@ -846,7 +928,7 @@ class Meshive(_BaseClient):
                 response = self._client.request(method, url, params=params, json=json, headers=headers,
                                                 timeout=timeout)
             except _RETRY_EXCEPTIONS as exc:
-                delay = self._retry_delay(attempt) if _may_resend(long_running, exc=exc) else None
+                delay = self._retry_delay(attempt) if _may_resend(long_running or once, exc=exc) else None
                 if delay is None:
                     _mark_operation(exc, headers["Idempotency-Key"], method, path)
                     raise
@@ -856,7 +938,7 @@ class Meshive(_BaseClient):
                 _mark_operation(exc, headers["Idempotency-Key"], method, path)
                 raise
             else:
-                delay = self._retry_delay(attempt, response) if _may_resend(long_running, response=response) else None
+                delay = self._retry_delay(attempt, response) if _may_resend(long_running or once, response=response) else None
                 if delay is None:
                     try:
                         data = self._process(response)
@@ -957,11 +1039,13 @@ class Meshive(_BaseClient):
         timeout: float = 600.0,
         interval: float = 5.0,
         transaction_id: int | str | None = None,
+        port_locks: dict[int, bool] | None = None,
     ) -> Pod:
         """Wait for a pod just created with `create_pod(name, ...)` to appear and reach `until`, and return it.
 
             created = client.create_pod("my-pod", template_id, workspace="my-workspace", gpu_model="RTX 3060")
-            pod = client.wait_for_new_pod("my-pod", "my-workspace", transaction_id=created.transaction_id)
+            pod = client.wait_for_new_pod("my-pod", "my-workspace", transaction_id=created.transaction_id,
+                                          port_locks=created.port_locks)
 
         create_pod returns before the pod has an ID, so this finds it by name (user_alias), then waits like
         wait_for_pod. With `transaction_id` (create_pod's `transaction_id`) it also follows the creation on every
@@ -969,6 +1053,8 @@ class Meshive(_BaseClient):
         is raised right away with the reason instead of waiting for the pod. Without it, or on a server that can't
         look the transaction up, only the pod is watched. Raises WaitTimeoutError if the pod doesn't appear or reach
         `until` within `timeout` seconds.
+        With `port_locks` (create_pod's `port_locks`) the pod's ports are checked once it is there: if a port that
+        was created to be locked is exposed without the lock, PortNotLockedError is raised (its `pod` is the pod).
         """
         if not name:
             raise ValueError("name is required")  # an empty name would match system pods, which have no label
@@ -977,9 +1063,10 @@ class Meshive(_BaseClient):
         while True:
             pod = next((p for p in self.list_pods(workspace) if p.user_alias == name), None)
             if pod is not None:
-                return self._wait_for_pod(pod.pod_name, workspace, until=until,
-                                          timeout=max(deadline - time.monotonic(), 0.0), interval=interval,
-                                          watch=watch)
+                pod = self._wait_for_pod(pod.pod_name, workspace, until=until,
+                                         timeout=max(deadline - time.monotonic(), 0.0), interval=interval,
+                                         watch=watch)
+                return _check_port_locks(pod, port_locks)
             self._check_creation(watch, workspace)
             _new_pod_expired(deadline, name, timeout)
             time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
@@ -1314,9 +1401,12 @@ class Meshive(_BaseClient):
                      harvest_destination: Any = None, local_volumes: Any = None,
                      cpu_line: str | None = None, template_ports: Any = None,
                      model_set: str | None = None, watched_template_folders: Any = None,
-                     hf_token_id: int | None = None) -> PodEstimate:
+                     hf_token_id: int | None = None, lock_public_ports: bool = True) -> PodEstimate:
         """Pod estimate — creates nothing (read scope is enough). Same arguments as create_pod; the price includes any
-        new local_volumes (breakdown "local_storage"), and `model_set` describes the model set when one is given."""
+        new local_volumes (breakdown "local_storage"), and `model_set` describes the model set when one is given.
+        `port_locks` lists the lock each exposed port would get, and a lock the server can't give is refused here
+        as it would be by create_pod (EndpointLockUnavailableError)."""
+        params = {"workspace": _query_value(workspace, "workspace")}
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
@@ -1325,9 +1415,16 @@ class Meshive(_BaseClient):
                                input_assets=input_assets, watched_folders=watched_folders,
                                harvest_destination=harvest_destination, local_volumes=local_volumes,
                                cpu_line=cpu_line, template_ports=template_ports, model_set=model_set,
-                               watched_template_folders=watched_template_folders, hf_token_id=hf_token_id)
-        return PodEstimate.from_dict(self._send("POST", "/pods/estimate",
-                                                 params={"workspace": _query_value(workspace, "workspace")}, json=body))
+                               watched_template_folders=watched_template_folders, hf_token_id=hf_token_id,
+                               lock_public_ports=lock_public_ports)
+        locks = self._pod_port_locks(body, template_id, params["workspace"], lock_public_ports, "create")
+        try:
+            data = self._send("POST", "/pods/estimate", params=params, json=body)
+        except MeshiveAPIError as err:
+            raise _lock_refused(err, "create") from None
+        estimate = PodEstimate.from_dict(data)
+        estimate.port_locks = locks
+        return estimate
 
     def create_pod(self, name: str, template_id: int, *, workspace: str, gpu_model: str | None = None,
                    gpu_count: int = 1, gpu_vram_gb: int | None = None, rental_type: str = "demand",
@@ -1339,7 +1436,7 @@ class Meshive(_BaseClient):
                    harvest_destination: Any = None, idempotency_key: str | None = None, local_volumes: Any = None,
                    cpu_line: str | None = None, template_ports: Any = None,
                    model_set: str | None = None, watched_template_folders: Any = None,
-                   hf_token_id: int | None = None) -> PodCreated:
+                   hf_token_id: int | None = None, lock_public_ports: bool = True) -> PodCreated:
         """Create a pod (202 accepted). It is billed hourly — check the price with estimate_pod first;
         max_price_per_hour caps the final hourly compute price. Placement above it can fail asynchronously.
         Storage (including the automatic PV) and asset storage charges are separate and not covered by the cap.
@@ -1376,7 +1473,18 @@ class Meshive(_BaseClient):
         the server refuses with 400 'Hugging Face token required'; 'License not accepted' / 'Access not approved' mean
         the token's account hasn't accepted the license (or isn't approved yet), and 'Hugging Face token rejected'
         means the token itself is invalid. Like model_set, this request waits for the files to be linked and isn't
-        resent after a timeout."""
+        resent after a timeout.
+
+        Ports exposed over HTTPS are created locked (lock_public_ports=True, the default): only workspace members
+        signed in to the console, and programs that send one of the port's access keys (create_access_key), get
+        through. A port in `ports` takes "locked": False to stay open to anyone with the URL, and so does a
+        template_ports item; a port the template opens follows the template author's choice when there is one.
+        lock_public_ports=False creates every exposed port open, as releases before 1.10 did. The SDK reads the
+        template first so that each of its exposed ports is sent with a lock value, and `port_locks` on the result
+        lists what was sent ({port: locked}); pass it to wait_for_new_pod to have the new pod checked.
+        When the server can't lock ports (the platform has locking turned off, or the server predates it),
+        EndpointLockUnavailableError is raised and nothing is created: the pod is never created open instead."""
+        params = {"workspace": _query_value(workspace, "workspace")}
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
@@ -1385,10 +1493,17 @@ class Meshive(_BaseClient):
                                input_assets=input_assets, watched_folders=watched_folders,
                                harvest_destination=harvest_destination, local_volumes=local_volumes,
                                cpu_line=cpu_line, template_ports=template_ports, model_set=model_set,
-                               watched_template_folders=watched_template_folders, hf_token_id=hf_token_id)
-        return PodCreated.from_dict(self._send("POST", "/pods", params={"workspace": _query_value(workspace, "workspace")},
-                                                json=body, idempotency_key=idempotency_key,
-                                                long_running="modelSet" in body or "hfTokenId" in body))
+                               watched_template_folders=watched_template_folders, hf_token_id=hf_token_id,
+                               lock_public_ports=lock_public_ports)
+        locks = self._pod_port_locks(body, template_id, params["workspace"], lock_public_ports, "create")
+        try:
+            data = self._send("POST", "/pods", params=params, json=body, idempotency_key=idempotency_key,
+                              long_running="modelSet" in body or "hfTokenId" in body)
+        except MeshiveAPIError as err:
+            raise _lock_refused(err, "create") from None
+        created = PodCreated.from_dict(data)
+        created.port_locks = locks
+        return created
 
     def stop_pod(self, pod_name: str, workspace: str, *, idempotency_key: str | None = None) -> ResourceAction:
         """Stop a pod (replicas=0). Pod billing stops; storage billing continues."""
@@ -1435,9 +1550,12 @@ class Meshive(_BaseClient):
                             detach_storages: Iterable[str] | None = None, allow_node_migration: bool | None = None,
                             allow_data_loss: bool | None = None, drop_watched_folders: Iterable[str] | None = None,
                             max_price_per_hour: Any = None,
-                            enable_folder_saving: bool | None = None) -> PodUpdateEstimate:
+                            enable_folder_saving: bool | None = None,
+                            lock_public_ports: bool = True) -> PodUpdateEstimate:
         """What update_pod would change, whether a running pod restarts, and the new hourly price — changes nothing
-        (read scope is enough). Same arguments as update_pod."""
+        (read scope is enough). Same arguments as update_pod. `port_locks` lists the lock values the change would
+        send, and a lock the server can't give is refused here as it would be by update_pod."""
+        params = {"workspace": _query_value(workspace, "workspace")}
         body = _write.pod_update_body(
             name=name, template_id=template_id, rental_type=rental_type, gpu_model=gpu_model, gpu_vram_gb=gpu_vram_gb,
             gpu_count=gpu_count, vcpu=vcpu, ram_gb=ram_gb, cpu_line=cpu_line, env=env, secret_keys=secret_keys,
@@ -1445,13 +1563,17 @@ class Meshive(_BaseClient):
             command=command, volumes=volumes, local_volumes=local_volumes, detach_storages=detach_storages,
             allow_node_migration=allow_node_migration, allow_data_loss=allow_data_loss,
             drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour,
-            enable_folder_saving=enable_folder_saving)
+            enable_folder_saving=enable_folder_saving, lock_public_ports=lock_public_ports)
+        locks = self._pod_port_locks(body, template_id, params["workspace"], lock_public_ports, "update",
+                                     pod_name)
         try:
-            data = self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/estimate",
-                              params={"workspace": _query_value(workspace, "workspace")}, json=body)
+            data = self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/estimate", params=params,
+                              json=body)
         except MeshiveAPIError as err:
-            raise _not_supported(err, "pod editing") from None
-        return PodUpdateEstimate.from_dict(data)
+            raise _not_supported(_lock_refused(err, "update"), "pod editing") from None
+        estimate = PodUpdateEstimate.from_dict(data)
+        estimate.port_locks = locks
+        return estimate
 
     def update_pod(self, pod_name: str, workspace: str, *, name: str | None = None,
                    template_id: int | None = None, rental_type: str | None = None, gpu_model: str | None = None,
@@ -1463,7 +1585,7 @@ class Meshive(_BaseClient):
                    detach_storages: Iterable[str] | None = None, allow_node_migration: bool | None = None,
                    allow_data_loss: bool | None = None, drop_watched_folders: Iterable[str] | None = None,
                    max_price_per_hour: Any = None, enable_folder_saving: bool | None = None,
-                   idempotency_key: str | None = None) -> PodUpdated:
+                   idempotency_key: str | None = None, lock_public_ports: bool = True) -> PodUpdated:
         """Change a pod as the console's edit screen does (202 accepted). Only what you pass changes.
 
         name renames it; template_id moves it to another template (variables, ports and command then start from
@@ -1488,7 +1610,20 @@ class Meshive(_BaseClient):
         raw["detail"]["paths"]; pass them as drop_watched_folders). ConflictError 'Resource values need
         confirmation' (an older pod) asks for ram_gb to be passed explicitly. Other refusals ('Nothing To Change',
         'Pod Type Locked', 'Incompatible Hardware', 'Port In Use', 'Cannot Change Resources', ...) carry the server's
-        explanation in the message."""
+        explanation in the message.
+
+        A port this call newly makes public is locked (lock_public_ports=True, the default), as in create_pod:
+        a new exposed port in `ports`, a port the pod keeps internal that `template_ports` exposes
+        ("external": True), and, with template_id, the exposed ports the new template adds (those follow the
+        template author's choice when there is one). lock_public_ports=False leaves those ports open to anyone
+        with the URL instead, and "locked": True or False on a port item decides for that port alone.
+        A port that is public already keeps the lock it has, whether it is locked or was unlocked on purpose:
+        lock_public_ports never touches it. Only naming it changes it — "locked" on its `template_ports` item
+        (applied without a restart), or set_port_lock.
+        To tell which ports are public already, the pod is read first when the change exposes a port or moves
+        the pod to another template; a change that makes nothing public sends no lock value and reads nothing.
+        A lock the server can't give is refused with EndpointLockUnavailableError and nothing is changed."""
+        params = {"workspace": _query_value(workspace, "workspace")}
         body = _write.pod_update_body(
             name=name, template_id=template_id, rental_type=rental_type, gpu_model=gpu_model, gpu_vram_gb=gpu_vram_gb,
             gpu_count=gpu_count, vcpu=vcpu, ram_gb=ram_gb, cpu_line=cpu_line, env=env, secret_keys=secret_keys,
@@ -1496,14 +1631,124 @@ class Meshive(_BaseClient):
             command=command, volumes=volumes, local_volumes=local_volumes, detach_storages=detach_storages,
             allow_node_migration=allow_node_migration, allow_data_loss=allow_data_loss,
             drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour,
-            enable_folder_saving=enable_folder_saving)
+            enable_folder_saving=enable_folder_saving, lock_public_ports=lock_public_ports)
+        locks = self._pod_port_locks(body, template_id, params["workspace"], lock_public_ports, "update",
+                                     pod_name)
         try:
-            data = self._send("PATCH", f"/pods/{_path_segment(pod_name, 'pod_name')}",
-                              params={"workspace": _query_value(workspace, "workspace")}, json=body,
+            data = self._send("PATCH", f"/pods/{_path_segment(pod_name, 'pod_name')}", params=params, json=body,
                               idempotency_key=idempotency_key)
         except MeshiveAPIError as err:
-            raise _not_supported(err, "pod editing") from None
-        return PodUpdated.from_dict(data)
+            raise _not_supported(_lock_refused(err, "update"), "pod editing") from None
+        updated = PodUpdated.from_dict(data)
+        updated.port_locks = locks
+        return updated
+
+    # --- Port locks and access keys ------------------------------------------------------
+
+    def _pod_port_locks(self, body: dict[str, Any], template_id: int | None, workspace: str, lock: bool,
+                        action: str, pod_name: str | None = None) -> dict[int, bool]:
+        """Finish a pod body's port locks and make sure the server will keep them. Returns {port: locked}.
+
+        Create: the template is read so that each port it exposes is sent with a lock value (the server never
+        applies the template's default itself).
+        Update (pod_name given): only ports the change newly makes public get a value. When the body exposes an
+        existing port or moves the pod to another template, the pod is read first to learn which ports are public
+        already: those keep their lock and get no value. An update that makes nothing public reads nothing.
+        If any port is to be locked, the server must know locks: one that doesn't would drop the value and create
+        the port open, so nothing is sent to it. A read that fails raises, and nothing is sent either."""
+        public_now: set[int] = set()
+        if pod_name is not None and _write.exposes_ports(body):
+            public_now = {e.port for e in self.get_pod(pod_name, workspace).endpoints if e.is_external}
+        if template_id is not None:
+            template = self.get_template(template_id, workspace)
+            _write.lock_template_ports(body, template.raw.get("endpoints"), lock, public_now)
+        elif pod_name is not None:
+            _write.lock_exposed_ports(body, public_now, lock)
+        locks = _write.port_locks(body)
+        if any(locks.values()):
+            try:
+                capabilities = self._get("/capabilities", prefix="/v1")
+            except MeshiveAPIError as err:
+                if err.status_code not in (404, 405):
+                    raise
+                capabilities = None
+            if not _locks_supported(capabilities):
+                raise _lock_unsupported(action)
+        return locks
+
+    def set_port_lock(self, pod_name: str, workspace: str, port: int, locked: bool, *,
+                      idempotency_key: str | None = None) -> PortLock:
+        """Lock (True) or unlock (False) one exposed port of a pod, without restarting it (write scope). A locked
+        port lets through only workspace members signed in to the console and programs that send one of the port's
+        access keys; an unlocked port is open to anyone with its URL. Unlocking keeps the port's keys: they work
+        again when it is locked again. Only ports exposed over HTTPS can be locked (400 'Not A Public Endpoint')."""
+        path = f"/pods/{_path_segment(pod_name, 'pod_name')}/ports/{_write.port_segment(port)}/lock"
+        try:
+            data = self._send("PATCH", path, params={"workspace": _query_value(workspace, "workspace")},
+                              json=_write.port_lock_body(locked), idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _port_route_error(err) from None
+        return PortLock.from_dict(data)
+
+    def list_access_keys(self, pod_name: str, workspace: str, port: int) -> list[AccessKey]:
+        """The access keys of one port that work now: name, first characters, who issued them and when they expire.
+        A key's value is never listed; it is shown once, by create_access_key or roll_access_key."""
+        path = f"/pods/{_path_segment(pod_name, 'pod_name')}/ports/{_write.port_segment(port)}/keys"
+        try:
+            data = self._get(path, params={"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _port_route_error(err) from None
+        return [AccessKey.from_dict(d) for d in data.get("keys") or [] if isinstance(d, dict)]
+
+    def create_access_key(self, pod_name: str, workspace: str, port: int, name: str, *,
+                          expires_in_days: int = 90) -> AccessKeyCreated:
+        """Create an access key for a locked port (write scope). Programs send its value as
+        `Authorization: Bearer <key>`, or as `X-Meshive-Key: <key>` when the app uses Authorization itself.
+        `access_key` on the result is the value: it is returned this once and can't be read again. expires_in_days is
+        30, 90 (the default) or 365, or 0 for a key that never expires. The port must be locked (400 'Endpoint Not
+        Locked'), and a port holds a limited number of keys (400 'Too Many Keys').
+        Not idempotent: every call creates another key, so a failed call is resent only when the server surely never
+        started on it. After a timeout, check list_access_keys before calling again, and revoke a key you can't use."""
+        path = f"/pods/{_path_segment(pod_name, 'pod_name')}/ports/{_write.port_segment(port)}/keys"
+        try:
+            data = self._send("POST", path, params={"workspace": _query_value(workspace, "workspace")},
+                              json=_write.access_key_body(name, expires_in_days), once=True)
+        except MeshiveAPIError as err:
+            raise _port_route_error(err) from None
+        return AccessKeyCreated.from_dict(data)
+
+    def roll_access_key(self, pod_name: str, workspace: str, port: int, key_id: int | str, *,
+                        overlap_seconds: int = 3600) -> AccessKeyCreated:
+        """Replace an access key's value (write scope): same name and port, a new value in `access_key` (returned
+        this once), and a new id. The old value keeps working for overlap_seconds — 3600 (the default), 86400 or
+        604800, or 0 to stop it at once — so clients can be moved to the new value; `previous_value_valid_until`
+        says until when. The new value expires after the same lifetime the key was created with, counted from now.
+        Not idempotent: every call issues another value, so it is resent only when the server surely never started
+        on it. After a timeout, check list_access_keys before calling again."""
+        path = (f"/pods/{_path_segment(pod_name, 'pod_name')}/ports/{_write.port_segment(port)}"
+                f"/keys/{_int_segment(key_id, 'key_id')}/roll")
+        try:
+            data = self._send("POST", path, params={"workspace": _query_value(workspace, "workspace")},
+                              json=_write.access_key_roll_body(overlap_seconds), once=True)
+        except MeshiveAPIError as err:
+            raise _port_route_error(err) from None
+        return AccessKeyCreated.from_dict(data)
+
+    def revoke_access_key(self, pod_name: str, workspace: str, port: int, key_id: int | str, *,
+                          idempotency_key: str | None = None) -> ResourceAction:
+        """Revoke an access key (write scope): its value stops working within seconds, and so does a previous value
+        that was still working after a roll. A connection that is already open (a WebSocket, for example) stays open
+        until it closes. It can't be undone; create a new key instead."""
+        key = _int_segment(key_id, "key_id")
+        path = f"/pods/{_path_segment(pod_name, 'pod_name')}/ports/{_write.port_segment(port)}/keys/{key}"
+        namespace = _query_value(workspace, "workspace")
+        try:
+            data = self._send("DELETE", path, params={"workspace": namespace}, idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _port_route_error(err) from None
+        data = data if isinstance(data, dict) else {}
+        return ResourceAction(resource="access_key", id=key, action="revoke", workspace=namespace, raw=data,
+                              replayed=bool(data.get("replayed", False)))
 
     # --- Writes: storage ---------------------------------------------------------------
 
@@ -2260,8 +2505,9 @@ class AsyncMeshive(_BaseClient):
         else:
             self._client = httpx.AsyncClient(timeout=timeout, transport=transport)
 
-    async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        url = self._url(path)
+    async def _get(self, path: str, params: dict[str, Any] | None = None, *,
+                   prefix: str = _config.API_PREFIX) -> Any:
+        url = self._url(path, prefix)
         headers = self._build_headers()
         attempt = 0
         while True:
@@ -2280,10 +2526,12 @@ class AsyncMeshive(_BaseClient):
 
     async def _send(self, method: str, path: str, *, params: dict[str, Any] | None = None,
               json: dict[str, Any] | None = None, idempotency_key: str | None = None,
-              long_running: bool = False) -> Any:
+              long_running: bool = False, once: bool = False) -> Any:
         """Write request. Sent with an Idempotency-Key, so on retry the server replays the first response (no double creation).
         long_running: a request the server may work on for minutes — a long read timeout, and resent only when the
-        server surely never started on it (see LONG_RUNNING_READ_TIMEOUT)."""
+        server surely never started on it (see LONG_RUNNING_READ_TIMEOUT).
+        once: a write the server does not deduplicate (its answer holds a secret, so it isn't stored for a replay) —
+        the usual timeout, but like long_running it is resent only when the server surely never started on it."""
         url = self._url(path)
         headers = self._build_headers()
         headers["Idempotency-Key"] = idempotency_key or str(uuid.uuid4())
@@ -2294,7 +2542,7 @@ class AsyncMeshive(_BaseClient):
                 response = await self._client.request(method, url, params=params, json=json, headers=headers,
                                                 timeout=timeout)
             except _RETRY_EXCEPTIONS as exc:
-                delay = self._retry_delay(attempt) if _may_resend(long_running, exc=exc) else None
+                delay = self._retry_delay(attempt) if _may_resend(long_running or once, exc=exc) else None
                 if delay is None:
                     _mark_operation(exc, headers["Idempotency-Key"], method, path)
                     raise
@@ -2304,7 +2552,7 @@ class AsyncMeshive(_BaseClient):
                 _mark_operation(exc, headers["Idempotency-Key"], method, path)
                 raise
             else:
-                delay = self._retry_delay(attempt, response) if _may_resend(long_running, response=response) else None
+                delay = self._retry_delay(attempt, response) if _may_resend(long_running or once, response=response) else None
                 if delay is None:
                     try:
                         data = self._process(response)
@@ -2397,9 +2645,11 @@ class AsyncMeshive(_BaseClient):
         timeout: float = 600.0,
         interval: float = 5.0,
         transaction_id: int | str | None = None,
+        port_locks: dict[int, bool] | None = None,
     ) -> Pod:
         """Wait for a pod just created with `create_pod(name, ...)` to appear and reach `until` (same rules as the
-        sync wait_for_new_pod, including `transaction_id` to report a failed creation right away)."""
+        sync wait_for_new_pod, including `transaction_id` to report a failed creation right away and `port_locks`
+        to check the new pod's locked ports)."""
         if not name:
             raise ValueError("name is required")  # an empty name would match system pods, which have no label
         watch = _CreationWatch(name, transaction_id, _wait_targets(until)[0])
@@ -2407,9 +2657,10 @@ class AsyncMeshive(_BaseClient):
         while True:
             pod = next((p for p in await self.list_pods(workspace) if p.user_alias == name), None)
             if pod is not None:
-                return await self._wait_for_pod(pod.pod_name, workspace, until=until,
-                                                timeout=max(deadline - time.monotonic(), 0.0), interval=interval,
-                                                watch=watch)
+                pod = await self._wait_for_pod(pod.pod_name, workspace, until=until,
+                                               timeout=max(deadline - time.monotonic(), 0.0), interval=interval,
+                                               watch=watch)
+                return _check_port_locks(pod, port_locks)
             await self._check_creation(watch, workspace)
             _new_pod_expired(deadline, name, timeout)
             await asyncio.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
@@ -2702,9 +2953,12 @@ class AsyncMeshive(_BaseClient):
                      harvest_destination: Any = None, local_volumes: Any = None,
                      cpu_line: str | None = None, template_ports: Any = None,
                      model_set: str | None = None, watched_template_folders: Any = None,
-                     hf_token_id: int | None = None) -> PodEstimate:
+                     hf_token_id: int | None = None, lock_public_ports: bool = True) -> PodEstimate:
         """Pod estimate — creates nothing (read scope is enough). Same arguments as create_pod; the price includes any
-        new local_volumes (breakdown "local_storage"), and `model_set` describes the model set when one is given."""
+        new local_volumes (breakdown "local_storage"), and `model_set` describes the model set when one is given.
+        `port_locks` lists the lock each exposed port would get, and a lock the server can't give is refused here
+        as it would be by create_pod (EndpointLockUnavailableError)."""
+        params = {"workspace": _query_value(workspace, "workspace")}
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
@@ -2713,9 +2967,16 @@ class AsyncMeshive(_BaseClient):
                                input_assets=input_assets, watched_folders=watched_folders,
                                harvest_destination=harvest_destination, local_volumes=local_volumes,
                                cpu_line=cpu_line, template_ports=template_ports, model_set=model_set,
-                               watched_template_folders=watched_template_folders, hf_token_id=hf_token_id)
-        return PodEstimate.from_dict(await self._send("POST", "/pods/estimate",
-                                                 params={"workspace": _query_value(workspace, "workspace")}, json=body))
+                               watched_template_folders=watched_template_folders, hf_token_id=hf_token_id,
+                               lock_public_ports=lock_public_ports)
+        locks = await self._pod_port_locks(body, template_id, params["workspace"], lock_public_ports, "create")
+        try:
+            data = await self._send("POST", "/pods/estimate", params=params, json=body)
+        except MeshiveAPIError as err:
+            raise _lock_refused(err, "create") from None
+        estimate = PodEstimate.from_dict(data)
+        estimate.port_locks = locks
+        return estimate
 
     async def create_pod(self, name: str, template_id: int, *, workspace: str, gpu_model: str | None = None,
                    gpu_count: int = 1, gpu_vram_gb: int | None = None, rental_type: str = "demand",
@@ -2727,7 +2988,7 @@ class AsyncMeshive(_BaseClient):
                    harvest_destination: Any = None, idempotency_key: str | None = None, local_volumes: Any = None,
                    cpu_line: str | None = None, template_ports: Any = None,
                    model_set: str | None = None, watched_template_folders: Any = None,
-                   hf_token_id: int | None = None) -> PodCreated:
+                   hf_token_id: int | None = None, lock_public_ports: bool = True) -> PodCreated:
         """Create a pod (202 accepted). It is billed hourly — check the price with estimate_pod first;
         max_price_per_hour caps the final hourly compute price. Placement above it can fail asynchronously.
         Storage (including the automatic PV) and asset storage charges are separate and not covered by the cap.
@@ -2764,7 +3025,13 @@ class AsyncMeshive(_BaseClient):
         the server refuses with 400 'Hugging Face token required'; 'License not accepted' / 'Access not approved' mean
         the token's account hasn't accepted the license (or isn't approved yet), and 'Hugging Face token rejected'
         means the token itself is invalid. Like model_set, this request waits for the files to be linked and isn't
-        resent after a timeout."""
+        resent after a timeout.
+
+        Ports exposed over HTTPS are created locked (lock_public_ports=True, the default), with the same rules as
+        the sync create_pod: per-port "locked", the template author's choice for the template's ports,
+        lock_public_ports=False for open ports, `port_locks` on the result, and EndpointLockUnavailableError
+        (nothing created) when the server can't lock ports."""
+        params = {"workspace": _query_value(workspace, "workspace")}
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
                                rental_type=rental_type, vcpu=vcpu, ram_gb=ram_gb, volumes=volumes,
                                env=env, secret_keys=secret_keys, ports=ports, command=command,
@@ -2773,10 +3040,17 @@ class AsyncMeshive(_BaseClient):
                                input_assets=input_assets, watched_folders=watched_folders,
                                harvest_destination=harvest_destination, local_volumes=local_volumes,
                                cpu_line=cpu_line, template_ports=template_ports, model_set=model_set,
-                               watched_template_folders=watched_template_folders, hf_token_id=hf_token_id)
-        return PodCreated.from_dict(await self._send("POST", "/pods", params={"workspace": _query_value(workspace, "workspace")},
-                                                json=body, idempotency_key=idempotency_key,
-                                                long_running="modelSet" in body or "hfTokenId" in body))
+                               watched_template_folders=watched_template_folders, hf_token_id=hf_token_id,
+                               lock_public_ports=lock_public_ports)
+        locks = await self._pod_port_locks(body, template_id, params["workspace"], lock_public_ports, "create")
+        try:
+            data = await self._send("POST", "/pods", params=params, json=body, idempotency_key=idempotency_key,
+                                    long_running="modelSet" in body or "hfTokenId" in body)
+        except MeshiveAPIError as err:
+            raise _lock_refused(err, "create") from None
+        created = PodCreated.from_dict(data)
+        created.port_locks = locks
+        return created
 
     async def stop_pod(self, pod_name: str, workspace: str, *, idempotency_key: str | None = None) -> ResourceAction:
         """Stop a pod (replicas=0). Pod billing stops; storage billing continues."""
@@ -2823,8 +3097,10 @@ class AsyncMeshive(_BaseClient):
                                   detach_storages: Iterable[str] | None = None, allow_node_migration: bool | None = None,
                                   allow_data_loss: bool | None = None, drop_watched_folders: Iterable[str] | None = None,
                                   max_price_per_hour: Any = None,
-                                  enable_folder_saving: bool | None = None) -> PodUpdateEstimate:
+                                  enable_folder_saving: bool | None = None,
+                                  lock_public_ports: bool = True) -> PodUpdateEstimate:
         """What update_pod would change and cost (POST /pods/{pod}/estimate). Same contract as the sync client."""
+        params = {"workspace": _query_value(workspace, "workspace")}
         body = _write.pod_update_body(
             name=name, template_id=template_id, rental_type=rental_type, gpu_model=gpu_model, gpu_vram_gb=gpu_vram_gb,
             gpu_count=gpu_count, vcpu=vcpu, ram_gb=ram_gb, cpu_line=cpu_line, env=env, secret_keys=secret_keys,
@@ -2832,13 +3108,17 @@ class AsyncMeshive(_BaseClient):
             command=command, volumes=volumes, local_volumes=local_volumes, detach_storages=detach_storages,
             allow_node_migration=allow_node_migration, allow_data_loss=allow_data_loss,
             drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour,
-            enable_folder_saving=enable_folder_saving)
+            enable_folder_saving=enable_folder_saving, lock_public_ports=lock_public_ports)
+        locks = await self._pod_port_locks(body, template_id, params["workspace"], lock_public_ports, "update",
+                                           pod_name)
         try:
-            data = await self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/estimate",
-                              params={"workspace": _query_value(workspace, "workspace")}, json=body)
+            data = await self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/estimate", params=params,
+                                    json=body)
         except MeshiveAPIError as err:
-            raise _not_supported(err, "pod editing") from None
-        return PodUpdateEstimate.from_dict(data)
+            raise _not_supported(_lock_refused(err, "update"), "pod editing") from None
+        estimate = PodUpdateEstimate.from_dict(data)
+        estimate.port_locks = locks
+        return estimate
 
     async def update_pod(self, pod_name: str, workspace: str, *, name: str | None = None,
                          template_id: int | None = None, rental_type: str | None = None, gpu_model: str | None = None,
@@ -2850,8 +3130,11 @@ class AsyncMeshive(_BaseClient):
                          detach_storages: Iterable[str] | None = None, allow_node_migration: bool | None = None,
                          allow_data_loss: bool | None = None, drop_watched_folders: Iterable[str] | None = None,
                          max_price_per_hour: Any = None, enable_folder_saving: bool | None = None,
-                         idempotency_key: str | None = None) -> PodUpdated:
-        """Change a pod (PATCH /pods/{pod}, 202). Same contract as the sync client."""
+                         idempotency_key: str | None = None, lock_public_ports: bool = True) -> PodUpdated:
+        """Change a pod (PATCH /pods/{pod}, 202). Same contract as the sync client: a port the call newly makes
+        public is locked unless lock_public_ports=False or its item says otherwise, and a port that is public
+        already keeps its lock."""
+        params = {"workspace": _query_value(workspace, "workspace")}
         body = _write.pod_update_body(
             name=name, template_id=template_id, rental_type=rental_type, gpu_model=gpu_model, gpu_vram_gb=gpu_vram_gb,
             gpu_count=gpu_count, vcpu=vcpu, ram_gb=ram_gb, cpu_line=cpu_line, env=env, secret_keys=secret_keys,
@@ -2859,14 +3142,102 @@ class AsyncMeshive(_BaseClient):
             command=command, volumes=volumes, local_volumes=local_volumes, detach_storages=detach_storages,
             allow_node_migration=allow_node_migration, allow_data_loss=allow_data_loss,
             drop_watched_folders=drop_watched_folders, max_price_per_hour=max_price_per_hour,
-            enable_folder_saving=enable_folder_saving)
+            enable_folder_saving=enable_folder_saving, lock_public_ports=lock_public_ports)
+        locks = await self._pod_port_locks(body, template_id, params["workspace"], lock_public_ports, "update",
+                                           pod_name)
         try:
-            data = await self._send("PATCH", f"/pods/{_path_segment(pod_name, 'pod_name')}",
-                              params={"workspace": _query_value(workspace, "workspace")}, json=body,
-                              idempotency_key=idempotency_key)
+            data = await self._send("PATCH", f"/pods/{_path_segment(pod_name, 'pod_name')}", params=params, json=body,
+                                    idempotency_key=idempotency_key)
         except MeshiveAPIError as err:
-            raise _not_supported(err, "pod editing") from None
-        return PodUpdated.from_dict(data)
+            raise _not_supported(_lock_refused(err, "update"), "pod editing") from None
+        updated = PodUpdated.from_dict(data)
+        updated.port_locks = locks
+        return updated
+
+    # --- Port locks and access keys ------------------------------------------------------
+
+    async def _pod_port_locks(self, body: dict[str, Any], template_id: int | None, workspace: str, lock: bool,
+                              action: str, pod_name: str | None = None) -> dict[int, bool]:
+        """Finish a pod body's port locks and make sure the server will keep them (see the sync client)."""
+        public_now: set[int] = set()
+        if pod_name is not None and _write.exposes_ports(body):
+            public_now = {e.port for e in (await self.get_pod(pod_name, workspace)).endpoints if e.is_external}
+        if template_id is not None:
+            template = await self.get_template(template_id, workspace)
+            _write.lock_template_ports(body, template.raw.get("endpoints"), lock, public_now)
+        elif pod_name is not None:
+            _write.lock_exposed_ports(body, public_now, lock)
+        locks = _write.port_locks(body)
+        if any(locks.values()):
+            try:
+                capabilities = await self._get("/capabilities", prefix="/v1")
+            except MeshiveAPIError as err:
+                if err.status_code not in (404, 405):
+                    raise
+                capabilities = None
+            if not _locks_supported(capabilities):
+                raise _lock_unsupported(action)
+        return locks
+
+    async def set_port_lock(self, pod_name: str, workspace: str, port: int, locked: bool, *,
+                            idempotency_key: str | None = None) -> PortLock:
+        """Lock (True) or unlock (False) one exposed port of a pod, without restarting it. Same contract as the sync
+        client."""
+        path = f"/pods/{_path_segment(pod_name, 'pod_name')}/ports/{_write.port_segment(port)}/lock"
+        try:
+            data = await self._send("PATCH", path, params={"workspace": _query_value(workspace, "workspace")},
+                                    json=_write.port_lock_body(locked), idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _port_route_error(err) from None
+        return PortLock.from_dict(data)
+
+    async def list_access_keys(self, pod_name: str, workspace: str, port: int) -> list[AccessKey]:
+        """The access keys of one port that work now (never their values). Same contract as the sync client."""
+        path = f"/pods/{_path_segment(pod_name, 'pod_name')}/ports/{_write.port_segment(port)}/keys"
+        try:
+            data = await self._get(path, params={"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _port_route_error(err) from None
+        return [AccessKey.from_dict(d) for d in data.get("keys") or [] if isinstance(d, dict)]
+
+    async def create_access_key(self, pod_name: str, workspace: str, port: int, name: str, *,
+                                expires_in_days: int = 90) -> AccessKeyCreated:
+        """Create an access key for a locked port; `access_key` on the result is its value, returned this once. Same
+        contract as the sync client: not idempotent, and resent only when the server surely never started on it."""
+        path = f"/pods/{_path_segment(pod_name, 'pod_name')}/ports/{_write.port_segment(port)}/keys"
+        try:
+            data = await self._send("POST", path, params={"workspace": _query_value(workspace, "workspace")},
+                                    json=_write.access_key_body(name, expires_in_days), once=True)
+        except MeshiveAPIError as err:
+            raise _port_route_error(err) from None
+        return AccessKeyCreated.from_dict(data)
+
+    async def roll_access_key(self, pod_name: str, workspace: str, port: int, key_id: int | str, *,
+                              overlap_seconds: int = 3600) -> AccessKeyCreated:
+        """Replace an access key's value; the old one keeps working for overlap_seconds. Same contract as the sync
+        client: not idempotent, and resent only when the server surely never started on it."""
+        path = (f"/pods/{_path_segment(pod_name, 'pod_name')}/ports/{_write.port_segment(port)}"
+                f"/keys/{_int_segment(key_id, 'key_id')}/roll")
+        try:
+            data = await self._send("POST", path, params={"workspace": _query_value(workspace, "workspace")},
+                                    json=_write.access_key_roll_body(overlap_seconds), once=True)
+        except MeshiveAPIError as err:
+            raise _port_route_error(err) from None
+        return AccessKeyCreated.from_dict(data)
+
+    async def revoke_access_key(self, pod_name: str, workspace: str, port: int, key_id: int | str, *,
+                                idempotency_key: str | None = None) -> ResourceAction:
+        """Revoke an access key: its value stops working within seconds. Same contract as the sync client."""
+        key = _int_segment(key_id, "key_id")
+        path = f"/pods/{_path_segment(pod_name, 'pod_name')}/ports/{_write.port_segment(port)}/keys/{key}"
+        namespace = _query_value(workspace, "workspace")
+        try:
+            data = await self._send("DELETE", path, params={"workspace": namespace}, idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _port_route_error(err) from None
+        data = data if isinstance(data, dict) else {}
+        return ResourceAction(resource="access_key", id=key, action="revoke", workspace=namespace, raw=data,
+                              replayed=bool(data.get("replayed", False)))
 
     # --- Writes: storage ---------------------------------------------------------------
 

@@ -492,9 +492,12 @@ def _gather_all_pods(client: Meshive) -> list[Pod]:
     pods: list[Pod] = []
     for ws in client.list_workspaces():
         try:
-            pods.extend(client.list_pods(ws.namespace_name))
+            workspace_pods = client.list_pods(ws.namespace_name)
+            for pod in workspace_pods:
+                pod.workspace_name = ws.workspace_name
+            pods.extend(workspace_pods)
         except MeshiveError as err:
-            print(fmt.clean(f"Warning: skipped workspace {ws.namespace_name}: {err}"), file=sys.stderr)
+            print(fmt.clean(f"Warning: skipped workspace {ws.workspace_name or ws.namespace_name}: {err}"), file=sys.stderr)
     return pods
 
 
@@ -564,15 +567,16 @@ def _print_workspaces(workspaces: list[Workspace], color: bool) -> None:
         return
     # NAME = workspace_name (user label), ID = namespace_name (lookup key).
     rows = [
-        [ws.workspace_name or "-", ws.namespace_name, ws.member_role or "-", fmt.status_cell(ws.status),
+        [ws.workspace_name or "-", ws.namespace_name, ", ".join(ws.owner_emails) or "unknown",
+         ws.member_role or "-", fmt.status_cell(ws.status),
          str(ws.resources.pod), fmt.money_hourly(ws.price_per_hour)]
         for ws in workspaces
     ]
-    colors = [[None, None, None, fmt.status_color(ws.status), None, None] for ws in workspaces]
+    colors = [[None, None, None, None, fmt.status_color(ws.status), None, None] for ws in workspaces]
     fmt.render_table(
-        ["NAME", "ID", "ROLE", "STATUS", "PODS", "PRICE/HR"],
+        ["NAME", "ID", "OWNER", "ROLE", "STATUS", "PODS", "PRICE/HR"],
         rows,
-        aligns=["l", "l", "l", "l", "r", "r"],
+        aligns=["l", "l", "l", "l", "l", "r", "r"],
         colors=colors,
         enabled=color,
     )
@@ -614,7 +618,7 @@ def _print_pods(pods: list[Pod], color: bool, show_workspace: bool = False) -> N
     if not pods:
         print("No pods.")
         return
-    # NAME = user_alias (user label), ID = pod_name (lookup key). --all adds WORKSPACE (namespace_name).
+    # NAME = user_alias (user label), ID = pod_name (lookup key). --all adds the workspace's display name.
     headers = ["NAME", "ID"]
     aligns = ["l", "l"]
     if show_workspace:
@@ -629,7 +633,7 @@ def _print_pods(pods: list[Pod], color: bool, show_workspace: bool = False) -> N
         row = [pod.user_alias or "-", pod.pod_name]
         color_row = [None, None]
         if show_workspace:
-            row.append(pod.namespace_name)
+            row.append(pod.workspace_name or pod.namespace_name)
             color_row.append(None)
         row += [fmt.status_cell(pod.status), pod.rental_type,
                 _pod_price(pod), fmt.relative_time(pod.created_at)]
@@ -646,11 +650,13 @@ def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
         created = f"{fmt.relative_time(pod.created_at)} ({pod.created_at.isoformat()})"
     print(f"name:      {fmt.clean(pod.user_alias or '-')}")  # user label
     print(f"id:        {fmt.clean(pod.pod_name)}")           # lookup key
-    print(f"workspace: {fmt.clean(pod.namespace_name)}")
+    print(f"workspace: {fmt.clean(pod.workspace_name or pod.namespace_name)}")
     print(f"status:    {fmt.paint(fmt.clean(fmt.status_cell(pod.status)), fmt.status_color(pod.status), color)}")
     print(f"rental:    {fmt.clean(pod.rental_type)}")
     print(f"price/hr:  {_pod_price(pod)}")
     print(f"created:   {created}")
+    if pod.template_name:
+        print(f"template:  {fmt.clean(pod.template_name)}")
     # The lines below are printed only when they apply (only when meaningful, not a list of booleans).
     premiums = [n for n, on in (("cpu", pod.cpu_premium), ("uptime", pod.uptime_premium),
                                 ("internet", pod.internet_premium)) if on]
@@ -667,6 +673,12 @@ def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
     if pod.is_maintenance:
         # The server sets is_maintenance while the host's maintenance window is open, and doesn't bill the pod then.
         print(fmt.paint("⚠ host maintenance: not billed while the window is open", "yellow", color))
+    if pod.linked_storages:
+        print()
+        rows = [[s.user_alias or s.pv_name, s.mount_path, fmt.gib(s.capacity), s.storage_type]
+                for s in pod.linked_storages]
+        fmt.render_table(["STORAGE", "MOUNT", "SIZE", "TYPE"], rows,
+                         aligns=["l", "l", "r", "l"], enabled=color)
     if pod.endpoints:
         print()
         rows = [[e.name or "-", str(e.port), e.external_url or e.internal_url or "-", e.readiness]
@@ -755,7 +767,9 @@ def _print_storage(s: Storage, color: bool) -> None:
     print(f"status:    {fmt.paint(fmt.clean(fmt.status_cell(s.status)), fmt.status_color(s.status), color)}")
     print(f"size:      {fmt.gib(s.total_size)}, {fmt.usage(s.usage_rate)} used ({fmt.gib(s.available_size)} free)")
     print(f"price/hr:  {fmt.money_hourly(s.price_per_hour)}")
-    print(f"pods:      {fmt.clean(', '.join(s.linked_pods)) if s.linked_pods else '-'}")
+    pod_labels = ([p.user_alias or p.pod_name for p in s.linked_pod_details]
+                  if s.linked_pod_details else s.linked_pods)
+    print(f"pods:      {fmt.clean(', '.join(pod_labels)) if pod_labels else '-'}")
     print(f"encrypted: {fmt.yes_no(s.encrypted)}")
     print(f"created:   {created}")
     if s.is_maintenance:

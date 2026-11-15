@@ -1,7 +1,7 @@
 """SDK response dataclasses.
 
 Server responses are camelCase (JSON), so from_dict reads camelCase keys.
-Deeply nested fields (a pod's machine/template/request, ...) aren't typed one by one;
+Deeply nested fields (a pod's machine/request, ...) aren't typed one by one;
 the original dict is kept in `.raw` → the SDK doesn't break when the backend adds fields.
 """
 from __future__ import annotations
@@ -84,6 +84,8 @@ class Workspace:
     # The key owner's role in this workspace — admin | billing | viewer. Writes are 403 for viewer.
     # For display, not authorization (the server checks again on every write). None if the server doesn't know.
     member_role: str | None = None
+    # Current billing members. A billing-role transfer changes this display information; [] means no owner is known.
+    owner_emails: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict) -> "Workspace":
@@ -98,6 +100,7 @@ class Workspace:
             created_at=_parse_dt(d.get("createdAt")),
             updated_at=_parse_dt(d.get("updatedAt")),
             member_role=d.get("memberRole"),
+            owner_emails=list(d.get("ownerEmails") or []),
             raw=d,
         )
 
@@ -146,11 +149,32 @@ class ConnectCredential:
 
 
 @dataclass
+class PodStorage:
+    """A volume mounted by a Pod. Capacity is in MiB; names are display data."""
+
+    pv_name: str
+    user_alias: str
+    mount_path: str
+    capacity: int
+    storage_type: str
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PodStorage":
+        return cls(
+            pv_name=str(d.get("pvName", "") or ""),
+            user_alias=str(d.get("userAlias", "") or ""),
+            mount_path=str(d.get("mountPath", "") or ""),
+            capacity=_as_int(d.get("capacity")),
+            storage_type=str(d.get("storageType", "") or ""),
+        )
+
+
+@dataclass
 class Pod:
     """GET /v1/sdk/pods[/{name}] item.
 
     Types the commonly used top-level scalars and connection info (endpoints, connect_credentials).
-    The remaining nested structures (machine/template/request/linkedStorages, ...) are in `.raw`.
+    The remaining nested structures (machine/template configuration/request, ...) are in `.raw`.
     Values the server didn't send are None (older servers) — don't read them as False/0.
     """
 
@@ -184,6 +208,10 @@ class Pod:
     container_running_at: datetime | None = None  # when the connect Pod's container became Running
     # Set when the pod is terminated because creating it failed (the platform cleans it up), not because it was deleted.
     creation_failure_reason: str | None = None
+    template_id: int | None = None
+    template_name: str | None = None
+    linked_storages: list[PodStorage] = field(default_factory=list)
+    workspace_name: str | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Pod":
@@ -221,6 +249,10 @@ class Pod:
             stop_reason_at=_parse_dt(d.get("stopReasonAt")),
             container_running_at=_parse_dt(d.get("containerRunningAt")),
             creation_failure_reason=(d.get("creationFailure") or {}).get("reason"),
+            template_id=_as_int(template["id"]) if template.get("id") is not None else None,
+            template_name=template.get("name"),
+            linked_storages=[PodStorage.from_dict(s) for s in d.get("linkedStorages") or [] if isinstance(s, dict)],
+            workspace_name=d.get("workspaceName"),
             raw=d,
         )
 
@@ -293,6 +325,135 @@ class SshAccess:
                    web_url=str(d.get("sshWebUrl", "") or ""),
                    expires_at=None if expired is None else datetime.fromtimestamp(_as_int(expired), tz=timezone.utc),
                    raw=d)
+
+
+@dataclass
+class CommandResult:
+    """POST /v1/sdk/pods/{pod}/exec response — a command run in a pod's main container.
+
+    A command run in the foreground has `exit_code` (None if it was cut off), `stdout`, `stderr` (together at most 64
+    KiB; `truncated` says more was printed) and `timed_out`. A background command (`mode` "background") has only
+    `run_id` and `log_path`: read it with get_command_run."""
+
+    pod_name: str
+    workspace: str
+    mode: str                       # run | background
+    exit_code: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    truncated: bool = False
+    timed_out: bool = False
+    duration_ms: int | None = None
+    run_id: str | None = None
+    log_path: str | None = None
+    stop_command: str | None = None   # background: run it with run_command to stop the run and what it started
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CommandResult":
+        duration = d.get("durationMs")
+        return cls(pod_name=str(d.get("podName", "") or ""), workspace=str(d.get("workspace", "") or ""),
+                   mode=str(d.get("mode", "run") or "run"),
+                   exit_code=None if d.get("exitCode") is None else _as_int(d.get("exitCode")),
+                   stdout=str(d.get("stdout", "") or ""), stderr=str(d.get("stderr", "") or ""),
+                   truncated=bool(d.get("truncated", False)), timed_out=bool(d.get("timedOut", False)),
+                   duration_ms=None if duration is None else _as_int(duration),
+                   run_id=d.get("runId"), log_path=d.get("logPath"), stop_command=d.get("stopCommand"), raw=d)
+
+
+@dataclass
+class CommandRun:
+    """GET /v1/sdk/pods/{pod}/exec/{run_id} response — a background command: `state` running | exited | lost
+    (stopped without an exit code, e.g. killed) | unknown, the exit code once it exited, and the end of its output.
+    A pod restart loses its runs."""
+
+    pod_name: str
+    workspace: str
+    run_id: str
+    state: str
+    exit_code: int | None = None
+    output: str = ""
+    truncated: bool = False
+    log_bytes: int = 0
+    log_path: str = ""
+    stop_command: str | None = None   # while running: run it with run_command to stop the run
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def finished(self) -> bool:
+        return self.state in ("exited", "lost")
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CommandRun":
+        return cls(pod_name=str(d.get("podName", "") or ""), workspace=str(d.get("workspace", "") or ""),
+                   run_id=str(d.get("runId", "") or ""), state=str(d.get("state", "unknown") or "unknown"),
+                   exit_code=None if d.get("exitCode") is None else _as_int(d.get("exitCode")),
+                   output=str(d.get("output", "") or ""), truncated=bool(d.get("truncated", False)),
+                   log_bytes=_as_int(d.get("logBytes")), log_path=str(d.get("logPath", "") or ""),
+                   stop_command=d.get("stopCommand"), raw=d)
+
+
+@dataclass
+class UploadTarget:
+    """One file of an upload session. `mode` "single": PUT the whole file to `url` (with its exact size as
+    Content-Length). "multipart": get part URLs with asset_upload_part_urls and PUT `part_size_bytes` pieces."""
+
+    file_id: int
+    relative_path: str
+    mode: str
+    url: str | None = field(default=None, repr=False)
+    part_size_bytes: int | None = None
+    part_count: int | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "UploadTarget":
+        size = d.get("partSizeBytes")
+        count = d.get("partCount")
+        return cls(file_id=_as_int(d.get("fileId")), relative_path=str(d.get("relativePath", "") or ""),
+                   mode=str(d.get("mode", "") or ""), url=d.get("url"),
+                   part_size_bytes=None if size is None else _as_int(size),
+                   part_count=None if count is None else _as_int(count))
+
+
+@dataclass
+class UploadSession:
+    """POST /v1/sdk/assets/uploads response — a new asset waiting for its files. The upload URLs expire after
+    `presign_expires_in` seconds (ask again with asset_upload_part_urls); the session itself stays open until
+    `expires_at`."""
+
+    upload_id: str                  # the new asset's id (asset_...)
+    name: str
+    files: list[UploadTarget]
+    presign_expires_in: int = 0
+    expires_at: datetime | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "UploadSession":
+        return cls(upload_id=str(d.get("uploadId", "") or ""), name=str(d.get("name", "") or ""),
+                   files=[UploadTarget.from_dict(f) for f in d.get("files") or []],
+                   presign_expires_in=_as_int(d.get("presignExpiresIn")),
+                   expires_at=_parse_dt(d.get("uploadExpiresAt")), raw=d)
+
+
+@dataclass
+class UploadedAsset:
+    """POST /v1/sdk/assets/uploads/{id}/complete response — the uploaded asset, `status` "ready" when done."""
+
+    asset_id: str
+    name: str
+    status: str
+    total_size_bytes: int
+    file_count: int
+    content_hash: str | None = None
+    skipped_empty_files: int = 0    # upload_asset of a folder: empty files left out (the server takes none)
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "UploadedAsset":
+        return cls(asset_id=str(d.get("assetExternalId", "") or ""), name=str(d.get("name", "") or ""),
+                   status=str(d.get("status", "") or ""), total_size_bytes=_as_int(d.get("totalSizeBytes")),
+                   file_count=_as_int(d.get("fileCount")), content_hash=d.get("contentHash"), raw=d)
 
 
 @dataclass
@@ -569,6 +730,25 @@ class Transaction:
 
 
 @dataclass
+class StoragePod:
+    """A Pod attached to a storage volume, with its display name and mount path."""
+
+    pod_name: str
+    user_alias: str
+    mount_path: str
+    is_downloader: bool = False
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "StoragePod":
+        return cls(
+            pod_name=str(d.get("podName", "") or ""),
+            user_alias=str(d.get("userAlias", "") or ""),
+            mount_path=str(d.get("mountPath", "") or ""),
+            is_downloader=bool(d.get("isDownloader", False)),
+        )
+
+
+@dataclass
 class Storage:
     """GET /v1/sdk/storages[/{storage_name}] item — a workspace volume (PV).
 
@@ -584,11 +764,12 @@ class Storage:
     available_size: float
     usage_rate: float          # 0.0~1.0
     price_per_hour: str
-    linked_pods: list[str] = field(default_factory=list)   # names of attached pods
+    linked_pods: list[str] = field(default_factory=list)   # lookup keys of attached pods (retained for compatibility)
     is_maintenance: bool = False
     encrypted: bool = False
     created_at: datetime | None = None
     raw: dict = field(default_factory=dict, repr=False)
+    linked_pod_details: list[StoragePod] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict) -> "Storage":
@@ -603,6 +784,7 @@ class Storage:
             usage_rate=_as_float(d.get("usageRate")),
             price_per_hour=str(d.get("pricePerHour", "0")),
             linked_pods=[p.get("podName", "") for p in d.get("linkedPod") or [] if isinstance(p, dict)],
+            linked_pod_details=[StoragePod.from_dict(p) for p in d.get("linkedPod") or [] if isinstance(p, dict)],
             is_maintenance=bool(d.get("isMaintenance", False)),
             encrypted=bool(d.get("encrypted", False)),
             created_at=_parse_dt(d.get("createdAt")),

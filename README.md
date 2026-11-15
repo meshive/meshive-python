@@ -144,6 +144,8 @@ except WaitTimeoutError:
 | Bring in a model or dataset from Hugging Face, CivitAI or a URL | `meshive asset-import <workspace> <repo or URL>` |
 | Download files or task outputs | `meshive asset-download <asset>`, `meshive task-outputs <task> --download ./out` |
 | SSH into a pod | `meshive ssh <workspace> <pod>` |
+| Run a command in a running pod (add `--background` for long work) | `meshive pod-exec <workspace> <pod> -- nvidia-smi` |
+| Upload a file or folder from your computer as an asset | `meshive asset-upload <workspace> ./my-data` |
 | Change a pod's GPU, ports, environment or storage | `meshive pod-update <workspace> <pod> --gpu "RTX 4090"` |
 | Grow or rename storage, or SSH into it | `meshive storage-update <workspace> <storage> --size 100`, `meshive storage-connect <workspace> <storage>` |
 | Start a pod with a ready-made set of models | `meshive model-sets <workspace> --template <template-id>`, then `meshive pod-create ... --model-set <slug>` |

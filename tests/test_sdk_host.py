@@ -593,5 +593,5 @@ def test_new_models_are_exported():
         assert name in meshive.__all__ and getattr(meshive, name).__name__ == name
 
 
-def test_version_is_1_8():
-    assert meshive.__version__.startswith("1.8.")
+def test_version_is_1_9():
+    assert meshive.__version__.startswith("1.9.")

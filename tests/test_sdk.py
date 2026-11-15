@@ -228,6 +228,63 @@ def test_workspace_member_role():
     assert Workspace.from_dict({"namespaceName": "ns"}).member_role is None
 
 
+def test_workspace_owner_emails_are_additive_and_optional():
+    payload = {**WORKSPACE, "memberRole": "viewer", "ownerEmails": ["a@example.com", "b@example.com"]}
+    workspace = Workspace.from_dict(payload)
+    assert workspace.owner_emails == ["a@example.com", "b@example.com"]
+    assert workspace.member_role == "viewer" and workspace.raw is payload
+    assert Workspace.from_dict(WORKSPACE).owner_emails == []
+    assert Workspace.from_dict({**WORKSPACE, "ownerEmails": None}).owner_emails == []
+    # A caller's display-only edits do not mutate the raw response or another workspace's default list.
+    workspace.owner_emails.append("c@example.com")
+    assert payload["ownerEmails"] == ["a@example.com", "b@example.com"]
+    first, second = Workspace.from_dict(WORKSPACE), Workspace.from_dict(WORKSPACE)
+    first.owner_emails.append("owner@example.com")
+    assert second.owner_emails == []
+
+
+def test_pod_storage_and_template_display_data():
+    import meshive
+    payload = {
+        **POD,
+        "workspaceName": "Research",
+        "template": {"id": 42, "name": "Jupyter", "envs": [{"key": "TOKEN", "value": "hidden-token"}]},
+        "linkedStorages": [
+            {"pvName": "pv-1", "userAlias": "datasets", "mountPath": "/data", "capacity": "10240", "storageType": "nfs"},
+            {"pvName": "pv-2", "userAlias": None, "mountPath": "/cache", "capacity": 20480, "storageType": "hostPath"},
+        ],
+    }
+    pod = Pod.from_dict(payload)
+    assert (pod.template_id, pod.template_name, pod.workspace_name) == (42, "Jupyter", "Research")
+    assert pod.linked_storages == [
+        meshive.PodStorage("pv-1", "datasets", "/data", 10240, "nfs"),
+        meshive.PodStorage("pv-2", "", "/cache", 20480, "hostPath"),
+    ]
+    assert pod.raw is payload
+    assert "hidden-token" not in repr(pod)
+    bare = Pod.from_dict(POD)
+    assert bare.template_id is None and bare.template_name is None and bare.linked_storages == []
+
+
+def test_storage_keeps_linked_pod_keys_and_adds_display_details():
+    import meshive
+    payload = {
+        "pvName": "pv-1",
+        "linkedPod": [
+            {"podName": "pod-1", "userAlias": "trainer", "mountPath": "/data", "isDownloader": False},
+            {"podName": "pod-2", "userAlias": None, "mountPath": "/mnt", "isDownloader": True},
+        ],
+    }
+    storage = meshive.Storage.from_dict(payload)
+    assert storage.linked_pods == ["pod-1", "pod-2"]
+    assert storage.linked_pod_details == [
+        meshive.StoragePod("pod-1", "trainer", "/data", False),
+        meshive.StoragePod("pod-2", "", "/mnt", True),
+    ]
+    assert storage.raw is payload
+    assert meshive.Storage.from_dict({}).linked_pod_details == []
+
+
 def test_task_detail_fields():
     t = Task.from_dict({
         "externalId": "task_1", "failedAssetExternalId": "asset_b", "outputUploadState": "uploading",

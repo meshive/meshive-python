@@ -51,6 +51,10 @@ from .exceptions import (
 )
 from .models import (
     ACTIVITY_OUTCOMES,
+    CommandResult,
+    CommandRun,
+    UploadSession,
+    UploadedAsset,
     ActivityPage,
     ApiKey,
     Asset,
@@ -402,6 +406,132 @@ def _raise_for_status(status_code: int, payload: Any, headers: httpx.Headers) ->
     if status_code == 429:
         raise RateLimitError(status_code, message, retry_after=_retry_after(headers), **common)
     raise MeshiveAPIError(status_code, message, **common)
+
+
+# --- Commands in a pod and file uploads (shared by both clients) ---------------------------------------
+
+COMMAND_MAX_TIMEOUT = 25        # seconds a foreground command may run (the server's limit)
+UPLOAD_PART_URL_BATCH = 8       # part URLs asked for at a time - each batch must be used before its URLs expire
+_UPLOAD_CHUNK = 1024 * 1024
+_UPLOAD_MAX_FILES = 1000
+
+
+def _command_body(command: str, timeout: int, background: bool) -> dict[str, Any]:
+    if not isinstance(command, str) or not command.strip():
+        raise ValueError("command must be a non-empty string")
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= COMMAND_MAX_TIMEOUT:
+        raise ValueError(f"timeout must be a whole number of seconds from 1 to {COMMAND_MAX_TIMEOUT}; "
+                         "start longer work with background=True")
+    return {"command": command, "timeout": timeout, "background": bool(background)}
+
+
+def _run_id_segment(run_id: str) -> str:
+    if not isinstance(run_id, str) or not re.fullmatch(r"run_[0-9a-f]{12}", run_id):
+        raise ValueError("run_id must look like run_0123456789ab")
+    return run_id
+
+
+def _upload_files_body(files: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    out = []
+    for f in files:
+        path = f.get("relative_path", f.get("relativePath", f.get("path")))
+        size = f.get("size_bytes", f.get("sizeBytes"))
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("every file needs a relative path")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ValueError(f"{path}: size_bytes must be a whole number of bytes")
+        item = {"relativePath": path, "sizeBytes": size}
+        if f.get("sha256"):
+            item["sha256"] = f["sha256"]
+        out.append(item)
+    if not out:
+        raise ValueError("an upload needs at least one file")
+    return out
+
+
+def _upload_start_body(files, name, asset_type, kind) -> dict[str, Any]:
+    body: dict[str, Any] = {"files": _upload_files_body(files)}
+    if name:
+        body["name"] = name
+    if asset_type:
+        body["assetType"] = asset_type
+    if kind:
+        body["kind"] = kind
+    return body
+
+
+def _upload_plan(path: str | os.PathLike[str]) -> tuple[list[tuple[str, Path, int]], str, str, int]:
+    """(files as (relative path, local path, size), kind, default name, empty files skipped) for one file or one
+    folder. Symbolic links are skipped so a folder upload never reads outside the folder, and empty files are skipped
+    like the console does (the server takes no 0-byte files)."""
+    root = Path(path)
+    if root.is_file():
+        if root.stat().st_size == 0:
+            raise ValueError(f"{root} is empty; empty files can't be uploaded")
+        return [(root.name, root, root.stat().st_size)], "file", root.name, 0
+    if not root.is_dir():
+        raise FileNotFoundError(f"{root} is not a file or folder")
+    files, empty = [], 0
+    for item in sorted(root.rglob("*")):
+        rel = item.relative_to(root)
+        if item.is_symlink() or not item.is_file():
+            continue
+        if any((root / parent).is_symlink() for parent in rel.parents if str(parent) != "."):
+            continue
+        size = item.stat().st_size
+        if size == 0:
+            empty += 1
+            continue
+        files.append((rel.as_posix(), item, size))
+    if not files:
+        raise ValueError(f"{root} has no files that aren't empty")
+    if len(files) > _UPLOAD_MAX_FILES:
+        raise ValueError(f"{root} has {len(files)} files; one upload takes at most {_UPLOAD_MAX_FILES}")
+    return files, "collection", root.name, empty
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(_UPLOAD_CHUNK), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _file_chunks(path: Path, offset: int, length: int) -> Iterable[bytes]:
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        left = length
+        while left > 0:
+            chunk = fh.read(min(_UPLOAD_CHUNK, left))
+            if not chunk:
+                raise MeshiveError(f"{path} got shorter while it was being uploaded")
+            left -= len(chunk)
+            yield chunk
+
+
+def _upload_put_failed(rel: str, status_code: int) -> MeshiveAPIError:
+    return MeshiveAPIError(status_code, f"Uploading {rel} failed (HTTP {status_code}). Upload links expire; "
+                                        "start the upload again.")
+
+
+def _match_targets(plan: list[tuple[str, Path, int]], session: UploadSession):
+    """Pair the session's files with the local ones - by path, or in order when the server normalized a path."""
+    if len(session.files) != len(plan):
+        raise MeshiveError("The server's upload session does not list the same files that were sent.")
+    by_path = {rel: (local, size) for rel, local, size in plan}
+    if all(t.relative_path in by_path for t in session.files):
+        return [(t, *by_path[t.relative_path]) for t in session.files]
+    return [(t, local, size) for t, (_, local, size) in zip(session.files, plan)]
+
+
+def _complete_body(files: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    return {"files": [{"fileId": int(f.get("file_id", f.get("fileId"))),
+                       **({"sha256": f["sha256"]} if f.get("sha256") else {}),
+                       "parts": [{"partNumber": int(p.get("part_number", p.get("partNumber"))),
+                                  "etag": str(p["etag"])} for p in f.get("parts") or []]}
+                      for f in files]}
 
 
 # --- Retries -----------------------------------------------------------------
@@ -1523,6 +1653,150 @@ class Meshive(_BaseClient):
         except MeshiveAPIError as err:
             raise _not_supported(err, "SSH access") from None
         return SshAccess.from_dict(data)
+
+    # --- Commands in a pod (write scope) ------------------------------------------------------------
+
+    def run_command(self, pod_name: str, workspace: str, command: str, *, timeout: int = 20,
+                    background: bool = False) -> CommandResult:
+        """Run `command` with `sh -c` in a running pod's main container (write scope). It waits up to `timeout`
+        seconds (1..25) and returns exit_code, stdout and stderr (64 KiB at most). With background=True it starts the
+        command detached and returns a run_id at once - read it with get_command_run. Not idempotent: calling again
+        runs the command again, so a failed call is resent only when the server surely never ran it."""
+        try:
+            data = self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/exec",
+                              params={"workspace": _query_value(workspace, "workspace")},
+                              json=_command_body(command, timeout, background), long_running=True)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "running commands in pods") from None
+        return CommandResult.from_dict(data)
+
+    def get_command_run(self, pod_name: str, workspace: str, run_id: str, *, tail: int = 100) -> CommandRun:
+        """A background command's state (running, exited, lost), exit code and last `tail` lines (1..1000) of output.
+        The run is gone after the pod restarts (NotFoundError)."""
+        path = f"/pods/{_path_segment(pod_name, 'pod_name')}/exec/{_run_id_segment(run_id)}"
+        try:
+            data = self._get(path, params={"workspace": _query_value(workspace, "workspace"), "tail": tail})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "running commands in pods") from None
+        return CommandRun.from_dict(data)
+
+    # --- Uploads to Asset Hub (write scope) -----------------------------------------------------------
+
+    def start_asset_upload(self, workspace: str, files: Iterable[dict[str, Any]], *, name: str | None = None,
+                           asset_type: str | None = None, kind: str | None = None) -> UploadSession:
+        """Start uploading files as a new asset. `files` = [{"relative_path", "size_bytes", "sha256"?}]. Each file of
+        the returned session is "single" (PUT it to `url`) or "multipart" (get part URLs). Finish with
+        complete_asset_upload; upload_asset does all of it for a local file or folder."""
+        try:
+            # Resent only when the server surely never got it: it keeps no operation record, so a resend after a
+            # timeout would leave a second, empty asset behind.
+            data = self._send("POST", "/assets/uploads", params={"workspace": _query_value(workspace, "workspace")},
+                              json=_upload_start_body(files, name, asset_type, kind), long_running=True)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "uploading files") from None
+        return UploadSession.from_dict(data)
+
+    def asset_upload_part_urls(self, upload_id: str, file_id: int, part_numbers: Iterable[int] = ()) -> dict:
+        """PUT URLs for parts of a multipart file (at most 100 per call) - or, with no part numbers, a new URL for a
+        single-PUT file. Returns {"presignExpiresIn", "files": [{"fileId", "mode", "url", "parts": [...]}]}."""
+        return self._send("POST", f"/assets/uploads/{_path_segment(upload_id, 'upload_id')}/part-urls",
+                          json={"files": [{"fileId": int(file_id), "partNumbers": [int(n) for n in part_numbers]}]})
+
+    def complete_asset_upload(self, upload_id: str, files: Iterable[dict[str, Any]] = ()) -> UploadedAsset:
+        """Finish an upload: [{"file_id", "sha256"?, "parts": [{"part_number", "etag"}] for multipart}]. The server
+        checks every file's size; calling again after success returns the same asset."""
+        return UploadedAsset.from_dict(
+            self._send("POST", f"/assets/uploads/{_path_segment(upload_id, 'upload_id')}/complete",
+                       json=_complete_body(files)))
+
+    def abort_asset_upload(self, upload_id: str) -> None:
+        """Cancel an upload that hasn't completed; what was already uploaded is removed."""
+        self._send("POST", f"/assets/uploads/{_path_segment(upload_id, 'upload_id')}/abort")
+
+    def upload_asset(self, path: str | os.PathLike[str], *, workspace: str, name: str | None = None,
+                     asset_type: str | None = None) -> UploadedAsset:
+        """Upload a local file, or a folder with everything in it, as a new Asset Hub asset (storage is billed).
+        Big files go up in parts. On failure the upload is cancelled. Pods and tasks then use it as an input asset."""
+        plan, kind, default_name, empty = _upload_plan(path)
+        hashes = {rel: _sha256_file(local) for rel, local, _ in plan}
+        session = self.start_asset_upload(
+            workspace, [{"relative_path": rel, "size_bytes": size, "sha256": hashes[rel]} for rel, _, size in plan],
+            name=name or default_name, asset_type=asset_type, kind=kind)
+        try:
+            done = []
+            for target, local, size in _match_targets(plan, session):
+                sha = hashes.get(target.relative_path) or _sha256_file(local)
+                if target.mode == "multipart":
+                    done.append({"file_id": target.file_id, "sha256": sha,
+                                 "parts": self._put_parts(session.upload_id, target, local, size)})
+                else:
+                    self._put_single(session.upload_id, target, local, size)
+                    done.append({"file_id": target.file_id, "sha256": sha})
+            asset = self.complete_asset_upload(session.upload_id, done)
+            asset.skipped_empty_files = empty
+            return asset
+        except BaseException:
+            try:
+                self.abort_asset_upload(session.upload_id)
+            except Exception:  # noqa: BLE001 - the original error matters more
+                pass
+            raise
+
+    def _put(self, url: str, local: Path, offset: int, length: int, rel: str) -> httpx.Response:
+        # Presigned URLs are sent without the auth header - the Meshive key never goes to storage.
+        read = max(float(self._timeout or 0), 300.0)
+        response = self._client.put(url, content=_file_chunks(local, offset, length),
+                                    headers={"Content-Length": str(length)},
+                                    timeout=httpx.Timeout(self._timeout, read=read))
+        if response.status_code >= 400:
+            raise _upload_put_failed(rel, response.status_code)
+        return response
+
+    def _fresh_single_url(self, upload_id: str, target) -> str:
+        fresh = self.asset_upload_part_urls(upload_id, target.file_id)
+        url = (fresh.get("files") or [{}])[0].get("url")
+        if not url:
+            raise MeshiveError(f"The server gave no upload link for {target.relative_path}.")
+        return url
+
+    def _put_single(self, upload_id: str, target, local: Path, size: int) -> None:
+        url = target.url or self._fresh_single_url(upload_id, target)
+        try:
+            self._put(url, local, 0, size, target.relative_path)
+        except MeshiveAPIError as err:
+            if err.status_code != 403:
+                raise
+            # Links expire a few minutes after they were issued (a long folder upload outlives them): get a new one.
+            self._put(self._fresh_single_url(upload_id, target), local, 0, size, target.relative_path)
+
+    def _put_parts(self, upload_id: str, target, local: Path, size: int) -> list[dict[str, Any]]:
+        part_size = int(target.part_size_bytes or 0)
+        count = int(target.part_count or 0)
+        if part_size <= 0 or count <= 0:
+            raise MeshiveError(f"The server gave no part size for {target.relative_path}.")
+        parts = []
+        for first in range(1, count + 1, UPLOAD_PART_URL_BATCH):
+            numbers = list(range(first, min(first + UPLOAD_PART_URL_BATCH, count + 1)))
+            fresh = self.asset_upload_part_urls(upload_id, target.file_id, numbers)
+            urls = {int(p["partNumber"]): p["url"] for p in (fresh.get("files") or [{}])[0].get("parts") or []}
+            for number in numbers:
+                if number not in urls:
+                    raise MeshiveError(f"The server gave no link for part {number} of {target.relative_path}.")
+                offset = (number - 1) * part_size
+                length, label = min(part_size, size - offset), f"{target.relative_path} part {number}"
+                try:
+                    response = self._put(urls[number], local, offset, length, label)
+                except MeshiveAPIError as err:
+                    if err.status_code != 403:
+                        raise
+                    # The batch's links expired before this part (a slow uplink): get a new link for it.
+                    again = self.asset_upload_part_urls(upload_id, target.file_id, [number])
+                    parts_again = (again.get("files") or [{}])[0].get("parts") or []
+                    if not parts_again:
+                        raise
+                    response = self._put(parts_again[0]["url"], local, offset, length, label)
+                parts.append({"part_number": number, "etag": response.headers.get("ETag", "").strip()})
+        return parts
 
     # --- Watched folders (harvest folders of a running Pod) ------------------------------------
 
@@ -2728,6 +3002,57 @@ class AsyncMeshive(_BaseClient):
         except MeshiveAPIError as err:
             raise _not_supported(err, "SSH access") from None
         return SshAccess.from_dict(data)
+
+    # --- Commands in a pod (write scope) ------------------------------------------------------------
+
+    async def run_command(self, pod_name: str, workspace: str, command: str, *, timeout: int = 20,
+                          background: bool = False) -> CommandResult:
+        """Run `command` with `sh -c` in a running pod's main container (see Meshive.run_command)."""
+        try:
+            data = await self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/exec",
+                                    params={"workspace": _query_value(workspace, "workspace")},
+                                    json=_command_body(command, timeout, background), long_running=True)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "running commands in pods") from None
+        return CommandResult.from_dict(data)
+
+    async def get_command_run(self, pod_name: str, workspace: str, run_id: str, *, tail: int = 100) -> CommandRun:
+        """A background command's state, exit code and last lines of output (see Meshive.get_command_run)."""
+        path = f"/pods/{_path_segment(pod_name, 'pod_name')}/exec/{_run_id_segment(run_id)}"
+        try:
+            data = await self._get(path, params={"workspace": _query_value(workspace, "workspace"), "tail": tail})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "running commands in pods") from None
+        return CommandRun.from_dict(data)
+
+    # --- Uploads to Asset Hub (write scope) -----------------------------------------------------------
+
+    async def start_asset_upload(self, workspace: str, files: Iterable[dict[str, Any]], *, name: str | None = None,
+                                 asset_type: str | None = None, kind: str | None = None) -> UploadSession:
+        """Start uploading files as a new asset (see Meshive.start_asset_upload)."""
+        try:
+            data = await self._send("POST", "/assets/uploads",
+                                    params={"workspace": _query_value(workspace, "workspace")},
+                                    json=_upload_start_body(files, name, asset_type, kind), long_running=True)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "uploading files") from None
+        return UploadSession.from_dict(data)
+
+    async def asset_upload_part_urls(self, upload_id: str, file_id: int, part_numbers: Iterable[int] = ()) -> dict:
+        """PUT URLs for parts of a multipart file, or a new URL for a single-PUT file (see Meshive)."""
+        return await self._send("POST", f"/assets/uploads/{_path_segment(upload_id, 'upload_id')}/part-urls",
+                                json={"files": [{"fileId": int(file_id),
+                                                 "partNumbers": [int(n) for n in part_numbers]}]})
+
+    async def complete_asset_upload(self, upload_id: str, files: Iterable[dict[str, Any]] = ()) -> UploadedAsset:
+        """Finish an upload (see Meshive.complete_asset_upload)."""
+        return UploadedAsset.from_dict(
+            await self._send("POST", f"/assets/uploads/{_path_segment(upload_id, 'upload_id')}/complete",
+                             json=_complete_body(files)))
+
+    async def abort_asset_upload(self, upload_id: str) -> None:
+        """Cancel an upload that hasn't completed."""
+        await self._send("POST", f"/assets/uploads/{_path_segment(upload_id, 'upload_id')}/abort")
 
     # --- Watched folders (harvest folders of a running Pod) ------------------------------------
 

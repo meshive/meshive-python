@@ -1115,14 +1115,40 @@ def cmd_forward(client: Meshive, args: argparse.Namespace, output: str, color: b
 
 def _serve(forwarder: Forwarder, announce: Callable[[], None], listen: int) -> int:
     """Runs the forwarder until Ctrl+C (which the CLI's entry point turns into exit code 130)."""
+    interrupted = False
+
     async def run() -> None:
+        nonlocal interrupted
+        loop = asyncio.get_running_loop()
+        stop: "asyncio.Future[None]" = loop.create_future()
+
+        def on_interrupt() -> None:
+            nonlocal interrupted
+            interrupted = True
+            if not stop.done():
+                stop.set_result(None)
+
+        # Where the loop can take SIGINT itself (not on Windows), Ctrl+C ends the wait below instead of being raised
+        # inside whichever connection happens to be running, which would leave a traceback behind on Python 3.10.
+        try:
+            loop.add_signal_handler(signal.SIGINT, on_interrupt)
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass
+
+        def quiet(_loop: asyncio.AbstractEventLoop, context: dict) -> None:
+            # A connection interrupted by Ctrl+C is not an error worth a traceback.
+            if isinstance(context.get("exception"), KeyboardInterrupt):
+                return
+            _loop.default_exception_handler(context)
+
+        loop.set_exception_handler(quiet)
         try:
             await forwarder.start()
         except OSError as exc:
             raise _CannotListen(exc.strerror or type(exc).__name__) from None
         try:
             announce()
-            await asyncio.get_running_loop().create_future()      # until cancelled
+            await stop                                            # until Ctrl+C
         finally:
             await forwarder.close()
 
@@ -1142,6 +1168,8 @@ def _serve(forwarder: Forwarder, announce: Callable[[], None], listen: int) -> i
     finally:
         if restore is not None:
             signal.signal(signal.SIGBREAK, restore)
+    if interrupted:
+        raise KeyboardInterrupt
     return 0
 
 

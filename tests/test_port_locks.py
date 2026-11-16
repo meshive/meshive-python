@@ -1485,3 +1485,14 @@ def test_cli_pod_key_roll_works_when_the_key_list_cannot_be_read(api, capsys, no
     api.routes[("GET", KEYS_PATH)] = (500, {"detail": "boom"})
     assert cli.main(["pod-key-roll", "ws", "p-0", "3000", "12", "--yes"]) == 0
     assert "its current value stops working in 1 hour" in capsys.readouterr().err
+
+
+def test_cli_pod_lock_that_is_in_effect_at_once_does_not_wait(api, capsys, non_tty, clock):
+    # Locking a port that is locked already answers with the current state: nothing to wait for.
+    for command, state, shown in (("pod-lock", "locked", "Locked"), ("pod-unlock", "unlocked", "Unlocked")):
+        api.routes[("PATCH", LOCK_PATH)] = _toggle(state)
+        assert cli.main([command, "ws", "p-0", "3000", "--yes"] if command == "pod-unlock"
+                        else [command, "ws", "p-0", "3000"]) == 0
+        captured = capsys.readouterr()
+        assert f"access: {shown}\n" in captured.out and "Waiting" not in captured.err
+    assert not api.sent("GET", POD_PATH)

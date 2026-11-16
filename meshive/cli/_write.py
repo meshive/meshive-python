@@ -7,8 +7,9 @@ Port locks: port-lock / port-unlock switch one public port's lock; port-prefligh
 locked port through without a key; port-keys, port-key-create, port-key-roll and port-key-revoke manage the port's
 access keys; pod-browser-sessions-revoke signs out the browser sessions on a pod's locked ports. port-forward (in
 _forward.py) reaches a locked port through 127.0.0.1.
-Hosting: maintenance-schedule/update/end/extend/cancel, machine-list/unlist/retry/delete, host-message-send,
-host-messages-read, machine-credentials, host-install.
+Hosting: maintenance-schedule/update/end/extend/cancel, machine-list-for-rent, machine-unlist/retry/delete,
+host-message-send, host-messages-mark-read, machine-credentials, host-install. The names machine-list and
+host-messages-read still work and print a note on stderr (see _RENAMED); they are removed in 2.0.
 
 Rule: commands that cost money or can't be undone (create/start/deploy/submit/delete, plus serving-scale and
 serving-resume, which can raise cost) first show an estimate or summary and ask for confirmation without `--yes` (exit 2 if not a TTY).
@@ -19,8 +20,9 @@ every member of the workspace sees the new name.
 if that doesn't happen in time. `workspace-delete` checks first: a workspace that isn't empty exits 1 without asking, and
 `--check` stops after the check (exit 0 if it can be deleted, 1 if not).
 Hosting commands that reach other users (maintenance, unlisting, removal, messages) or reveal a secret (machine
-credentials, install commands) ask first; machine-delete asks for the machine ID to be typed. machine-list,
-machine-retry and host-messages-read change only your own machine's state and don't ask, as in the console.
+credentials, install commands) ask first; machine-delete asks for the machine ID to be typed.
+machine-list-for-rent, machine-retry and host-messages-mark-read change only your own machine's state and don't ask,
+as in the console.
 Opening a port asks first: port-unlock, `port-preflight … on`, and pod-create / pod-update (which always ask) say
 which ports would be open, and which would be locked, before the question. port-key-revoke, port-key-roll and
 pod-browser-sessions-revoke ask too, because clients or members using the port lose access. port-lock,
@@ -1633,7 +1635,8 @@ def _print_maintenance_estimate(est: MaintenanceEstimate, color: bool) -> None:
 
 
 _ACTION_NOTES = {
-    "end": "The machine comes back unlisted. List it again with `meshive machine-list {machine}` when the work is done.",
+    "end": "The machine comes back unlisted. List it for rent again with `meshive machine-list-for-rent {machine}` "
+           "when the work is done.",
     "cancel": "Workspaces that were notified don't get a cancellation email.",
 }
 
@@ -1715,6 +1718,26 @@ def _print_listing(result: ListingResult, color: bool) -> None:
          ("accepted", fmt.yes_no(result.accepted))])
     if not result.listed:
         print(fmt.paint("New pods aren't placed on it until you list it again.", "dim", color))
+
+
+# Old command names that still work until 2.0: old name -> (new name, what the command does). Their names read like
+# a look at something (a list, reading messages), so a call by the old name says what it did on stderr; stdout, the
+# exit code and -o json/name are unchanged.
+_RENAMED = {
+    "machine-list": ("machine-list-for-rent", "puts the machine up for rent"),
+    "host-messages-read": ("host-messages-mark-read", "marks the messages read without showing them"),
+}
+
+
+def _renamed(old: str, handler: Callable[..., int]) -> Callable[..., int]:
+    new, what = _RENAMED[old]
+
+    def run(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+        print(f"Note: `meshive {old}` {what}; it is now `meshive {new}`. The old name is removed in 2.0.",
+              file=sys.stderr)
+        return handler(client, args, output, color)
+
+    return run
 
 
 def cmd_machine_list(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
@@ -2313,8 +2336,9 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--reason", required=True, help="Why — the workspaces using the machine see it in their email.")
     p.add_argument("--description", default=None)
     _yes(p)
-    p = sub.add_parser("machine-list", parents=[common],
-                       help="List a machine so new pods can be placed on it (says why when it can't be).")
+    p = sub.add_parser("machine-list-for-rent", parents=[common], aliases=["machine-list"],
+                       help="Put a machine up for rent so new pods can be placed on it (says why when it can't be). "
+                            "To see your machines: `meshive machines`.")
     p.add_argument("machine_id", help=machine_help)
     p = sub.add_parser("machine-unlist", parents=[common],
                        help="Unlist a machine: no new pods are placed on it; running pods keep running.")
@@ -2335,7 +2359,8 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
                    help="A workspace ID from the Clients of `meshive machine <id>`, or all of them.")
     p.add_argument("--title", required=True); p.add_argument("--content", default=None)
     _yes(p)
-    p = sub.add_parser("host-messages-read", parents=[common], help="Mark incoming messages of a machine read.")
+    p = sub.add_parser("host-messages-mark-read", parents=[common], aliases=["host-messages-read"],
+                       help="Mark incoming messages of a machine read (to read them: `meshive host-messages`).")
     p.add_argument("machine_id", help=machine_help)
     p.add_argument("message_ids", type=int, nargs="+", metavar="ID", help="Message IDs from `meshive host-messages`.")
     p = sub.add_parser("machine-credentials", parents=[common],
@@ -2404,12 +2429,14 @@ HANDLERS: dict[str, Handler] = {
         "cancel_maintenance", "Cancel maintenance window #{id}? It is removed for good, and workspaces that were "
                               "notified don't get a cancellation email."),
     "maintenance-extend": cmd_maintenance_extend,
-    "machine-list": cmd_machine_list,
+    "machine-list-for-rent": cmd_machine_list,
+    "machine-list": _renamed("machine-list", cmd_machine_list),
     "machine-unlist": cmd_machine_unlist,
     "machine-retry": cmd_machine_retry,
     "machine-delete": cmd_machine_delete,
     "host-message-send": cmd_host_message_send,
-    "host-messages-read": cmd_host_messages_read,
+    "host-messages-mark-read": cmd_host_messages_read,
+    "host-messages-read": _renamed("host-messages-read", cmd_host_messages_read),
     "machine-credentials": cmd_machine_credentials,
     "host-install": cmd_host_install,
 }

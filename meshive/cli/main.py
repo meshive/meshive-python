@@ -127,7 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  meshive task-submit <ws> <name> --script FILE --image IMG --cpu-preset micro-2c8g\n"
             "  meshive port-lock|port-unlock <ws> <pod> <port>  (port-keys, port-key-create: its access keys)\n"
             "  meshive maintenance-schedule <machine> --reason R --start ISO --end ISO [--emergency]\n"
-            "  meshive machine-list|machine-unlist|machine-delete <machine>\n"
+            "  meshive machine-list-for-rent|machine-unlist|machine-delete <machine>\n"
             "  meshive host-message-send <machine> --to WORKSPACE|all --title T\n"
             "\n"
             "Run `meshive <command> --help` for filters and options.\n"
@@ -1001,7 +1001,7 @@ def _print_host_messages(messages: list[HostMessage], color: bool) -> None:
             print("  " + fmt.clean(line))
     if any(m.direction == "in" and not m.is_read for m in messages):
         print()
-        print(fmt.paint("Mark them read: meshive host-messages-read <machine> ID...", "dim", color))
+        print(fmt.paint("Mark them read: meshive host-messages-mark-read <machine> ID...", "dim", color))
 
 
 def _print_payouts(account: PayoutAccount, payouts: list[Payout], color: bool) -> None:

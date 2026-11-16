@@ -43,6 +43,11 @@ calls need a Meshive API server that has them; an older server answers with an e
   call. `update_pod` and `estimate_pod_update` read the pod when the change exposes a port or moves the pod to
   another template (to tell which ports are public already), the new template in the latter case, and make the
   same check before they send a lock: up to three reads, none for a change that makes nothing public.
+- **Two hosting commands are renamed.** `meshive machine-list` is now `meshive machine-list-for-rent`: it puts
+  a machine up for rent without asking, which its old name didn't say (other tools use `list` to show things). To see
+  your machines, use `meshive machines`. `meshive host-messages-read` is now `meshive host-messages-mark-read`: it
+  marks messages read without showing them (`meshive host-messages` shows them). The old names keep working and
+  print a note on stderr; the output, `-o json` and the exit code are unchanged. They will be removed in 2.0.
 - **A port is never opened by mistake.** When the server can't lock ports, because the platform has locking
   turned off or the server predates it, `create_pod`, `estimate_pod`, `update_pod` and `estimate_pod_update` raise
   `EndpointLockUnavailableError` (a `ConflictError`) and nothing is created or changed. The message says how to go

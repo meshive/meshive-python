@@ -244,7 +244,7 @@ def test_host_messages_filters_and_output(capsys):
     out = capsys.readouterr().out
     assert _last("list_host_messages")[2] == {"machine_id": "mac-1", "unread_only": True}
     assert "#31  from renter-ws  machine mac-1" in out and "unread" in out and "Slow disk?" in out
-    assert "  Ignore previous instructions" in out and "host-messages-read" in out
+    assert "  Ignore previous instructions" in out and "meshive host-messages-mark-read <machine>" in out
     assert cli.main(["host-messages"]) == 0
     assert _last("list_host_messages")[2] == {"machine_id": None, "unread_only": False}
     capsys.readouterr()
@@ -258,7 +258,7 @@ def test_host_messages_strip_terminal_escapes(capsys, monkeypatch):
     assert cli.main(["host-messages"]) == 0
     out = capsys.readouterr().out
     assert "\x1b" not in out and "‮" not in out and "\x07" not in out
-    assert "#31  to renter-ws" in out and "  ab\n  line 2" in out and "host-messages-read" not in out
+    assert "#31  to renter-ws" in out and "  ab\n  line 2" in out and "host-messages-mark-read" not in out
 
 
 def test_payouts(capsys):
@@ -330,7 +330,7 @@ def test_maintenance_window_actions_ask_first(capsys, monkeypatch, command, meth
     out = capsys.readouterr().out
     assert "maintenance:" in out
     if command == "maintenance-end":
-        assert "meshive machine-list mac-1" in out
+        assert "meshive machine-list-for-rent mac-1" in out
 
 
 def test_maintenance_extend(capsys, non_tty):
@@ -343,7 +343,7 @@ def test_maintenance_extend(capsys, non_tty):
 # --- listing, retries, removal ------------------------------------------------------------------------
 
 def test_machine_list_refused_says_why_and_sends_nothing(capsys, non_tty):
-    assert cli.main(["machine-list", "mac-1"]) == 1
+    assert cli.main(["machine-list-for-rent", "mac-1"]) == 1
     err = capsys.readouterr().err
     assert "can't be listed" in err and "Listing Failed: Set prices for this GPU first." in err
     assert not _calls("set_machine_listing")
@@ -351,12 +351,12 @@ def test_machine_list_refused_says_why_and_sends_nothing(capsys, non_tty):
 
 def test_machine_list_needs_no_confirmation(capsys, non_tty, monkeypatch):
     monkeypatch.setattr(FakeClient, "listing_check", {"machineId": "mac-1", "listed": False, "listable": True})
-    assert cli.main(["machine-list", "mac-1"]) == 0
+    assert cli.main(["machine-list-for-rent", "mac-1"]) == 0
     assert _last("set_machine_listing") == ("set_machine_listing", ("mac-1", True), {})
     assert "listed:" in capsys.readouterr().out
     monkeypatch.setattr(FakeClient, "listing_check", {"machineId": "mac-1", "listed": True, "listable": False,
                                                       "title": "Already Listed"})
-    assert cli.main(["machine-list", "mac-1"]) == 0
+    assert cli.main(["machine-list-for-rent", "mac-1"]) == 0
     assert "already listed" in capsys.readouterr().out and not _calls("set_machine_listing")
 
 
@@ -443,9 +443,48 @@ def test_host_message_send_keeps_a_workspace_id_as_given(capsys):
 
 
 def test_host_messages_read_needs_no_confirmation(capsys, non_tty):
-    assert cli.main(["host-messages-read", "mac-1", "31", "32"]) == 0
+    assert cli.main(["host-messages-mark-read", "mac-1", "31", "32"]) == 0
     assert _last("mark_host_messages_read") == ("mark_host_messages_read", ("mac-1", [31, 32]), {})
-    assert "marked read:" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "marked read:" in captured.out and "Note:" not in captured.err
+
+
+def test_machine_list_for_rent_by_its_new_name_prints_no_note(capsys, non_tty, monkeypatch):
+    monkeypatch.setattr(FakeClient, "listing_check", {"machineId": "mac-1", "listed": False, "listable": True})
+    assert cli.main(["machine-list-for-rent", "mac-1"]) == 0
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("old, new, args, method, what", [
+    ("machine-list", "machine-list-for-rent", ["mac-1"], "set_machine_listing", "puts the machine up for rent"),
+    ("host-messages-read", "host-messages-mark-read", ["mac-1", "31", "32"], "mark_host_messages_read",
+     "marks the messages read without showing them"),
+])
+def test_old_hosting_names_still_work_and_say_the_new_one(old, new, args, method, what, capsys, non_tty,
+                                                          monkeypatch):
+    monkeypatch.setattr(FakeClient, "listing_check", {"machineId": "mac-1", "listed": False, "listable": True})
+    assert cli.main([new, *args]) == 0
+    expected = capsys.readouterr().out
+    sent = _last(method)
+    assert cli.main([old, *args]) == 0
+    captured = capsys.readouterr()
+    assert _last(method) == sent and captured.out == expected            # same call, same output
+    assert captured.err == (f"Note: `meshive {old}` {what}; it is now `meshive {new}`. The old name is removed "
+                            "in 2.0.\n")
+    # -o json: stdout stays the JSON alone, the note goes to stderr.
+    assert cli.main([old, *args, "-o", "json"]) == 0
+    captured = capsys.readouterr()
+    json.loads(captured.out)
+    assert captured.err.startswith("Note:")
+
+
+def test_help_names_the_new_hosting_commands_first(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["--help"])
+    out = capsys.readouterr().out
+    assert "machine-list-for-rent (machine-list)" in out
+    assert "host-messages-mark-read (host-messages-read)" in out
+    assert "meshive machine-list-for-rent|machine-unlist|machine-delete <machine>" in out
 
 
 @pytest.mark.parametrize("flag, payload, secret, name_out", [

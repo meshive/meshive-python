@@ -499,7 +499,8 @@ class Forwarder:
                                      "request on.")
         else:
             self._once("rejected", "The access key was rejected (401): it may be expired, revoked or made for "
-                                   f"another port. Create a new one with `{self._key_command}` and start "
+                                   "another port (a key made a few seconds ago may not work yet: try again "
+                                   f"shortly). Create a new one with `{self._key_command}` and start "
                                    "`meshive forward` again with it.")
 
     # ------------------------------------------------------------------ who may use the listener

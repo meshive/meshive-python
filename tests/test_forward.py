@@ -756,6 +756,7 @@ async def test_a_rejected_key_is_passed_on_as_401_and_explained_once():
         assert endpoint.keys == [[OTHER_KEY], [OTHER_KEY]] and endpoint.requests == []
         notices = [line for line in said if "rejected" in line]
         assert len(notices) == 1 and KEY_COMMAND in notices[0]
+        assert "a key made a few seconds ago may not work yet" in notices[0]     # a new key takes a moment
         assert OTHER_KEY not in "\n".join(said)
 
 

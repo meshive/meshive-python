@@ -648,6 +648,12 @@ def _print_pods(pods: list[Pod], color: bool, show_workspace: bool = False) -> N
     fmt.render_table(headers, rows, aligns=aligns, colors=colors, enabled=color)
 
 
+def _access_label(endpoint) -> str:
+    """ACCESS cell: a lock choice that isn't in effect yet shows as Locking… / Unlocking…."""
+    return {"locking": "Locking…", "unlocking": "Unlocking…"}.get(endpoint.lock_state or "",
+                                                                  endpoint.access.capitalize())
+
+
 def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
     created = "-"
     if pod.created_at:
@@ -687,7 +693,7 @@ def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
         print()
         # ACCESS: Internal (inside the workspace only), Locked (members' browsers and access keys) or Unlocked
         # (anyone with the URL). A server that doesn't report locks has none, so its exposed ports are Unlocked.
-        rows = [[e.name or "-", str(e.port), e.access.capitalize(), e.external_url or e.internal_url or "-",
+        rows = [[e.name or "-", str(e.port), _access_label(e), e.external_url or e.internal_url or "-",
                  e.readiness] for e in pod.endpoints]
         colors = [[None, None, None, None, "green" if e.readiness == "ready" else "yellow"] for e in pod.endpoints]
         fmt.render_table(["ENDPOINT", "PORT", "ACCESS", "URL", "STATE"], rows, aligns=["l", "r", "l", "l", "l"],

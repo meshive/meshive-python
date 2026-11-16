@@ -82,6 +82,18 @@ calls need a Meshive API server that has them; an older server answers with an e
   made by web pages on other sites (`--allow-origin` names a page that may use it), but programs on your computer
   reach the port through it without a key. `--listen PORT` picks another local port and `-v` prints one line per
   request. It runs until Ctrl+C and uses only the Python standard library.
+- **Waiting for a lock to take effect.** A lock choice can take a few seconds to reach every route of the port, and
+  until it does a locked port may still be reachable without a key. `PodEndpoint.lock_state` and `PortLock.state`
+  are `"locked"`, `"locking"`, `"unlocked"` or `"unlocking"` (`None` from a server that doesn't report it);
+  `locked` and `access` still say what was chosen. `wait_port_lock(pod, workspace, port, timeout=60, poll=1)`
+  polls until the state is `"locked"` or `"unlocked"` and returns the endpoint; on a timeout it returns the last
+  endpoint read instead of raising. `meshive pod-lock` and `meshive pod-unlock` wait by default (up to 60 seconds,
+  progress on stderr; `--no-wait` skips it), and `meshive pod` shows `Locking…` or `Unlocking…` in the ACCESS
+  column meanwhile.
+- **Expired access keys.** An expired key stays in `list_access_keys` for 30 days, with `AccessKey.expired` set, and
+  it can be rolled or revoked. Rolling an expired key ignores `overlap_seconds`, and `previous_value_valid_until`
+  is `None`. `meshive pod-keys` shows `expired 3 days ago (2026-11-13 09:00 UTC)` in the EXPIRES column, and
+  `meshive pod-key-roll` says the key has expired instead of the overlap warning.
 - **Permissions.** Locking, unlocking, creating, rolling and revoking need a read & write key from a workspace
   admin or billing member. Listing keys works with a read-only key.
 

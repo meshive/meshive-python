@@ -1048,23 +1048,59 @@ _OVERLAPS = {"now": 0, "1h": 3600, "24h": 86400, "7d": 604800}
 _OVERLAP_WORDS = {0: "at once", 3600: "in 1 hour", 86400: "in 24 hours", 604800: "in 7 days"}
 
 
-def _print_port_lock(result: PortLock, args: argparse.Namespace, color: bool) -> None:
+_LOCK_WAIT_SECONDS = 60.0
+_STATE_LABELS = {"locked": "Locked", "unlocked": "Unlocked", "locking": "Locking…", "unlocking": "Unlocking…"}
+
+
+def _lock_access(state: str | None, locked: bool, args: argparse.Namespace) -> str:
+    """The `access` line of pod-lock / pod-unlock. A choice that isn't in effect yet says so, and what to do."""
+    if state in ("locking", "unlocking"):
+        meaning = "the port may still be open" if state == "locking" else "requests may still be refused"
+        return (f"{_STATE_LABELS[state]} (not confirmed yet; {meaning} — check again with "
+                f"`meshive pod {args.workspace} {args.pod_name}`)")
+    return _STATE_LABELS.get(state) or ("Locked" if locked else "Unlocked")
+
+
+def _print_port_lock(result: PortLock, args: argparse.Namespace, color: bool, state: str | None = None) -> None:
+    state = state or result.state
     _kv([("pod", args.pod_name), ("port", str(result.port or args.port)),
-         ("access", "Locked" if result.locked else "Unlocked")])
+         ("access", _lock_access(state, result.locked, args))])
+    pending = state in ("locking", "unlocking")
     if result.locked:
         print(fmt.paint("Only workspace members signed in to the console and programs with an access key get "
-                        f"through. Create a key with `meshive pod-key-create {args.workspace} {args.pod_name} "
-                        f"{args.port} --name NAME`.", "dim", color))
+                        f"through{' once it takes effect' if pending else ''}. Create a key with `meshive "
+                        f"pod-key-create {args.workspace} {args.pod_name} {args.port} --name NAME`.", "dim", color))
+    elif pending:
+        print(fmt.paint("Anyone with the URL gets through once it takes effect. The port's access keys are kept and "
+                        "work again when it is locked again.", "dim", color))
     else:
         print(fmt.paint("Anyone with the URL gets through now. The port's access keys are kept and work again when "
                         "it is locked again.", "dim", color))
 
 
+def _set_port_lock(client: Meshive, args: argparse.Namespace, locked: bool, output: str, color: bool) -> int:
+    result = client.set_port_lock(args.pod_name, args.workspace, args.port, locked)
+    state = result.state
+    # A server that reports no state has its choice in effect at once. Otherwise wait until it is confirmed, so a
+    # script that runs next can rely on the lock.
+    if state in ("locking", "unlocking") and not args.no_wait:
+        print(f"Waiting for the port to {'lock' if locked else 'open'} (up to {int(_LOCK_WAIT_SECONDS)} seconds)…",
+              file=sys.stderr)
+        try:
+            state = client.wait_port_lock(args.pod_name, args.workspace, args.port,
+                                          timeout=_LOCK_WAIT_SECONDS).lock_state or state
+        except (MeshiveAPIError, httpx.RequestError) as exc:
+            print(fmt.clean(f"Could not check whether it took effect: {exc}"), file=sys.stderr)
+    raw = dict(result.raw)
+    if state:
+        raw["state"] = state
+    _emit(output, raw, [str(result.port or args.port)], lambda: _print_port_lock(result, args, color, state))
+    return 0
+
+
 def cmd_pod_lock(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     # Locking only adds protection, so it doesn't ask. Programs calling the port without a key get 401 from now on.
-    result = client.set_port_lock(args.pod_name, args.workspace, args.port, True)
-    _emit(output, result.raw, [str(result.port or args.port)], lambda: _print_port_lock(result, args, color))
-    return 0
+    return _set_port_lock(client, args, True, output, color)
 
 
 def cmd_pod_unlock(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
@@ -1072,14 +1108,14 @@ def cmd_pod_unlock(client: Meshive, args: argparse.Namespace, output: str, color
           file=sys.stderr)
     if not _confirm(args, f"Unlock port {args.port} of pod {args.pod_name}?"):
         return 2
-    result = client.set_port_lock(args.pod_name, args.workspace, args.port, False)
-    _emit(output, result.raw, [str(result.port or args.port)], lambda: _print_port_lock(result, args, color))
-    return 0
+    return _set_port_lock(client, args, False, output, color)
 
 
 def _key_expiry(key: AccessKey) -> str:
     if key.expires_at is None:
         return "never"
+    if key.expired:
+        return f"expired {fmt.relative_time(key.expires_at)} ({fmt.utc_time(key.expires_at)})"
     return f"{fmt.relative_time(key.expires_at)} ({fmt.utc_time(key.expires_at)})"
 
 
@@ -1158,11 +1194,26 @@ def cmd_pod_key_create(client: Meshive, args: argparse.Namespace, output: str, c
     return 0
 
 
+def _key_has_expired(client: Meshive, args: argparse.Namespace) -> bool:
+    """Whether the key being rolled is expired. A key that can't be looked up is treated as not expired: the roll
+    itself reports a missing key."""
+    try:
+        keys = client.list_access_keys(args.pod_name, args.workspace, args.port)
+    except (MeshiveAPIError, httpx.RequestError):
+        return False
+    return any(k.id == args.key_id and k.expired for k in keys)
+
+
 def cmd_pod_key_roll(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     overlap = _overlap_seconds(args.overlap)
-    when = _OVERLAP_WORDS.get(overlap, f"in {overlap} seconds")
-    print(fmt.clean(f"Rolling issues a new value for key {args.key_id}; its current value stops working {when}. "
-                    "Clients must be moved to the new value by then."), file=sys.stderr)
+    if _key_has_expired(client, args):
+        # An expired key's old value stopped working already, so there is nothing to overlap.
+        overlap = 0
+        print(fmt.clean(f"Key {args.key_id} has expired; rolling issues a new value."), file=sys.stderr)
+    else:
+        when = _OVERLAP_WORDS.get(overlap, f"in {overlap} seconds")
+        print(fmt.clean(f"Rolling issues a new value for key {args.key_id}; its current value stops working {when}. "
+                        "Clients must be moved to the new value by then."), file=sys.stderr)
     if not _confirm(args, f"Roll access key {args.key_id} of port {args.port} on pod {args.pod_name}?"):
         return 2
     try:
@@ -1990,6 +2041,8 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
         p.add_argument("workspace", help="Workspace ID (namespace name).")
         p.add_argument("pod_name", help="Pod ID (pod name).")
         p.add_argument("port", type=int, help="Port number, as `meshive pod` lists it.")
+        p.add_argument("--no-wait", action="store_true",
+                       help="Don't wait until the choice is in effect (by default it waits up to 60 seconds).")
         if name == "pod-unlock":
             _yes(p)
     p = sub.add_parser("pod-keys", parents=[common],

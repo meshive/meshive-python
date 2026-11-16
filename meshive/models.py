@@ -22,6 +22,22 @@ def _parse_dt(value: str | None) -> datetime | None:
         return None
 
 
+LOCK_STATES = ("locked", "locking", "unlocked", "unlocking")
+
+
+def _lock_state(value: object) -> str | None:
+    """A lock state the server reports, or None for a missing or unknown value."""
+    return value if isinstance(value, str) and value in LOCK_STATES else None
+
+
+def _is_past(moment: datetime | None) -> bool:
+    if moment is None:
+        return False
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment <= datetime.now(timezone.utc)
+
+
 def _as_float(value: object) -> float:
     """Number/numeric string → float. 0.0 if it can't be converted (safe when the server sends Numeric as a string)."""
     try:
@@ -122,6 +138,10 @@ class PodEndpoint:
     locked: bool | None = None
     lock_decided_at: datetime | None = None   # when someone last chose locked or unlocked; None = never chosen
     access_key_count: int | None = None       # access keys that work now (list_access_keys); None if not reported
+    # Whether the lock choice is in effect: "locked", "locking" (chosen, not confirmed yet: the port may still be open),
+    # "unlocked" or "unlocking" (chosen, not confirmed yet: requests may still be refused). None for an internal port
+    # and from servers that don't report it. `locked` and `access` stay the choice itself.
+    lock_state: str | None = None
 
     @property
     def access(self) -> str:
@@ -147,6 +167,7 @@ class PodEndpoint:
             locked=locked if isinstance(locked, bool) else None,
             lock_decided_at=_parse_dt(d.get("lockDecidedAt")),
             access_key_count=key_count if isinstance(key_count, int) and not isinstance(key_count, bool) else None,
+            lock_state=_lock_state(d.get("lockState")),
         )
 
 
@@ -348,14 +369,19 @@ class PortLock:
     """PATCH /v1/sdk/pods/{pod}/ports/{port}/lock response — the lock the port now has."""
 
     port: int
-    locked: bool
+    locked: bool                   # the choice that was made
     raw: dict = field(default_factory=dict, repr=False)
     replayed: bool = False         # see ResourceAction.replayed
+    # Whether the choice is in effect yet: locked | locking | unlocked | unlocking (see PodEndpoint.lock_state).
+    # None from servers that don't report it; their lock is in effect at once.
+    state: str | None = None
+    lock_decided_at: datetime | None = None   # when the choice was made
 
     @classmethod
     def from_dict(cls, d: dict) -> "PortLock":
         return cls(port=_as_int(d.get("port")), locked=bool(d.get("locked", False)), raw=d,
-                   replayed=bool(d.get("replayed", False)))
+                   replayed=bool(d.get("replayed", False)), state=_lock_state(d.get("state")),
+                   lock_decided_at=_parse_dt(d.get("lockDecidedAt")))
 
 
 @dataclass
@@ -378,17 +404,24 @@ class AccessKey:
     expires_at: datetime | None = None    # None = never expires
     # After a roll: until when the previous value still works. None when no previous value works.
     previous_value_valid_until: datetime | None = None
+    # True once the key has expired. An expired key stays in the list for 30 days, and can be rolled or revoked.
+    # Read when the key was listed; servers that don't report it get it worked out from `expires_at`.
+    expired: bool = False
     raw: dict = field(default_factory=dict, repr=False)
 
     @classmethod
     def _parse(cls, d: dict) -> dict:
         port = d.get("containerPort")
+        expires_at = _parse_dt(d.get("expiresAt"))
+        expired = d.get("expired")
+        if not isinstance(expired, bool):
+            expired = _is_past(expires_at)
         return dict(
             id=_as_int(d.get("id")), name=str(d.get("keyName", "") or ""), prefix=str(d.get("keyPrefix", "") or ""),
             port=_as_int(port) if port is not None else None, port_name=str(d.get("portAlias", "") or ""),
             pod_name=d.get("podName"), created_by=d.get("createdBy"), created_at=_parse_dt(d.get("createdAt")),
-            issued_at=_parse_dt(d.get("issuedAt")), expires_at=_parse_dt(d.get("expiresAt")),
-            previous_value_valid_until=_parse_dt(d.get("previousValueValidUntil")),
+            issued_at=_parse_dt(d.get("issuedAt")), expires_at=expires_at,
+            previous_value_valid_until=_parse_dt(d.get("previousValueValidUntil")), expired=expired,
             # The value never goes into raw, so printing or logging raw can't leak it.
             raw={k: v for k, v in d.items() if k != "accessKey"})
 

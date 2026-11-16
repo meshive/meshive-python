@@ -57,6 +57,7 @@ from .models import (
     AccessKey,
     AccessKeyCreated,
     PortLock,
+    PodEndpoint,
     CommandResult,
     CommandRun,
     UploadSession,
@@ -459,6 +460,17 @@ def _lock_unsupported(action: str) -> EndpointLockUnavailableError:
     return EndpointLockUnavailableError(
         "This Meshive API server does not support locking ports yet (it predates this SDK release) and would "
         f"open them to anyone with the URL, so nothing was sent. {_LOCK_WAY_OUT[action]}", reason="unsupported")
+
+
+_LOCK_APPLYING = ("locking", "unlocking")
+
+
+def _pod_port(pod: Pod, pod_name: str, port: int) -> PodEndpoint:
+    """The endpoint of `pod` that opens `port`; NotFoundError when the pod has no such port."""
+    for endpoint in pod.endpoints:
+        if endpoint.port == port:
+            return endpoint
+    raise NotFoundError(404, f"Pod '{pod_name}' doesn't open port {port}.", title="Port Not Found")
 
 
 def _port_route_error(err: MeshiveAPIError) -> MeshiveAPIError:
@@ -1681,7 +1693,9 @@ class Meshive(_BaseClient):
         """Lock (True) or unlock (False) one exposed port of a pod, without restarting it (write scope). A locked
         port lets through only workspace members signed in to the console and programs that send one of the port's
         access keys; an unlocked port is open to anyone with its URL. Unlocking keeps the port's keys: they work
-        again when it is locked again. Only ports exposed over HTTPS can be locked (400 'Not A Public Endpoint')."""
+        again when it is locked again. Only ports exposed over HTTPS can be locked (400 'Not A Public Endpoint').
+        The choice may take a few seconds to take effect: `state` on the result is "locking" or "unlocking" until it
+        does, and the port can still be reached without a key meanwhile (see wait_port_lock)."""
         path = f"/pods/{_path_segment(pod_name, 'pod_name')}/ports/{_write.port_segment(port)}/lock"
         try:
             data = self._send("PATCH", path, params={"workspace": _query_value(workspace, "workspace")},
@@ -1690,8 +1704,25 @@ class Meshive(_BaseClient):
             raise _port_route_error(err) from None
         return PortLock.from_dict(data)
 
+    def wait_port_lock(self, pod_name: str, workspace: str, port: int, *, timeout: float = 60.0,
+                       poll: float = 1.0) -> PodEndpoint:
+        """Wait until the lock choice of one exposed port is in effect, and return that endpoint. Right after
+        set_port_lock the port's `lock_state` is "locking" (chosen, not confirmed yet: the port may still be open) or
+        "unlocking" (requests may still be refused); this polls the pod every `poll` seconds until it is "locked" or
+        "unlocked". It returns at once for a server that doesn't report lock states. When `timeout` seconds pass
+        first it returns the last endpoint read, with the state still "locking" or "unlocking": that is not an error,
+        so check `lock_state` on the result before relying on the lock."""
+        number = int(_write.port_segment(port))
+        deadline = time.monotonic() + timeout
+        while True:
+            endpoint = _pod_port(self.get_pod(pod_name, workspace), pod_name, number)
+            if endpoint.lock_state not in _LOCK_APPLYING or time.monotonic() >= deadline:
+                return endpoint
+            time.sleep(min(poll, max(deadline - time.monotonic(), 0.0)))
+
     def list_access_keys(self, pod_name: str, workspace: str, port: int) -> list[AccessKey]:
-        """The access keys of one port that work now: name, first characters, who issued them and when they expire.
+        """The access keys of one port: name, first characters, who issued them and when they expire. A key that has
+        expired (`expired`) stays in the list for 30 days; it no longer works, but it can be rolled or revoked.
         A key's value is never listed; it is shown once, by create_access_key or roll_access_key."""
         path = f"/pods/{_path_segment(pod_name, 'pod_name')}/ports/{_write.port_segment(port)}/keys"
         try:
@@ -1723,6 +1754,8 @@ class Meshive(_BaseClient):
         this once), and a new id. The old value keeps working for overlap_seconds — 3600 (the default), 86400 or
         604800, or 0 to stop it at once — so clients can be moved to the new value; `previous_value_valid_until`
         says until when. The new value expires after the same lifetime the key was created with, counted from now.
+        An expired key can be rolled too: its old value stopped working already, so overlap_seconds is ignored and
+        `previous_value_valid_until` is None.
         Not idempotent: every call issues another value, so it is resent only when the server surely never started
         on it. After a timeout, check list_access_keys before calling again."""
         path = (f"/pods/{_path_segment(pod_name, 'pod_name')}/ports/{_write.port_segment(port)}"
@@ -3191,8 +3224,21 @@ class AsyncMeshive(_BaseClient):
             raise _port_route_error(err) from None
         return PortLock.from_dict(data)
 
+    async def wait_port_lock(self, pod_name: str, workspace: str, port: int, *, timeout: float = 60.0,
+                             poll: float = 1.0) -> PodEndpoint:
+        """Wait until the lock choice of one exposed port is in effect. Same contract as the sync client: it returns
+        the endpoint once `lock_state` is "locked" or "unlocked", or the last one read after `timeout` seconds."""
+        number = int(_write.port_segment(port))
+        deadline = time.monotonic() + timeout
+        while True:
+            endpoint = _pod_port(await self.get_pod(pod_name, workspace), pod_name, number)
+            if endpoint.lock_state not in _LOCK_APPLYING or time.monotonic() >= deadline:
+                return endpoint
+            await asyncio.sleep(min(poll, max(deadline - time.monotonic(), 0.0)))
+
     async def list_access_keys(self, pod_name: str, workspace: str, port: int) -> list[AccessKey]:
-        """The access keys of one port that work now (never their values). Same contract as the sync client."""
+        """The access keys of one port, expired ones included for 30 days (never their values). Same contract as the
+        sync client."""
         path = f"/pods/{_path_segment(pod_name, 'pod_name')}/ports/{_write.port_segment(port)}/keys"
         try:
             data = await self._get(path, params={"workspace": _query_value(workspace, "workspace")})

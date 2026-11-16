@@ -535,6 +535,15 @@ def port_lock_body(locked: Any) -> dict[str, Any]:
     return {"locked": locked}
 
 
+def port_preflight_body(allow: Any) -> dict[str, Any]:
+    """PATCH …/ports/{port}/preflight body. Only a real bool is taken, so a string such as "false" can't let
+    preflight requests through by accident."""
+    if not isinstance(allow, bool):
+        raise ValueError("allow must be an explicit boolean (True to let preflight requests through, False to refuse "
+                         "them)")
+    return {"allowPreflight": allow}
+
+
 def access_key_body(name: Any, expires_in_days: Any) -> dict[str, Any]:
     """POST …/ports/{port}/keys body. Which lifetimes exist is the server's rule (30, 90 or 365 days, or 0 for a key
     that never expires), so only the type is checked. None is refused rather than read as "never expires"."""

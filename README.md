@@ -149,10 +149,12 @@ except WaitTimeoutError:
 | Run a command in a running pod (add `--background` for long work) | `meshive pod-exec <workspace> <pod> -- nvidia-smi` |
 | Upload a file or folder from your computer as an asset | `meshive asset-upload <workspace> ./my-data` |
 | Change a pod's GPU, ports, environment or storage | `meshive pod-update <workspace> <pod> --gpu "RTX 4090"` |
-| Lock or unlock a pod's public port | `meshive pod-lock <workspace> <pod> <port>`, `meshive pod-unlock <workspace> <pod> <port>` |
-| Give a program access to a locked port | `meshive pod-key-create <workspace> <pod> <port> --name ci`, then send `Authorization: Bearer <key>` |
-| List, roll or revoke a port's access keys | `meshive pod-keys <workspace> <pod> <port>`, `meshive pod-key-roll ...`, `meshive pod-key-revoke ...` |
-| Use a locked port from an app that only takes an address | `meshive forward <workspace> <pod> <port>` with the key in `MESHIVE_ACCESS_KEY`, then point the app at `http://127.0.0.1:<port>` |
+| Lock or unlock a pod's public port | `meshive port-lock <workspace> <pod> <port>`, `meshive port-unlock <workspace> <pod> <port>` |
+| Give a program access to a locked port | `meshive port-key-create <workspace> <pod> <port> --name ci`, then send `Authorization: Bearer <key>` |
+| List, roll or revoke a port's access keys, and see when each was last used | `meshive port-keys <workspace> <pod> <port>`, `meshive port-key-roll ...`, `meshive port-key-revoke ...` |
+| Let a page on another site call a locked port (CORS preflight) | `meshive port-preflight <workspace> <pod> <port> on` (`off` to undo) |
+| Sign out everyone who opened a pod's locked ports in a browser | `meshive pod-browser-sessions-revoke <workspace> <pod>` |
+| Use a locked port from an app that only takes an address | `meshive port-forward <workspace> <pod> <port>` with the key in `MESHIVE_ACCESS_KEY`, then point the app at `http://127.0.0.1:<port>` |
 | Grow or rename storage, or SSH into it | `meshive storage-update <workspace> <storage> --size 100`, `meshive storage-connect <workspace> <storage>` |
 | Start a pod with a ready-made set of models | `meshive model-sets <workspace> --template <template-id>`, then `meshive pod-create ... --model-set <slug>` |
 | See why a pod is still starting | `meshive transactions <workspace>` |
@@ -174,11 +176,11 @@ Every command has `--help`. The [CLI reference](https://docs.meshive.ai/sdk-cli/
   change or delete, and it expires (after 30 days by default).
 - **Public ports are created locked.** A port that is newly exposed over HTTPS, on a new pod or by `pod-update`,
   lets in only workspace members signed in to the console, and programs that send one of the port's access keys
-  (`meshive pod-key-create`). Pass `--no-lock` (`lock_public_ports=False`) to create them open to anyone with the
+  (`meshive port-key-create`). Pass `--no-lock` (`lock_public_ports=False`) to create them open to anyone with the
   URL, as before 1.10. Ports that are public already keep the lock they have.
   An access key starts with `mshv_`. Send a pod's URL only that key, never your Meshive account API key
   (`meshive_...`).
-- **Apps that can't send a key.** `meshive forward <workspace> <pod> <port>` listens on `http://127.0.0.1:<port>`
+- **Apps that can't send a key.** `meshive port-forward <workspace> <pod> <port>` listens on `http://127.0.0.1:<port>`
   on your computer and passes every request on to the locked port with the access key added, WebSockets included.
   The key is read from the `MESHIVE_ACCESS_KEY` environment variable or from `--key-file`, never from the command
   line. It answers only on 127.0.0.1 and refuses requests made by web pages on other sites; programs on your
@@ -220,7 +222,7 @@ The API key is looked up in this order: the `--api-key` option (or `Meshive(api_
 | Code | Meaning |
 | --- | --- |
 | `0` | Success. |
-| `1` | The API returned an error, the key is missing or invalid, the API couldn't be reached, or `workspace-delete` found the workspace isn't empty. |
+| `1` | The API returned an error, the key is missing or invalid, the API couldn't be reached, `workspace-delete` found the workspace isn't empty, or `port-lock`/`port-unlock` couldn't confirm within 60 seconds that the choice is in effect. |
 | `2` | Bad arguments, or a command needed confirmation and didn't get it (no terminal and no `--yes`, or you answered no). |
 | `130` | Interrupted with Ctrl-C. |
 

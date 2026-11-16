@@ -8,8 +8,9 @@ import json
 import httpx
 import pytest
 
-from meshive import (AccessKey, AccessKeyCreated, ConflictError, EndpointLockUnavailableError, MeshiveAPIError,
-                     NotFoundError, Pod, PodEndpoint, PortLock, PortNotLockedError, ResourceAction)
+from meshive import (AccessKey, AccessKeyCreated, BrowserSessionsRevoked, ConflictError,
+                     EndpointLockUnavailableError, MeshiveAPIError, MeshiveError, NotFoundError, Pod, PodEndpoint,
+                     PortLock, PortNotLockedError, PortPreflight, ResourceAction, WaitTimeoutError)
 from tests.test_sdk import async_client, isolate_config_dir, slept, sync_client  # noqa: F401  (autouse fixtures)
 
 cli = importlib.import_module("meshive.cli.main")
@@ -76,7 +77,8 @@ def _json(request: httpx.Request) -> dict:
 def test_new_names_are_exported():
     import meshive
 
-    for name in ("PortLock", "AccessKey", "AccessKeyCreated", "EndpointLockUnavailableError", "PortNotLockedError"):
+    for name in ("PortLock", "PortPreflight", "BrowserSessionsRevoked", "AccessKey", "AccessKeyCreated",
+                 "EndpointLockUnavailableError", "PortNotLockedError"):
         assert name in meshive.__all__ and getattr(meshive, name).__name__ == name
 
 
@@ -950,7 +952,7 @@ def test_cli_pod_create_locks_public_ports_and_shows_it(api, capsys):
                      "--yes"]) == 0
     captured = capsys.readouterr()
     assert "ports:     7000 locked, 8080 unlocked, 8188 locked, 9000 locked" in captured.out
-    assert "pod-key-create" in captured.out                    # how a program gets in is said with the estimate
+    assert "port-key-create" in captured.out                    # how a program gets in is said with the estimate
     # 8080 is open because the template's author chose so: said before the question, on stderr.
     assert "Port 8080 will be open to anyone with the URL (not locked)." in captured.err
     for path in ("/v1/sdk/pods/estimate", "/v1/sdk/pods"):
@@ -1010,7 +1012,7 @@ def test_cli_pod_create_wait_fails_when_a_port_is_not_locked(api, capsys):
                      "--yes"]) == 1
     captured = capsys.readouterr()
     assert "port 8080 of pod p-0 is exposed without the lock" in captured.err
-    assert "meshive pod-lock ws p-0 PORT" in captured.err and "p-0" in captured.out
+    assert "meshive port-lock ws p-0 PORT" in captured.err and "p-0" in captured.out
     # With the locks in place the same wait succeeds.
     assert cli.main(["pod-create", "ws", "p", "--template", "457", "--wait", "running", "--yes"]) == 0
 
@@ -1022,7 +1024,7 @@ def test_cli_pod_update_locks_a_new_public_port_and_says_so(api, capsys):
     captured = capsys.readouterr()
     assert "ports:     9000 locked" in captured.out                       # with the estimate
     # Said before the question, with how a program gets in. Nothing is opened to everyone, so no such warning.
-    assert "Port 9000 will be locked" in captured.err and "pod-key-create" in captured.err
+    assert "Port 9000 will be locked" in captured.err and "port-key-create" in captured.err
     assert "open to anyone" not in captured.err
     # An internal port the update exposes, and a move to another template (9000 is the port it adds).
     assert cli.main(["pod-update", "ws", "p-0", "--template-port", "9100:::external", "--yes"]) == 0
@@ -1095,135 +1097,135 @@ def test_cli_pod_update_unlocking_a_port_warns_and_asks(api, capsys, non_tty):
         api.routes = saved
 
 
-def test_cli_pod_lock_does_not_ask(api, capsys, non_tty):
-    assert cli.main(["pod-lock", "ws", "p-0", "3000"]) == 0
+def test_cli_port_lock_does_not_ask(api, capsys, non_tty):
+    assert cli.main(["port-lock", "ws", "p-0", "3000"]) == 0
     assert api.body("PATCH", LOCK_PATH) == {"locked": True}
     out = capsys.readouterr().out
-    assert "Locked" in out and "meshive pod-key-create ws p-0 3000 --name NAME" in out
-    assert cli.main(["pod-lock", "ws", "p-0", "3000", "-o", "name"]) == 0
+    assert "Locked" in out and "meshive port-key-create ws p-0 3000 --name NAME" in out
+    assert cli.main(["port-lock", "ws", "p-0", "3000", "-o", "name"]) == 0
     assert capsys.readouterr().out == "3000\n"
 
 
-def test_cli_pod_unlock_asks_first(api, capsys, non_tty, monkeypatch):
-    assert cli.main(["pod-unlock", "ws", "p-0", "3000"]) == 2
+def test_cli_port_unlock_asks_first(api, capsys, non_tty, monkeypatch):
+    assert cli.main(["port-unlock", "ws", "p-0", "3000"]) == 2
     err = capsys.readouterr().err
     assert "opens port 3000 of pod p-0 to anyone with its URL" in err and "--yes" in err
     assert not api.sent("PATCH", LOCK_PATH)
     monkeypatch.setattr("sys.stdin", _Tty("n\n"))
-    assert cli.main(["pod-unlock", "ws", "p-0", "3000"]) == 2 and not api.sent("PATCH", LOCK_PATH)
+    assert cli.main(["port-unlock", "ws", "p-0", "3000"]) == 2 and not api.sent("PATCH", LOCK_PATH)
     assert "Unlock port 3000 of pod p-0? [y/N]" in capsys.readouterr().err
     monkeypatch.setattr("sys.stdin", _Tty("y\n"))
-    assert cli.main(["pod-unlock", "ws", "p-0", "3000"]) == 0
+    assert cli.main(["port-unlock", "ws", "p-0", "3000"]) == 0
     assert api.body("PATCH", LOCK_PATH) == {"locked": False}
     out = capsys.readouterr().out
     assert "Unlocked" in out and "access keys are kept" in out
-    assert cli.main(["pod-unlock", "ws", "p-0", "3000", "--yes", "-o", "json"]) == 0
+    assert cli.main(["port-unlock", "ws", "p-0", "3000", "--yes", "-o", "json"]) == 0
     assert json.loads(capsys.readouterr().out)["locked"] is False
 
 
-def test_cli_pod_keys_lists_prefixes_never_values(api, capsys):
-    assert cli.main(["pod-keys", "ws", "p-0", "3000"]) == 0
+def test_cli_port_keys_lists_prefixes_never_values(api, capsys):
+    assert cli.main(["port-keys", "ws", "p-0", "3000"]) == 0
     out = capsys.readouterr().out
     assert out.splitlines()[0].split()[:4] == ["ID", "NAME", "KEY", "EXPIRES"]
     assert "mshv_Zq7Zq7Zq…" in out and "batch-script" in out and "dev@example.com" in out and KEY not in out
     assert "2026-11-14 15:00 UTC" in out                       # until when the rolled key's old value works
-    assert cli.main(["pod-keys", "ws", "p-0", "3000", "-o", "json"]) == 0
+    assert cli.main(["port-keys", "ws", "p-0", "3000", "-o", "json"]) == 0
     listed = json.loads(capsys.readouterr().out)
     assert [k["id"] for k in listed] == [12, 31] and all("accessKey" not in k for k in listed)
-    assert cli.main(["pod-keys", "ws", "p-0", "3000", "-o", "name"]) == 0
+    assert cli.main(["port-keys", "ws", "p-0", "3000", "-o", "name"]) == 0
     assert capsys.readouterr().out == "12\n31\n"
     api.routes[("GET", KEYS_PATH)] = (200, {"keys": []})
-    assert cli.main(["pod-keys", "ws", "p-0", "3000"]) == 0
+    assert cli.main(["port-keys", "ws", "p-0", "3000"]) == 0
     assert "No access keys for port 3000" in capsys.readouterr().out
 
 
-def test_cli_pod_key_create_prints_the_value_once(api, capsys, non_tty):
-    assert cli.main(["pod-key-create", "ws", "p-0", "3000", "--name", "batch-script"]) == 0      # doesn't ask
+def test_cli_port_key_create_prints_the_value_once(api, capsys, non_tty):
+    assert cli.main(["port-key-create", "ws", "p-0", "3000", "--name", "batch-script"]) == 0      # doesn't ask
     captured = capsys.readouterr()
     assert captured.out.count(KEY) == 1 and KEY not in captured.err
     assert "shown only now" in captured.out and "Authorization: Bearer <key>" in captured.out
     assert "X-Meshive-Key" in captured.out and "batch-script" in captured.out
     assert api.body("POST", KEYS_PATH) == {"name": "batch-script", "expiresInDays": 90}
     # -o name: only the value, for KEY=$(…). -o json: the server's answer, value included, as other secrets are.
-    assert cli.main(["pod-key-create", "ws", "p-0", "3000", "--name", "ci", "-o", "name"]) == 0
+    assert cli.main(["port-key-create", "ws", "p-0", "3000", "--name", "ci", "-o", "name"]) == 0
     assert capsys.readouterr().out == KEY + "\n"
-    assert cli.main(["pod-key-create", "ws", "p-0", "3000", "--name", "ci", "--expires", "never", "-o", "json"]) == 0
+    assert cli.main(["port-key-create", "ws", "p-0", "3000", "--name", "ci", "--expires", "never", "-o", "json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["accessKey"] == KEY and payload["id"] == 12
     assert api.body("POST", KEYS_PATH)["expiresInDays"] == 0
-    assert cli.main(["pod-key-create", "ws", "p-0", "3000", "--name", "ci", "--expires", "365"]) == 0
+    assert cli.main(["port-key-create", "ws", "p-0", "3000", "--name", "ci", "--expires", "365"]) == 0
     assert api.body("POST", KEYS_PATH)["expiresInDays"] == 365
     capsys.readouterr()
     for bad in ("soon", "0", "-5"):
         before = len(api.sent("POST", KEYS_PATH))
-        assert cli.main(["pod-key-create", "ws", "p-0", "3000", "--name", "ci", "--expires", bad]) == 2
+        assert cli.main(["port-key-create", "ws", "p-0", "3000", "--name", "ci", "--expires", bad]) == 2
         assert "--expires expects" in capsys.readouterr().err and len(api.sent("POST", KEYS_PATH)) == before
 
 
-def test_cli_pod_key_create_is_not_repeated_after_a_timeout(api, capsys, slept):
+def test_cli_port_key_create_is_not_repeated_after_a_timeout(api, capsys, slept):
     api.routes[("POST", KEYS_PATH)] = _timeout
-    assert cli.main(["pod-key-create", "ws", "p-0", "3000", "--name", "ci"]) == 1
+    assert cli.main(["port-key-create", "ws", "p-0", "3000", "--name", "ci"]) == 1
     captured = capsys.readouterr()
     assert "isn't known whether the key was created" in captured.err and "It was not sent again" in captured.err
-    assert "meshive pod-keys ws p-0 3000" in captured.err and "pod-key-revoke" in captured.err
+    assert "meshive port-keys ws p-0 3000" in captured.err and "port-key-revoke" in captured.err
     assert len(api.sent("POST", KEYS_PATH)) == 1 and captured.out == ""
     # A connection that broke mid-request is the same case: the server may have issued the value.
     api.routes[("POST", KEYS_PATH)] = _cut_off
-    assert cli.main(["pod-key-create", "ws", "p-0", "3000", "--name", "ci"]) == 1
+    assert cli.main(["port-key-create", "ws", "p-0", "3000", "--name", "ci"]) == 1
     assert "isn't known whether the key was created" in capsys.readouterr().err
     assert len(api.sent("POST", KEYS_PATH)) == 2
     # A request that never reached the server is an ordinary connection error: nothing was created.
     api.routes[("POST", KEYS_PATH)] = lambda r: (_ for _ in ()).throw(httpx.ConnectError("refused", request=r))
-    assert cli.main(["pod-key-create", "ws", "p-0", "3000", "--name", "ci"]) == 1
+    assert cli.main(["port-key-create", "ws", "p-0", "3000", "--name", "ci"]) == 1
     err = capsys.readouterr().err
     assert "could not reach the Meshive API" in err and "isn't known" not in err
 
 
-def test_cli_pod_key_roll_asks_and_prints_the_new_value_once(api, capsys, non_tty, monkeypatch):
-    assert cli.main(["pod-key-roll", "ws", "p-0", "3000", "12"]) == 2
+def test_cli_port_key_roll_asks_and_prints_the_new_value_once(api, capsys, non_tty, monkeypatch):
+    assert cli.main(["port-key-roll", "ws", "p-0", "3000", "12"]) == 2
     err = capsys.readouterr().err
     assert "its current value stops working in 1 hour" in err and "--yes" in err
     assert not api.sent("POST", f"{KEYS_PATH}/12/roll")
-    assert cli.main(["pod-key-roll", "ws", "p-0", "3000", "12", "--yes"]) == 0
+    assert cli.main(["port-key-roll", "ws", "p-0", "3000", "12", "--yes"]) == 0
     captured = capsys.readouterr()
     assert captured.out.count(KEY) == 1 and KEY not in captured.err
     assert "works until 2026-11-14 15:00 UTC" in captured.out and "31" in captured.out
     assert api.body("POST", f"{KEYS_PATH}/12/roll") == {"overlapSeconds": 3600}
     for text, seconds, words in (("now", 0, "at once"), ("24h", 86400, "in 24 hours"), ("7d", 604800, "in 7 days")):
-        assert cli.main(["pod-key-roll", "ws", "p-0", "3000", "12", "--overlap", text, "--yes", "-o", "name"]) == 0
+        assert cli.main(["port-key-roll", "ws", "p-0", "3000", "12", "--overlap", text, "--yes", "-o", "name"]) == 0
         captured = capsys.readouterr()
         assert captured.out == KEY + "\n" and f"stops working {words}" in captured.err
         assert api.body("POST", f"{KEYS_PATH}/12/roll") == {"overlapSeconds": seconds}
-    assert cli.main(["pod-key-roll", "ws", "p-0", "3000", "12", "--overlap", "soon", "--yes"]) == 2
+    assert cli.main(["port-key-roll", "ws", "p-0", "3000", "12", "--overlap", "soon", "--yes"]) == 2
     assert "--overlap expects" in capsys.readouterr().err
     api.routes[("POST", f"{KEYS_PATH}/12/roll")] = _timeout
     sent = len(api.sent("POST", f"{KEYS_PATH}/12/roll"))
-    assert cli.main(["pod-key-roll", "ws", "p-0", "3000", "12", "--yes"]) == 1
+    assert cli.main(["port-key-roll", "ws", "p-0", "3000", "12", "--yes"]) == 1
     assert "isn't known whether the key was rolled" in capsys.readouterr().err
     assert len(api.sent("POST", f"{KEYS_PATH}/12/roll")) == sent + 1
 
 
-def test_cli_pod_key_revoke_asks_first(api, capsys, non_tty, monkeypatch):
-    assert cli.main(["pod-key-revoke", "ws", "p-0", "3000", "12"]) == 2
+def test_cli_port_key_revoke_asks_first(api, capsys, non_tty, monkeypatch):
+    assert cli.main(["port-key-revoke", "ws", "p-0", "3000", "12"]) == 2
     err = capsys.readouterr().err
     assert "can't be undone" in err and "--yes" in err and not api.sent("DELETE", f"{KEYS_PATH}/12")
     monkeypatch.setattr("sys.stdin", _Tty("no\n"))
-    assert cli.main(["pod-key-revoke", "ws", "p-0", "3000", "12"]) == 2
+    assert cli.main(["port-key-revoke", "ws", "p-0", "3000", "12"]) == 2
     assert "Revoke access key 12 of port 3000 on pod p-0? [y/N]" in capsys.readouterr().err
     assert not api.sent("DELETE", f"{KEYS_PATH}/12")
-    assert cli.main(["pod-key-revoke", "ws", "p-0", "3000", "12", "--yes"]) == 0
+    assert cli.main(["port-key-revoke", "ws", "p-0", "3000", "12", "--yes"]) == 0
     assert len(api.sent("DELETE", f"{KEYS_PATH}/12")) == 1 and "revoked key" in capsys.readouterr().out
-    assert cli.main(["pod-key-revoke", "ws", "p-0", "3000", "12", "--yes", "-o", "name"]) == 0
+    assert cli.main(["port-key-revoke", "ws", "p-0", "3000", "12", "--yes", "-o", "name"]) == 0
     assert capsys.readouterr().out == "12\n"
 
 
 def test_cli_port_commands_explain_a_server_that_cannot_lock(api, capsys):
     api.routes[("PATCH", LOCK_PATH)] = (404, {"detail": "Not Found"})
-    assert cli.main(["pod-lock", "ws", "p-0", "3000"]) == 1
+    assert cli.main(["port-lock", "ws", "p-0", "3000"]) == 1
     assert "does not support port locks and access keys yet" in capsys.readouterr().err
     api.routes[("POST", KEYS_PATH)] = (404, {"detail": {"title": "Not Found", "message": "Endpoint lock is not "
                                                        "available.", "code": "endpoint_lock_disabled"}})
-    assert cli.main(["pod-key-create", "ws", "p-0", "3000", "--name", "ci"]) == 1
+    assert cli.main(["port-key-create", "ws", "p-0", "3000", "--name", "ci"]) == 1
     assert "turned off on this Meshive server right now" in capsys.readouterr().err
 
 
@@ -1289,58 +1291,72 @@ def test_set_port_lock_returns_the_state():
     assert sync_client(api).set_port_lock("p-0", "ws", 3000, True).state == "locking"
 
 
-def test_wait_port_lock_polls_until_the_state_settles(clock, slept):
+def test_wait_for_port_lock_polls_until_the_state_settles(clock, slept):
     api = Api({("GET", POD_PATH): _pod_with_state("locking", "locking", "locked")})
-    endpoint = sync_client(api).wait_port_lock("p-0", "ws", 3000)
+    endpoint = sync_client(api).wait_for_port_lock("p-0", "ws", 3000)
     assert isinstance(endpoint, PodEndpoint) and endpoint.lock_state == "locked"
     assert len(api.sent("GET", POD_PATH)) == 3 and slept == [1.0, 1.0]
     assert api.sent("GET", POD_PATH)[0].url.params["workspace"] == "ws"
 
 
-def test_wait_port_lock_unlocking_waits_too(clock):
+def test_wait_for_port_lock_unlocking_waits_too(clock):
     api = Api({("GET", POD_PATH): _pod_with_state("unlocking", "unlocked")})
-    assert sync_client(api).wait_port_lock("p-0", "ws", 3000).lock_state == "unlocked"
+    assert sync_client(api).wait_for_port_lock("p-0", "ws", 3000).lock_state == "unlocked"
 
 
 @pytest.mark.parametrize("state", ["locked", "unlocked", None])
-def test_wait_port_lock_returns_at_once_when_nothing_is_pending(clock, slept, state):
+def test_wait_for_port_lock_returns_at_once_when_nothing_is_pending(clock, slept, state):
     # None: a server that doesn't report states, whose lock is in effect at once.
     api = Api({("GET", POD_PATH): _pod_with_state(state)})
-    assert sync_client(api).wait_port_lock("p-0", "ws", 3000).lock_state == state
+    assert sync_client(api).wait_for_port_lock("p-0", "ws", 3000).lock_state == state
     assert len(api.sent("GET", POD_PATH)) == 1 and slept == []
 
 
-def test_wait_port_lock_returns_the_last_value_on_timeout(clock, slept):
+def test_wait_for_port_lock_raises_on_timeout_with_the_last_endpoint(clock, slept):
     api = Api({("GET", POD_PATH): _pod_with_state("locking")})
-    endpoint = sync_client(api).wait_port_lock("p-0", "ws", 3000, timeout=5.0, poll=2.0)
-    assert endpoint.lock_state == "locking"                      # not an error: the state says it
+    with pytest.raises(WaitTimeoutError) as caught:
+        sync_client(api).wait_for_port_lock("p-0", "ws", 3000, timeout=5.0, interval=2.0)
     assert slept == [2.0, 2.0, 1.0] and len(api.sent("GET", POD_PATH)) == 4
+    error = caught.value
+    assert isinstance(error, MeshiveError) and isinstance(error, TimeoutError)     # like the other waits
+    assert isinstance(error.last, PodEndpoint) and error.last.lock_state == "locking" and error.last.port == 3000
+    assert "last state: locking; the port may still be open" in str(error)
 
 
-def test_wait_port_lock_with_no_time_reads_once(clock, slept):
+def test_wait_for_port_lock_with_no_time_reads_once(clock, slept):
     api = Api({("GET", POD_PATH): _pod_with_state("locking")})
-    assert sync_client(api).wait_port_lock("p-0", "ws", 3000, timeout=0).lock_state == "locking"
+    with pytest.raises(WaitTimeoutError):
+        sync_client(api).wait_for_port_lock("p-0", "ws", 3000, timeout=0)
     assert len(api.sent("GET", POD_PATH)) == 1 and slept == []
+    # Nothing pending: no time is needed.
+    api = Api({("GET", POD_PATH): _pod_with_state("locked")})
+    assert sync_client(api).wait_for_port_lock("p-0", "ws", 3000, timeout=0).lock_state == "locked"
 
 
-def test_wait_port_lock_checks_the_port_and_the_pod():
+def test_other_waits_still_raise_wait_timeout_without_last():
+    assert WaitTimeoutError("x").last is None and str(WaitTimeoutError("x")) == "x"
+
+
+def test_wait_for_port_lock_checks_the_port_and_the_pod():
     api = Api({("GET", POD_PATH): (200, POD)})
     with pytest.raises(NotFoundError, match="doesn't open port 4000"):
-        sync_client(api).wait_port_lock("p-0", "ws", 4000)
+        sync_client(api).wait_for_port_lock("p-0", "ws", 4000)
     with pytest.raises(ValueError):
-        sync_client(api).wait_port_lock("p-0", "ws", "3000")
+        sync_client(api).wait_for_port_lock("p-0", "ws", "3000")
     with pytest.raises(ValueError):
-        sync_client(api).wait_port_lock("", "ws", 3000)
+        sync_client(api).wait_for_port_lock("", "ws", 3000)
 
 
-def test_wait_port_lock_async(clock, slept):
+def test_wait_for_port_lock_async(clock, slept):
     api = Api({("GET", POD_PATH): _pod_with_state("locking", "locked")})
-    endpoint = asyncio.run(async_client(api).wait_port_lock("p-0", "ws", 3000))
+    endpoint = asyncio.run(async_client(api).wait_for_port_lock("p-0", "ws", 3000))
     assert endpoint.lock_state == "locked" and slept == [1.0]
     api = Api({("GET", POD_PATH): _pod_with_state("unlocking")})
     slept.clear()
-    endpoint = asyncio.run(async_client(api).wait_port_lock("p-0", "ws", 3000, timeout=2.0, poll=1.0))
-    assert endpoint.lock_state == "unlocking" and slept == [1.0, 1.0]
+    with pytest.raises(WaitTimeoutError) as caught:
+        asyncio.run(async_client(api).wait_for_port_lock("p-0", "ws", 3000, timeout=2.0, interval=1.0))
+    assert caught.value.last.lock_state == "unlocking" and slept == [1.0, 1.0]
+    assert "requests may still be refused" in str(caught.value)
 
 
 def test_cli_pod_shows_locking_and_unlocking(api, capsys):
@@ -1360,64 +1376,71 @@ def _toggle(state):
                                                "lockDecidedAt": "2026-11-16T05:00:00Z"})
 
 
-def test_cli_pod_lock_waits_until_it_is_in_effect(api, capsys, non_tty, clock):
+def test_cli_port_lock_waits_until_it_is_in_effect(api, capsys, non_tty, clock):
     api.routes[("PATCH", LOCK_PATH)] = _toggle("locking")
     api.routes[("GET", POD_PATH)] = _pod_with_state("locking", "locked")
-    assert cli.main(["pod-lock", "ws", "p-0", "3000"]) == 0
+    assert cli.main(["port-lock", "ws", "p-0", "3000"]) == 0
     captured = capsys.readouterr()
     assert "access: Locked" in captured.out and "Locking" not in captured.out
     assert "Waiting for the port to lock (up to 60 seconds)" in captured.err and "Waiting" not in captured.out
     assert len(api.sent("GET", POD_PATH)) == 2
     api.routes[("GET", POD_PATH)] = _pod_with_state("locked")
-    assert cli.main(["pod-lock", "ws", "p-0", "3000", "-o", "json"]) == 0
+    assert cli.main(["port-lock", "ws", "p-0", "3000", "-o", "json"]) == 0
     assert json.loads(capsys.readouterr().out)["state"] == "locked"
 
 
-def test_cli_pod_lock_that_is_not_confirmed_in_time_says_so(api, capsys, non_tty, clock):
+def test_cli_port_lock_that_is_not_confirmed_in_time_says_so(api, capsys, non_tty, clock):
     api.routes[("PATCH", LOCK_PATH)] = _toggle("locking")
     api.routes[("GET", POD_PATH)] = _pod_with_state("locking")
-    assert cli.main(["pod-lock", "ws", "p-0", "3000"]) == 0                      # not an error
+    assert cli.main(["port-lock", "ws", "p-0", "3000"]) == 1                      # not confirmed: exit 1
     out = capsys.readouterr().out
     assert ("access: Locking… (not confirmed yet; the port may still be open — check again with "
             "`meshive pod ws p-0`)") in out
     assert clock[0] - 1000.0 == 60.0                                              # waited the 60 seconds
 
 
-def test_cli_pod_lock_no_wait_does_not_poll(api, capsys, non_tty, clock):
+def test_cli_port_lock_no_wait_does_not_poll(api, capsys, non_tty, clock):
     api.routes[("PATCH", LOCK_PATH)] = _toggle("locking")
-    assert cli.main(["pod-lock", "ws", "p-0", "3000", "--no-wait"]) == 0
+    assert cli.main(["port-lock", "ws", "p-0", "3000", "--no-wait"]) == 0
     captured = capsys.readouterr()
     assert "access: Locking… (not confirmed yet" in captured.out and "Waiting" not in captured.err
     assert not api.sent("GET", POD_PATH)
 
 
-def test_cli_pod_unlock_waits_too(api, capsys, non_tty, clock):
+def test_cli_port_unlock_waits_too(api, capsys, non_tty, clock):
     api.routes[("PATCH", LOCK_PATH)] = _toggle("unlocking")
     api.routes[("GET", POD_PATH)] = _pod_with_state("unlocking", "unlocked")
-    assert cli.main(["pod-unlock", "ws", "p-0", "3000", "--yes"]) == 0
+    assert cli.main(["port-unlock", "ws", "p-0", "3000", "--yes"]) == 0
     captured = capsys.readouterr()
     assert "access: Unlocked" in captured.out and "Waiting for the port to open" in captured.err
     api.routes[("GET", POD_PATH)] = _pod_with_state("unlocking")
-    assert cli.main(["pod-unlock", "ws", "p-0", "3000", "--yes"]) == 0
+    assert cli.main(["port-unlock", "ws", "p-0", "3000", "--yes"]) == 1
     assert "access: Unlocking… (not confirmed yet; requests may still be refused" in capsys.readouterr().out
-    assert cli.main(["pod-unlock", "ws", "p-0", "3000", "--yes", "--no-wait"]) == 0
+    assert cli.main(["port-unlock", "ws", "p-0", "3000", "--yes", "--no-wait"]) == 0
     assert "Unlocking…" in capsys.readouterr().out
 
 
-def test_cli_pod_lock_on_a_server_without_states_does_not_wait(api, capsys, non_tty, clock):
+def test_cli_port_lock_on_a_server_without_states_does_not_wait(api, capsys, non_tty, clock):
     # The default `api` toggle answers {port, locked} only: nothing to wait for, no extra request.
-    assert cli.main(["pod-lock", "ws", "p-0", "3000"]) == 0
+    assert cli.main(["port-lock", "ws", "p-0", "3000"]) == 0
     captured = capsys.readouterr()
     assert "access: Locked" in captured.out and "Waiting" not in captured.err
     assert not api.sent("GET", POD_PATH)
 
 
-def test_cli_pod_lock_survives_a_failing_check(api, capsys, non_tty, clock):
+def test_cli_port_lock_survives_a_failing_check(api, capsys, non_tty, clock):
     api.routes[("PATCH", LOCK_PATH)] = _toggle("locking")
     api.routes[("GET", POD_PATH)] = (500, {"detail": "boom"})
-    assert cli.main(["pod-lock", "ws", "p-0", "3000"]) == 0
+    assert cli.main(["port-lock", "ws", "p-0", "3000"]) == 1                      # the state is unknown
     captured = capsys.readouterr()
     assert "Could not check whether it took effect" in captured.err and "Locking…" in captured.out
+
+
+def test_cli_port_lock_json_output_on_timeout_still_says_the_state(api, capsys, non_tty, clock):
+    api.routes[("PATCH", LOCK_PATH)] = _toggle("locking")
+    api.routes[("GET", POD_PATH)] = _pod_with_state("locking")
+    assert cli.main(["port-lock", "ws", "p-0", "3000", "-o", "json"]) == 1
+    assert json.loads(capsys.readouterr().out)["state"] == "locking"
 
 
 # =================================================================================================
@@ -1455,44 +1478,234 @@ def test_rolling_an_expired_key_has_no_previous_value():
     assert rolled.previous_value_valid_until is None and rolled.access_key == KEY and rolled.expired is False
 
 
-def test_cli_pod_keys_shows_expired_keys(api, capsys):
+def test_cli_port_keys_shows_expired_keys(api, capsys):
     api.routes[("GET", KEYS_PATH)] = (200, {"keys": [KEY_ITEM, EXPIRED_ITEM]})
-    assert cli.main(["pod-keys", "ws", "p-0", "3000"]) == 0
+    assert cli.main(["port-keys", "ws", "p-0", "3000"]) == 0
     out = capsys.readouterr().out
     row = next(line for line in out.splitlines() if "old-ci" in line)
     assert "expired " in row and " ago (2026-11-10 09:00 UTC)" in row
     assert "expired" not in next(line for line in out.splitlines() if "batch-script" in line)
-    assert cli.main(["pod-keys", "ws", "p-0", "3000", "-o", "json"]) == 0
+    assert cli.main(["port-keys", "ws", "p-0", "3000", "-o", "json"]) == 0
     assert [k["expired"] for k in json.loads(capsys.readouterr().out) if "expired" in k] == [True]
 
 
-def test_cli_pod_key_roll_of_an_expired_key(api, capsys, non_tty):
+def test_cli_port_key_roll_of_an_expired_key(api, capsys, non_tty):
     api.routes[("GET", KEYS_PATH)] = (200, {"keys": [KEY_ITEM, EXPIRED_ITEM]})
     api.routes[("POST", f"{KEYS_PATH}/44/roll")] = (201, {**ROLLED, "id": 45, "previousValueValidUntil": None})
-    assert cli.main(["pod-key-roll", "ws", "p-0", "3000", "44", "--overlap", "7d", "--yes"]) == 0
+    assert cli.main(["port-key-roll", "ws", "p-0", "3000", "44", "--overlap", "7d", "--yes"]) == 0
     captured = capsys.readouterr()
     assert "Key 44 has expired; rolling issues a new value." in captured.err
     assert "stops working" not in captured.err and "old value" not in captured.out
     assert api.body("POST", f"{KEYS_PATH}/44/roll") == {"overlapSeconds": 0}
     assert captured.out.count(KEY) == 1
     # A key that is still good keeps the overlap warning, and a bad --overlap is still refused.
-    assert cli.main(["pod-key-roll", "ws", "p-0", "3000", "12", "--yes"]) == 0
+    assert cli.main(["port-key-roll", "ws", "p-0", "3000", "12", "--yes"]) == 0
     assert "its current value stops working in 1 hour" in capsys.readouterr().err
-    assert cli.main(["pod-key-roll", "ws", "p-0", "3000", "44", "--overlap", "soon", "--yes"]) == 2
+    assert cli.main(["port-key-roll", "ws", "p-0", "3000", "44", "--overlap", "soon", "--yes"]) == 2
 
 
-def test_cli_pod_key_roll_works_when_the_key_list_cannot_be_read(api, capsys, non_tty, slept):
+def test_cli_port_key_roll_works_when_the_key_list_cannot_be_read(api, capsys, non_tty, slept):
     api.routes[("GET", KEYS_PATH)] = (500, {"detail": "boom"})
-    assert cli.main(["pod-key-roll", "ws", "p-0", "3000", "12", "--yes"]) == 0
+    assert cli.main(["port-key-roll", "ws", "p-0", "3000", "12", "--yes"]) == 0
     assert "its current value stops working in 1 hour" in capsys.readouterr().err
 
 
-def test_cli_pod_lock_that_is_in_effect_at_once_does_not_wait(api, capsys, non_tty, clock):
+def test_cli_port_lock_that_is_in_effect_at_once_does_not_wait(api, capsys, non_tty, clock):
     # Locking a port that is locked already answers with the current state: nothing to wait for.
-    for command, state, shown in (("pod-lock", "locked", "Locked"), ("pod-unlock", "unlocked", "Unlocked")):
+    for command, state, shown in (("port-lock", "locked", "Locked"), ("port-unlock", "unlocked", "Unlocked")):
         api.routes[("PATCH", LOCK_PATH)] = _toggle(state)
-        assert cli.main([command, "ws", "p-0", "3000", "--yes"] if command == "pod-unlock"
+        assert cli.main([command, "ws", "p-0", "3000", "--yes"] if command == "port-unlock"
                         else [command, "ws", "p-0", "3000"]) == 0
         captured = capsys.readouterr()
         assert f"access: {shown}\n" in captured.out and "Waiting" not in captured.err
     assert not api.sent("GET", POD_PATH)
+
+
+# =================================================================================================
+# When an access key was last used
+# =================================================================================================
+
+def test_access_key_last_used_at():
+    used = AccessKey.from_dict({**KEY_ITEM, "lastUsedAt": "2026-11-16T07:30:00Z"})
+    assert used.last_used_at.isoformat() == "2026-11-16T07:30:00+00:00"
+    assert AccessKey.from_dict({**KEY_ITEM, "lastUsedAt": None}).last_used_at is None    # never used
+    assert AccessKey.from_dict(KEY_ITEM).last_used_at is None                             # an older server
+    assert AccessKeyCreated.from_dict({**ROLLED, "lastUsedAt": "2026-11-16T07:30:00Z"}).last_used_at is not None
+
+
+def test_cli_port_keys_shows_when_each_key_was_last_used(api, capsys):
+    from datetime import datetime, timedelta, timezone
+
+    two_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=2, minutes=5)).isoformat()
+    api.routes[("GET", KEYS_PATH)] = (200, {"keys": [{**KEY_ITEM, "lastUsedAt": two_hours_ago},
+                                                     {**EXPIRED_ITEM, "lastUsedAt": None}]})
+    assert cli.main(["port-keys", "ws", "p-0", "3000"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    header = lines[0]
+    assert header.index("EXPIRES") < header.index("LAST USED") < header.index("ISSUED BY")
+    column = header.index("LAST USED")
+    used = next(line for line in lines if "batch-script" in line)
+    unused = next(line for line in lines if "old-ci" in line)
+    assert used[column:].startswith("2 hours ago") and unused[column:].startswith("never")
+
+
+def test_cli_port_keys_has_no_last_used_column_on_an_older_server(api, capsys):
+    api.routes[("GET", KEYS_PATH)] = (200, {"keys": [KEY_ITEM]})
+    assert cli.main(["port-keys", "ws", "p-0", "3000"]) == 0
+    assert "LAST USED" not in capsys.readouterr().out
+
+
+# =================================================================================================
+# Preflight requests on a locked port
+# =================================================================================================
+
+PREFLIGHT_PATH = "/v1/sdk/pods/p-0/ports/3000/preflight"
+
+
+def test_pod_endpoint_allow_preflight():
+    endpoints = POD["template"]["endpoints"]
+    parsed = Pod.from_dict({**POD, "template": {"endpoints": [
+        {**endpoints[0], "allowPreflight": True}, {**endpoints[1], "allowPreflight": False},
+        {**endpoints[2], "allowPreflight": None}, {**endpoints[0], "allowPreflight": "true"}]}}).endpoints
+    assert [e.allow_preflight for e in parsed] == [True, False, None, None]
+    assert all(e.allow_preflight is None for e in Pod.from_dict(POD).endpoints)         # an older server
+
+
+@pytest.mark.parametrize("allow", [True, False])
+def test_set_port_preflight_request_and_result(allow):
+    api = Api({("PATCH", PREFLIGHT_PATH): (200, {"port": 3000, "allowPreflight": allow})})
+    result = sync_client(api).set_port_preflight("p-0", "ws", 3000, allow, idempotency_key="pf-1")
+    request = api.sent("PATCH", PREFLIGHT_PATH)[0]
+    assert request.url.params["workspace"] == "ws" and _json(request) == {"allowPreflight": allow}
+    assert request.headers["Idempotency-Key"] == "pf-1"
+    assert isinstance(result, PortPreflight) and (result.port, result.allow_preflight) == (3000, allow)
+
+
+def test_set_port_preflight_async():
+    api = Api({("PATCH", PREFLIGHT_PATH): (200, {"port": 3000, "allowPreflight": True})})
+    result = asyncio.run(async_client(api).set_port_preflight("p-0", "ws", 3000, True))
+    assert result.allow_preflight is True and _json(api.sent("PATCH", PREFLIGHT_PATH)[0]) == {"allowPreflight": True}
+
+
+@pytest.mark.parametrize("args", [("p-0", "ws", 3000, "on"), ("p-0", "ws", 3000, 1), ("p-0", "ws", 3000, None),
+                                  ("p-0", "ws", 0, True), ("", "ws", 3000, True), ("p-0", " ", 3000, True)])
+def test_set_port_preflight_checks_arguments_before_sending(args):
+    api = Api()
+    with pytest.raises(ValueError):
+        sync_client(api).set_port_preflight(*args)
+    assert not api.requests
+
+
+def test_set_port_preflight_on_older_or_switched_off_servers():
+    with pytest.raises(NotFoundError, match="does not support the preflight setting of locked ports yet"):
+        sync_client(Api({("PATCH", PREFLIGHT_PATH): (404, {"detail": "Not Found"})})).set_port_preflight(
+            "p-0", "ws", 3000, True)
+    off = {"detail": {"title": "Not Found", "message": "Endpoint lock is not available.",
+                      "code": "endpoint_lock_disabled"}}
+    with pytest.raises(NotFoundError, match="preflight requests can't be let through"):
+        sync_client(Api({("PATCH", PREFLIGHT_PATH): (404, off)})).set_port_preflight("p-0", "ws", 3000, True)
+    internal = {"detail": {"title": "Not A Public Endpoint", "message": "Only a public port has this setting."}}
+    with pytest.raises(MeshiveAPIError, match="Only a public port"):
+        sync_client(Api({("PATCH", PREFLIGHT_PATH): (400, internal)})).set_port_preflight("p-0", "ws", 3000, True)
+
+
+def _preflight_echo(request):
+    return httpx.Response(200, json={"port": 3000, "allowPreflight": _json(request)["allowPreflight"]})
+
+
+def test_cli_port_preflight_on_asks_first(api, capsys, non_tty, monkeypatch):
+    api.routes[("PATCH", PREFLIGHT_PATH)] = _preflight_echo
+    assert cli.main(["port-preflight", "ws", "p-0", "3000", "on"]) == 2
+    err = capsys.readouterr().err
+    assert "will reach the app without a key" in err and "A key in a web page is visible to its visitors" in err
+    assert not api.sent("PATCH", PREFLIGHT_PATH)
+    monkeypatch.setattr("sys.stdin", _Tty("y\n"))
+    assert cli.main(["port-preflight", "ws", "p-0", "3000", "on"]) == 0
+    captured = capsys.readouterr()
+    assert "Allow preflight requests on port 3000 of pod p-0? [y/N]" in captured.err
+    assert "preflight: allowed without a key" in captured.out
+    assert api.body("PATCH", PREFLIGHT_PATH) == {"allowPreflight": True}
+    assert cli.main(["port-preflight", "ws", "p-0", "3000", "on", "--yes", "-o", "json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert (printed["port"], printed["allowPreflight"]) == (3000, True)
+
+
+def test_cli_port_preflight_off_does_not_ask(api, capsys, non_tty):
+    api.routes[("PATCH", PREFLIGHT_PATH)] = _preflight_echo
+    assert cli.main(["port-preflight", "ws", "p-0", "3000", "off"]) == 0
+    captured = capsys.readouterr()
+    assert "preflight: needs a key, like other requests" in captured.out and "[y/N]" not in captured.err
+    assert api.body("PATCH", PREFLIGHT_PATH) == {"allowPreflight": False}
+    with pytest.raises(SystemExit):
+        cli.main(["port-preflight", "ws", "p-0", "3000", "maybe"])
+
+
+def test_cli_pod_says_which_locked_ports_let_preflight_through(api, capsys):
+    endpoints = POD["template"]["endpoints"]
+    api.routes[("GET", POD_PATH)] = (200, {**POD, "template": {"endpoints": [
+        {**endpoints[0], "allowPreflight": True},                       # locked: said
+        {**endpoints[1], "allowPreflight": True},                       # unlocked: the setting does nothing
+        {**endpoints[2], "allowPreflight": None}]}})
+    assert cli.main(["pod", "ws", "p-0"]) == 0
+    out = capsys.readouterr().out
+    assert "Preflight (OPTIONS) requests reach the app without a key on port 8188." in out
+    header = next(line for line in out.splitlines() if line.startswith("ENDPOINT"))
+    assert header.split() == ["ENDPOINT", "PORT", "ACCESS", "URL", "STATE"]          # the table is unchanged
+    api.routes[("GET", POD_PATH)] = (200, POD)
+    assert cli.main(["pod", "ws", "p-0"]) == 0
+    assert "Preflight" not in capsys.readouterr().out
+
+
+# =================================================================================================
+# Signing out a pod's browser sessions
+# =================================================================================================
+
+SESSIONS_PATH = "/v1/sdk/pods/p-0/browser-sessions/revoke"
+REVOKED = {"podName": "p-0", "endpointCount": 2, "revokedAt": "2026-11-16T08:00:00Z"}
+
+
+def test_revoke_browser_sessions_request_and_result():
+    api = Api({("POST", SESSIONS_PATH): (200, REVOKED)})
+    result = sync_client(api).revoke_browser_sessions("p-0", "ws", idempotency_key="rs-1")
+    request = api.sent("POST", SESSIONS_PATH)[0]
+    assert request.url.params["workspace"] == "ws" and request.headers["Idempotency-Key"] == "rs-1"
+    assert isinstance(result, BrowserSessionsRevoked)
+    assert (result.pod_name, result.endpoint_count) == ("p-0", 2)
+    assert result.revoked_at.isoformat() == "2026-11-16T08:00:00+00:00"
+    result = asyncio.run(async_client(Api({("POST", SESSIONS_PATH): (200, REVOKED)})).revoke_browser_sessions(
+        "p-0", "ws"))
+    assert result.endpoint_count == 2
+
+
+def test_revoke_browser_sessions_checks_arguments_and_older_servers():
+    api = Api()
+    for args in (("", "ws"), ("p-0", " ")):
+        with pytest.raises(ValueError):
+            sync_client(api).revoke_browser_sessions(*args)
+    assert not api.requests
+    with pytest.raises(NotFoundError, match="does not support signing out the browser sessions of a pod yet"):
+        sync_client(Api({("POST", SESSIONS_PATH): (404, {"detail": "Not Found"})})).revoke_browser_sessions("p-0", "ws")
+    missing = {"detail": {"title": "Pod Not Found", "message": "No pod named 'p-0' in workspace 'ws'."}}
+    with pytest.raises(NotFoundError, match="No pod named"):
+        sync_client(Api({("POST", SESSIONS_PATH): (404, missing)})).revoke_browser_sessions("p-0", "ws")
+
+
+def test_cli_pod_browser_sessions_revoke_asks_first(api, capsys, non_tty):
+    api.routes[("POST", SESSIONS_PATH)] = (200, REVOKED)
+    assert cli.main(["pod-browser-sessions-revoke", "ws", "p-0"]) == 2
+    err = capsys.readouterr().err
+    assert "Access keys keep working" in err and "already open stay open" in err and "--yes" in err
+    assert not api.sent("POST", SESSIONS_PATH)
+    assert cli.main(["pod-browser-sessions-revoke", "ws", "p-0", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "public ports: 2" in out and "2026-11-16 08:00 UTC" in out and "few seconds" in out
+    assert cli.main(["pod-browser-sessions-revoke", "ws", "p-0", "--yes", "-o", "json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert {k: printed[k] for k in REVOKED} == REVOKED
+
+
+def test_old_command_names_are_gone(capsys):
+    for old in ("pod-lock", "pod-unlock", "pod-keys", "pod-key-create", "pod-key-roll", "pod-key-revoke", "forward"):
+        with pytest.raises(SystemExit):
+            cli.main([old, "ws", "p-0", "3000"])
+    capsys.readouterr()

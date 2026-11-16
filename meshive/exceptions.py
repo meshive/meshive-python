@@ -15,11 +15,16 @@ class ConfigurationError(MeshiveError):
 
 
 class WaitTimeoutError(MeshiveError, TimeoutError):
-    """wait_for_pod did not reach the target state within the time limit.
+    """A wait_for_* call did not reach the target state within the time limit. The message names the last state
+    read; `last` holds what was read last when the wait has it (wait_for_port_lock: the PodEndpoint), else None.
 
     It is also a built-in TimeoutError, so both `except MeshiveError` and `except TimeoutError`
     catch it.
     """
+
+    def __init__(self, *args: object, last: object = None) -> None:
+        super().__init__(*args)
+        self.last = last
 
 
 class PodCreationFailedError(MeshiveError):
@@ -113,7 +118,7 @@ class PortNotLockedError(MeshiveError):
         name = getattr(pod, "pod_name", "") or "?"
         listed = ", ".join(str(port) for port in ports)
         super().__init__(f"Pod {name} was created, but port {listed} is exposed without the lock that was asked for: "
-                         "anyone with the URL gets through. Lock it with set_port_lock (`meshive pod-lock`), or "
+                         "anyone with the URL gets through. Lock it with set_port_lock (`meshive port-lock`), or "
                          "delete the pod.")
         self.pod = pod
         self.pod_name = name

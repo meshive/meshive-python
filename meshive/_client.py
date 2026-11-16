@@ -57,6 +57,8 @@ from .models import (
     AccessKey,
     AccessKeyCreated,
     PortLock,
+    PortPreflight,
+    BrowserSessionsRevoked,
     PodEndpoint,
     CommandResult,
     CommandRun,
@@ -473,15 +475,29 @@ def _pod_port(pod: Pod, pod_name: str, port: int) -> PodEndpoint:
     raise NotFoundError(404, f"Pod '{pod_name}' doesn't open port {port}.", title="Port Not Found")
 
 
-def _port_route_error(err: MeshiveAPIError) -> MeshiveAPIError:
-    """Errors of the port lock and access key routes, made understandable: an older server without the routes, and
-    a server where the platform has locking turned off (it then refuses to lock a port and to create or roll a key,
-    while unlocking, listing and revoking still work)."""
+_PORT_FEATURE = "port locks and access keys"
+_PREFLIGHT_FEATURE = "the preflight setting of locked ports"
+_SESSIONS_FEATURE = "signing out the browser sessions of a pod"
+
+
+def _port_route_error(err: MeshiveAPIError, what: str = _PORT_FEATURE) -> MeshiveAPIError:
+    """Errors of the port lock, preflight and access key routes, made understandable: an older server without the
+    routes, and a server where the platform has locking turned off (it then refuses to lock a port, to let preflight
+    requests through and to create or roll a key, while unlocking, listing and revoking still work)."""
     if err.status_code == 404 and _error_code(err) == _LOCK_DISABLED_CODE:
         return NotFoundError(404, "Port locking is turned off on this Meshive server right now, so ports can't be "
-                                  "locked and access keys can't be created or rolled. Try again later.",
+                                  "locked, preflight requests can't be let through, and access keys can't be created "
+                                  "or rolled. Try again later.",
                              title=err.title, raw=err.raw)
-    return _not_supported(err, "port locks and access keys")
+    return _not_supported(err, what)
+
+
+def _port_lock_wait_expired(deadline: float, pod_name: str, port: int, endpoint: PodEndpoint) -> None:
+    if time.monotonic() < deadline:
+        return
+    meaning = "the port may still be open" if endpoint.lock_state == "locking" else "requests may still be refused"
+    raise WaitTimeoutError(f"Timed out waiting for the lock of port {port} on pod {pod_name} to take effect "
+                           f"(last state: {endpoint.lock_state}; {meaning}).", last=endpoint)
 
 
 def _unlocked_ports(pod: Pod, port_locks: Any) -> list[int]:
@@ -1416,7 +1432,7 @@ class Meshive(_BaseClient):
                      hf_token_id: int | None = None, lock_public_ports: bool = True) -> PodEstimate:
         """Pod estimate — creates nothing (read scope is enough). Same arguments as create_pod; the price includes any
         new local_volumes (breakdown "local_storage"), and `model_set` describes the model set when one is given.
-        `port_locks` lists the lock each exposed port would get, and a lock the server can't give is refused here
+        `port_locks` lists the lock each public port would get, and a lock the server can't give is refused here
         as it would be by create_pod (EndpointLockUnavailableError)."""
         params = {"workspace": _query_value(workspace, "workspace")}
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
@@ -1491,8 +1507,8 @@ class Meshive(_BaseClient):
         signed in to the console, and programs that send one of the port's access keys (create_access_key), get
         through. A port in `ports` takes "locked": False to stay open to anyone with the URL, and so does a
         template_ports item; a port the template opens follows the template author's choice when there is one.
-        lock_public_ports=False creates every exposed port open, as releases before 1.10 did. The SDK reads the
-        template first so that each of its exposed ports is sent with a lock value, and `port_locks` on the result
+        lock_public_ports=False creates every public port open, as releases before 1.10 did. The SDK reads the
+        template first so that each of its public ports is sent with a lock value, and `port_locks` on the result
         lists what was sent ({port: locked}); pass it to wait_for_new_pod to have the new pod checked.
         When the server can't lock ports (the platform has locking turned off, or the server predates it),
         EndpointLockUnavailableError is raised and nothing is created: the pod is never created open instead."""
@@ -1625,8 +1641,8 @@ class Meshive(_BaseClient):
         explanation in the message.
 
         A port this call newly makes public is locked (lock_public_ports=True, the default), as in create_pod:
-        a new exposed port in `ports`, a port the pod keeps internal that `template_ports` exposes
-        ("external": True), and, with template_id, the exposed ports the new template adds (those follow the
+        a new public port in `ports`, a port the pod keeps internal that `template_ports` exposes
+        ("external": True), and, with template_id, the public ports the new template adds (those follow the
         template author's choice when there is one). lock_public_ports=False leaves those ports open to anyone
         with the URL instead, and "locked": True or False on a port item decides for that port alone.
         A port that is public already keeps the lock it has, whether it is locked or was unlocked on purpose:
@@ -1690,12 +1706,12 @@ class Meshive(_BaseClient):
 
     def set_port_lock(self, pod_name: str, workspace: str, port: int, locked: bool, *,
                       idempotency_key: str | None = None) -> PortLock:
-        """Lock (True) or unlock (False) one exposed port of a pod, without restarting it (write scope). A locked
+        """Lock (True) or unlock (False) one public port of a pod, without restarting it (write scope). A locked
         port lets through only workspace members signed in to the console and programs that send one of the port's
         access keys; an unlocked port is open to anyone with its URL. Unlocking keeps the port's keys: they work
         again when it is locked again. Only ports exposed over HTTPS can be locked (400 'Not A Public Endpoint').
         The choice may take a few seconds to take effect: `state` on the result is "locking" or "unlocking" until it
-        does, and the port can still be reached without a key meanwhile (see wait_port_lock)."""
+        does, and the port can still be reached without a key meanwhile (see wait_for_port_lock)."""
         path = f"/pods/{_path_segment(pod_name, 'pod_name')}/ports/{_write.port_segment(port)}/lock"
         try:
             data = self._send("PATCH", path, params={"workspace": _query_value(workspace, "workspace")},
@@ -1704,21 +1720,51 @@ class Meshive(_BaseClient):
             raise _port_route_error(err) from None
         return PortLock.from_dict(data)
 
-    def wait_port_lock(self, pod_name: str, workspace: str, port: int, *, timeout: float = 60.0,
-                       poll: float = 1.0) -> PodEndpoint:
-        """Wait until the lock choice of one exposed port is in effect, and return that endpoint. Right after
+    def wait_for_port_lock(self, pod_name: str, workspace: str, port: int, *, timeout: float = 60.0,
+                           interval: float = 1.0) -> PodEndpoint:
+        """Wait until the lock choice of one public port is in effect, and return that endpoint. Right after
         set_port_lock the port's `lock_state` is "locking" (chosen, not confirmed yet: the port may still be open) or
-        "unlocking" (requests may still be refused); this polls the pod every `poll` seconds until it is "locked" or
-        "unlocked". It returns at once for a server that doesn't report lock states. When `timeout` seconds pass
-        first it returns the last endpoint read, with the state still "locking" or "unlocking": that is not an error,
-        so check `lock_state` on the result before relying on the lock."""
+        "unlocking" (requests may still be refused); this reads the pod every `interval` seconds until it is "locked"
+        or "unlocked". It returns at once for a server that doesn't report lock states. When `timeout` seconds pass
+        first it raises WaitTimeoutError, whose `last` is the endpoint as last read."""
         number = int(_write.port_segment(port))
         deadline = time.monotonic() + timeout
         while True:
             endpoint = _pod_port(self.get_pod(pod_name, workspace), pod_name, number)
-            if endpoint.lock_state not in _LOCK_APPLYING or time.monotonic() >= deadline:
+            if endpoint.lock_state not in _LOCK_APPLYING:
                 return endpoint
-            time.sleep(min(poll, max(deadline - time.monotonic(), 0.0)))
+            _port_lock_wait_expired(deadline, pod_name, number, endpoint)
+            time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+
+    def set_port_preflight(self, pod_name: str, workspace: str, port: int, allow: bool, *,
+                           idempotency_key: str | None = None) -> PortPreflight:
+        """Let CORS preflight requests (OPTIONS) to a locked public port reach the app without a key (True), or
+        refuse them like any other request without a key (False, the default for every port). Write scope; no
+        restart, and it takes effect within seconds. Requests that follow a preflight (GET, POST, ...) still need a
+        key, and the app's own CORS settings decide which sites may call it. A key put in a web page is visible to
+        everyone who opens that page. The setting is kept when the port is unlocked and locked again. Only public
+        ports have it (400 'Not A Public Endpoint')."""
+        path = f"/pods/{_path_segment(pod_name, 'pod_name')}/ports/{_write.port_segment(port)}/preflight"
+        try:
+            data = self._send("PATCH", path, params={"workspace": _query_value(workspace, "workspace")},
+                              json=_write.port_preflight_body(allow), idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _port_route_error(err, _PREFLIGHT_FEATURE) from None
+        return PortPreflight.from_dict(data)
+
+    def revoke_browser_sessions(self, pod_name: str, workspace: str, *,
+                                idempotency_key: str | None = None) -> BrowserSessionsRevoked:
+        """Sign out every browser session on the pod's locked ports (write scope): workspace members who opened them
+        in a browser have to enter again through the console, within seconds. Access keys keep working, and
+        connections that are already open (a WebSocket, for example) stay open. It can't be undone, and calling it
+        again is safe."""
+        path = f"/pods/{_path_segment(pod_name, 'pod_name')}/browser-sessions/revoke"
+        try:
+            data = self._send("POST", path, params={"workspace": _query_value(workspace, "workspace")},
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, _SESSIONS_FEATURE) from None
+        return BrowserSessionsRevoked.from_dict(data if isinstance(data, dict) else {})
 
     def list_access_keys(self, pod_name: str, workspace: str, port: int) -> list[AccessKey]:
         """The access keys of one port: name, first characters, who issued them and when they expire. A key that has
@@ -2989,7 +3035,7 @@ class AsyncMeshive(_BaseClient):
                      hf_token_id: int | None = None, lock_public_ports: bool = True) -> PodEstimate:
         """Pod estimate — creates nothing (read scope is enough). Same arguments as create_pod; the price includes any
         new local_volumes (breakdown "local_storage"), and `model_set` describes the model set when one is given.
-        `port_locks` lists the lock each exposed port would get, and a lock the server can't give is refused here
+        `port_locks` lists the lock each public port would get, and a lock the server can't give is refused here
         as it would be by create_pod (EndpointLockUnavailableError)."""
         params = {"workspace": _query_value(workspace, "workspace")}
         body = _write.pod_body(name, template_id, gpu_model=gpu_model, gpu_count=gpu_count, gpu_vram_gb=gpu_vram_gb,
@@ -3214,7 +3260,7 @@ class AsyncMeshive(_BaseClient):
 
     async def set_port_lock(self, pod_name: str, workspace: str, port: int, locked: bool, *,
                             idempotency_key: str | None = None) -> PortLock:
-        """Lock (True) or unlock (False) one exposed port of a pod, without restarting it. Same contract as the sync
+        """Lock (True) or unlock (False) one public port of a pod, without restarting it. Same contract as the sync
         client."""
         path = f"/pods/{_path_segment(pod_name, 'pod_name')}/ports/{_write.port_segment(port)}/lock"
         try:
@@ -3224,17 +3270,43 @@ class AsyncMeshive(_BaseClient):
             raise _port_route_error(err) from None
         return PortLock.from_dict(data)
 
-    async def wait_port_lock(self, pod_name: str, workspace: str, port: int, *, timeout: float = 60.0,
-                             poll: float = 1.0) -> PodEndpoint:
-        """Wait until the lock choice of one exposed port is in effect. Same contract as the sync client: it returns
-        the endpoint once `lock_state` is "locked" or "unlocked", or the last one read after `timeout` seconds."""
+    async def wait_for_port_lock(self, pod_name: str, workspace: str, port: int, *, timeout: float = 60.0,
+                                 interval: float = 1.0) -> PodEndpoint:
+        """Wait until the lock choice of one public port is in effect. Same contract as the sync client: it returns
+        the endpoint once `lock_state` is "locked" or "unlocked", and raises WaitTimeoutError after `timeout`
+        seconds."""
         number = int(_write.port_segment(port))
         deadline = time.monotonic() + timeout
         while True:
             endpoint = _pod_port(await self.get_pod(pod_name, workspace), pod_name, number)
-            if endpoint.lock_state not in _LOCK_APPLYING or time.monotonic() >= deadline:
+            if endpoint.lock_state not in _LOCK_APPLYING:
                 return endpoint
-            await asyncio.sleep(min(poll, max(deadline - time.monotonic(), 0.0)))
+            _port_lock_wait_expired(deadline, pod_name, number, endpoint)
+            await asyncio.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+
+    async def set_port_preflight(self, pod_name: str, workspace: str, port: int, allow: bool, *,
+                                 idempotency_key: str | None = None) -> PortPreflight:
+        """Let CORS preflight requests to a locked public port reach the app without a key, or not. Same contract
+        as the sync client."""
+        path = f"/pods/{_path_segment(pod_name, 'pod_name')}/ports/{_write.port_segment(port)}/preflight"
+        try:
+            data = await self._send("PATCH", path, params={"workspace": _query_value(workspace, "workspace")},
+                                    json=_write.port_preflight_body(allow), idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _port_route_error(err, _PREFLIGHT_FEATURE) from None
+        return PortPreflight.from_dict(data)
+
+    async def revoke_browser_sessions(self, pod_name: str, workspace: str, *,
+                                      idempotency_key: str | None = None) -> BrowserSessionsRevoked:
+        """Sign out every browser session on the pod's locked ports; access keys and open connections are not
+        affected. Same contract as the sync client."""
+        path = f"/pods/{_path_segment(pod_name, 'pod_name')}/browser-sessions/revoke"
+        try:
+            data = await self._send("POST", path, params={"workspace": _query_value(workspace, "workspace")},
+                                    idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, _SESSIONS_FEATURE) from None
+        return BrowserSessionsRevoked.from_dict(data if isinstance(data, dict) else {})
 
     async def list_access_keys(self, pod_name: str, workspace: str, port: int) -> list[AccessKey]:
         """The access keys of one port, expired ones included for 30 days (never their values). Same contract as the

@@ -109,8 +109,11 @@ def build_parser() -> argparse.ArgumentParser:
             "  meshive host-messages          Messages from the workspaces using your machines\n"
             "  meshive earnings               Show your earnings (as a host)\n"
             "  meshive payouts                Show your payout account and payouts (as a host)\n"
+            "  meshive logs <ws> <pod>        A pod's logs (meshive task-logs <task> for a task)\n"
+            "  meshive port-forward <ws> <pod> <port>  (a locked port at http://127.0.0.1:<port>; key in MESHIVE_ACCESS_KEY)\n"
             "\n"
-            "Write commands (need a key with the write scope; they ask for confirmation unless --yes):\n"
+            "Write commands (need a key with the write scope; the ones that spend, open or delete ask first,\n"
+            "  --yes skips that):\n"
             "  meshive workspace-create [name] [--estimate] [--wait]  (free; --wait returns once it is running)\n"
             "  meshive workspace-update <ws> --name NAME [--estimate]  (rename it)\n"
             "  meshive workspace-delete <ws> [--check]  (only an empty workspace; --check changes nothing)\n"
@@ -122,14 +125,14 @@ def build_parser() -> argparse.ArgumentParser:
             "  meshive storage-update <ws> <pv> --size GiB\n"
             "  meshive storage-connect <ws> <pv>  (SSH and SFTP access to a storage)\n"
             "  meshive task-submit <ws> <name> --script FILE --image IMG --cpu-preset micro-2c8g\n"
-            "  meshive logs <ws> <pod>          meshive task-logs <task>\n"
-            "  meshive forward <ws> <pod> <port>  (a locked port at http://127.0.0.1:<port>; key in MESHIVE_ACCESS_KEY)\n"
+            "  meshive port-lock|port-unlock <ws> <pod> <port>  (port-keys, port-key-create: its access keys)\n"
             "  meshive maintenance-schedule <machine> --reason R --start ISO --end ISO [--emergency]\n"
             "  meshive machine-list|machine-unlist|machine-delete <machine>\n"
             "  meshive host-message-send <machine> --to WORKSPACE|all --title T\n"
             "\n"
             "Run `meshive <command> --help` for filters and options.\n"
-            "Scripting: `-o name` prints just the IDs, one per line (pipe into xargs).\n"
+            "Scripting: `-o name` prints just the IDs, one per line (pipe into xargs); a few commands print the one\n"
+            "  value a script captures instead, such as a new access key (see -o in `meshive <command> --help`).\n"
             "Auth: `meshive login`, or set MESHIVE_API_KEY / pass --api-key.\n"
             "Docs: https://github.com/meshive/meshive-python"
         ),
@@ -151,7 +154,8 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--base-url", default=None, help="API base URL (overrides MESHIVE_BASE_URL).")
     common.add_argument(
         "-o", "--output", choices=["table", "json", "name"], default=None,
-        help="Output format: table (default), json (raw payload), name (IDs only, one per line).",
+        help="Output format: table (default), json (raw payload), name (the one value a script captures: IDs one "
+             "per line; the balance for `credit`; the key itself for `port-key-create`/`port-key-roll`).",
     )
     # --json is an alias of -o json (an older flag, kept for backward compatibility).
     common.add_argument("--json", action="store_true", dest="as_json", help="Shorthand for -o json.")
@@ -426,7 +430,8 @@ def build_parser() -> argparse.ArgumentParser:
     forward_cli.add_parser(sub, common)
 
     sub.add_parser("api-keys", parents=[common], aliases=["keys"],
-                   help="List your API keys (prefixes only; the secret is never shown).")
+                   help="List your account's API keys (prefixes only; the secret is never shown). A port's access "
+                        "keys: `meshive port-keys`.")
     p_activity = sub.add_parser("activity", parents=[common],
                                 help="Show what this account's API keys did, with results (newest first). Request "
                                      "contents are never recorded; activity is kept for 180 days.")
@@ -692,12 +697,18 @@ def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
     if pod.endpoints:
         print()
         # ACCESS: Internal (inside the workspace only), Locked (members' browsers and access keys) or Unlocked
-        # (anyone with the URL). A server that doesn't report locks has none, so its exposed ports are Unlocked.
+        # (anyone with the URL). A server that doesn't report locks has none, so its public ports are Unlocked.
         rows = [[e.name or "-", str(e.port), _access_label(e), e.external_url or e.internal_url or "-",
                  e.readiness] for e in pod.endpoints]
         colors = [[None, None, None, None, "green" if e.readiness == "ready" else "yellow"] for e in pod.endpoints]
         fmt.render_table(["ENDPOINT", "PORT", "ACCESS", "URL", "STATE"], rows, aligns=["l", "r", "l", "l", "l"],
                          colors=colors, enabled=color)
+        # A locked port that lets preflight requests through says so below the table, keeping the table as wide as
+        # before. The setting does nothing while the port is unlocked, so it is shown only for locked ports.
+        preflight = sorted({e.port for e in pod.endpoints if e.allow_preflight is True and e.access == "locked"})
+        if preflight:
+            ports = ", ".join(str(port) for port in preflight)
+            print(fmt.paint(f"Preflight (OPTIONS) requests reach the app without a key on port {ports}.", "dim", color))
     if pod.connect_credentials:
         print()
         hidden = False
@@ -2080,7 +2091,7 @@ _HANDLERS: dict[str, Handler] = {
     "credit": _cmd_credit,
     "credit-history": _cmd_credit_history,
     **write_cli.HANDLERS,
-    "forward": forward_cli.cmd_forward,
+    "port-forward": forward_cli.cmd_forward,
 }
 
 

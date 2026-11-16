@@ -1,4 +1,4 @@
-"""`meshive forward`: the local forwarder, tested over real sockets against a stand-in for a pod port's public
+"""`meshive port-forward`: the local forwarder, tested over real sockets against a stand-in for a pod port's public
 address (TLS with a test certificate, the lock's key check, and a small app behind it), and the command."""
 import asyncio
 import base64
@@ -32,7 +32,7 @@ DATA = Path(__file__).parent / "data"
 HOST = "0123456789abcdef.test-cluster.meshive.test"       # the name the test certificate is issued for
 KEY = "mshv_" + "Zq7" * 14 + "x"                           # "mshv_" + 43 characters
 OTHER_KEY = "mshv_" + "Ab3" * 14 + "y"
-KEY_COMMAND = "meshive pod-key-create ws p-0 8188 --name NAME"
+KEY_COMMAND = "meshive port-key-create ws p-0 8188 --name NAME"
 
 
 @pytest.fixture(autouse=True)
@@ -1757,7 +1757,7 @@ POD = {"podName": "p-0", "namespaceName": "ws", "userAlias": "p", "status": "run
 
 @pytest.fixture
 def command(monkeypatch):
-    """`meshive forward` with the API answered locally and the listener not started: returns what would have run."""
+    """`meshive port-forward` with the API answered locally and the listener not started: returns what would have run."""
     started = []
 
     def handler(request):
@@ -1771,7 +1771,7 @@ def command(monkeypatch):
         return 0
 
     def command(*args):
-        return cli.main(["forward", *args])
+        return cli.main(["port-forward", *args])
 
     command.pod, command.started = POD, started
     monkeypatch.setattr(cli, "Meshive", lambda *a, **kw: sync_client(handler))
@@ -1809,7 +1809,7 @@ def test_command_refuses_a_locked_port_without_a_key(command, capsys):
     assert command("ws", "p-0", "8188") == 2
     err = capsys.readouterr().err
     assert "port 8188 of pod p-0 is locked, and no access key was given" in err
-    assert "meshive pod-key-create ws p-0 8188 --name NAME" in err and "MESHIVE_ACCESS_KEY" in err
+    assert "meshive port-key-create ws p-0 8188 --name NAME" in err and "MESHIVE_ACCESS_KEY" in err
     assert "--key-file" in err and command.started == []
 
 
@@ -1915,7 +1915,7 @@ def test_command_has_no_option_that_takes_the_key(command, capsys):
 
 def test_command_is_listed(capsys):
     with pytest.raises(SystemExit):
-        cli.main(["forward", "--help"])
+        cli.main(["port-forward", "--help"])
     out = capsys.readouterr().out
     assert "MESHIVE_ACCESS_KEY" in out and "--key-file" in out and "--listen" in out
 
@@ -1960,7 +1960,7 @@ class Api:
     def close(self): pass
 
 cli.Meshive = Api
-raise SystemExit(cli.main(["forward", "ws", "p-0", "8188", "--listen", "0", "-o", "name"]))
+raise SystemExit(cli.main(["port-forward", "ws", "p-0", "8188", "--listen", "0", "-o", "name"]))
 """
 
 

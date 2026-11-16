@@ -133,8 +133,9 @@ class PodEndpoint:
     is_external: bool
     # Same rule as the console: readinessState (preparing|ready|interrupted) if present, otherwise ready|preparing from isReady.
     readiness: str
-    # Whether the exposed port is locked: only workspace members' browsers and the port's access keys get through.
-    # None from servers that don't report it (they have no locks, so the port is open).
+    # The lock chosen for this public port (True = locked: only workspace members' browsers and the port's access keys
+    # get through). Whether it is in effect yet is `lock_state`. None from servers that don't report it (they have no
+    # locks, so the port is open).
     locked: bool | None = None
     lock_decided_at: datetime | None = None   # when someone last chose locked or unlocked; None = never chosen
     access_key_count: int | None = None       # access keys that work now (list_access_keys); None if not reported
@@ -142,6 +143,9 @@ class PodEndpoint:
     # "unlocked" or "unlocking" (chosen, not confirmed yet: requests may still be refused). None for an internal port
     # and from servers that don't report it. `locked` and `access` stay the choice itself.
     lock_state: str | None = None
+    # Whether CORS preflight requests (OPTIONS) reach the app without a key while the port is locked
+    # (set_port_preflight). None for an internal port and from servers that don't report it.
+    allow_preflight: bool | None = None
 
     @property
     def access(self) -> str:
@@ -155,7 +159,7 @@ class PodEndpoint:
         state = d.get("readinessState")
         if state not in ("preparing", "ready", "interrupted"):
             state = "ready" if d.get("isReady") else "preparing"
-        locked, key_count = d.get("isLocked"), d.get("accessKeyCount")
+        locked, key_count, preflight = d.get("isLocked"), d.get("accessKeyCount"), d.get("allowPreflight")
         return cls(
             name=str(d.get("userAlias", "") or ""),
             port=_as_int(d.get("containerPort")),
@@ -168,6 +172,7 @@ class PodEndpoint:
             lock_decided_at=_parse_dt(d.get("lockDecidedAt")),
             access_key_count=key_count if isinstance(key_count, int) and not isinstance(key_count, bool) else None,
             lock_state=_lock_state(d.get("lockState")),
+            allow_preflight=preflight if isinstance(preflight, bool) else None,
         )
 
 
@@ -385,6 +390,39 @@ class PortLock:
 
 
 @dataclass
+class PortPreflight:
+    """PATCH /v1/sdk/pods/{pod}/ports/{port}/preflight response — whether preflight requests to the port now reach
+    the app without a key."""
+
+    port: int
+    allow_preflight: bool
+    raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PortPreflight":
+        return cls(port=_as_int(d.get("port")), allow_preflight=d.get("allowPreflight") is True, raw=d,
+                   replayed=bool(d.get("replayed", False)))
+
+
+@dataclass
+class BrowserSessionsRevoked:
+    """POST /v1/sdk/pods/{pod}/browser-sessions/revoke response. Browser sessions on the pod's locked ports that
+    began before `revoked_at` are refused within seconds."""
+
+    pod_name: str
+    endpoint_count: int            # public ports whose browser sessions were signed out
+    revoked_at: datetime | None
+    raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "BrowserSessionsRevoked":
+        return cls(pod_name=str(d.get("podName", "") or ""), endpoint_count=_as_int(d.get("endpointCount")),
+                   revoked_at=_parse_dt(d.get("revokedAt")), raw=d, replayed=bool(d.get("replayed", False)))
+
+
+@dataclass
 class AccessKey:
     """An access key of a locked port (GET /v1/sdk/pods/{pod}/ports/{port}/keys item). Programs send the key's value as
     `Authorization: Bearer <key>`, or as `X-Meshive-Key: <key>` when the app uses Authorization itself.
@@ -407,6 +445,10 @@ class AccessKey:
     # True once the key has expired. An expired key stays in the list for 30 days, and can be rolled or revoked.
     # Read when the key was listed; servers that don't report it get it worked out from `expires_at`.
     expired: bool = False
+    # When a program last got through with this key (with the previous value too, while it still works after a roll).
+    # Updated every few minutes, so a key used just now may still show an older time. None = not used yet, or a server
+    # that doesn't report it.
+    last_used_at: datetime | None = None
     raw: dict = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -422,6 +464,7 @@ class AccessKey:
             pod_name=d.get("podName"), created_by=d.get("createdBy"), created_at=_parse_dt(d.get("createdAt")),
             issued_at=_parse_dt(d.get("issuedAt")), expires_at=expires_at,
             previous_value_valid_until=_parse_dt(d.get("previousValueValidUntil")), expired=expired,
+            last_used_at=_parse_dt(d.get("lastUsedAt")),
             # The value never goes into raw, so printing or logging raw can't leak it.
             raw={k: v for k, v in d.items() if k != "accessKey"})
 
@@ -1971,7 +2014,7 @@ class PodEstimate:
     # The model set the pod starts with: {"slug", "name", "file_count", "total_size_bytes", "min_vram_gb",
     # "min_vram_estimated"}. None without one, and from servers that don't report it.
     model_set: dict | None = None
-    # {port: locked} — the lock value this request sends for each exposed port (worked out by the SDK, not the server).
+    # {port: locked} — the lock value this request sends for each public port (worked out by the SDK, not the server).
     port_locks: dict = field(default_factory=dict)
 
     @classmethod
@@ -1997,7 +2040,7 @@ class PodCreated:
     accepted: bool = True
     raw: dict = field(default_factory=dict, repr=False)
     replayed: bool = False         # see ResourceAction.replayed
-    # {port: locked} — the lock value the request sent for each exposed port (worked out by the SDK, not the server).
+    # {port: locked} — the lock value the request sent for each public port (worked out by the SDK, not the server).
     # Pass it to wait_for_new_pod(port_locks=...) to have the new pod's ports checked against it.
     port_locks: dict = field(default_factory=dict)
 

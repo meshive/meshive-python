@@ -1,4 +1,4 @@
-"""`meshive forward <workspace> <pod> <port>`: reach an exposed pod port through 127.0.0.1.
+"""`meshive port-forward <workspace> <pod> <port>`: reach a public pod port through 127.0.0.1.
 
 A locked port lets a program in only when it sends the port's access key in a header. Some apps take nothing but
 an address: a ComfyUI client, a browser, a library with no way to set a header. The forwarder listens on
@@ -6,7 +6,7 @@ an address: a ComfyUI client, a browser, a library with no way to set a header. 
 an app is pointed at `http://127.0.0.1:<port>` instead.
 
 The key comes from the MESHIVE_ACCESS_KEY environment variable or from --key-file, never from the command line,
-and is never created here (`meshive pod-key-create` does that). It is not printed, logged or put in an error.
+and is never created here (`meshive port-key-create` does that). It is not printed, logged or put in an error.
 
 Who can use the listener. It hands the key's access to whoever can send it a request, so it refuses the requests
 a web page on another site could make the browser send:
@@ -78,8 +78,8 @@ _PER_CONNECTION = frozenset({"connection", "keep-alive", "proxy-connection", "te
 _SAFE_TO_REPEAT = frozenset({"GET", "HEAD", "OPTIONS"})
 
 _CONTINUE_PAGE = (
-    "<!doctype html><meta charset=\"utf-8\"><title>meshive forward</title>"
-    "<p>This address was opened from another website, so <code>meshive forward</code> did not pass the request "
+    "<!doctype html><meta charset=\"utf-8\"><title>meshive port-forward</title>"
+    "<p>This address was opened from another website, so <code>meshive port-forward</code> did not pass the request "
     "on.</p><p>If you meant to open it, <a href=\"\">continue</a>.</p>\n")
 
 
@@ -392,7 +392,7 @@ class Forwarder:
     def __init__(self, host: str, *, listen_port: int, port: int = 443, key: str | None = None, send_key: bool = True,
                  allow_origins: Iterable[str] = (), connect_to: tuple[str, int] | None = None,
                  ssl_context: ssl.SSLContext | None = None, verbose: bool = False,
-                 log: Callable[[str], None] | None = None, key_command: str = "meshive pod-key-create",
+                 log: Callable[[str], None] | None = None, key_command: str = "meshive port-key-create",
                  port_label: str = "The port"):
         host = host.lower()
         if not _HOST_SHAPE.match(host):
@@ -492,7 +492,7 @@ class Forwarder:
         if self._key is None:
             self._once("locked", f"{self._port_label} is locked and no access key was given, so requests get 401. "
                                  f"Create a key with `{self._key_command}`, put it in {ENV_ACCESS_KEY} (or pass "
-                                 "--key-file) and start `meshive forward` again.")
+                                 "--key-file) and start `meshive port-forward` again.")
         elif not self._send_key:
             self._send_key = True
             self._once("locked now", f"{self._port_label} is locked now: the access key is sent from the next "
@@ -501,7 +501,7 @@ class Forwarder:
             self._once("rejected", "The access key was rejected (401): it may be expired, revoked or made for "
                                    "another port (a key made a few seconds ago may not work yet: try again "
                                    f"shortly). Create a new one with `{self._key_command}` and start "
-                                   "`meshive forward` again with it.")
+                                   "`meshive port-forward` again with it.")
 
     # ------------------------------------------------------------------ who may use the listener
 
@@ -516,7 +516,8 @@ class Forwarder:
             self._once("host", "Refused a request addressed to another host name: the forwarder answers only at "
                                f"{self.local_url} and http://localhost:{self.listen_port}.")
             raise _Reply(421, "Misdirected Request",
-                         f"meshive forward answers only at {self.local_url} and http://localhost:{self.listen_port}.",
+                         f"meshive port-forward answers only at {self.local_url} and "
+                         f"http://localhost:{self.listen_port}.",
                          note="Host is not this listener")
         origins = _values(headers, "origin")
         origin = origins[0].lower() if origins else None
@@ -527,7 +528,7 @@ class Forwarder:
             self._once(("origin", shown), f"Refused a request made by a page on {shown}. If that page should use "
                                           f"this forwarder, start it with --allow-origin {shown}.")
             raise _Reply(403, "Forbidden",
-                         "meshive forward refused a request made by a page on another site. To let that page use "
+                         "meshive port-forward refused a request made by a page on another site. To let that page use "
                          "it, start it with --allow-origin <the page's origin>.", note="Origin is another site")
         site = _values(headers, "sec-fetch-site")
         if origin is None and site and not all(value.lower() in ("same-origin", "none") for value in site):
@@ -548,7 +549,7 @@ class Forwarder:
             self._once("site", "Refused a request made by a page on another site. If that page should use this "
                                "forwarder, start it with --allow-origin <the page's origin>.")
             raise _Reply(403, "Forbidden",
-                         "meshive forward refused a request made by a page on another site. To let that page use "
+                         "meshive port-forward refused a request made by a page on another site. To let that page use "
                          "it, start it with --allow-origin <the page's origin>.", note="request from another site")
         return local
 
@@ -615,12 +616,13 @@ class Forwarder:
             reader, writer = await asyncio.wait_for(self._open(), self.connect_timeout)
         except ssl.SSLCertVerificationError:
             self._once("certificate", f"Could not verify the certificate of {self._origin}; nothing was sent.")
-            raise _Reply(502, "Bad Gateway", f"meshive forward could not verify the certificate of {self._origin}.",
+            raise _Reply(502, "Bad Gateway",
+                         f"meshive port-forward could not verify the certificate of {self._origin}.",
                          note="certificate not verified") from None
         except (OSError, asyncio.TimeoutError) as exc:
             reason = _why(exc)
             self._once(("connect", reason), f"Could not connect to {self._origin} ({reason}).")
-            raise _Reply(502, "Bad Gateway", f"meshive forward could not connect to {self._origin} ({reason}).",
+            raise _Reply(502, "Bad Gateway", f"meshive port-forward could not connect to {self._origin} ({reason}).",
                          note=f"connect failed: {reason}") from None
         _keep_alive(writer.get_extra_info("socket"))
         conn.upstream, conn.upstream_writer = _Stream(reader), writer
@@ -638,7 +640,7 @@ class Forwarder:
             self._once("full", f"{self.max_connections} connections are open at once; more are refused until some "
                                "close.")
             self._write_reply(conn, _Reply(503, "Service Unavailable",
-                                           "meshive forward has too many open connections."), None)
+                                           "meshive port-forward has too many open connections."), None)
             try:
                 await writer.drain()
             except OSError:
@@ -819,7 +821,7 @@ class Forwarder:
                 target = parts[1]
                 framing, length = _request_framing(headers)
             except ValueError as exc:
-                raise _Reply(400, "Bad Request", f"meshive forward could not read the request ({exc}).",
+                raise _Reply(400, "Bad Request", f"meshive port-forward could not read the request ({exc}).",
                              note=f"malformed request: {exc}") from None
             local = self._guard(method, headers)
             connection = _tokens(headers, "connection")
@@ -890,7 +892,7 @@ class Forwarder:
                     raise ValueError("unexpected upgrade")
                 framed, stated = _response_framing(method, status, answer) if status >= 200 else ("none", None)
             except ValueError as exc:
-                raise _Reply(502, "Bad Gateway", f"The endpoint sent a response meshive forward could not read "
+                raise _Reply(502, "Bad Gateway", f"The endpoint sent a response meshive port-forward could not read "
                              f"({exc}).", note=f"malformed response: {exc}") from None
             if status == 101 or status >= 200:
                 break
@@ -1054,7 +1056,7 @@ def _read_key(path: str | None) -> str | None:
         text = text[1:-1].strip()
     if not _KEY_SHAPE.match(text):
         raise ValueError(f"{source} does not hold an access key. A key is mshv_ followed by 43 characters, as "
-                         "`meshive pod-key-create` prints it once.")
+                         "`meshive port-key-create` prints it once.")
     return text
 
 
@@ -1083,7 +1085,7 @@ def cmd_forward(client: Meshive, args: argparse.Namespace, output: str, color: b
     if not 0 <= listen <= 65535:
         raise ValueError(f"--listen must be between 0 and 65535, got {listen}")
     key = _read_key(args.key_file)
-    key_command = f"meshive pod-key-create {args.workspace} {args.pod_name} {args.port} --name NAME"
+    key_command = f"meshive port-key-create {args.workspace} {args.pod_name} {args.port} --name NAME"
 
     pod = client.get_pod(args.pod_name, args.workspace)
     client.close()      # the API is not needed again, and the forwarder runs for hours
@@ -1215,12 +1217,12 @@ def _cannot_listen(exc: OSError, listen: int) -> str:
 
 def add_parser(sub: "argparse._SubParsersAction[argparse.ArgumentParser]", common: argparse.ArgumentParser) -> None:
     p = sub.add_parser(
-        "forward", parents=[common],
-        help="Reach an exposed port of a pod at http://127.0.0.1:<port>, with the port's access key added to "
+        "port-forward", parents=[common],
+        help="Reach a public port of a pod at http://127.0.0.1:<port>, with the port's access key added to "
              "every request (for apps that take only an address). Runs until Ctrl+C.",
         description="Listens on 127.0.0.1 and passes every request on to the port's public HTTPS address, adding "
                     f"the port's access key. The key is read from the {ENV_ACCESS_KEY} environment variable or "
-                    "from --key-file, never from the command line; create one with `meshive pod-key-create`. A "
+                    "from --key-file, never from the command line; create one with `meshive port-key-create`. A "
                     "port that isn't locked needs no key. Requests made by web pages on other sites are refused; "
                     "programs on this computer that can connect to 127.0.0.1 are not.")
     p.add_argument("workspace", help="Workspace ID (namespace name).")

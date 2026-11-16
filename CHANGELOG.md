@@ -50,13 +50,13 @@ calls need a Meshive API server that has them; an older server answers with an e
 
 ### What's new
 
-- **Lock state on pods.** `PodEndpoint.locked` says whether an exposed port is locked, `access` is `"internal"`,
+- **Lock state on pods.** `PodEndpoint.locked` is the lock chosen for a public port, `access` is `"internal"`,
   `"locked"` or `"unlocked"`, and `access_key_count` counts the keys that work now. `meshive pod` shows an ACCESS
-  column. `PodEstimate.port_locks` and `PodCreated.port_locks` list the lock each exposed port is created with
+  column. `PodEstimate.port_locks` and `PodCreated.port_locks` list the lock each public port is created with
   (`PodUpdateEstimate.port_locks` and `PodUpdated.port_locks` list what an update sends), and
   `wait_for_new_pod(..., port_locks=created.port_locks)` checks the new pod against it (`PortNotLockedError` if a
   port that should be locked is open).
-- **Lock or unlock a port.** `set_port_lock(pod, workspace, port, True)` locks an exposed port and `False` unlocks
+- **Lock or unlock a port.** `set_port_lock(pod, workspace, port, True)` locks a public port and `False` unlocks
   it, without restarting the pod. Unlocking keeps the port's access keys; they work again when it is locked again.
 - **Access keys for programs.** `create_access_key(pod, workspace, port, name)` returns an `AccessKeyCreated`
   whose `access_key` is the key's value. It is returned this once and can't be read again. Programs send it as
@@ -68,12 +68,13 @@ calls need a Meshive API server that has them; an older server answers with an e
   `repr` and of `.raw`.
 - **Creating and rolling a key are not resent.** Each call issues a new value, so after a timeout the SDK does not
   send the request again; check `list_access_keys` first.
-- **CLI.** `meshive pod-lock` and `meshive pod-unlock <workspace> <pod> <port>`; `meshive pod-keys`,
-  `meshive pod-key-create --name NAME [--expires DAYS|never]`, `meshive pod-key-roll KEY_ID [--overlap now|1h|24h|7d]`
-  and `meshive pod-key-revoke KEY_ID`. `pod-key-create` prints the value once (`-o name` prints only the value).
-  Unlocking, rolling and revoking ask first; `pod-create` and `pod-update` say which ports would be locked and which
-  open before they ask. Both take `--no-lock`, `--lock-port` and `--unlock-port`.
-- **`meshive forward` for apps that can't send a key.** `meshive forward <workspace> <pod> <port>` listens on
+- **CLI.** `meshive port-lock` and `meshive port-unlock <workspace> <pod> <port>`; `meshive port-keys`,
+  `meshive port-key-create --name NAME [--expires DAYS|never]`, `meshive port-key-roll KEY_ID [--overlap now|1h|24h|7d]`
+  and `meshive port-key-revoke KEY_ID`. `port-key-create` prints the value once (`-o name` prints only the value).
+  `meshive port-keys` shows when each key was last used (LAST USED: `2 hours ago`, or `never`). Unlocking, rolling
+  and revoking ask first; `pod-create` and `pod-update` say which ports would be locked and which open before they
+  ask. Both take `--no-lock`, `--lock-port` and `--unlock-port`.
+- **`meshive port-forward` for apps that can't send a key.** `meshive port-forward <workspace> <pod> <port>` listens on
   `http://127.0.0.1:<port>` and passes every request on to the port's public address with the access key added
   (as `X-Meshive-Key`; your app's own `Authorization` is left alone). Point an app that only takes an address at
   it: a ComfyUI client, a browser, a library with no way to set a header. WebSockets, streamed answers and uploads
@@ -85,17 +86,38 @@ calls need a Meshive API server that has them; an older server answers with an e
 - **Waiting for a lock to take effect.** A lock choice can take a few seconds to reach every route of the port, and
   until it does a locked port may still be reachable without a key. `PodEndpoint.lock_state` and `PortLock.state`
   are `"locked"`, `"locking"`, `"unlocked"` or `"unlocking"` (`None` from a server that doesn't report it);
-  `locked` and `access` still say what was chosen. `wait_port_lock(pod, workspace, port, timeout=60, poll=1)`
-  polls until the state is `"locked"` or `"unlocked"` and returns the endpoint; on a timeout it returns the last
-  endpoint read instead of raising. `meshive pod-lock` and `meshive pod-unlock` wait by default (up to 60 seconds,
-  progress on stderr; `--no-wait` skips it), and `meshive pod` shows `Locking…` or `Unlocking…` in the ACCESS
-  column meanwhile.
+  `locked` and `access` still say what was chosen. `wait_for_port_lock(pod, workspace, port, timeout=60, interval=1)`
+  reads the pod until the state is `"locked"` or `"unlocked"` and returns the endpoint. Like `wait_for_pod`, it
+  raises `WaitTimeoutError` when the time runs out; the error's `last` is the endpoint as last read. A server that
+  doesn't report lock states returns at once. `meshive port-lock` and `meshive port-unlock` wait by default (up to
+  60 seconds, progress on stderr) and exit with code 1 when the choice isn't confirmed by then, or when the check
+  fails; they still print the state (`access: Locking… (…)`). `--no-wait` skips the wait and exits 0. `meshive pod`
+  shows `Locking…` or `Unlocking…` in the ACCESS column meanwhile.
 - **Expired access keys.** An expired key stays in `list_access_keys` for 30 days, with `AccessKey.expired` set, and
   it can be rolled or revoked. Rolling an expired key ignores `overlap_seconds`, and `previous_value_valid_until`
-  is `None`. `meshive pod-keys` shows `expired 3 days ago (2026-11-13 09:00 UTC)` in the EXPIRES column, and
-  `meshive pod-key-roll` says the key has expired instead of the overlap warning.
-- **Permissions.** Locking, unlocking, creating, rolling and revoking need a read & write key from a workspace
-  admin or billing member. Listing keys works with a read-only key.
+  is `None`. `meshive port-keys` shows `expired 3 days ago (2026-11-13 09:00 UTC)` in the EXPIRES column, and
+  `meshive port-key-roll` says the key has expired instead of the overlap warning.
+- **When a key was last used.** `AccessKey.last_used_at` is when a program last got through with the key (with its
+  previous value too, while that still works after a roll), or `None` when it hasn't been used. It is updated every
+  few minutes, so a key used just now may show an older time. Use it to find keys nobody uses any more, and revoke
+  them.
+- **Pages on other sites (preflight requests).** A browser asks a locked port with a CORS preflight request
+  (`OPTIONS`) before a page on another site calls it, and that request carries no key, so the lock refuses it.
+  `set_port_preflight(pod, workspace, port, True)` lets those preflight requests reach the app without a key;
+  every other request still needs one, and the app's own CORS settings decide which sites may call it. It is off for
+  every port until you turn it on, and it is kept when the port is unlocked and locked again.
+  `PodEndpoint.allow_preflight` says whether it is on (`None` for an internal port and from a server that doesn't
+  report it). On the command line: `meshive port-preflight <workspace> <pod> <port> on|off`; `on` asks first,
+  because a key put in a web page is visible to everyone who opens that page. `meshive pod` lists the locked ports
+  that let preflight requests through, below the endpoint table.
+- **Sign out browser sessions.** Workspace members who open a locked port in a browser stay signed in there for 7
+  days. `revoke_browser_sessions(pod, workspace)` (`meshive pod-browser-sessions-revoke <workspace> <pod>`, which
+  asks first) signs out those sessions on every public port of the pod within seconds; members enter again through
+  the console. Access keys keep working, and connections that are already open stay open. It returns a
+  `BrowserSessionsRevoked` with the number of public ports and when the sessions were cut.
+- **Permissions.** Locking, unlocking, the preflight setting, signing out browser sessions, and creating, rolling
+  and revoking keys need a read & write key from a workspace admin or billing member. Listing keys works with a
+  read-only key.
 
 ### Fixed
 

@@ -346,9 +346,27 @@ def test_workspaces_show_all_billing_owners_and_unknown_fallback(capsys):
     cli._print_workspaces(workspaces, False)
     out = capsys.readouterr().out
     assert "OWNER" in out and "ROLE" in out
-    assert "a@example.com, b@example.com" in out and "billing" in out
+    assert "a@example.com,b@example.com" in out and "billing" in out
     assert "unknown" in out and "viewer" in out
     assert "ns-a" in out and "ns-b" in out
+
+
+def test_workspaces_owner_column_keeps_earlier_columns_where_scripts_read_them(capsys):
+    """OWNER came after the existing columns: NAME ID ROLE STATUS PODS PRICE/HR keep their positions, and a row
+    with several owners has as many whitespace-separated fields as a row with one."""
+    workspaces = [
+        Workspace.from_dict({"namespaceName": "ns-a", "workspaceName": "team", "memberRole": "billing",
+                             "status": "running", "ownerEmails": ["a@example.com"]}),
+        Workspace.from_dict({"namespaceName": "ns-b", "workspaceName": "team", "memberRole": "viewer",
+                             "status": "running", "ownerEmails": ["b@example.com", "c@example.com"]}),
+    ]
+    cli._print_workspaces(workspaces, False)
+    header, *rows = capsys.readouterr().out.splitlines()
+    assert header.split() == ["NAME", "ID", "ROLE", "STATUS", "PODS", "PRICE/HR", "OWNER"]
+    fields = [row.split() for row in rows]
+    assert [f[2] for f in fields] == ["billing", "viewer"]
+    assert len(fields[0]) == len(fields[1])
+    assert fields[1][-1] == "b@example.com,c@example.com"
 
 
 def test_pods_output(capsys):

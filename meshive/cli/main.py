@@ -569,17 +569,18 @@ def _print_workspaces(workspaces: list[Workspace], color: bool) -> None:
         print("No workspaces.")
         return
     # NAME = workspace_name (user label), ID = namespace_name (lookup key).
+    # OWNER is the last column so the columns before it keep the positions they had before 1.9.0, and several owners
+    # are joined without spaces so they never add a field to the row.
     rows = [
-        [ws.workspace_name or "-", ws.namespace_name, ", ".join(ws.owner_emails) or "unknown",
-         ws.member_role or "-", fmt.status_cell(ws.status),
-         str(ws.resources.pod), fmt.money_hourly(ws.price_per_hour)]
+        [ws.workspace_name or "-", ws.namespace_name, ws.member_role or "-", fmt.status_cell(ws.status),
+         str(ws.resources.pod), fmt.money_hourly(ws.price_per_hour), ",".join(ws.owner_emails) or "unknown"]
         for ws in workspaces
     ]
-    colors = [[None, None, None, None, fmt.status_color(ws.status), None, None] for ws in workspaces]
+    colors = [[None, None, None, fmt.status_color(ws.status), None, None, None] for ws in workspaces]
     fmt.render_table(
-        ["NAME", "ID", "OWNER", "ROLE", "STATUS", "PODS", "PRICE/HR"],
+        ["NAME", "ID", "ROLE", "STATUS", "PODS", "PRICE/HR", "OWNER"],
         rows,
-        aligns=["l", "l", "l", "l", "l", "r", "r"],
+        aligns=["l", "l", "l", "l", "r", "r", "l"],
         colors=colors,
         enabled=color,
     )

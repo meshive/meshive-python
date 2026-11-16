@@ -85,6 +85,13 @@ calls need a Meshive API server that has them; an older server answers with an e
 - **Permissions.** Locking, unlocking, creating, rolling and revoking need a read & write key from a workspace
   admin or billing member. Listing keys works with a read-only key.
 
+### Fixed
+
+- **CLI: the OWNER column of `meshive workspaces` is the last column.** In 1.9.0 it came between ID and ROLE, so a
+  script that reads the table by position got an email where it read the role, and a workspace with several owners
+  shifted the following columns once more. NAME, ID, ROLE, STATUS, PODS and PRICE/HR are back where they were before
+  1.9.0, and several owners are joined with `,` and no space. `-o json` stays the format meant for scripts.
+
 ## v1.9.0
 
 You can run commands in a running pod and upload files from your computer to Asset Hub, without SSH or the console.

@@ -3,6 +3,7 @@ address (TLS with a test certificate, the lock's key check, and a small app behi
 import asyncio
 import base64
 import contextlib
+import errno
 import functools
 import hashlib
 import importlib
@@ -14,6 +15,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -165,15 +167,24 @@ class Endpoint:
                 assert await reader.readexactly(2) == b"\r\n"
         return await reader.readexactly(int(headers.get("content-length", "0")))
 
-    async def _close_unread(self, reader, writer):
+    async def _close_unread(self, reader, writer, then="linger"):
         """Answered without reading the body: the connection is closed on it, as servers do, a moment later (so
         that the answer is not lost to a reset). Real servers wait about as long (Go 0.5 s after half-closing,
         nginx up to 5 s between reads); the wait ends as soon as the forwarder closes its side. A shorter wait
         made tests fail on a busy computer: the reset could reach the forwarder before it had read the answer's
-        body, and an answer that loses its body is (rightly) broken off rather than passed on."""
+        body, and an answer that loses its body is (rightly) broken off rather than passed on.
+
+        `then` is what the server does after answering: "linger" reads and drops what still comes, as above;
+        "close" reads nothing more and closes a moment later; "keep" leaves the connection open without reading
+        for a while, then reads and drops what comes until the other side closes."""
         await writer.drain()
+        if then == "close":
+            await asyncio.sleep(1.0)
+            return False
+        if then == "keep":
+            await asyncio.sleep(1.5)
         with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(reader.read(), 2.0)
+            await asyncio.wait_for(reader.read(), 2.0 if then == "linger" else 10.0)
         return False
 
     async def _one(self, reader, writer, served):
@@ -203,8 +214,9 @@ class Endpoint:
             pairs = [(name, value) for name, value in pairs if name.lower() != "x-meshive-key"
                      and not (name.lower() == "authorization" and "mshv_" in value)]
         if path == "/early":        # an app that answers before it has read the body
-            writer.write(_answer(413, [("Connection", "close")], b"too large"))
-            return await self._close_unread(reader, writer)
+            then = target.partition("then=")[2] or "linger"
+            writer.write(_answer(413, [] if then == "keep" else [("Connection", "close")], b"too large"))
+            return await self._close_unread(reader, writer, then)
         if "100-continue" in headers.get("expect", "").lower():
             writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
         body = await self._body(reader, headers)
@@ -304,6 +316,76 @@ class Endpoint:
             else:
                 writer.write(_answer(200, head, seen))
         return True
+
+
+class EndingEndpoint:
+    """A server that turns every request away at once, without reading its body, ends the session from its side
+    (a TLS close_notify, or a half close without TLS), and then goes on reading and dropping whatever the client
+    still sends until the client closes. A front server that refuses an upload may do just that. It runs in a
+    thread with blocking sockets, so that it behaves the same on every event loop."""
+
+    def __init__(self, *, tls=True):
+        self.tls = tls
+        self.taken = []         # bytes read and dropped after the session ended, per connection (None: reset)
+        self._listener = socket.create_server(("127.0.0.1", 0))
+        self._listener.settimeout(0.2)
+        self.port = self._listener.getsockname()[1]
+        self._stop = False
+        self._context = None
+        if tls:
+            self._context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            self._context.load_cert_chain(DATA / "forward_endpoint.pem")
+        self._thread = threading.Thread(target=self._accept, daemon=True)
+        self._thread.start()
+
+    def close(self):
+        self._stop = True
+        self._thread.join(5)
+        self._listener.close()
+
+    def _accept(self):
+        while not self._stop:
+            try:
+                conn, _ = self._listener.accept()
+            except OSError:
+                continue
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn):
+        raw = conn
+        try:
+            conn.settimeout(20)
+            sock = self._context.wrap_socket(conn, server_side=True) if self.tls else conn
+            raw = sock
+            head = b""
+            while b"\r\n\r\n" not in head:
+                data = sock.recv(65536)
+                if not data:
+                    raise ConnectionError("no request")
+                head += data
+            time.sleep(0.5)     # deciding takes a moment, while the body piles up in the buffers on the way
+            sock.sendall(_answer(401, [("X-Meshive-Lock-Denied", "1"), ("Content-Type", "application/json")],
+                                 b'{"error":"unauthorized"}'))
+            if self.tls:
+                sock.setblocking(False)
+                with contextlib.suppress(ssl.SSLError):
+                    # Sends close_notify. Waiting for the client's own then fails (the client is still sending)
+                    # or would block: either way the session is over from here.
+                    sock.unwrap()
+                raw = socket.socket(fileno=sock.detach())
+                raw.setblocking(True)
+                raw.settimeout(20)
+            else:
+                sock.shutdown(socket.SHUT_WR)
+            taken = 0
+            while data := raw.recv(64 * 1024):    # at about the pace of a network, not of a loopback
+                taken += len(data)
+                time.sleep(0.002)
+            self.taken.append(taken)
+        except OSError:
+            self.taken.append(None)
+        finally:
+            raw.close()
 
 
 def _trusting_the_test_ca():
@@ -1057,6 +1139,123 @@ async def test_an_early_answer_with_expect_100_continue():
         assert await client.closed(5)
 
 
+async def _upload(client, target, size):
+    """Sends a POST of `size` bytes as fast as the connection takes it, and returns the answer. The sending
+    goes on in the background while the answer is read, as a client that is answered early does; it stops
+    quietly when the forwarder closes the connection."""
+    client.send(f"POST {target} HTTP/1.1\r\nHost: 127.0.0.1:{client.port}\r\nContent-Length: {size}\r\n\r\n")
+    block = os.urandom(1 << 20)
+
+    async def send():
+        with contextlib.suppress(ConnectionError, OSError):
+            for _ in range(size >> 20):
+                client.send(block)
+                await client.writer.drain()
+
+    sending = asyncio.ensure_future(send())
+    try:
+        return await client.answer(), block
+    finally:
+        await asyncio.sleep(0)
+        if not sending.done():
+            # Still sending what nobody reads: the forwarder lingers, then closes, which ends it.
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(sending), 10)
+        sending.cancel()
+        await asyncio.gather(sending, return_exceptions=True)
+
+
+# An antivirus that inspects loopback traffic was seen to hold such uploads for about 20 s and then reset them,
+# in every process at once, when several test processes ran side by side.
+@needs_untouched_traffic
+@scenario
+@pytest.mark.parametrize("target, status", [
+    ("/echo", 401),                     # the lock refuses the key, reads no more and lingers
+    ("/early?then=linger", 413),        # the app answers first, reads no more and lingers
+    ("/early?then=close", 413),         # ... closes without reading another byte
+    ("/early?then=keep", 413),          # ... keeps the connection open without reading, for a while
+    ("/echo", 200),                     # the app reads all of it, then answers
+])
+async def test_a_large_upload_answered_early_or_late_leaves_the_forwarder_healthy(target, status):
+    """A large upload, answered before the endpoint has read the body (which leaves megabytes it will never take
+    in the forwarder's buffers) or after it has read all of it. Whatever the endpoint does after an early answer,
+    the answer arrives at once, nothing goes wrong inside the event loop, both connections end, and the forwarder
+    goes on serving."""
+    loop = asyncio.get_running_loop()
+    trouble = []
+    loop.set_exception_handler(lambda _loop, context: trouble.append(context))
+    size = 16 << 20
+    async with forwarding() as (forwarder, endpoint, said):
+        forwarder._key = OTHER_KEY if status == 401 else KEY
+        for _ in range(2):
+            client = await Raw.connect(forwarder)
+            started = time.monotonic()
+            answer, block = await _upload(client, target, size)
+            assert answer.status == status
+            if status == 200:
+                assert answer.json()["length"] == size
+                assert answer.json()["sha256"] == hashlib.sha256(block * (size >> 20)).hexdigest()
+            else:
+                assert answer.get("connection") == "close" and time.monotonic() - started < 10
+            client.close()
+            # Every connection ends: the client's, and the one to the endpoint.
+            await until(lambda: not forwarder._tasks and not endpoint.open, 10)
+        forwarder._key = KEY
+        assert (await ask(forwarder, "GET", "/echo")).status == 200
+        endpoint.requests.clear()
+    for _ in range(20):         # whatever the event loop still had scheduled for those connections
+        await asyncio.sleep(0.01)
+    assert [context.get("message") for context in trouble] == []
+    assert not any("Internal error" in line for line in said)
+
+
+@scenario
+async def test_an_endpoint_that_ends_the_session_under_an_upload_and_keeps_reading():
+    """The endpoint refuses an upload, ends its TLS session while megabytes of the body are still waiting in the
+    forwarder's buffers, and then reads what comes. On the selector event loop of some Python releases (3.12.4
+    among them; later ones clear the callback only once the connection is lost) the TLS layer then closes the
+    socket transport with data still buffered, which leaves the transport without a write callback; once the
+    endpoint has read enough, the data still held above it is written, and the loop runs a callback of None on
+    every pass from then on. The forwarder drops such a connection as soon as the answer is through, so none of
+    this happens: the client gets the 401, both connections end, the forwarder goes on serving."""
+    loop = asyncio.get_running_loop()
+    trouble = []
+    loop.set_exception_handler(lambda _loop, context: trouble.append(context))
+    tls = not tls_is_inspected()
+    endpoint = EndingEndpoint(tls=tls)
+
+    class OnASlowLink(Forwarder if tls else PlainForwarder):
+        async def _open(self):
+            # A small send buffer, as the window of a slow link would be: what the TLS layer holds back can
+            # then be written only in part when the endpoint has read a little.
+            reader, writer = await super()._open()
+            writer.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 64 * 1024)
+            return reader, writer
+
+    said = []
+    forwarder = OnASlowLink(
+        HOST, listen_port=0, key=OTHER_KEY, connect_to=("127.0.0.1", endpoint.port),
+        ssl_context=_trusting_the_test_ca(), verbose=True, log=said.append, key_command=KEY_COMMAND)
+    await forwarder.start()
+    try:
+        for attempt in range(1, 6):
+            client = await Raw.connect(forwarder)
+            started = time.monotonic()
+            answer, _ = await _upload(client, "/upload", 16 << 20)
+            assert answer.status == 401 and time.monotonic() - started < 10
+            client.close()
+            # Both connections end (the endpoint's may see a reset: what it was still sent is thrown away).
+            await until(lambda: len(endpoint.taken) == attempt and not forwarder._tasks, 10)
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+        assert [context.get("message") for context in trouble] == []
+        started = time.monotonic()
+        assert (await ask(forwarder, "GET", "/")).status == 401 and time.monotonic() - started < 5
+    finally:
+        await forwarder.close()
+        endpoint.close()
+
+
 @scenario
 @pytest.mark.parametrize("request_line, body", [("GET /slow", b""), ("POST /slow", b"abc"),
                                                 ("GET /silent-stream", b"")])
@@ -1731,7 +1930,22 @@ def test_command_says_when_the_local_port_is_taken(monkeypatch, capsys):
     finally:
         taken.close()
     err = capsys.readouterr().err
-    assert f"could not listen on 127.0.0.1:{port}" in err and "--listen PORT" in err
+    assert err.strip() == (f"Error: port {port} on 127.0.0.1 is already in use or not available. Choose another "
+                           "local port with --listen PORT (--listen 0 picks a free one).")
+
+
+@pytest.mark.parametrize("code", sorted({errno.EADDRINUSE, errno.EACCES, 10048, 10013}))
+def test_a_port_that_is_taken_or_reserved_is_named_as_such(code):
+    """Windows says 10013 (access denied) for a port another program holds exclusively or the system reserves:
+    for the person both mean "use another port"."""
+    message = forward_cli._cannot_listen(OSError(code, "error while attempting to bind"), 8188)
+    assert message.startswith("Error: port 8188 on 127.0.0.1 is already in use or not available.")
+    assert "--listen PORT" in message and "bind" not in message
+
+
+def test_another_failure_to_listen_keeps_its_reason():
+    message = forward_cli._cannot_listen(OSError(errno.EADDRNOTAVAIL, "cannot assign requested address"), 0)
+    assert message == "Error: could not listen on 127.0.0.1:0: cannot assign requested address."
 
 
 RUN_IT = """
@@ -1776,5 +1990,6 @@ def test_command_stops_cleanly_when_interrupted():
             process.kill()
             process.communicate()
     assert process.returncode == 130, err
+    assert err.splitlines()[-1] == "Stopped.", err
     assert "Traceback" not in err and "Error" not in err and "exception" not in err.lower(), err
     assert KEY not in out + err

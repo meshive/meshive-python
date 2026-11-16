@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import codecs
+import errno
 import json
 import os
 import re
@@ -949,6 +950,18 @@ class Forwarder:
             raise _Hangup() from None
         self._log(method, target, status)
 
+        if early:
+            # The endpoint answered without taking the whole body, and won't take the rest: what is still
+            # buffered for it is dropped with the connection, at once, instead of being flushed to a peer that
+            # stopped reading. Waiting would also run into a flaw of the selector event loop in some Python
+            # releases (3.12.4 among them): when the endpoint ends its TLS session while body data is still
+            # buffered, the TLS layer closes the socket transport with that data in it, which clears the
+            # transport's write callback; once the endpoint reads again, the data the TLS layer still holds is
+            # written and the loop registers a callback of None, then runs it on every pass for as long as the
+            # socket lives. Aborting the connection discards the buffered data and unregisters the socket.
+            if conn.client_task is not None:
+                conn.client_task.cancel()       # it writes the body to this connection: stop it first
+            self._drop_upstream(conn, abort=True)
         await self._stop_client_side(conn)
         if not conn.body_sent:          # the client was still sending a body nobody will read (see _finish)
             conn.linger = True
@@ -960,16 +973,24 @@ class Forwarder:
         """After an upgrade: bytes both ways until either side closes."""
         assert conn.upstream is not None and conn.upstream_writer is not None
 
-        async def copy(source: _Stream, writer: asyncio.StreamWriter) -> None:
+        async def copy(source: _Stream, writer: asyncio.StreamWriter) -> bool:
+            """True when the source ended, False when the writer stopped taking data."""
             try:
                 await _copy_all(source, writer)
             except _SinkClosed:
-                pass
+                return False
+            return True
 
         directions = [asyncio.ensure_future(copy(conn.client, conn.upstream_writer)),
                       asyncio.ensure_future(copy(conn.upstream, conn.writer))]
         try:
             await asyncio.wait(directions, return_when=asyncio.FIRST_COMPLETED)
+            from_endpoint = directions[1]
+            if from_endpoint.done() and from_endpoint.exception() is None and from_endpoint.result():
+                # The endpoint ended the connection: nothing sent to it now is read, so what is still buffered
+                # for it is dropped with the connection at once (see the early answer in _forward).
+                directions[0].cancel()
+                self._drop_upstream(conn, abort=True)
         finally:
             for direction in directions:
                 direction.cancel()
@@ -1114,7 +1135,7 @@ def cmd_forward(client: Meshive, args: argparse.Namespace, output: str, color: b
 
 
 def _serve(forwarder: Forwarder, announce: Callable[[], None], listen: int) -> int:
-    """Runs the forwarder until Ctrl+C (which the CLI's entry point turns into exit code 130)."""
+    """Runs the forwarder until Ctrl+C, and then returns 130 (128 + SIGINT, as the CLI does for an interrupt)."""
     interrupted = False
 
     async def run() -> None:
@@ -1145,7 +1166,7 @@ def _serve(forwarder: Forwarder, announce: Callable[[], None], listen: int) -> i
         try:
             await forwarder.start()
         except OSError as exc:
-            raise _CannotListen(exc.strerror or type(exc).__name__) from None
+            raise _CannotListen(exc) from None
         try:
             announce()
             await stop                                            # until Ctrl+C
@@ -1161,16 +1182,34 @@ def _serve(forwarder: Forwarder, announce: Callable[[], None], listen: int) -> i
             pass
     try:
         asyncio.run(run())
+    except KeyboardInterrupt:       # where the loop can't take SIGINT itself, it is raised out of the loop
+        interrupted = True
     except _CannotListen as exc:
-        hint = "" if listen == 0 else " Pick another local port with --listen PORT (0 picks a free one)."
-        print(fmt.clean(f"Error: could not listen on 127.0.0.1:{listen}: {exc}.{hint}"), file=sys.stderr)
+        print(fmt.clean(_cannot_listen(exc.args[0], listen)), file=sys.stderr)
         return 1
     finally:
         if restore is not None:
             signal.signal(signal.SIGBREAK, restore)
     if interrupted:
-        raise KeyboardInterrupt
+        print(file=sys.stderr)      # past the ^C the terminal shows
+        print("Stopped.", file=sys.stderr)
+        return 130
     return 0
+
+
+# Taken by another program, or (on Windows) reserved or held exclusively by one: either way, another port is the
+# way out. 10048 and 10013 are WSAEADDRINUSE and WSAEACCES.
+_PORT_TAKEN = frozenset({errno.EADDRINUSE, errno.EACCES, 10048, 10013})
+
+
+def _cannot_listen(exc: OSError, listen: int) -> str:
+    """Why the local port can't be used, in plain words (the system's own text is no help with this)."""
+    if listen != 0 and (exc.errno in _PORT_TAKEN or getattr(exc, "winerror", None) in _PORT_TAKEN):
+        return (f"Error: port {listen} on 127.0.0.1 is already in use or not available. Choose another local "
+                "port with --listen PORT (--listen 0 picks a free one).")
+    reason = exc.strerror or type(exc).__name__
+    hint = "" if listen == 0 else " Choose another local port with --listen PORT (--listen 0 picks a free one)."
+    return f"Error: could not listen on 127.0.0.1:{listen}: {reason}.{hint}"
 
 
 def add_parser(sub: "argparse._SubParsersAction[argparse.ArgumentParser]", common: argparse.ArgumentParser) -> None:

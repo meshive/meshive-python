@@ -22,6 +22,21 @@ pip install -U meshive
   loaded; `value` is milliseconds per write) or `full` (the system disk, device `/`, is almost full; `value` is the
   percent used). `meshive machine <id>` adds a `disk` line to its Diagnostics block, for example
   `nvme0n1 not responding` or `/ 92% used`. From a server that doesn't send them yet the list is empty.
+- **Why a pod stopped.** `get_pod` now returns `Pod.recent_exits`: the times the pod's main container ended
+  abnormally, newest first (up to 5), each with `at`, `reason` (as Kubernetes reports it: `OOMKilled`, `Error`,
+  `ContainerCannotRun`, ...), `oom_kind` (`"ram"` when it went over its RAM limit, `"vram"` when the GPU ran out of
+  memory), `exit_code` and `message`. A clean exit (code 0) isn't listed. For a GPU out-of-memory error, `message` is
+  the error line the program logged; any `message` can come from the pod, so treat it as untrusted text (credentials
+  and signed URLs are taken out, and it is at most 300 characters). `meshive pod <workspace> <pod>` shows them in an
+  EXITED table. Pods from `list_pods` and from a server that doesn't send them have `recent_exits=None`.
+- **Send feedback.** `send_feedback(summary, kind=..., details=..., tool=..., error_code=...)` and
+  `meshive feedback "one line" [--kind bug|idea|complaint] [--details TEXT]` send a bug report, an idea or a
+  complaint to the Meshive team, as the console's Send feedback does. It needs a key with the write scope. `tool` and
+  `error_code` name a call that failed and the code it returned; the server keeps them only as lowercase
+  identifiers. Leave secrets, environment values, log output and resource names out of the text. The team reviews
+  every report. When the server isn't taking feedback it answers `NotFoundError` (title `Feedback Unavailable`); an
+  account that sends several in a short time gets `RateLimitError` (title `Too Many Reports`; `retry_after` says when
+  to send again).
 
 ## v1.10.0
 

@@ -160,11 +160,13 @@ except WaitTimeoutError:
 | Start a pod with a ready-made set of models | `meshive model-sets <workspace> --template <template-id>`, then `meshive pod-create ... --model-set <slug>` |
 | See why a pod is still starting | `meshive transactions <workspace>` |
 | Watch a pod's usage and logs | `meshive pod-metrics <workspace> <pod>`, `meshive logs <workspace> <pod>` |
+| See why a pod keeps restarting or died (out of RAM, out of GPU memory, ...) | `meshive pod <workspace> <pod>` (its EXITED table) |
 | Check your credit and spending | `meshive credit`, `meshive workspace <workspace>` |
 | See what your API keys (and agents using them) did, with results | `meshive activity`, `meshive activity --reads` |
 | Host your own machines and see earnings | `meshive machines`, `meshive earnings`, `meshive payouts` |
 | Schedule maintenance on a hosted machine, list or unlist it for rent, or remove it | `meshive maintenance-schedule <machine> ...`, `meshive machine-list-for-rent <machine>`, `meshive machine-unlist <machine>`, `meshive machine-delete <machine>` |
 | Read and answer messages from the workspaces using your machines | `meshive host-messages`, `meshive host-message-send <machine> --to <workspace>` |
+| Report a bug or send an idea to the Meshive team | `meshive feedback "one line" --kind bug --details "what happened"` |
 
 Every command has `--help`. The [CLI reference](https://docs.meshive.ai/sdk-cli/cli/) lists them all.
 

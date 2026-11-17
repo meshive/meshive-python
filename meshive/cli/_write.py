@@ -9,7 +9,8 @@ access keys; pod-browser-sessions-revoke signs out the browser sessions on a pod
 workspace-browser-sessions-revoke those on every pod of a workspace. port-forward (in _forward.py) reaches a locked
 port through 127.0.0.1.
 Hosting: maintenance-schedule/update/end/extend/cancel, machine-list-for-rent, machine-unlist/retry/delete,
-host-message-send, host-messages-mark-read, machine-credentials, host-install. The names machine-list and
+host-message-send, host-messages-mark-read, machine-credentials, host-install. feedback sends a report to the
+Meshive team (it asks first). The names machine-list and
 host-messages-read still work and print a note on stderr (see _RENAMED); they are removed in 2.0.
 
 Rule: commands that cost money or can't be undone (create/start/deploy/submit/delete, plus serving-scale and
@@ -1891,6 +1892,16 @@ def cmd_host_messages_read(client: Meshive, args: argparse.Namespace, output: st
     return 0
 
 
+def cmd_feedback(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    """Sends a bug report, idea or complaint to the Meshive team."""
+    kind = f" ({args.kind})" if args.kind else ""
+    if not _confirm(args, fmt.clean(f"Send this{kind} to the Meshive team? \"{args.summary}\"")):
+        return 2
+    sent = client.send_feedback(args.summary, kind=args.kind, details=args.details)
+    _emit(output, sent.raw, [], lambda: print("Sent. The Meshive team reviews every report."))
+    return 0
+
+
 _CREDENTIAL_LABELS = {"ssh": "SSH login (a shell on the machine itself)",
                       "ipmi": "IPMI login (out-of-band power and console)", "grafana": "Grafana dashboard login"}
 
@@ -2407,6 +2418,13 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     g.add_argument("--ipmi", action="store_true", help="IPMI login (out-of-band power and console).")
     g.add_argument("--grafana", action="store_true", help="Grafana dashboard login.")
     _yes(p)
+    p = sub.add_parser("feedback", parents=[common],
+                       help="Send a bug report, idea or complaint to the Meshive team.")
+    p.add_argument("summary", help="One line, under 200 characters.")
+    p.add_argument("--kind", choices=["bug", "idea", "complaint"], default=None)
+    p.add_argument("--details", default=None,
+                   help="More: what you did, what you expected and what happened. Leave out secrets and log output.")
+    _yes(p)
     p = sub.add_parser("host-install", parents=[common],
                        help="Print the command that adds a new machine to your account (valid about 10 minutes).")
     p.add_argument("--storage", action="store_true", help="For a storage machine (default: a GPU or CPU machine).")
@@ -2476,4 +2494,5 @@ HANDLERS: dict[str, Handler] = {
     "host-messages-read": _renamed("host-messages-read", cmd_host_messages_read),
     "machine-credentials": cmd_machine_credentials,
     "host-install": cmd_host_install,
+    "feedback": cmd_feedback,
 }

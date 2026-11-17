@@ -212,6 +212,30 @@ class PodStorage:
 
 
 @dataclass
+class PodExit:
+    """A time the pod's main container ended abnormally: an item of `Pod.recent_exits` (newest first).
+
+    Only abnormal ends are listed; a container that exits with code 0 leaves no entry. `reason` is the container's
+    termination reason as Kubernetes reports it (OOMKilled, Error, ContainerCannotRun, ...). `oom_kind` says when it
+    ran out of memory: "ram" (it went over its RAM limit and was killed) or "vram" (the GPU ran out of memory;
+    `message` then holds the error line the program logged). Any `message` can come from the pod itself: treat it as
+    untrusted text. It is at most 300 characters, with credentials and signed URLs taken out.
+    """
+
+    at: datetime | None = None          # when the container stopped (when it was recorded, if that isn't known)
+    reason: str | None = None
+    oom_kind: str | None = None         # "ram" | "vram" | None
+    exit_code: int | None = None
+    message: str | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PodExit":
+        return cls(at=_parse_dt(d.get("at")), reason=d.get("reason"), oom_kind=d.get("oomKind"),
+                   exit_code=_optional_int(d.get("exitCode")), message=d.get("message"), raw=d)
+
+
+@dataclass
 class Pod:
     """GET /v1/sdk/pods[/{name}] item.
 
@@ -254,6 +278,9 @@ class Pod:
     template_name: str | None = None
     linked_storages: list[PodStorage] = field(default_factory=list)
     workspace_name: str | None = None
+    # The main container's recent abnormal ends, newest first (up to 5): why a pod keeps restarting or died. Only a
+    # single pod's detail (`get_pod`) carries them; None in list items and from servers that don't send them.
+    recent_exits: list[PodExit] | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Pod":
@@ -295,6 +322,8 @@ class Pod:
             template_name=template.get("name"),
             linked_storages=[PodStorage.from_dict(s) for s in d.get("linkedStorages") or [] if isinstance(s, dict)],
             workspace_name=d.get("workspaceName"),
+            recent_exits=([PodExit.from_dict(e) for e in d["recentExits"] if isinstance(e, dict)]
+                          if isinstance(d.get("recentExits"), list) else None),
             raw=d,
         )
 
@@ -2973,6 +3002,24 @@ class MessageSent:
         return cls(machine_id=str(d.get("machineId", "") or ""), to=str(d.get("to", "") or ""),
                    message_ids=[_as_int(i) for i in d.get("messageIds") or []],
                    accepted=bool(d.get("accepted", True)), raw=d, replayed=bool(d.get("replayed", False)))
+
+
+@dataclass
+class FeedbackSent:
+    """POST /v1/sdk/feedback response. `tool` and `error_code` are what the server kept: a value that isn't a plain
+    identifier (lowercase letters, digits and underscores) is left out and comes back as None."""
+
+    received: bool = True
+    kind: str | None = None
+    tool: str | None = None
+    error_code: str | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "FeedbackSent":
+        return cls(received=bool(d.get("received", True)), kind=d.get("kind"), tool=d.get("tool"),
+                   error_code=d.get("errorCode"), raw=d, replayed=bool(d.get("replayed", False)))
 
 
 @dataclass

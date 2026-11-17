@@ -94,6 +94,7 @@ from .models import (
     MaintenanceEstimate,
     MaintenanceWindow,
     MessagesRead,
+    FeedbackSent,
     MessageSent,
     DowntimeEvent,
     Payout,
@@ -2482,6 +2483,22 @@ class Meshive(_BaseClient):
             raise _not_supported(err, "host messages") from None
         return MessageSent.from_dict(data)
 
+    def send_feedback(self, summary: str, *, kind: str | None = None, details: str | None = None,
+                      tool: str | None = None, error_code: str | None = None,
+                      idempotency_key: str | None = None) -> FeedbackSent:
+        """Send a bug report, idea or complaint to the Meshive team (write scope), as the console's Send feedback does.
+        `summary` is one line; `details` can say what you did, what you expected and what happened. For a failed call,
+        `tool` names it and `error_code` is the code it returned (lowercase identifiers; anything else is dropped).
+        Don't put secrets, environment values, log output or resource names in the text. The team reviews every
+        report. A server that isn't taking feedback now answers NotFoundError ('Feedback Unavailable'); an account that
+        sends several in a short time gets RateLimitError ('Too Many Reports', with retry_after)."""
+        body = _write.feedback_body(summary=summary, kind=kind, details=details, tool=tool, error_code=error_code)
+        try:
+            data = self._send("POST", "/feedback", json=body, idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "feedback") from None
+        return FeedbackSent.from_dict(data)
+
     def mark_host_messages_read(self, machine_id: str, message_ids: int | Iterable[int], *,
                                 idempotency_key: str | None = None) -> MessagesRead:
         """Mark incoming messages of a machine read. An id that isn't a message of this machine is a NotFoundError and
@@ -3890,6 +3907,17 @@ class AsyncMeshive(_BaseClient):
         except MeshiveAPIError as err:
             raise _not_supported(err, "host messages") from None
         return MessageSent.from_dict(data)
+
+    async def send_feedback(self, summary: str, *, kind: str | None = None, details: str | None = None,
+                            tool: str | None = None, error_code: str | None = None,
+                            idempotency_key: str | None = None) -> FeedbackSent:
+        """Send a bug report, idea or complaint to the Meshive team (write scope). Same contract as the sync client."""
+        body = _write.feedback_body(summary=summary, kind=kind, details=details, tool=tool, error_code=error_code)
+        try:
+            data = await self._send("POST", "/feedback", json=body, idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "feedback") from None
+        return FeedbackSent.from_dict(data)
 
     async def mark_host_messages_read(self, machine_id: str, message_ids: int | Iterable[int], *,
                                 idempotency_key: str | None = None) -> MessagesRead:

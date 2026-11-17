@@ -844,6 +844,28 @@ def host_message_body(*, to: str, title: str, content: str = "") -> dict[str, An
     return {"to": _require_str(to, "to"), "title": _require_str(title, "title"), "content": _text(content, "content")}
 
 
+FEEDBACK_KINDS = ("bug", "idea", "complaint")
+
+
+def feedback_body(*, summary: str, kind: str | None = None, details: str | None = None, tool: str | None = None,
+                  error_code: str | None = None) -> dict[str, Any]:
+    """POST /feedback body. The length limits (a one-line summary under 200 characters, 4000 with the details) are the
+    server's; so is which `tool` / `error_code` values it keeps."""
+    body: dict[str, Any] = {"summary": _require_str(summary, "summary")}
+    if kind is not None:
+        value = kind.strip().lower() if isinstance(kind, str) else ""
+        if value not in FEEDBACK_KINDS:
+            raise ValueError(f"kind must be one of {', '.join(FEEDBACK_KINDS)}")
+        body["kind"] = value
+    for key, value, name in (("details", details, "details"), ("tool", tool, "tool"),
+                             ("errorCode", error_code, "error_code")):
+        if value is not None:
+            text = _text(value, name)
+            if text.strip():
+                body[key] = text
+    return body
+
+
 def message_ids_body(message_ids: Any) -> dict[str, Any]:
     """POST …/messages/read body. How many ids one request takes is the server's rule."""
     items = [message_ids] if isinstance(message_ids, (int, str)) else list(message_ids or [])

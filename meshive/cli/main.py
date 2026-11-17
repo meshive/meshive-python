@@ -41,6 +41,7 @@ from ..models import (
     Payout,
     PayoutAccount,
     Pod,
+    PodExit,
     PodMetrics,
     ReadActivity,
     Serving,
@@ -131,6 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  meshive maintenance-schedule <machine> --reason R --start ISO --end ISO [--emergency]\n"
             "  meshive machine-list-for-rent|machine-unlist|machine-delete <machine>\n"
             "  meshive host-message-send <machine> --to WORKSPACE|all --title T\n"
+            "  meshive feedback \"one line\" [--kind bug|idea|complaint] [--details TEXT]  (to the Meshive team)\n"
             "\n"
             "Run `meshive <command> --help` for filters and options.\n"
             "Scripting: `-o name` prints just the IDs, one per line (pipe into xargs); a few commands print the one\n"
@@ -661,6 +663,19 @@ def _access_label(endpoint) -> str:
                                                                   endpoint.access.capitalize())
 
 
+_OOM_LABELS = {"ram": "out of RAM", "vram": "out of GPU memory"}
+
+
+def _exit_reason(e: PodExit) -> str:
+    reason = e.reason or "-"
+    return f"{reason} ({_OOM_LABELS[e.oom_kind]})" if e.oom_kind in _OOM_LABELS else reason
+
+
+def _shorten(text: str, width: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= width else text[:width - 1] + "…"
+
+
 def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
     created = "-"
     if pod.created_at:
@@ -690,6 +705,14 @@ def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
     if pod.is_maintenance:
         # The server sets is_maintenance while the host's maintenance window is open, and doesn't bill the pod then.
         print(fmt.paint("⚠ host maintenance: not billed while the window is open", "yellow", color))
+    if pod.recent_exits:
+        print()
+        # Why the main container ended abnormally lately, newest first. DETAIL can come from the pod itself.
+        rows = [[fmt.relative_time(e.at), _exit_reason(e), "-" if e.exit_code is None else str(e.exit_code),
+                 _shorten(e.message or "-", 80)] for e in pod.recent_exits]
+        colors = [[None, "yellow" if e.oom_kind else None, None, "dim"] for e in pod.recent_exits]
+        fmt.render_table(["EXITED", "REASON", "CODE", "DETAIL"], rows, aligns=["l", "l", "r", "l"], colors=colors,
+                         enabled=color)
     if pod.linked_storages:
         print()
         rows = [[s.user_alias or s.pv_name, s.mount_path, fmt.gib(s.capacity), s.storage_type]

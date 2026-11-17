@@ -1592,6 +1592,36 @@ def test_estimate_pod_update():
     assert len(est.changes) == 2 and est.breakdown == {"gpu": "0.31"} and est.note == "The running pod restarts."
     bare = PodUpdateEstimate.from_dict({"podName": "p-0"})          # an older or partial answer
     assert bare.restarts is None and bare.current_price_per_hour is None and bare.changes == []
+    assert bare.scratch_disk is None and bare.warnings == []
+
+
+def test_estimates_read_the_scratch_disk_and_warnings():
+    from meshive import PodEstimate, PodUpdateEstimate
+
+    body = {"pricePerHourUsd": "1.002", "breakdown": {"gpu": "1", "scratch_disk": "0.002"},
+            "scratchDisk": {"paths": ["/workspace"], "newPaths": ["/workspace"], "initialGb": 20,
+                            "pricePerHourUsd": "0.002"},
+            "warnings": [{"code": "deletes_scratch_disk", "message": "Deletes the scratch disk at /mnt and its files."},
+                         {"code": "x"}, "junk"]}
+    for cls in (PodEstimate, PodUpdateEstimate):
+        est = cls.from_dict(body)
+        assert est.scratch_disk == {"paths": ["/workspace"], "new_paths": ["/workspace"], "initial_gb": 20,
+                                    "price_per_hour": "0.002"}
+        assert est.warnings == [{"code": "deletes_scratch_disk",
+                                 "message": "Deletes the scratch disk at /mnt and its files."}]
+        assert est.breakdown["scratch_disk"] == "0.002"
+    old = PodEstimate.from_dict({"pricePerHourUsd": "1"})             # a server without scratch disk reporting
+    assert old.scratch_disk is None and old.warnings == []
+
+
+def test_pod_scratch_disks():
+    from meshive import Pod
+
+    pod = Pod.from_dict({"podName": "p-0", "hasUnpreservedWorkspace": True,
+                         "scratchDisks": [{"path": "/workspace", "sizeGib": 20.4, "pricePerHour": "0.00208"}]})
+    assert pod.scratch_disks == [{"path": "/workspace", "size_gib": 20.4, "price_per_hour": "0.00208"}]
+    assert Pod.from_dict({"podName": "p-0", "scratchDisks": []}).scratch_disks == []
+    assert Pod.from_dict({"podName": "p-0"}).scratch_disks is None    # a server that doesn't say
 
 
 @pytest.mark.parametrize("kwargs", [

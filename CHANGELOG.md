@@ -37,6 +37,14 @@ pip install -U meshive
   every report. When the server isn't taking feedback it answers `NotFoundError` (title `Feedback Unavailable`); an
   account that sends several in a short time gets `RateLimitError` (title `Too Many Reports`; `retry_after` says when
   to send again).
+- **Scratch disk warnings.** `Pod.scratch_disks` lists the platform disks at the template's workspace folders
+  (`[{"path", "size_gib", "price_per_hour"}]`); a move to another machine deletes them with their files.
+  `PodEstimate` and `PodUpdateEstimate` add `scratch_disk` (the disk after the request and its hourly price) and
+  `warnings` (`[{"code", "message"}]`, such as a scratch disk the change deletes or erases on spot). `pod-create` and
+  `pod-update` print each as a `warning:` line before asking (on stderr for json and name output), the move and
+  consent messages of `pod-start` and `pod-update` name the scratch disk and its path instead of "unpreserved
+  workspace files", and `pod-watch` shows a folder that overlaps one of your volumes as `blocked (your volume)`.
+  From a server that doesn't send them yet, `scratch_disks` and `scratch_disk` are `None` and `warnings` is empty.
 
 ## v1.10.0
 

@@ -1549,7 +1549,7 @@ class Meshive(_BaseClient):
         console would: wait_any_node for a pod already waiting for any node; any_node, or wait_any_node if no node has
         room now, when its original node can no longer run its configuration; otherwise same_node, or wait_same_node
         if that node has no room now. The result's `placement` says which one was used.
-        Moving to another node (any_node, wait_any_node) permanently deletes work files that aren't preserved;
+        Moving to another node (any_node, wait_any_node) permanently deletes any scratch disk the pod has;
         allow_data_loss=True is a separate data-loss consent for this pod/move request. Without it such a start is
         refused with ConflictError 'Data Loss Consent Required', whose raw["detail"]["placement"] names the placement."""
         data = self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/start",
@@ -1635,7 +1635,7 @@ class Meshive(_BaseClient):
         Some changes are refused until consent is given — ask the user, then call again with it:
         ConflictError 'Node Migration Required' (the pod's machine can't fit the change; allow_node_migration=True
         lets it move to another machine), ConflictError 'Data Loss Consent Required' (the move deletes the pod's
-        unpreserved workspace files; allow_data_loss=True as well), and MeshiveAPIError 400 whose
+        scratch disk; allow_data_loss=True as well), and MeshiveAPIError 400 whose
         raw["detail"]["code"] is "harvest_roots_orphaned" (the change removes the watched folders in
         raw["detail"]["paths"]; pass them as drop_watched_folders). ConflictError 'Resource values need
         confirmation' (an older pod) asks for ram_gb to be passed explicitly. Other refusals ('Nothing To Change',
@@ -3175,7 +3175,7 @@ class AsyncMeshive(_BaseClient):
         console would: wait_any_node for a pod already waiting for any node; any_node, or wait_any_node if no node has
         room now, when its original node can no longer run its configuration; otherwise same_node, or wait_same_node
         if that node has no room now. The result's `placement` says which one was used.
-        Moving to another node (any_node, wait_any_node) permanently deletes work files that aren't preserved;
+        Moving to another node (any_node, wait_any_node) permanently deletes any scratch disk the pod has;
         allow_data_loss=True is a separate data-loss consent for this pod/move request. Without it such a start is
         refused with ConflictError 'Data Loss Consent Required', whose raw["detail"]["placement"] names the placement."""
         data = await self._send("POST", f"/pods/{_path_segment(pod_name, 'pod_name')}/start",

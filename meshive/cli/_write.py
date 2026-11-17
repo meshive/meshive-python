@@ -307,6 +307,13 @@ def _print_pod_estimate(est: PodEstimate, color: bool) -> None:
     if any(est.port_locks.values()):
         print(fmt.paint("Locked ports let in only workspace members signed in to the console and programs with an "
                         "access key (`meshive port-key-create`).", "dim", color))
+    _print_warnings(est, color)
+
+
+def _print_warnings(est: PodEstimate | PodUpdateEstimate, color: bool, file: Any = None) -> None:
+    """The estimate's warnings that apply to this request, one line each."""
+    for warning in getattr(est, "warnings", None) or []:
+        print(fmt.paint(fmt.clean(f"warning: {warning.get('message', '')}"), "yellow", color), file=file)
 
 
 def _model_set_cell(model_set: dict[str, Any]) -> str:
@@ -571,7 +578,7 @@ def cmd_pod_watch(client: Meshive, args: argparse.Namespace, output: str, color:
         else:
             fmt.render_table(
                 ["FOLDER", "FROM", "STATE", "FILES"],
-                [[f.path, f.origin, "blocked (network storage)" if f.blocked_reason else ("on" if f.enabled else "off"),
+                [[f.path, f.origin, _blocked_label(f.blocked_reason) if f.blocked_reason else ("on" if f.enabled else "off"),
                   ", ".join(f.include_override if f.include_override is not None else f.include) or "all"]
                  for f in current.folders], enabled=color)
         if current.restart_hint:
@@ -581,6 +588,11 @@ def cmd_pod_watch(client: Meshive, args: argparse.Namespace, output: str, color:
 
     _emit(output, current.raw, [f.path for f in current.folders or []], show)
     return 0
+
+
+def _blocked_label(reason: str) -> str:
+    """A watched folder that is never watched, by the server's reason."""
+    return "blocked (your volume)" if reason == "nested_volume" else "blocked (network storage)"
 
 
 def _toggle(template: dict[str, Any], user: list[dict[str, Any]], path: str, enabled: bool) -> None:
@@ -654,6 +666,8 @@ def _pod_create(client: Meshive, args: argparse.Namespace, output: str, color: b
         return 0
     if output == "table":      # show the estimate before asking — not mixed into json/name output
         _print_pod_estimate(estimate, color)
+    else:
+        _print_warnings(estimate, color, sys.stderr)
     _warn_open_ports([port for port, locked in estimate.port_locks.items() if not locked])
     if not _confirm(args, f"Create pod '{args.name}' at {fmt.money_hourly(estimate.price_per_hour)}/hr?"):
         return 2
@@ -713,10 +727,41 @@ def _pod_create(client: Meshive, args: argparse.Namespace, output: str, color: b
     return 0
 
 
-# Placements that may start the pod on another node, which deletes its unpreserved workspace files.
+# Placements that may start the pod on another node, which deletes its scratch disk.
 _MOVING_PLACEMENTS = ("any_node", "wait_any_node")
-_MOVE_WARNING = ("Moving this pod to another node permanently deletes unpreserved workspace files. "
-                 "Attached local hostPath storage stays on the old node.")
+_LOCAL_STAYS = "Attached local hostPath storage stays on the old node."
+
+
+def _move_warning(paths: Any = None, local_stays: bool = True) -> str:
+    """What a move to another node deletes: the scratch disk at `paths` (a pod's scratch_disks, or the 409's
+    scratchDiskPaths), or the scratch disk without a path when the server doesn't say where."""
+    names = [str(p.get("path") if isinstance(p, dict) else p) for p in paths or []]
+    where = f" at {', '.join(names)}" if names else ""
+    stays = f" {_LOCAL_STAYS}" if local_stays else ""
+    return fmt.clean(f"Moving this pod deletes its scratch disk{where} and its files.{stays}")
+
+
+def _migration_notes(client: Meshive | None, args: argparse.Namespace | None) -> list[str]:
+    """What a move would cost this pod, for a 'Node Migration Required' refusal (whose 409 says nothing about it):
+    the scratch disk only when the pod has one, the local-storage sentence only when it has local storage.
+    Nothing when the pod can't be read."""
+    if client is None or args is None:
+        return []
+    try:
+        pod = client.get_pod(args.pod_name, args.workspace)
+    except MeshiveAPIError:
+        return []
+    local = any(s.storage_type == "hostPath" for s in pod.linked_storages or [])
+    if pod.scratch_disks:
+        return [_move_warning(pod.scratch_disks, local)]
+    if pod.scratch_disks is None and pod.has_unpreserved_workspace:     # older server: the flag, no paths
+        return [_move_warning(None, local)]
+    return [_LOCAL_STAYS] if local else []
+
+
+def _consent_paths(err: MeshiveAPIError) -> list[str]:
+    paths = _error_detail(err).get("scratchDiskPaths")
+    return [str(p) for p in paths] if isinstance(paths, list) else []
 _CONSENT_REQUIRED = "Data Loss Consent Required"    # the server's 409 title for a move without consent
 
 
@@ -731,11 +776,11 @@ def _start_placement(args: argparse.Namespace) -> str | None:
 
 
 def _start_refused_for_consent(err: ConflictError, given: str) -> int:
-    """The server refused a start that may move the pod because it has unpreserved workspace files. Without
+    """The server refused a start that may move the pod because it has a scratch disk. Without
     --placement the CLI couldn't know in advance, so name the placement the server chose and how to consent to it."""
     detail = err.raw.get("detail") if isinstance(err.raw, dict) else None
     chosen = str((detail.get("placement") if isinstance(detail, dict) else None) or given or "PLACEMENT")
-    print(_MOVE_WARNING, file=sys.stderr)
+    print(_move_warning(_consent_paths(err)), file=sys.stderr)
     if given:
         print("Error: separate data-loss consent is required: --allow-data-loss (in addition to --yes).", file=sys.stderr)
     else:
@@ -760,14 +805,14 @@ def _pod_action(method: str, needs_confirm: bool, question: str):
             if placement.lower() in _MOVING_PLACEMENTS:
                 current = client.get_pod(args.pod_name, args.workspace)
                 if current.has_unpreserved_workspace is not False:
-                    print(_MOVE_WARNING, file=sys.stderr)
+                    print(_move_warning(current.scratch_disks), file=sys.stderr)
                     if not extra["allow_data_loss"]:
                         if not sys.stdin.isatty():
                             print("Error: separate data-loss consent is required: --allow-data-loss (in addition to --yes).",
                                   file=sys.stderr)
                             return 2
                         if not _confirm(argparse.Namespace(yes=False),
-                                        f"Permanently lose unpreserved files for {args.workspace}/{args.pod_name} if it moves?"):
+                                        f"Permanently lose the scratch disk of {args.workspace}/{args.pod_name} if it moves?"):
                             return 2
                         extra["allow_data_loss"] = True
         if method == "delete_pod":
@@ -973,9 +1018,11 @@ def _print_pod_update_estimate(est: PodUpdateEstimate, color: bool) -> None:
         print(fmt.clean(f"ports:     {_port_lock_cell(est.port_locks)}"))
     if est.note:
         print(fmt.paint(est.note, "dim", color))
+    _print_warnings(est, color)
 
 
-def _pod_update_refused(err: MeshiveAPIError) -> int | None:
+def _pod_update_refused(err: MeshiveAPIError, client: Meshive | None = None,
+                        args: argparse.Namespace | None = None) -> int | None:
     """A change the server holds back until it gets consent: say what to rerun with (exit 2, like pod-start's
     consent paths). None for any other error."""
     detail = _error_detail(err)
@@ -988,12 +1035,13 @@ def _pod_update_refused(err: MeshiveAPIError) -> int | None:
         return 2
     if err.title == "Node Migration Required":
         print(fmt.clean(f"Error: {err}"), file=sys.stderr)
-        print(_MOVE_WARNING, file=sys.stderr)
+        for note in _migration_notes(client, args):
+            print(note, file=sys.stderr)
         print("To let the pod move to another machine, re-run with --allow-node-migration (in addition to --yes); "
-              "add --allow-data-loss to also consent to losing its unpreserved workspace files.", file=sys.stderr)
+              "if it then asks, add --allow-data-loss.", file=sys.stderr)
         return 2
     if err.title == _CONSENT_REQUIRED:
-        print(_MOVE_WARNING, file=sys.stderr)
+        print(_move_warning(_consent_paths(err)), file=sys.stderr)
         print("Error: separate data-loss consent is required: re-run with --allow-data-loss "
               "(in addition to --allow-node-migration and --yes).", file=sys.stderr)
         return 2
@@ -1017,6 +1065,8 @@ def cmd_pod_update(client: Meshive, args: argparse.Namespace, output: str, color
             return 0
         if output == "table":
             _print_pod_update_estimate(estimate, color)
+        else:
+            _print_warnings(estimate, color, sys.stderr)
         price = f"{fmt.money_hourly(estimate.price_per_hour)}/hr"
         restart = " It restarts to apply the change." if estimate.restarts else ""
         _say_port_locks(estimate.port_locks)
@@ -1027,7 +1077,7 @@ def cmd_pod_update(client: Meshive, args: argparse.Namespace, output: str, color
         return _lock_unavailable(err, "changed", "Re-run with --no-lock to make the change with the ports it opens "
                                                  "open to anyone with the URL (or --unlock-port PORT for one port).")
     except MeshiveAPIError as err:
-        code = _pod_update_refused(err)
+        code = _pod_update_refused(err, client, args)
         if code is None:
             raise
         return code
@@ -2104,7 +2154,7 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--allow-node-migration", action="store_true",
                    help="Let the pod move to another machine when its machine can't fit the change.")
     p.add_argument("--allow-data-loss", action="store_true",
-                   help="Separately consent to permanent loss of unpreserved workspace files if the pod moves.")
+                   help="Separately consent to permanent loss of the pod's scratch disk if the pod moves.")
     p.add_argument("--drop-watched-folder", action="append", metavar="PATH",
                    help="Agree that the change removes this watched folder (repeatable); the error names them.")
     p.add_argument("--enable-folder-saving", action="store_true",
@@ -2125,12 +2175,12 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
             p.add_argument("--placement", default=None, metavar="PLACEMENT",
                            help="same_node, any_node, wait_same_node or wait_any_node. wait_* keeps the pod waiting "
                                 "until capacity frees up; any_node and wait_any_node may move it to another node, which "
-                                "permanently deletes unpreserved workspace files. Without it the server picks what the "
+                                "permanently deletes any scratch disk it has. Without it the server picks what the "
                                 "console would (same_node, or wait_same_node when its node has no room now; any_node or "
                                 "wait_any_node when its node can no longer run it) and the output shows which.")
             p.add_argument("--any-node", action="store_true", help="Short for --placement any_node.")
             p.add_argument("--allow-data-loss", action="store_true",
-                           help="Separately consent to permanent loss of unpreserved workspace files for this pod's migration.")
+                           help="Separately consent to permanent loss of the pod's scratch disk for this pod's migration.")
             _yes(p)
         if name == "pod-delete":
             p.add_argument("--delete-local-storage", action="append", metavar="PV",

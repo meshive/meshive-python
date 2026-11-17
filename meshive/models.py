@@ -281,6 +281,9 @@ class Pod:
     # The main container's recent abnormal ends, newest first (up to 5): why a pod keeps restarting or died. Only a
     # single pod's detail (`get_pod`) carries them; None in list items and from servers that don't send them.
     recent_exits: list[PodExit] | None = None
+    # The platform disks at the template's workspace folders: [{"path", "size_gib", "price_per_hour"}]. A move to
+    # another machine deletes them with their files. [] when the pod has none; None from servers that don't say.
+    scratch_disks: list[dict] | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Pod":
@@ -324,8 +327,37 @@ class Pod:
             workspace_name=d.get("workspaceName"),
             recent_exits=([PodExit.from_dict(e) for e in d["recentExits"] if isinstance(e, dict)]
                           if isinstance(d.get("recentExits"), list) else None),
+            scratch_disks=_scratch_disks(d.get("scratchDisks")),
             raw=d,
         )
+
+
+def _scratch_disks(value: object) -> list[dict] | None:
+    """A pod's `scratchDisks` → [{"path", "size_gib", "price_per_hour"}]; None when the server didn't send it."""
+    if not isinstance(value, list):
+        return None
+    return [{"path": str(s.get("path", "") or ""), "size_gib": _as_optional_float(s.get("sizeGib")),
+             "price_per_hour": str(s.get("pricePerHour", "0") or "0")}
+            for s in value if isinstance(s, dict)]
+
+
+def _scratch_disk(value: object) -> dict | None:
+    """An estimate's `scratchDisk` → {"paths", "new_paths", "initial_gb", "price_per_hour"}, or None (no scratch disk
+    after the request, or a server that doesn't say)."""
+    if not isinstance(value, dict):
+        return None
+    return {"paths": [str(p) for p in value.get("paths") or []],
+            "new_paths": [str(p) for p in value.get("newPaths") or []],
+            "initial_gb": value.get("initialGb"),
+            "price_per_hour": str(value.get("pricePerHourUsd", "0") or "0")}
+
+
+def _warnings(value: object) -> list[dict]:
+    """An estimate's `warnings` → [{"code", "message"}]; [] when there are none or the server doesn't send them."""
+    if not isinstance(value, list):
+        return []
+    return [{"code": str(w.get("code", "") or ""), "message": str(w.get("message", "") or "")}
+            for w in value if isinstance(w, dict) and w.get("message")]
 
 
 @dataclass
@@ -339,7 +371,9 @@ class WatchedFolder:
     include: list[str] = field(default_factory=list)   # the template's include
     include_override: list[str] | None = None          # None = template include, [] = everything, [..] = only these
     since: str | None = None       # user folders: only files created after this time (None = existing files too)
-    blocked_reason: str | None = None   # network_storage = on NFS, so not harvested (can't be turned on)
+    # Why it is never watched (can't be turned on): network_storage = on network storage, nested_volume = contains or
+    # sits on one of your volumes inside the scratch disk.
+    blocked_reason: str | None = None
 
 
 @dataclass
@@ -2045,6 +2079,12 @@ class PodEstimate:
     model_set: dict | None = None
     # {port: locked} — the lock value this request sends for each public port (worked out by the SDK, not the server).
     port_locks: dict = field(default_factory=dict)
+    # The platform disk at the template's workspace folder after the request: {"paths", "new_paths", "initial_gb",
+    # "price_per_hour"} (USD/h of the disks this request creates, included in price_per_hour as
+    # breakdown["scratch_disk"]). None when there is none, and from servers that don't report it.
+    scratch_disk: dict | None = None
+    # Short warnings that apply to this request: [{"code", "message"}], most severe first. Show them before going ahead.
+    warnings: list = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict) -> "PodEstimate":
@@ -2052,7 +2092,8 @@ class PodEstimate:
         return cls(price_per_hour=str(d.get("pricePerHourUsd", "0")), breakdown=d.get("breakdown") or {},
                    resources=d.get("resources") or {}, availability=d.get("availability") or {},
                    template=d.get("template") or {}, volumes=list(d.get("volumes") or []),
-                   note=d.get("note") or "", raw=d, model_set=model_set if isinstance(model_set, dict) else None)
+                   note=d.get("note") or "", raw=d, model_set=model_set if isinstance(model_set, dict) else None,
+                   scratch_disk=_scratch_disk(d.get("scratchDisk")), warnings=_warnings(d.get("warnings")))
 
 
 @dataclass
@@ -2379,6 +2420,10 @@ class PodUpdateEstimate:
     raw: dict = field(default_factory=dict, repr=False)
     # {port: locked} — the lock value this request sends, for the ports it sends one for (worked out by the SDK).
     port_locks: dict = field(default_factory=dict)
+    # Same as in PodEstimate: the scratch disk after the change (new_paths = the disks it creates) and the warnings
+    # that apply to it, such as a scratch disk it deletes.
+    scratch_disk: dict | None = None
+    warnings: list = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict) -> "PodUpdateEstimate":
@@ -2387,7 +2432,8 @@ class PodUpdateEstimate:
                    price_per_hour=str(d.get("pricePerHourUsd", "0")),
                    current_price_per_hour=_optional_str(d.get("currentPricePerHourUsd")),
                    breakdown=d.get("breakdown") or {}, resources=d.get("resources") or {},
-                   volumes=list(d.get("volumes") or []), note=d.get("note") or "", raw=d)
+                   volumes=list(d.get("volumes") or []), note=d.get("note") or "", raw=d,
+                   scratch_disk=_scratch_disk(d.get("scratchDisk")), warnings=_warnings(d.get("warnings")))
 
 
 @dataclass

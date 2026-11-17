@@ -484,6 +484,16 @@ def test_pod_details_show_template_and_storage_names(capsys):
     assert "pv-internal" not in out
 
 
+def test_pod_details_show_the_scratch_disk(capsys):
+    pod = Pod.from_dict({"podName": "pod-1", "scratchDisks": [
+        {"path": "/workspace", "sizeGib": 20.0, "pricePerHour": "0.00208333"}]})
+    cli._print_pod(pod, False)
+    assert "scratch:   /workspace, 20 GiB, $0.002/hr" in capsys.readouterr().out.splitlines()
+    for disks in ([], None):                       # none, or a server that doesn't say
+        cli._print_pod(Pod.from_dict({"podName": "pod-1", "scratchDisks": disks}), False)
+        assert "scratch" not in capsys.readouterr().out
+
+
 def test_storage_details_use_linked_pod_labels_and_keep_missing_name_fallback(capsys):
     storage = Storage.from_dict({
         "linkedPod": [{"podName": "pod-internal", "userAlias": "trainer"}, {"podName": "pod-legacy"}],

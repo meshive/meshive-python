@@ -676,6 +676,13 @@ def _shorten(text: str, width: int) -> str:
     return text if len(text) <= width else text[:width - 1] + "…"
 
 
+def _scratch_disk_cell(disk: dict) -> str:
+    """A pod's scratch disk as '/workspace, 20 GiB, $0.002/hr'."""
+    size = disk.get("size_gib")
+    parts = [str(disk.get("path") or "-")] + ([fmt.gib(size * 1024)] if size is not None else [])
+    return ", ".join(parts + [f"{fmt.money_hourly(disk.get('price_per_hour'))}/hr"])
+
+
 def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
     created = "-"
     if pod.created_at:
@@ -689,6 +696,8 @@ def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
     print(f"created:   {created}")
     if pod.template_name:
         print(f"template:  {fmt.clean(pod.template_name)}")
+    if pod.scratch_disks:
+        print(fmt.clean("scratch:   " + "; ".join(_scratch_disk_cell(d) for d in pod.scratch_disks)))
     # The lines below are printed only when they apply (only when meaningful, not a list of booleans).
     premiums = [n for n, on in (("cpu", pod.cpu_premium), ("uptime", pod.uptime_premium),
                                 ("internet", pod.internet_premium)) if on]

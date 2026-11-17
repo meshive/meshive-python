@@ -50,7 +50,7 @@ from ..exceptions import (ConflictError, EndpointLockUnavailableError, MeshiveAP
                           PodCreationFailedError, PortNotLockedError, WaitTimeoutError)
 from ..models import (AccessKey, AccessKeyCreated, ListingResult, Logs, MachineClients, MachineDeleteCheck,
                       MachineDeleted, MaintenanceAction,
-                      MaintenanceEstimate, PodEstimate, PodUpdated, PodUpdateEstimate, PortLock, ResourceAction,
+                      MaintenanceEstimate, Pod, PodEstimate, PodUpdated, PodUpdateEstimate, PortLock, ResourceAction,
                       StorageConnection, StorageEstimate, StorageUpdateEstimate, TaskEstimate, WorkspaceDeleteCheck,
                       WorkspaceEstimate, WorkspaceUpdateEstimate)
 
@@ -345,6 +345,8 @@ def _volume_cell(volume: dict[str, Any]) -> str:
     if volume.get("new"):
         extra = ", encrypted" if volume.get("encrypted") else ""
         return f"{volume.get('name')} (new local, {volume.get('size_gb')} GiB{extra})→{volume.get('mount_path')}"
+    if not volume.get("storage"):      # an edit's new local volume has no storage id yet
+        return f"{volume.get('name') or '-'} (new local)→{volume.get('mount_path')}"
     return f"{volume.get('storage')}→{volume.get('mount_path')}"
 
 
@@ -732,13 +734,29 @@ _MOVING_PLACEMENTS = ("any_node", "wait_any_node")
 _LOCAL_STAYS = "Attached local hostPath storage stays on the old node."
 
 
-def _move_warning(paths: Any = None, local_stays: bool = True) -> str:
+def _move_warning(paths: Any, local_stays: bool) -> str:
     """What a move to another node deletes: the scratch disk at `paths` (a pod's scratch_disks, or the 409's
-    scratchDiskPaths), or the scratch disk without a path when the server doesn't say where."""
+    scratchDiskPaths), or the scratch disk without a path when the server doesn't say where. `local_stays` adds the
+    local-storage sentence, only for a pod that has local storage."""
     names = [str(p.get("path") if isinstance(p, dict) else p) for p in paths or []]
     where = f" at {', '.join(names)}" if names else ""
     stays = f" {_LOCAL_STAYS}" if local_stays else ""
     return fmt.clean(f"Moving this pod deletes its scratch disk{where} and its files.{stays}")
+
+
+def _has_local_storage(pod: Pod) -> bool:
+    return any(s.storage_type == "hostPath" for s in pod.linked_storages or [])
+
+
+def _reads_local_storage(client: Meshive | None, args: argparse.Namespace | None) -> bool:
+    """Whether the pod has attached local storage, for a 409 that names only its scratch disk. False when the pod
+    can't be read."""
+    if client is None or args is None:
+        return False
+    try:
+        return _has_local_storage(client.get_pod(args.pod_name, args.workspace))
+    except MeshiveAPIError:
+        return False
 
 
 def _migration_notes(client: Meshive | None, args: argparse.Namespace | None) -> list[str]:
@@ -751,7 +769,7 @@ def _migration_notes(client: Meshive | None, args: argparse.Namespace | None) ->
         pod = client.get_pod(args.pod_name, args.workspace)
     except MeshiveAPIError:
         return []
-    local = any(s.storage_type == "hostPath" for s in pod.linked_storages or [])
+    local = _has_local_storage(pod)
     if pod.scratch_disks:
         return [_move_warning(pod.scratch_disks, local)]
     if pod.scratch_disks is None and pod.has_unpreserved_workspace:     # older server: the flag, no paths
@@ -775,12 +793,12 @@ def _start_placement(args: argparse.Namespace) -> str | None:
     return placement or ("any_node" if args.any_node else "")
 
 
-def _start_refused_for_consent(err: ConflictError, given: str) -> int:
+def _start_refused_for_consent(err: ConflictError, given: str, client: Meshive, args: argparse.Namespace) -> int:
     """The server refused a start that may move the pod because it has a scratch disk. Without
     --placement the CLI couldn't know in advance, so name the placement the server chose and how to consent to it."""
     detail = err.raw.get("detail") if isinstance(err.raw, dict) else None
     chosen = str((detail.get("placement") if isinstance(detail, dict) else None) or given or "PLACEMENT")
-    print(_move_warning(_consent_paths(err)), file=sys.stderr)
+    print(_move_warning(_consent_paths(err), _reads_local_storage(client, args)), file=sys.stderr)
     if given:
         print("Error: separate data-loss consent is required: --allow-data-loss (in addition to --yes).", file=sys.stderr)
     else:
@@ -805,7 +823,7 @@ def _pod_action(method: str, needs_confirm: bool, question: str):
             if placement.lower() in _MOVING_PLACEMENTS:
                 current = client.get_pod(args.pod_name, args.workspace)
                 if current.has_unpreserved_workspace is not False:
-                    print(_move_warning(current.scratch_disks), file=sys.stderr)
+                    print(_move_warning(current.scratch_disks, _has_local_storage(current)), file=sys.stderr)
                     if not extra["allow_data_loss"]:
                         if not sys.stdin.isatty():
                             print("Error: separate data-loss consent is required: --allow-data-loss (in addition to --yes).",
@@ -822,7 +840,7 @@ def _pod_action(method: str, needs_confirm: bool, question: str):
         except ConflictError as err:
             if method != "start_pod" or err.title != _CONSENT_REQUIRED:
                 raise
-            return _start_refused_for_consent(err, placement)
+            return _start_refused_for_consent(err, placement, client, args)
         _emit(output, action.raw, [action.id], lambda: _print_action(action, color))
         return 0
     return handler
@@ -1041,7 +1059,7 @@ def _pod_update_refused(err: MeshiveAPIError, client: Meshive | None = None,
               "if it then asks, add --allow-data-loss.", file=sys.stderr)
         return 2
     if err.title == _CONSENT_REQUIRED:
-        print(_move_warning(_consent_paths(err)), file=sys.stderr)
+        print(_move_warning(_consent_paths(err), _reads_local_storage(client, args)), file=sys.stderr)
         print("Error: separate data-loss consent is required: re-run with --allow-data-loss "
               "(in addition to --allow-node-migration and --yes).", file=sys.stderr)
         return 2

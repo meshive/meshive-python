@@ -342,14 +342,18 @@ def _scratch_disks(value: object) -> list[dict] | None:
 
 
 def _scratch_disk(value: object) -> dict | None:
-    """An estimate's `scratchDisk` → {"paths", "new_paths", "initial_gb", "price_per_hour"}, or None (no scratch disk
-    after the request, or a server that doesn't say)."""
+    """An estimate's `scratchDisk` → {"paths", "new_paths", "initial_gb", "price_per_hour", "total_price_per_hour"},
+    or None (no scratch disk after the request, or a server that doesn't say). price_per_hour covers only the disks
+    the request creates; total_price_per_hour is what all of them cost per hour after it (None from servers that
+    don't send it)."""
     if not isinstance(value, dict):
         return None
+    total = value.get("totalPricePerHourUsd")
     return {"paths": [str(p) for p in value.get("paths") or []],
             "new_paths": [str(p) for p in value.get("newPaths") or []],
             "initial_gb": value.get("initialGb"),
-            "price_per_hour": str(value.get("pricePerHourUsd", "0") or "0")}
+            "price_per_hour": str(value.get("pricePerHourUsd", "0") or "0"),
+            "total_price_per_hour": None if total is None else str(total)}
 
 
 def _warnings(value: object) -> list[dict]:
@@ -2080,8 +2084,10 @@ class PodEstimate:
     # {port: locked} — the lock value this request sends for each public port (worked out by the SDK, not the server).
     port_locks: dict = field(default_factory=dict)
     # The platform disk at the template's workspace folder after the request: {"paths", "new_paths", "initial_gb",
-    # "price_per_hour"} (USD/h of the disks this request creates, included in price_per_hour as
-    # breakdown["scratch_disk"]). None when there is none, and from servers that don't report it.
+    # "price_per_hour", "total_price_per_hour"}. price_per_hour is USD/h of the disks this request creates (included
+    # in price_per_hour as breakdown["scratch_disk"]; "0" when none is new); total_price_per_hour is what every disk
+    # in paths costs per hour after the request (None from servers that don't send it). None when there is none, and
+    # from servers that don't report it.
     scratch_disk: dict | None = None
     # Short warnings that apply to this request: [{"code", "message"}], most severe first. Show them before going ahead.
     warnings: list = field(default_factory=list)

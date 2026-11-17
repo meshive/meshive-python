@@ -1652,6 +1652,49 @@ def test_pod_start_preview_mentions_the_scratch_disk_only_for_a_pod_that_has_one
     assert (out.out + out.err).count("scratch disk") == 1
 
 
+LOCAL_STORAGE = {"linkedStorages": [{"pvName": "pv-l", "mountPath": "/data", "storageType": "hostPath"}]}
+NFS_STORAGE = {"linkedStorages": [{"pvName": "pv-n", "mountPath": "/workspace/data", "storageType": "nfs"}]}
+
+
+@pytest.mark.parametrize("storages, says_local", [(NFS_STORAGE, False), (LOCAL_STORAGE, True)])
+def test_pod_start_move_mentions_local_storage_only_when_the_pod_has_it(capsys, non_tty, monkeypatch, storages,
+                                                                        says_local):
+    _pod_with(monkeypatch, {**SCRATCH_POD, **storages})
+    assert cli.main(["pod-start", "ws", "p-0", "--any-node", "--yes"]) == 2
+    err = capsys.readouterr().err
+    assert "Moving this pod deletes its scratch disk at /workspace and its files." in err
+    assert ("hostPath" in err) is says_local, err
+
+
+@pytest.mark.parametrize("storages, says_local", [(NFS_STORAGE, False), (LOCAL_STORAGE, True)])
+def test_consent_refusals_mention_local_storage_only_when_the_pod_has_it(capsys, non_tty, edit_client, monkeypatch,
+                                                                         storages, says_local):
+    """The 409 names only the scratch disk: the CLI reads the pod for the local-storage sentence."""
+    from meshive.exceptions import ConflictError
+    _pod_with(monkeypatch, {**SCRATCH_POD, **storages})
+    _start_returns(monkeypatch, error=ConflictError(409, "consent required", title="Data Loss Consent Required",
+                                                    raw={"detail": {"placement": "wait_any_node",
+                                                                    "scratchDiskPaths": ["/workspace"]}}))
+    assert cli.main(["pod-start", "ws", "p-0", "--yes"]) == 2
+    assert ("hostPath" in capsys.readouterr().err) is says_local
+    monkeypatch.setattr(FakeClient, "update_pod", _fake("update_pod", _refusal(
+        409, "Data Loss Consent Required", scratchDiskPaths=["/workspace"])))
+    assert cli.main(["pod-update", "ws", "p-0", "--gpu", "RTX 4090", "--yes", "-o", "json"]) == 2
+    assert ("hostPath" in capsys.readouterr().err) is says_local
+
+
+def test_pod_update_preview_names_a_new_local_volume(capsys, edit_client, monkeypatch):
+    estimate = {**POD_UPDATE_ESTIMATE, "volumes": [
+        {"storage": "pv-a", "name": "data", "mount_path": "/workspace/data", "storage_type": "nfs"},
+        {"storage": None, "name": "cli-in", "mount_path": "/workspace/models", "storage_type": "hostPath"}]}
+    monkeypatch.setattr(FakeClient, "estimate_pod_update",
+                        _fake("estimate_pod_update", lambda: PodUpdateEstimate.from_dict(estimate)))
+    assert cli.main(["pod-update", "ws", "p-0", "--local-volume", "cli-in:/workspace/models:10", "--estimate"]) == 0
+    out = capsys.readouterr().out
+    assert "volumes:   pv-a→/workspace/data, cli-in (new local)→/workspace/models" in out.splitlines()
+    assert "None" not in out
+
+
 def test_pod_watch_shows_why_a_folder_is_blocked(capsys, monkeypatch):
     monkeypatch.setattr(FakeClient, "WATCHED", {"version": "4:cd", "editable": True, "roots": [
         {"role": "user", "path": "/data/out", "origin": "user", "enabled": False, "blockedReason": "network_storage"},

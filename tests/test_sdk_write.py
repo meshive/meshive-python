@@ -1606,12 +1606,22 @@ def test_estimates_read_the_scratch_disk_and_warnings():
     for cls in (PodEstimate, PodUpdateEstimate):
         est = cls.from_dict(body)
         assert est.scratch_disk == {"paths": ["/workspace"], "new_paths": ["/workspace"], "initial_gb": 20,
-                                    "price_per_hour": "0.002"}
+                                    "price_per_hour": "0.002", "total_price_per_hour": None}
         assert est.warnings == [{"code": "deletes_scratch_disk",
                                  "message": "Deletes the scratch disk at /mnt and its files."}]
         assert est.breakdown["scratch_disk"] == "0.002"
     old = PodEstimate.from_dict({"pricePerHourUsd": "1"})             # a server without scratch disk reporting
     assert old.scratch_disk is None and old.warnings == []
+
+
+def test_update_estimate_reads_what_a_kept_scratch_disk_costs():
+    """price_per_hour is only what the request creates ("0" for a disk the pod keeps); the server's total says what
+    the disks cost per hour after it."""
+    from meshive import PodUpdateEstimate
+
+    est = PodUpdateEstimate.from_dict({"scratchDisk": {"paths": ["/workspace"], "newPaths": [], "initialGb": 20,
+                                                       "pricePerHourUsd": "0", "totalPricePerHourUsd": "0.00208333"}})
+    assert est.scratch_disk["price_per_hour"] == "0" and est.scratch_disk["total_price_per_hour"] == "0.00208333"
 
 
 def test_pod_scratch_disks():

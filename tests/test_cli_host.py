@@ -158,6 +158,7 @@ def test_machine_shows_clients_maintenance_and_diagnostics(capsys):
     assert "Maintenance" in out and "RAM swap" in out and "2099-01-10 09:00 UTC" in out
     assert "Fan swap" not in out and "1 past window(s): meshive maintenance mac-1" in out
     assert "Diagnostics" in out and "boot:" in out and "ports:" in out and "speed_below_max" in out
+    assert "disk:" in out and "nvme0n1 not responding, / 92% used" in out
     assert _calls("list_maintenance")
 
 
@@ -176,7 +177,7 @@ def test_machine_on_an_older_server(capsys, monkeypatch):
     assert cli.main(["machine", "mac-1"]) == 0
     out = capsys.readouterr().out
     assert "status:    ● ONLINE" in out and "No pods or volumes of other users." in out
-    assert "fee:" not in out and "messages:" not in out and "Maintenance" not in out
+    assert "fee:" not in out and "messages:" not in out and "Maintenance" not in out and "disk:" not in out
     assert "stage" in out           # what the state already says is still shown
 
 
@@ -195,6 +196,31 @@ def test_machine_with_a_failed_setup_and_boot_errors(capsys, monkeypatch):
     assert "setup step:" in out and "2/5" in out and "1 error(s)" in out and "unreachable: 2222/tcp" in out
     assert "gpu_driver: nvidia-smi [31mfailed" in out and "\x1b" not in out
     assert "meshive machine-retry mac-1" in out and "No upcoming maintenance." in out
+
+
+@pytest.mark.parametrize("warning, text", [
+    ({"kind": "stall", "device": "nvme0n1", "value": 150}, "nvme0n1 not responding"),
+    ({"kind": "slow", "device": "nvme1n1", "value": 31.24, "threshold": 20}, "nvme1n1 slow (31.2 ms per write)"),
+    ({"kind": "slow", "device": "nvme1n1", "value": None}, "nvme1n1 slow"),
+    ({"kind": "full", "device": "/", "value": 92.4}, "/ 92% used"),
+    ({"kind": "full", "device": "/", "value": 89.6}, "/ 89% used"),    # rounded down, not up to the 90% alert level
+    ({"kind": "full", "device": "/", "value": 99.6}, "/ 99% used"),
+    ({"kind": "full", "device": "/", "value": "nan"}, "/ almost full"),
+    ({"kind": "full", "device": "/", "value": "inf"}, "/ almost full"),
+    ({"kind": "full", "device": "/", "value": "n/a"}, "/ almost full"),
+    ({"kind": "smart", "device": "sda"}, "sda smart"),          # a kind this CLI doesn't know yet
+    ({}, "- -"),
+])
+def test_disk_warning_text(warning, text):
+    assert cli._disk_warning_text(warning) == text
+
+
+def test_machine_disk_warnings_are_cleaned(capsys, monkeypatch):
+    monkeypatch.setattr(FakeClient, "detail", {**MACHINE_DETAIL, "diskWarnings": [
+        {"kind": "slow", "device": "nvme0n1\x1b[31m", "value": 25.0, "threshold": 20.0}]})
+    assert cli.main(["machine", "mac-1"]) == 0
+    out = capsys.readouterr().out
+    assert "disk:" in out and "slow (25.0 ms per write)" in out and "\x1b" not in out
 
 
 def test_maintenance_lists_every_window(capsys):

@@ -2640,8 +2640,12 @@ class MachineDetail(Machine):
     """GET /v1/sdk/machines/{machine_id} response — a Machine with what the console's machine view shows.
 
     clients is who uses the machine (other users' workspaces). schedules is the maintenance summary
-    ({"upcoming": [...], "ongoing": ...}); list_maintenance has every window with its status. boot_report and
-    network_warnings are the diagnostics the console shows (None / [] when there are none). platform_fee is the
+    ({"upcoming": [...], "ongoing": ...}); list_maintenance has every window with its status. boot_report,
+    network_warnings and disk_warnings are the diagnostics the console shows (None / [] when there are none).
+    A disk warning is {"kind", "device", "since", "value", "threshold"}: kind "stall" (the disk stopped responding;
+    value is seconds without progress, new workloads are paused), "slow" (writes are slow while the disk is lightly
+    loaded; value is milliseconds per write) or "full" (the system disk, device "/", is almost full; value is the
+    percent used). threshold is the alert level for that kind. platform_fee is the
     current platform fee as a fraction (0.2 = 20%) and promotional_fee_until is when a promotional fee ends. Fields
     an older server doesn't send stay empty (platform_fee None), so the detail of an older server still parses.
     """
@@ -2652,6 +2656,7 @@ class MachineDetail(Machine):
     network_warnings: list[dict] = field(default_factory=list)
     platform_fee: float | None = None
     promotional_fee_until: datetime | None = None
+    disk_warnings: list[dict] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict) -> "MachineDetail":
@@ -2661,6 +2666,8 @@ class MachineDetail(Machine):
         detail.schedules = schedules if isinstance(schedules, dict) else {}
         detail.boot_report = boot if isinstance(boot, dict) else None
         detail.network_warnings = [w for w in d.get("networkWarnings") or [] if isinstance(w, dict)]
+        disk = d.get("diskWarnings")
+        detail.disk_warnings = [w for w in disk if isinstance(w, dict)] if isinstance(disk, list) else []
         detail.platform_fee = _as_optional_float(d.get("platformFee"))
         detail.promotional_fee_until = _parse_dt(d.get("promotionalFeeUntil"))
         return detail

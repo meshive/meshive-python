@@ -12,6 +12,17 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## Unreleased
+
+### What's new
+
+- **Disk warnings for hosts.** `MachineDetail.disk_warnings` lists the disk problems the console shows for a machine,
+  each as `{"kind", "device", "since", "value", "threshold"}`: `stall` (a disk stopped responding; new workloads on
+  the machine are paused and its listing is turned off), `slow` (writes are slow even when the disk is lightly
+  loaded; `value` is milliseconds per write) or `full` (the system disk, device `/`, is almost full; `value` is the
+  percent used). `meshive machine <id>` adds a `disk` line to its Diagnostics block, for example
+  `nvme0n1 not responding` or `/ 92% used`. From a server that doesn't send them yet the list is empty.
+
 ## v1.10.0
 
 A pod's public ports can be locked, and from this release new pods are created with them locked. A locked port lets

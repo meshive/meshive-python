@@ -1,6 +1,7 @@
 import argparse
 import getpass
 import json
+import math
 import os
 import sys
 from collections.abc import Callable
@@ -52,6 +53,7 @@ from ..models import (
     WhoAmI,
     Workspace,
     WorkspaceDetail,
+    _as_optional_float,
     _parse_dt,
 )
 
@@ -901,6 +903,22 @@ def _print_machine_maintenance(machine_id: str, windows: list[MaintenanceWindow]
         print(fmt.paint(fmt.clean(f"{past} past window(s): meshive maintenance {machine_id}"), "dim", color))
 
 
+def _disk_warning_text(warning: dict) -> str:
+    """One disk warning in a few words: "nvme0n1 not responding", "nvme0n1 slow (31.2 ms per write)", "/ 92% used"."""
+    device, kind = str(warning.get("device") or "-"), str(warning.get("kind") or "-")
+    value = _as_optional_float(warning.get("value"))
+    if kind == "stall":
+        return f"{device} not responding"
+    if kind == "slow":
+        return f"{device} slow ({value:.1f} ms per write)" if value is not None else f"{device} slow"
+    if kind == "full":
+        # Rounded down like the console and the emails, so 89.6% does not read as the 90% alert level.
+        if value is not None and math.isfinite(value):
+            return f"{device} {math.floor(value)}% used"
+        return f"{device} almost full"
+    return f"{device} {kind}"
+
+
 def _print_machine_diagnostics(machine: MachineDetail, color: bool) -> None:
     state = machine.raw.get("state") or {}
     pairs: list[tuple[str, str]] = []
@@ -928,6 +946,8 @@ def _print_machine_diagnostics(machine: MachineDetail, color: bool) -> None:
             pairs.append(("ports", "unreachable: " + ", ".join(unreachable) if unreachable else "failed"))
     if machine.network_warnings:
         pairs.append(("network", ", ".join(str(w.get("code", "-")) for w in machine.network_warnings)))
+    if machine.disk_warnings:
+        pairs.append(("disk", ", ".join(_disk_warning_text(w) for w in machine.disk_warnings)))
     if not pairs:
         return
     print()

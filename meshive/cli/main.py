@@ -683,6 +683,25 @@ def _scratch_disk_cell(disk: dict) -> str:
     return ", ".join(parts + [f"{fmt.money_hourly(disk.get('price_per_hour'))}/hr"])
 
 
+def _print_pod_failure(pod: Pod, color: bool) -> None:
+    """One line under the status while the pod's failure matters (the server decides when), then the line the
+    program printed, indented. A failed creation wins over the last exit."""
+    if pod.creation_failure is not None:
+        headline, output = f"Create failed: {pod.creation_failure.summary}", pod.creation_failure.output
+    elif pod.last_exit is not None:
+        e = pod.last_exit
+        parts = [f"Restarted {pod.restart_count} time{'s' if pod.restart_count != 1 else ''}"] \
+            if pod.restart_count else []
+        parts += [e.summary or _exit_reason(e), fmt.relative_time(e.at)]
+        headline, output = " · ".join(parts), e.message
+    else:
+        return
+    print(fmt.paint(fmt.clean(headline), "red", color))
+    if output:
+        # Printed by the pod's own program: untrusted text.
+        print(fmt.paint(fmt.clean(f"  {_shorten(output, 300)}"), "dim", color))
+
+
 def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
     created = "-"
     if pod.created_at:
@@ -691,6 +710,7 @@ def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
     print(f"id:        {fmt.clean(pod.pod_name)}")           # lookup key
     print(f"workspace: {fmt.clean(pod.workspace_name or pod.namespace_name)}")
     print(f"status:    {fmt.paint(fmt.clean(fmt.status_cell(pod.status)), fmt.status_color(pod.status), color)}")
+    _print_pod_failure(pod, color)
     print(f"rental:    {fmt.clean(pod.rental_type)}")
     print(f"price/hr:  {_pod_price(pod)}")
     print(f"created:   {created}")

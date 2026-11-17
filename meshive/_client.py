@@ -816,6 +816,24 @@ def _new_pod_expired(deadline: float, name: str, timeout: float) -> None:
         raise WaitTimeoutError(f"Pod {name!r} did not appear within {timeout:g}s.")
 
 
+def _name_key(name: str | None) -> str:
+    """A display name as the server compares it: case and surrounding spaces don't count."""
+    return (name or "").strip().lower()
+
+
+def _pods_named(pods: list[Pod], name: str) -> list[Pod]:
+    """list_pods(name=...) on a server that ignores `name` returns every pod: keep the ones with that display name."""
+    key = _name_key(name)
+    return [p for p in pods if _name_key(p.user_alias) == key and not p.is_downloader]
+
+
+def _find_new_pod(pods: list[Pod], name: str, pod_name: str | None) -> Pod | None:
+    """The pod create_pod made: by its pod_name when the server returned one, else by its display name."""
+    if pod_name:
+        return next((p for p in pods if p.pod_name == pod_name), None)
+    return next((p for p in pods if p.user_alias == name), None)
+
+
 # --- Shared wait_for_workspace decisions -------------------------------------------
 # `running` is the only status that means pods and tasks are accepted. `error` can't recover, so it ends the wait at
 # once. Nothing else does: the list can lag a moment behind a create, so a new workspace may be missing from it at
@@ -997,10 +1015,17 @@ class Meshive(_BaseClient):
         """My workspaces (GET /workspaces)."""
         return [Workspace.from_dict(d) for d in self._get("/workspaces")]
 
-    def list_pods(self, workspace: str) -> list[Pod]:
-        """Pods in a workspace (GET /pods?workspace=)."""
-        data = self._get("/pods", params={"workspace": workspace})
-        return [Pod.from_dict(d) for d in data.get("pods", [])]
+    def list_pods(self, workspace: str, *, name: str | None = None) -> list[Pod]:
+        """Pods in a workspace (GET /pods?workspace=).
+
+        With `name` (a display name; case and surrounding spaces don't count) only that pod: the live pod with the
+        name, else a pod with that name that is being created or whose creation failed in the last 24 hours (status
+        terminated, with `creation_failure`). [] when there is none."""
+        if name is None or not name.strip():
+            data = self._get("/pods", params={"workspace": workspace})
+            return [Pod.from_dict(d) for d in data.get("pods", [])]
+        data = self._get("/pods", params={"workspace": workspace, "name": name})
+        return _pods_named([Pod.from_dict(d) for d in data.get("pods", [])], name)
 
     def get_pod(self, pod_name: str, workspace: str) -> Pod:
         """A single pod (GET /pods/{pod_name}?workspace=)."""
@@ -1037,16 +1062,22 @@ class Meshive(_BaseClient):
         return self._wait_for_pod(pod_name, workspace, until=until, timeout=timeout, interval=interval)
 
     def _wait_for_pod(self, pod_name: str, workspace: str, *, until: str | Iterable[str], timeout: float,
-                      interval: float, watch: _CreationWatch | None = None) -> Pod:
+                      interval: float, watch: _CreationWatch | None = None, missing_ok: bool = False) -> Pod:
+        """missing_ok: a pod that isn't found (404) is not there yet, so the wait goes on (wait_for_new_pod)."""
         targets, terminal = _wait_targets(until)
         deadline = time.monotonic() + timeout
         last = ""
         while True:
             self._check_creation(watch, workspace)
-            pod = self.get_pod(pod_name, workspace)
-            if _wait_reached(pod, targets, terminal, pod_name):
-                return pod
-            last = pod.status
+            try:
+                pod = self.get_pod(pod_name, workspace)
+            except NotFoundError:
+                if not missing_ok:
+                    raise
+            else:
+                if _wait_reached(pod, targets, terminal, pod_name):
+                    return pod
+                last = pod.status
             _wait_expired(deadline, pod_name, targets, last)
             time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
 
@@ -1070,19 +1101,21 @@ class Meshive(_BaseClient):
         interval: float = 5.0,
         transaction_id: int | str | None = None,
         port_locks: dict[int, bool] | None = None,
+        pod_name: str | None = None,
     ) -> Pod:
         """Wait for a pod just created with `create_pod(name, ...)` to appear and reach `until`, and return it.
 
             created = client.create_pod("my-pod", template_id, workspace="my-workspace", gpu_model="RTX 3060")
             pod = client.wait_for_new_pod("my-pod", "my-workspace", transaction_id=created.transaction_id,
-                                          port_locks=created.port_locks)
+                                          port_locks=created.port_locks, pod_name=created.pod_name)
 
-        create_pod returns before the pod has an ID, so this finds it by name (user_alias), then waits like
-        wait_for_pod. With `transaction_id` (create_pod's `transaction_id`) it also follows the creation on every
-        poll: if the server records it as failed, or as cancelled because the pod was deleted, PodCreationFailedError
-        is raised right away with the reason instead of waiting for the pod. Without it, or on a server that can't
-        look the transaction up, only the pod is watched. Raises WaitTimeoutError if the pod doesn't appear or reach
-        `until` within `timeout` seconds.
+        This finds the pod in the workspace's pod list, by `pod_name` (create_pod's `pod_name`, which older servers
+        leave None) or else by name (user_alias), then waits like wait_for_pod; a pod that isn't found yet while
+        waiting is waited for, not an error. With `transaction_id` (create_pod's `transaction_id`) it also follows
+        the creation on every poll: if the server records it as failed, or as cancelled because the pod was deleted,
+        PodCreationFailedError is raised right away with the reason instead of waiting for the pod. Without it, or on
+        a server that can't look the transaction up, only the pod is watched. Raises WaitTimeoutError if the pod
+        doesn't appear or reach `until` within `timeout` seconds.
         With `port_locks` (create_pod's `port_locks`) the pod's ports are checked once it is there: if a port that
         was created to be locked is exposed without the lock, PortNotLockedError is raised (its `pod` is the pod).
         """
@@ -1091,11 +1124,11 @@ class Meshive(_BaseClient):
         watch = _CreationWatch(name, transaction_id, _wait_targets(until)[0])
         deadline = time.monotonic() + timeout
         while True:
-            pod = next((p for p in self.list_pods(workspace) if p.user_alias == name), None)
+            pod = _find_new_pod(self.list_pods(workspace), name, pod_name)
             if pod is not None:
                 pod = self._wait_for_pod(pod.pod_name, workspace, until=until,
                                          timeout=max(deadline - time.monotonic(), 0.0), interval=interval,
-                                         watch=watch)
+                                         watch=watch, missing_ok=True)
                 return _check_port_locks(pod, port_locks)
             self._check_creation(watch, workspace)
             _new_pod_expired(deadline, name, timeout)
@@ -1488,7 +1521,8 @@ class Meshive(_BaseClient):
         an output folder — $MESHIVE_OUTPUT_DIR and its storage follow (get_watched_folders lists them on a running pod).
         Templates without an output folder (for example NIM or vLLM) take watched_folders too, as long as the pod has
         storage to hold them.
-        Pass the result's transaction_id to wait_for_new_pod to learn right away if the creation fails.
+        Pass the result's transaction_id to wait_for_new_pod to learn right away if the creation fails. The result's
+        pod_name (None from older servers) can be read with get_pod from the start, also while it is created.
         model_set starts the pod with one of the template's model sets (a slug from list_model_sets; one per pod). The
         server fetches the set's files before it answers, which can take minutes, so this request waits up to
         LONG_RUNNING_READ_TIMEOUT seconds for the answer and is not resent after a timeout: the first request may
@@ -2690,10 +2724,13 @@ class AsyncMeshive(_BaseClient):
         """My workspaces (GET /workspaces)."""
         return [Workspace.from_dict(d) for d in await self._get("/workspaces")]
 
-    async def list_pods(self, workspace: str) -> list[Pod]:
-        """Pods in a workspace (GET /pods?workspace=)."""
-        data = await self._get("/pods", params={"workspace": workspace})
-        return [Pod.from_dict(d) for d in data.get("pods", [])]
+    async def list_pods(self, workspace: str, *, name: str | None = None) -> list[Pod]:
+        """Pods in a workspace (GET /pods?workspace=); with `name`, only that pod (same rules as the sync list_pods)."""
+        if name is None or not name.strip():
+            data = await self._get("/pods", params={"workspace": workspace})
+            return [Pod.from_dict(d) for d in data.get("pods", [])]
+        data = await self._get("/pods", params={"workspace": workspace, "name": name})
+        return _pods_named([Pod.from_dict(d) for d in data.get("pods", [])], name)
 
     async def get_pod(self, pod_name: str, workspace: str) -> Pod:
         """A single pod (GET /pods/{pod_name}?workspace=)."""
@@ -2722,16 +2759,21 @@ class AsyncMeshive(_BaseClient):
         return await self._wait_for_pod(pod_name, workspace, until=until, timeout=timeout, interval=interval)
 
     async def _wait_for_pod(self, pod_name: str, workspace: str, *, until: str | Iterable[str], timeout: float,
-                            interval: float, watch: _CreationWatch | None = None) -> Pod:
+                            interval: float, watch: _CreationWatch | None = None, missing_ok: bool = False) -> Pod:
         targets, terminal = _wait_targets(until)
         deadline = time.monotonic() + timeout
         last = ""
         while True:
             await self._check_creation(watch, workspace)
-            pod = await self.get_pod(pod_name, workspace)
-            if _wait_reached(pod, targets, terminal, pod_name):
-                return pod
-            last = pod.status
+            try:
+                pod = await self.get_pod(pod_name, workspace)
+            except NotFoundError:
+                if not missing_ok:
+                    raise
+            else:
+                if _wait_reached(pod, targets, terminal, pod_name):
+                    return pod
+                last = pod.status
             _wait_expired(deadline, pod_name, targets, last)
             await asyncio.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
 
@@ -2755,20 +2797,21 @@ class AsyncMeshive(_BaseClient):
         interval: float = 5.0,
         transaction_id: int | str | None = None,
         port_locks: dict[int, bool] | None = None,
+        pod_name: str | None = None,
     ) -> Pod:
         """Wait for a pod just created with `create_pod(name, ...)` to appear and reach `until` (same rules as the
-        sync wait_for_new_pod, including `transaction_id` to report a failed creation right away and `port_locks`
-        to check the new pod's locked ports)."""
+        sync wait_for_new_pod, including `transaction_id` to report a failed creation right away, `port_locks`
+        to check the new pod's locked ports and `pod_name` to find it by create_pod's `pod_name`)."""
         if not name:
             raise ValueError("name is required")  # an empty name would match system pods, which have no label
         watch = _CreationWatch(name, transaction_id, _wait_targets(until)[0])
         deadline = time.monotonic() + timeout
         while True:
-            pod = next((p for p in await self.list_pods(workspace) if p.user_alias == name), None)
+            pod = _find_new_pod(await self.list_pods(workspace), name, pod_name)
             if pod is not None:
                 pod = await self._wait_for_pod(pod.pod_name, workspace, until=until,
                                                timeout=max(deadline - time.monotonic(), 0.0), interval=interval,
-                                               watch=watch)
+                                               watch=watch, missing_ok=True)
                 return _check_port_locks(pod, port_locks)
             await self._check_creation(watch, workspace)
             _new_pod_expired(deadline, name, timeout)
@@ -3119,7 +3162,8 @@ class AsyncMeshive(_BaseClient):
         an output folder — $MESHIVE_OUTPUT_DIR and its storage follow (get_watched_folders lists them on a running pod).
         Templates without an output folder (for example NIM or vLLM) take watched_folders too, as long as the pod has
         storage to hold them.
-        Pass the result's transaction_id to wait_for_new_pod to learn right away if the creation fails.
+        Pass the result's transaction_id to wait_for_new_pod to learn right away if the creation fails. The result's
+        pod_name (None from older servers) can be read with get_pod from the start, also while it is created.
         model_set starts the pod with one of the template's model sets (a slug from list_model_sets; one per pod). The
         server fetches the set's files before it answers, which can take minutes, so this request waits up to
         LONG_RUNNING_READ_TIMEOUT seconds for the answer and is not resent after a timeout: the first request may

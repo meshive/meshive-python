@@ -837,7 +837,7 @@ def test_get_transaction_not_found_and_older_servers():
     ({"events": [{"type": "Normal", "reason": "Pulled", "message": "pulled"},
                  {"type": "Warning", "reason": "BackOff", "message": "Back-off restarting failed container"}]}, "",
      "failed at step run: Back-off restarting failed container"),
-    ({"events": [{"type": "Normal", "reason": "Scheduled", "message": None}]}, "", "failed at step run: Scheduled"),
+    ({"events": [{"type": "Normal", "reason": "Scheduled", "message": None}]}, "", "failed at step run"),  # Normal: never the reason
     ({}, "node went away", "failed at step run: node went away"),
     (None, "", "failed at step run"),
 ])

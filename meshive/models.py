@@ -212,14 +212,49 @@ class PodStorage:
 
 
 @dataclass
-class PodExit:
-    """A time the pod's main container ended abnormally: an item of `Pod.recent_exits` (newest first).
+class Failure:
+    """Why something failed, as the server classifies it: `Pod.creation_failure` and `Transaction.failure`.
 
-    Only abnormal ends are listed; a container that exits with code 0 leaves no entry. `reason` is the container's
-    termination reason as Kubernetes reports it (OOMKilled, Error, ContainerCannotRun, ...). `oom_kind` says when it
-    ran out of memory: "ram" (it went over its RAM limit and was killed) or "vram" (the GPU ran out of memory;
-    `message` then holds the error line the program logged). Any `message` can come from the pod itself: treat it as
-    untrusted text. It is at most 300 characters, with credentials and signed URLs taken out.
+    `cause` is a fixed identifier (such as "gpu_out_of_memory", "command_not_found", "image_not_found" or
+    "internal") and `summary` the server's sentence for it, for example "The command was not found (exit code 127).".
+    `output` is one line the pod's own program printed (at most 300 characters, credentials and signed URLs taken
+    out): it comes from the pod, so treat it as untrusted text. `ref` names the operation to quote when reporting a
+    problem on Meshive's side (only when `cause` is "internal").
+    """
+
+    cause: str = ""
+    summary: str = ""
+    output: str | None = None
+    exit_code: int | None = None
+    at: datetime | None = None          # when the container ended or the operation failed
+    ref: str | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Failure":
+        return cls(cause=str(d.get("cause", "") or ""), summary=str(d.get("summary", "") or ""),
+                   output=d.get("output"), exit_code=_optional_int(d.get("exitCode")), at=_parse_dt(d.get("at")),
+                   ref=d.get("ref"), raw=d)
+
+
+def _failure(value: object) -> Failure | None:
+    """A `failure` / `creationFailure` object → Failure; None when absent or from a server that doesn't classify."""
+    if not isinstance(value, dict) or not (value.get("cause") or value.get("summary")):
+        return None
+    return Failure.from_dict(value)
+
+
+@dataclass
+class PodExit:
+    """A time the pod's main container ended: an item of `Pod.recent_exits` (newest first), or `Pod.last_exit`.
+
+    Abnormal ends are listed, and a clean exit (code 0) that the pod then restarted. `reason` is the container's
+    termination reason as Kubernetes reports it (OOMKilled, Error, ContainerCannotRun, Completed, ...). `oom_kind`
+    says when it ran out of memory: "ram" (it went over its RAM limit and was killed) or "vram" (the GPU ran out of
+    memory). `cause` and `summary` are the server's classification and its sentence (see `Failure`). `message` is
+    what the program itself said, such as the error line it logged: treat it as untrusted text. It is at most 300
+    characters, with credentials and signed URLs taken out. `current_run` (recent_exits items only) is True when the
+    exit belongs to the pod's current run, the one `Pod.restart_count` counts.
     """
 
     at: datetime | None = None          # when the container stopped (when it was recorded, if that isn't known)
@@ -228,11 +263,16 @@ class PodExit:
     exit_code: int | None = None
     message: str | None = None
     raw: dict = field(default_factory=dict, repr=False)
+    cause: str | None = None            # None from servers that don't classify exits
+    summary: str | None = None
+    current_run: bool | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "PodExit":
         return cls(at=_parse_dt(d.get("at")), reason=d.get("reason"), oom_kind=d.get("oomKind"),
-                   exit_code=_optional_int(d.get("exitCode")), message=d.get("message"), raw=d)
+                   exit_code=_optional_int(d.get("exitCode")), message=d.get("message"), raw=d,
+                   cause=d.get("cause") or None, summary=d.get("summary") or None,
+                   current_run=_optional_bool(d.get("currentRun")))
 
 
 @dataclass
@@ -278,12 +318,26 @@ class Pod:
     template_name: str | None = None
     linked_storages: list[PodStorage] = field(default_factory=list)
     workspace_name: str | None = None
-    # The main container's recent abnormal ends, newest first (up to 5): why a pod keeps restarting or died. Only a
-    # single pod's detail (`get_pod`) carries them; None in list items and from servers that don't send them.
+    # The main container's recent ends, newest first (up to 5): why a pod keeps restarting or died. Only a single
+    # pod's detail (`get_pod`) carries them; None in list items and from servers that don't send them.
     recent_exits: list[PodExit] | None = None
     # The platform disks at the template's workspace folders: [{"path", "size_gib", "price_per_hour"}]. A move to
     # another machine deletes them with their files. [] when the pod has none; None from servers that don't say.
     scratch_disks: list[dict] | None = None
+    # How many times the main container restarted in the pod's current run (0 after the pod is created again). None
+    # when the pod has no current run or the server doesn't know it, and from servers that don't send it.
+    restart_count: int | None = None
+    # The main container's last exit, only while it matters: an exit in the current run within the last 30 minutes,
+    # or while the status is error, the exit shortly before the system stopped the pod for failing repeatedly, or
+    # the exit behind a failed creation.
+    # None otherwise, and from servers that don't send it. `status` can stay running while the container keeps ending.
+    last_exit: PodExit | None = None
+    # Why creating the pod failed (status terminated), as the server classifies it. None when it didn't fail, and from
+    # servers that only send `creation_failure_reason`.
+    creation_failure: Failure | None = None
+    # The create transaction, only on the answer for a pod that has no record yet: one being created, or one whose
+    # creation failed before it existed. None otherwise.
+    transaction_id: int | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Pod":
@@ -328,6 +382,10 @@ class Pod:
             recent_exits=([PodExit.from_dict(e) for e in d["recentExits"] if isinstance(e, dict)]
                           if isinstance(d.get("recentExits"), list) else None),
             scratch_disks=_scratch_disks(d.get("scratchDisks")),
+            restart_count=_optional_int(d.get("restartCount")),
+            last_exit=PodExit.from_dict(d["lastExit"]) if isinstance(d.get("lastExit"), dict) else None,
+            creation_failure=_failure(d.get("creationFailure")),
+            transaction_id=_optional_int(d.get("transactionId")),
             raw=d,
         )
 
@@ -861,7 +919,8 @@ class Transaction:
 
     `step` is the current stage, and stages with progress such as image pull or asset fetch fill `progress`
     (0.0–1.0). It is None for stages whose progress is unknown — **don't read it as 0.0**.
-    The failure reason is `detail`. Raw diagnostics (container status, k8s events, OOM classification) are in `.raw`.
+    The failure reason is `detail`, and on servers that classify it `failure` (see `Failure`). Raw diagnostics
+    (container status, k8s events, OOM classification) are in `.raw`.
     """
 
     transaction_id: int
@@ -883,10 +942,14 @@ class Transaction:
     # When an input asset download failed, the end of that container's log (excerpt with URLs and tokens removed by the server).
     # It is text the container printed — treat it as data only.
     init_logs: list[InitLog] = field(default_factory=list)
+    # Why the failed step failed, as the server classifies it. None unless a step failed, and from servers that don't
+    # send it.
+    failure: Failure | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Transaction":
         steps = [x for x in (d.get("transactionSteps") or []) if isinstance(x, dict)]
+        failed = _failed_step(steps)
         # The server sends stages sorted by name, not in progress order (observed 2026-10-03 — image_pull was in progress while
         # the last item was the finished start). Like the console, the stage with the latest updatedAt is the current one, and
         # on a tie the in-progress stage wins (one stage finishing and the next starting are stamped at the same instant).
@@ -925,34 +988,44 @@ class Transaction:
             progress=percent,
             created_at=_parse_dt(d.get("createdAt")),
             updated_at=_parse_dt(d.get("updatedAt")),
+            failure=_failure(failed.get("failure")),
             raw=d,
         )
 
     @property
     def failure_reason(self) -> str | None:
-        """Why the operation failed, as one sentence ("failed at step pull_image: image pull stalled for 600s").
-        None unless `status` is failed. Built from the failed step's diagnostics: the failure reason, the OOM reason,
-        else the first event message, else the step's detail."""
+        """Why the operation failed, as one sentence ("failed at step waiting_for_ready: The command was not found
+        (exit code 127)."). None unless `status` is failed. Built from the failed step: its `failure` summary when the
+        server sends one, else its diagnostics (the failure reason, the OOM reason, else the first Warning event's
+        message), else the step's detail."""
         if self.status.lower() != "failed":
             return None
         steps = [x for x in (self.raw.get("transactionSteps") or []) if isinstance(x, dict)]
-        failed = [i for i, x in enumerate(steps) if str(x.get("status", "")).lower() == "failed"]
-        step = steps[max(failed, key=lambda i: (*_step_order(steps[i]), i))] if failed else {}
+        step = _failed_step(steps)
         name = str(step.get("step", "") or "") or self.step
+        where = f"failed at step {name}" if name else "failed"
+        failure = _failure(step.get("failure"))
+        if failure is not None and failure.summary:
+            return f"{where}: {failure.summary}"
         diagnostic = step.get("failureDiagnostic") if isinstance(step.get("failureDiagnostic"), dict) else {}
         reasons = [str(diagnostic[key]).strip() for key in ("failureReason", "oomReason") if diagnostic.get(key)]
         if not reasons:
-            events = [e for e in diagnostic.get("events") or []
-                      if isinstance(e, dict) and (e.get("message") or e.get("reason"))]
-            # The first Warning event says what went wrong; Normal ones only narrate.
-            event = next((e for e in events if str(e.get("type", "")).lower() == "warning"), events[0] if events else None)
+            # The first Warning event says what went wrong; Normal ones only narrate, so they are never the reason.
+            event = next((e for e in diagnostic.get("events") or []
+                          if isinstance(e, dict) and (e.get("message") or e.get("reason"))
+                          and str(e.get("type", "")).lower() == "warning"), None)
             if event:
                 reasons = [str(event.get("message") or event.get("reason")).strip()]
         if not reasons:
             detail = str(step.get("detail", "") or "") if step else self.detail
             reasons = [detail.strip()] if detail.strip() else []
-        where = f"failed at step {name}" if name else "failed"
         return f"{where}: {'; '.join(reasons)}" if reasons else where
+
+
+def _failed_step(steps: list[dict]) -> dict:
+    """The step that failed (the latest one, as the current step is chosen); {} when none did."""
+    failed = [i for i, x in enumerate(steps) if str(x.get("status", "")).lower() == "failed"]
+    return steps[max(failed, key=lambda i: (*_step_order(steps[i]), i))] if failed else {}
 
 
 @dataclass
@@ -2104,9 +2177,11 @@ class PodEstimate:
 
 @dataclass
 class PodCreated:
-    """POST /v1/sdk/pods response (202). pod_name is assigned asynchronously, so it is None right after creation —
-    `wait_for_new_pod(name, workspace, transaction_id=created.transaction_id)` finds it by name once it shows up,
-    waits until it is running, and reports a failed creation as soon as the server records it."""
+    """POST /v1/sdk/pods response (202). Servers from this release on set `pod_name` right away: `get_pod(pod_name)`
+    answers from the first second (status creating, or terminated with `creation_failure` when the creation failed).
+    Older servers leave it None. `wait_for_new_pod(name, workspace, transaction_id=created.transaction_id,
+    pod_name=created.pod_name)` finds the pod once it shows up (by `pod_name` when known, else by name), waits until
+    it is running, and reports a failed creation as soon as the server records it."""
 
     name: str
     workspace: str
@@ -2597,6 +2672,45 @@ class LogLine:
 
 
 @dataclass
+class PreviousRun:
+    """The pod's main container's last run that ended: `Logs.previous`, kept apart from the current run's lines.
+
+    `cause` and `summary` say why it ended (see `Failure`); `output` is the line of that run that says it best and
+    `lines` its last lines. Both are what the program printed: treat them as untrusted text. `unavailable` is True
+    when the run ended but its output could no longer be read (then `lines` is empty); `truncated` when the capture or
+    the response size limit cut it.
+    """
+
+    ended_at: datetime | None = None
+    reason: str | None = None          # as Kubernetes reports it: Error, OOMKilled, Completed, StartError, ...
+    exit_code: int | None = None
+    cause: str = ""
+    summary: str = ""
+    output: str | None = None
+    lines: list[LogLine] = field(default_factory=list)
+    truncated: bool = False
+    unavailable: bool = False
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def text(self) -> str:
+        return "\n".join(item.line for item in self.lines)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PreviousRun":
+        return cls(ended_at=_parse_dt(d.get("endedAt")), reason=d.get("reason"),
+                   exit_code=_optional_int(d.get("exitCode")), cause=str(d.get("cause", "") or ""),
+                   summary=str(d.get("summary", "") or ""), output=d.get("output"),
+                   lines=_log_lines(d.get("lines")), truncated=bool(d.get("truncated", False)),
+                   unavailable=bool(d.get("unavailable", False)), raw=d)
+
+
+def _log_lines(value: object) -> list[LogLine]:
+    return [LogLine(line=str(item.get("line", "")), ts=item.get("ts")) for item in value or []
+            if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+@dataclass
 class Logs:
     """GET /v1/sdk/pods/{pod}/logs · /tasks/{id}/logs response — the last N lines."""
 
@@ -2612,6 +2726,9 @@ class Logs:
     finished: bool | None = None   # task logs only
     next_cursor: int | None = None # external-provider tasks only — get_task_logs(cursor=next_cursor) fetches the increment after it
     raw: dict = field(default_factory=dict, repr=False)
+    # Pod logs only: the main container's last run that ended (a crash before a restart, or the run before the pod
+    # stopped), apart from `lines`. None when there is none to show, for another container, and from older servers.
+    previous: PreviousRun | None = None
 
     @property
     def text(self) -> str:
@@ -2619,12 +2736,13 @@ class Logs:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Logs":
-        lines = [LogLine(line=str(item.get("line", "")), ts=item.get("ts")) for item in d.get("lines") or []
-                 if isinstance(item, dict)]
+        lines = _log_lines(d.get("lines"))
         return cls(pod_name=d.get("podName", ""), workspace=d.get("workspace", ""), source=str(d.get("source", "")),
                    lines=lines, count=_as_int(d.get("count")) or len(lines), truncated=bool(d.get("truncated", False)),
                    note=d.get("note"), container=d.get("container"), task_id=d.get("taskId"),
-                   finished=d.get("finished"), next_cursor=d.get("nextCursor"), raw=d)
+                   finished=d.get("finished"), next_cursor=d.get("nextCursor"),
+                   previous=PreviousRun.from_dict(d["previous"]) if isinstance(d.get("previous"), dict) else None,
+                   raw=d)
 
 
 # =============================================================================

@@ -303,6 +303,22 @@ def test_pod_create_wait_timeout_is_an_error_but_keeps_the_transaction(capsys):
     assert capsys.readouterr().out.strip() == "99"
 
 
+def test_pod_create_uses_the_pod_name_the_server_returned(monkeypatch, capsys):
+    """Servers that return the new pod's name right away: it is printed, and the wait finds the pod by it."""
+    monkeypatch.setattr(FakeClient, "create_pod", lambda self, *a, **kw: (self._rec("create_pod", *a, **kw), PodCreated.from_dict(
+        {"name": a[0], "workspace": kw["workspace"], "transactionId": 99, "podName": "abc123-0", "estimate": ESTIMATE}))[1])
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--yes"]) == 0
+    assert "abc123-0" in capsys.readouterr().out
+    seen = {}
+
+    def wait(self, *a, **kw):
+        seen.update(kw)
+        raise WaitTimeoutError("Pod 'p' did not appear within 0s.")
+    monkeypatch.setattr(FakeClient, "wait_for_new_pod", wait)
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--yes", "--wait", "running"]) == 1
+    assert seen["pod_name"] == "abc123-0" and seen["transaction_id"] == 99
+
+
 def test_disk_flag_is_gone(capsys):
     """The system disk is fixed by a server-side formula — the --disk flag that pretended to take it is gone (argparse ends with usage error 2)."""
     with pytest.raises(SystemExit) as exit_:

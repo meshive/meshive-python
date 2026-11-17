@@ -160,7 +160,7 @@ except WaitTimeoutError:
 | Start a pod with a ready-made set of models | `meshive model-sets <workspace> --template <template-id>`, then `meshive pod-create ... --model-set <slug>` |
 | See why a pod is still starting | `meshive transactions <workspace>` |
 | Watch a pod's usage and logs | `meshive pod-metrics <workspace> <pod>`, `meshive logs <workspace> <pod>` |
-| See why a pod keeps restarting or died (out of RAM, out of GPU memory, ...) | `meshive pod <workspace> <pod>` (its EXITED table) |
+| See why a pod keeps restarting, died or couldn't be created (out of RAM, out of GPU memory, ...) | `meshive pod <workspace> <pod>` (the line under its status, its EXITED table), `meshive logs <workspace> <pod>` (the run that ended comes first) |
 | Check your credit and spending | `meshive credit`, `meshive workspace <workspace>` |
 | See what your API keys (and agents using them) did, with results | `meshive activity`, `meshive activity --reads` |
 | Host your own machines and see earnings | `meshive machines`, `meshive earnings`, `meshive payouts` |

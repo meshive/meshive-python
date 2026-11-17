@@ -39,6 +39,7 @@ import shlex
 import sys
 import time
 import warnings
+from datetime import timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -50,7 +51,8 @@ from ..exceptions import (ConflictError, EndpointLockUnavailableError, MeshiveAP
                           PodCreationFailedError, PortNotLockedError, WaitTimeoutError)
 from ..models import (AccessKey, AccessKeyCreated, ListingResult, Logs, MachineClients, MachineDeleteCheck,
                       MachineDeleted, MaintenanceAction,
-                      MaintenanceEstimate, Pod, PodEstimate, PodUpdated, PodUpdateEstimate, PortLock, ResourceAction,
+                      MaintenanceEstimate, Pod, PodEstimate, PodUpdated, PodUpdateEstimate, PortLock, PreviousRun,
+                      ResourceAction,
                       StorageConnection, StorageEstimate, StorageUpdateEstimate, TaskEstimate, WorkspaceDeleteCheck,
                       WorkspaceEstimate, WorkspaceUpdateEstimate)
 
@@ -360,7 +362,27 @@ def _print_action(action: ResourceAction, color: bool) -> None:
         print(fmt.paint("The pod waits until a node has room for it, then starts.", "dim", color))
 
 
+def _previous_run_header(run: PreviousRun) -> str:
+    """'--- previous run (ended 02:01:35Z, exit 1: The GPU ran out of memory.) ---'"""
+    ended = []
+    if run.ended_at is not None:
+        at = run.ended_at if run.ended_at.tzinfo else run.ended_at.replace(tzinfo=timezone.utc)
+        ended.append(f"ended {at.astimezone(timezone.utc).strftime('%H:%M:%SZ')}")
+    if run.exit_code is not None:
+        ended.append(f"exit {run.exit_code}")
+    head = ", ".join(ended)
+    inside = f"{head}: {run.summary}" if head and run.summary else head or run.summary
+    return f"--- previous run ({inside}) ---" if inside else "--- previous run ---"
+
+
 def _print_logs(logs: Logs, color: bool) -> None:
+    if logs.previous is not None:
+        # The main container's last run that ended, before the current run's lines. Its lines are the program's own.
+        print(fmt.paint(fmt.clean(_previous_run_header(logs.previous)), "dim", color))
+        for item in logs.previous.lines:
+            print(fmt.clean(item.line))
+        if logs.lines:
+            print(fmt.paint("--- current run ---", "dim", color))
     if not logs.lines:
         print(fmt.paint(logs.note or "No logs.", "dim", color))
         return
@@ -696,7 +718,8 @@ def _pod_create(client: Meshive, args: argparse.Namespace, output: str, color: b
             txn = created.transaction_id if str(created.transaction_id).isdigit() else None
             # port_locks: the new pod's ports are checked against the locks that were asked for.
             pod_name = client.wait_for_new_pod(args.name, args.workspace, until=args.wait, timeout=args.wait_timeout,
-                                               transaction_id=txn, port_locks=created.port_locks).pod_name
+                                               transaction_id=txn, port_locks=created.port_locks,
+                                               pod_name=created.pod_name).pod_name
         except WaitTimeoutError as exc:
             timed_out = exc
         except PodCreationFailedError as exc:
@@ -704,7 +727,8 @@ def _pod_create(client: Meshive, args: argparse.Namespace, output: str, color: b
         except PortNotLockedError as exc:
             pod_name, not_locked = exc.pod_name, exc
     pairs = [("accepted", fmt.yes_no(created.accepted)), ("name", created.name),
-             ("pod", pod_name or ("(not created)" if failed else "(assigned shortly — see `meshive pods`)")),
+             ("pod", pod_name or ("(not created)" if failed
+                                  else created.pod_name or "(assigned shortly — see `meshive pods`)")),
              ("transaction", str(created.transaction_id))]
     if created.port_locks:
         pairs.append(("ports", _port_lock_cell(created.port_locks)))

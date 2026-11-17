@@ -47,6 +47,38 @@ pip install -U meshive
   workspace files", `meshive pod` adds a `scratch` line with each disk's path, size and price per hour, and
   `pod-watch` shows a folder that overlaps one of your volumes as `blocked (your volume)`.
   From a server that doesn't send them yet, `scratch_disks` and `scratch_disk` are `None` and `warnings` is empty.
+- **Why a pod keeps restarting or failed.** The server now classifies a failure into a fixed `cause` (such as
+  `gpu_out_of_memory`, `command_not_found` or `image_not_found`) with a `summary` sentence, and gives the line the
+  program printed separately as `output`/`message` (untrusted text, at most 300 characters).
+  - `Pod.restart_count` counts the main container's restarts in the current run, and `Pod.last_exit` (a `PodExit`)
+    is its last exit while that matters: within the last 30 minutes of the current run, while the status is error,
+    shortly before the system stopped the pod for failing repeatedly, or behind a failed creation. Both are on `list_pods` items too. `status` can
+    stay `running` while the container keeps ending, so read these instead.
+  - `PodExit` adds `cause`, `summary` and `current_run` (whether a `recent_exits` item belongs to the current run).
+    `recent_exits` now also lists a clean exit (code 0) that the pod restarted.
+  - `Pod.creation_failure` and `Transaction.failure` are a new `Failure` (`cause`, `summary`, `output`, `exit_code`,
+    `at`, `ref`). `Transaction.failure_reason` uses `failure.summary` when it is there.
+  - `Logs.previous` is a new `PreviousRun`: the main container's last run that ended, kept apart from the current
+    run's `lines` (`ended_at`, `reason`, `exit_code`, `cause`, `summary`, `output`, `lines`, `truncated`,
+    `unavailable`, and `text`).
+  - `PodCreated.pod_name` is set right away, and `get_pod(pod_name)` answers from the start: status `creating` while
+    it is created, `terminated` with `creation_failure` when the creation failed; such a pod has no record yet and
+    carries its create transaction as `Pod.transaction_id`. `list_pods(workspace, name=...)`
+    finds a pod by its display name, including one being created or whose creation failed in the last 24 hours.
+    `wait_for_new_pod(..., pod_name=created.pod_name)` finds the new pod by it, and a pod that isn't found yet while
+    waiting is waited for.
+  - `meshive pod` prints a line under the status, such as `Restarted 3 times · The GPU ran out of memory. · 2
+    minutes ago` or `Create failed: The command was not found (exit code 127).`, with the program's line under it.
+    `meshive logs` prints the run that ended first, between `--- previous run (...) ---` and `--- current run ---`.
+    `meshive pod-create` prints the pod name the server returned.
+
+  From a server that doesn't send them yet, the new fields are `None`, `list_pods(name=...)` filters the full list
+  itself, and `pod_name` stays `None`.
+
+### Changed
+
+- **`Transaction.failure_reason` no longer quotes a Normal event.** When a failed step has no failure reason, only a
+  Warning event's message is used, then the step's detail; a Normal event only narrates what happened.
 
 ### Fixed
 

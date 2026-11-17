@@ -478,6 +478,7 @@ def _pod_port(pod: Pod, pod_name: str, port: int) -> PodEndpoint:
 _PORT_FEATURE = "port locks and access keys"
 _PREFLIGHT_FEATURE = "the preflight setting of locked ports"
 _SESSIONS_FEATURE = "signing out the browser sessions of a pod"
+_WORKSPACE_SESSIONS_FEATURE = "signing out the browser sessions of a whole workspace"
 
 
 def _port_route_error(err: MeshiveAPIError, what: str = _PORT_FEATURE) -> MeshiveAPIError:
@@ -1764,6 +1765,18 @@ class Meshive(_BaseClient):
                               idempotency_key=idempotency_key)
         except MeshiveAPIError as err:
             raise _not_supported(err, _SESSIONS_FEATURE) from None
+        return BrowserSessionsRevoked.from_dict(data if isinstance(data, dict) else {})
+
+    def revoke_workspace_browser_sessions(self, workspace: str, *,
+                                          idempotency_key: str | None = None) -> BrowserSessionsRevoked:
+        """Sign out every browser session on the locked ports of every pod in the workspace (write scope), as
+        revoke_browser_sessions does for one pod. Access keys keep working, and connections that are already open
+        stay open. It can't be undone, and calling it again is safe. The result's `pod_name` is empty."""
+        path = f"/workspaces/{_path_segment(workspace, 'workspace')}/browser-sessions/revoke"
+        try:
+            data = self._send("POST", path, idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, _WORKSPACE_SESSIONS_FEATURE) from None
         return BrowserSessionsRevoked.from_dict(data if isinstance(data, dict) else {})
 
     def list_access_keys(self, pod_name: str, workspace: str, port: int) -> list[AccessKey]:
@@ -3306,6 +3319,17 @@ class AsyncMeshive(_BaseClient):
                                     idempotency_key=idempotency_key)
         except MeshiveAPIError as err:
             raise _not_supported(err, _SESSIONS_FEATURE) from None
+        return BrowserSessionsRevoked.from_dict(data if isinstance(data, dict) else {})
+
+    async def revoke_workspace_browser_sessions(self, workspace: str, *,
+                                                idempotency_key: str | None = None) -> BrowserSessionsRevoked:
+        """Sign out every browser session on the locked ports of every pod in the workspace. Same contract as the
+        sync client."""
+        path = f"/workspaces/{_path_segment(workspace, 'workspace')}/browser-sessions/revoke"
+        try:
+            data = await self._send("POST", path, idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, _WORKSPACE_SESSIONS_FEATURE) from None
         return BrowserSessionsRevoked.from_dict(data if isinstance(data, dict) else {})
 
     async def list_access_keys(self, pod_name: str, workspace: str, port: int) -> list[AccessKey]:

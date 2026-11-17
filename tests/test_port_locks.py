@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import io
 import json
+import re
 
 import httpx
 import pytest
@@ -1709,3 +1710,54 @@ def test_old_command_names_are_gone(capsys):
         with pytest.raises(SystemExit):
             cli.main([old, "ws", "p-0", "3000"])
     capsys.readouterr()
+
+
+def test_cli_port_key_roll_of_a_key_no_longer_listed_stops_before_the_overlap_line(api, capsys, non_tty):
+    # A key revoked, or expired more than 30 days ago, is off the list: say so first, ask nothing, send nothing.
+    api.routes[("GET", KEYS_PATH)] = (200, {"keys": [KEY_ITEM]})
+    assert cli.main(["port-key-roll", "ws", "p-0", "3000", "77", "--yes"]) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("Error: port 3000 of pod p-0 has no access key 77.")
+    assert "stops working" not in captured.err and "Roll access key" not in captured.err
+    assert "meshive port-key-create ws p-0 3000 --name NAME" in captured.err and captured.out == ""
+    assert not api.sent("POST", f"{KEYS_PATH}/77/roll")
+
+
+WS_SESSIONS_PATH = "/v1/sdk/workspaces/ws/browser-sessions/revoke"
+WS_REVOKED = {"podName": None, "endpointCount": 5, "revokedAt": "2026-11-17T08:00:00Z"}
+
+
+def test_revoke_workspace_browser_sessions_request_and_result():
+    api = Api({("POST", WS_SESSIONS_PATH): (200, WS_REVOKED)})
+    result = sync_client(api).revoke_workspace_browser_sessions("ws", idempotency_key="ws-1")
+    request = api.sent("POST", WS_SESSIONS_PATH)[0]
+    assert request.headers["Idempotency-Key"] == "ws-1" and "workspace" not in request.url.params
+    assert isinstance(result, BrowserSessionsRevoked)
+    assert (result.pod_name, result.endpoint_count) == ("", 5)
+    assert result.revoked_at.isoformat() == "2026-11-17T08:00:00+00:00"
+    result = asyncio.run(async_client(Api({("POST", WS_SESSIONS_PATH): (200, WS_REVOKED)}))
+                         .revoke_workspace_browser_sessions("ws"))
+    assert result.endpoint_count == 5
+
+
+def test_revoke_workspace_browser_sessions_checks_arguments_and_older_servers():
+    api = Api()
+    with pytest.raises(ValueError):
+        sync_client(api).revoke_workspace_browser_sessions(" ")
+    assert not api.requests
+    with pytest.raises(NotFoundError, match="does not support signing out the browser sessions of a whole workspace"):
+        sync_client(Api({("POST", WS_SESSIONS_PATH): (404, {"detail": "Not Found"})})
+                    ).revoke_workspace_browser_sessions("ws")
+
+
+def test_cli_workspace_browser_sessions_revoke_asks_first(api, capsys, non_tty):
+    api.routes[("POST", WS_SESSIONS_PATH)] = (200, WS_REVOKED)
+    assert cli.main(["workspace-browser-sessions-revoke", "ws"]) == 2
+    err = capsys.readouterr().err
+    assert "any pod in workspace ws" in err and "Access keys keep working" in err and "--yes" in err
+    assert not api.sent("POST", WS_SESSIONS_PATH)
+    assert cli.main(["workspace-browser-sessions-revoke", "ws", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert re.search(r"workspace: +ws", out) and "public ports: 5" in out and "2026-11-17 08:00 UTC" in out
+    assert cli.main(["workspace-browser-sessions-revoke", "ws", "--yes", "-o", "name"]) == 0
+    assert capsys.readouterr().out == "ws\n"

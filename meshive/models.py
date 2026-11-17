@@ -407,10 +407,10 @@ class PortPreflight:
 
 @dataclass
 class BrowserSessionsRevoked:
-    """POST /v1/sdk/pods/{pod}/browser-sessions/revoke response. Browser sessions on the pod's locked ports that
-    began before `revoked_at` are refused within seconds."""
+    """POST /v1/sdk/pods/{pod}/browser-sessions/revoke and /v1/sdk/workspaces/{workspace}/browser-sessions/revoke
+    response. Browser sessions on the locked ports that began before `revoked_at` are refused within seconds."""
 
-    pod_name: str
+    pod_name: str                  # empty when the whole workspace was signed out
     endpoint_count: int            # public ports whose browser sessions were signed out
     revoked_at: datetime | None
     raw: dict = field(default_factory=dict, repr=False)

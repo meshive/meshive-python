@@ -5,8 +5,9 @@ Pods: pod-exec runs a command in a running pod (pod-exec-status reads a backgrou
 local file or folder as an asset.
 Port locks: port-lock / port-unlock switch one public port's lock; port-preflight lets CORS preflight requests to a
 locked port through without a key; port-keys, port-key-create, port-key-roll and port-key-revoke manage the port's
-access keys; pod-browser-sessions-revoke signs out the browser sessions on a pod's locked ports. port-forward (in
-_forward.py) reaches a locked port through 127.0.0.1.
+access keys; pod-browser-sessions-revoke signs out the browser sessions on a pod's locked ports, and
+workspace-browser-sessions-revoke those on every pod of a workspace. port-forward (in _forward.py) reaches a locked
+port through 127.0.0.1.
 Hosting: maintenance-schedule/update/end/extend/cancel, machine-list-for-rent, machine-unlist/retry/delete,
 host-message-send, host-messages-mark-read, machine-credentials, host-install. The names machine-list and
 host-messages-read still work and print a note on stderr (see _RENAMED); they are removed in 2.0.
@@ -24,9 +25,9 @@ credentials, install commands) ask first; machine-delete asks for the machine ID
 machine-list-for-rent, machine-retry and host-messages-mark-read change only your own machine's state and don't ask,
 as in the console.
 Opening a port asks first: port-unlock, `port-preflight … on`, and pod-create / pod-update (which always ask) say
-which ports would be open, and which would be locked, before the question. port-key-revoke, port-key-roll and
-pod-browser-sessions-revoke ask too, because clients or members using the port lose access. port-lock,
-`port-preflight … off` and port-key-create only add protection and don't ask. A new key's value is printed once.
+which ports would be open, and which would be locked, before the question. port-key-revoke, port-key-roll,
+pod-browser-sessions-revoke and workspace-browser-sessions-revoke ask too, because clients or members using the
+port lose access. port-lock, `port-preflight … off` and port-key-create only add protection and don't ask. A new key's value is printed once.
 port-lock and port-unlock wait until the choice is in effect and exit 1 when it isn't confirmed within 60 seconds.
 """
 from __future__ import annotations
@@ -1163,6 +1164,24 @@ def cmd_pod_browser_sessions_revoke(client: Meshive, args: argparse.Namespace, o
     return 0
 
 
+def cmd_workspace_browser_sessions_revoke(client: Meshive, args: argparse.Namespace, output: str,
+                                          color: bool) -> int:
+    print(fmt.clean(f"Workspace members who opened a locked port of any pod in workspace {args.workspace} in a "
+                    "browser will have to enter again through the console. Access keys keep working, and "
+                    "connections that are already open stay open. This can't be undone."), file=sys.stderr)
+    if not _confirm(args, f"Sign out all browser sessions in workspace {args.workspace}?"):
+        return 2
+    result = client.revoke_workspace_browser_sessions(args.workspace)
+
+    def show() -> None:
+        _kv([("workspace", args.workspace), ("public ports", str(result.endpoint_count)),
+             ("signed out", fmt.utc_time(result.revoked_at) if result.revoked_at else "-")])
+        print(fmt.paint("Browser sessions signed out. This takes a few seconds to apply.", "dim", color))
+
+    _emit(output, result.raw, [args.workspace], show)
+    return 0
+
+
 def _key_expiry(key: AccessKey) -> str:
     if key.expires_at is None:
         return "never"
@@ -1251,19 +1270,31 @@ def cmd_port_key_create(client: Meshive, args: argparse.Namespace, output: str, 
     return 0
 
 
-def _key_has_expired(client: Meshive, args: argparse.Namespace) -> bool:
-    """Whether the key being rolled is expired. A key that can't be looked up is treated as not expired: the roll
-    itself reports a missing key."""
+def _key_to_roll(client: Meshive, args: argparse.Namespace) -> str | None:
+    """How the key being rolled stands, read from the port's key list: "active", "expired", "missing" (not on the
+    list: revoked, or expired more than 30 days ago), or None when the list can't be read (the roll itself then
+    reports a missing key)."""
     try:
         keys = client.list_access_keys(args.pod_name, args.workspace, args.port)
     except (MeshiveAPIError, httpx.RequestError):
-        return False
-    return any(k.id == args.key_id and k.expired for k in keys)
+        return None
+    key = next((k for k in keys if k.id == args.key_id), None)
+    if key is None:
+        return "missing"
+    return "expired" if key.expired else "active"
 
 
 def cmd_port_key_roll(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     overlap = _overlap_seconds(args.overlap)
-    if _key_has_expired(client, args):
+    state = _key_to_roll(client, args)
+    if state == "missing":
+        # Said before anything else, so no line about the roll reads as if it is about to happen.
+        print(fmt.clean(f"Error: port {args.port} of pod {args.pod_name} has no access key {args.key_id}. A revoked "
+                        "key, or one that expired more than 30 days ago, can't be rolled: create a new one with "
+                        f"`meshive port-key-create {args.workspace} {args.pod_name} {args.port} --name NAME`."),
+              file=sys.stderr)
+        return 1
+    if state == "expired":
         # An expired key's old value stopped working already, so there is nothing to overlap.
         overlap = 0
         print(fmt.clean(f"Key {args.key_id} has expired; rolling issues a new value."), file=sys.stderr)
@@ -2137,6 +2168,11 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("workspace", help="Workspace ID (namespace name).")
     p.add_argument("pod_name", help="Pod ID (pod name).")
     _yes(p)
+    p = sub.add_parser("workspace-browser-sessions-revoke", parents=[common],
+                       help="Sign out the browser sessions on the locked ports of every pod in a workspace (browser "
+                            "cookies only; access keys and open connections are not affected).")
+    p.add_argument("workspace", help="Workspace ID (namespace name).")
+    _yes(p)
     p = sub.add_parser("port-keys", parents=[common],
                        help="List the access keys of a locked port (names and first characters, never the values). "
                             "LAST USED is updated every few minutes.")
@@ -2395,6 +2431,7 @@ HANDLERS: dict[str, Handler] = {
     "port-unlock": cmd_port_unlock,
     "port-preflight": cmd_port_preflight,
     "pod-browser-sessions-revoke": cmd_pod_browser_sessions_revoke,
+    "workspace-browser-sessions-revoke": cmd_workspace_browser_sessions_revoke,
     "port-keys": cmd_port_keys,
     "port-key-create": cmd_port_key_create,
     "port-key-roll": cmd_port_key_roll,

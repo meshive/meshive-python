@@ -120,6 +120,8 @@ calls need a Meshive API server that has them; an older server answers with an e
   asks first) signs out those sessions on every public port of the pod within seconds; members enter again through
   the console. Access keys keep working, and connections that are already open stay open. It returns a
   `BrowserSessionsRevoked` with the number of public ports and when the sessions were cut.
+  `revoke_workspace_browser_sessions(workspace)` (`meshive workspace-browser-sessions-revoke <workspace>`) does the
+  same for every pod in the workspace at once.
 - **Permissions.** Locking, unlocking, the preflight setting, signing out browser sessions, and creating, rolling
   and revoking keys need a read & write key from a workspace admin or billing member. Listing keys works with a
   read-only key.

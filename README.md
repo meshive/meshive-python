@@ -154,6 +154,7 @@ except WaitTimeoutError:
 | List, roll or revoke a port's access keys, and see when each was last used | `meshive port-keys <workspace> <pod> <port>`, `meshive port-key-roll ...`, `meshive port-key-revoke ...` |
 | Let a page on another site call a locked port (CORS preflight) | `meshive port-preflight <workspace> <pod> <port> on` (`off` to undo) |
 | Sign out everyone who opened a pod's locked ports in a browser | `meshive pod-browser-sessions-revoke <workspace> <pod>` |
+| Do the same for every pod in a workspace | `meshive workspace-browser-sessions-revoke <workspace>` |
 | Use a locked port from an app that only takes an address | `meshive port-forward <workspace> <pod> <port>` with the key in `MESHIVE_ACCESS_KEY`, then point the app at `http://127.0.0.1:<port>` |
 | Grow or rename storage, or SSH into it | `meshive storage-update <workspace> <storage> --size 100`, `meshive storage-connect <workspace> <storage>` |
 | Start a pod with a ready-made set of models | `meshive model-sets <workspace> --template <template-id>`, then `meshive pod-create ... --model-set <slug>` |

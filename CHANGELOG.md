@@ -12,6 +12,197 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## v1.10.0
+
+A pod's public ports can be locked, and from this release new pods are created with them locked. A locked port lets
+in only workspace members signed in to the console, and programs that send one of the port's access keys. Code
+written for 1.0 to 1.9 keeps running, but read "Changed" below: the public ports it creates are now locked. The new
+calls need a Meshive API server that has them; an older server answers with an error that says so.
+
+This release also shows why a pod keeps restarting or failed to be created, lists disk warnings for hosts and the
+scratch disks a pod create, edit or move affects, and lets you send feedback to the Meshive team.
+
+### Changed
+
+- **New pods get locked public ports.** `create_pod` and `meshive pod-create` now create every port that is exposed
+  over HTTPS locked: the ports you open with `ports`, and the ports the template opens (those follow the template
+  author's choice when there is one). Until 1.9 they were open to anyone with the URL. A script that creates a pod
+  and then calls its public URL without a key now gets `401`: create an access key for the port and send it (see
+  below), or keep the old behavior:
+  - `create_pod(..., lock_public_ports=False)` or `meshive pod-create ... --no-lock` creates every public port open;
+  - `ports=[{"port": 8888, "locked": False}]`, a `template_ports` item with `"locked": False`, or
+    `--unlock-port 8888` leaves one port open.
+
+- **Ports an update newly makes public are locked too.** `update_pod` and `meshive pod-update` lock a new public
+  port (`ports`), a port the pod keeps internal that the update exposes (`template_ports` with `"external": True`)
+  and, when the pod moves to another template, the public ports that template adds. `lock_public_ports=False`,
+  `"locked": False` on the port, `--no-lock` or `--unlock-port` leave them open, as above.
+- **Ports that are public already are never touched.** Pods that exist keep their ports as they are, and an update
+  leaves the lock of a port that is public already alone, whether it is locked or was unlocked on purpose. Only
+  naming the port changes it: `"locked"` on its `template_ports` item, `--lock-port` / `--unlock-port`, or
+  `set_port_lock`. An update that makes no port public sends no lock value and makes no extra request.
+- **Extra read requests.** `create_pod` and `estimate_pod` read the template first, so that each port it exposes is
+  sent with a lock value, and check that the server can lock ports before they send a lock: one or two reads per
+  call. `update_pod` and `estimate_pod_update` read the pod when the change exposes a port or moves the pod to
+  another template (to tell which ports are public already), the new template in the latter case, and make the
+  same check before they send a lock: up to three reads, none for a change that makes nothing public.
+- **Two hosting commands are renamed.** `meshive machine-list` is now `meshive machine-list-for-rent`: it puts
+  a machine up for rent without asking, which its old name didn't say (other tools use `list` to show things). To see
+  your machines, use `meshive machines`. `meshive host-messages-read` is now `meshive host-messages-mark-read`: it
+  marks messages read without showing them (`meshive host-messages` shows them). The old names keep working and
+  print a note on stderr; the output, `-o json` and the exit code are unchanged. They will be removed in 2.0.
+- **A port is never opened by mistake.** When the server can't lock ports, because the platform has locking
+  turned off or the server predates it, `create_pod`, `estimate_pod`, `update_pod` and `estimate_pod_update` raise
+  `EndpointLockUnavailableError` (a `ConflictError`) and nothing is created or changed. The message says how to go
+  ahead with open ports. The SDK does not retry with open ports by itself.
+
+- **`Transaction.failure_reason` no longer quotes a Normal event.** When a failed step has no failure reason, only a
+  Warning event's message is used, then the step's detail; a Normal event only narrates what happened.
+
+### What's new
+
+- **Lock state on pods.** `PodEndpoint.locked` is the lock chosen for a public port, `access` is `"internal"`,
+  `"locked"` or `"unlocked"`, and `access_key_count` counts the keys that work now. `meshive pod` shows an ACCESS
+  column. `PodEstimate.port_locks` and `PodCreated.port_locks` list the lock each public port is created with
+  (`PodUpdateEstimate.port_locks` and `PodUpdated.port_locks` list what an update sends), and
+  `wait_for_new_pod(..., port_locks=created.port_locks)` checks the new pod against it (`PortNotLockedError` if a
+  port that should be locked is open).
+- **Lock or unlock a port.** `set_port_lock(pod, workspace, port, True)` locks a public port and `False` unlocks
+  it, without restarting the pod. Unlocking keeps the port's access keys; they work again when it is locked again.
+- **Access keys for programs.** `create_access_key(pod, workspace, port, name)` returns an `AccessKeyCreated`
+  whose `access_key` is the key's value. It is returned this once and can't be read again. Programs send it as
+  `Authorization: Bearer <key>`, or as `X-Meshive-Key: <key>` when the app uses `Authorization` itself. A key lasts
+  90 days by default (`expires_in_days` 30, 90 or 365, or 0 for a key that never expires). `list_access_keys` lists a
+  port's keys by name and first characters, never their values. `roll_access_key` replaces a key's value and keeps
+  the old one working for `overlap_seconds` (an hour by default) so clients can be moved; `revoke_access_key` stops
+  a key within seconds. A connection that is already open stays open until it closes. The value is left out of
+  `repr` and of `.raw`.
+- **Creating and rolling a key are not resent.** Each call issues a new value, so after a timeout the SDK does not
+  send the request again; check `list_access_keys` first.
+- **CLI.** `meshive port-lock` and `meshive port-unlock <workspace> <pod> <port>`; `meshive port-keys`,
+  `meshive port-key-create --name NAME [--expires DAYS|never]`, `meshive port-key-roll KEY_ID [--overlap now|1h|24h|7d]`
+  and `meshive port-key-revoke KEY_ID`. `port-key-create` prints the value once (`-o name` prints only the value).
+  `meshive port-keys` shows when each key was last used (LAST USED: `2 hours ago`, or `never`). Unlocking, rolling
+  and revoking ask first; `pod-create` and `pod-update` say which ports would be locked and which open before they
+  ask. Both take `--no-lock`, `--lock-port` and `--unlock-port`.
+- **`meshive port-forward` for apps that can't send a key.** `meshive port-forward <workspace> <pod> <port>` listens on
+  `http://127.0.0.1:<port>` and passes every request on to the port's public address with the access key added
+  (as `X-Meshive-Key`; your app's own `Authorization` is left alone). Point an app that only takes an address at
+  it: a ComfyUI client, a browser, a library with no way to set a header. WebSockets, streamed answers and uploads
+  go through. The key is read from the `MESHIVE_ACCESS_KEY` environment variable or from `--key-file`, never from
+  the command line, and a port that isn't locked needs none. It answers only on 127.0.0.1 and refuses requests
+  made by web pages on other sites (`--allow-origin` names a page that may use it), but programs on your computer
+  reach the port through it without a key. `--listen PORT` picks another local port and `-v` prints one line per
+  request. It runs until Ctrl+C and uses only the Python standard library.
+- **Waiting for a lock to take effect.** A lock choice can take a few seconds to reach every route of the port, and
+  until it does a locked port may still be reachable without a key. `PodEndpoint.lock_state` and `PortLock.state`
+  are `"locked"`, `"locking"`, `"unlocked"` or `"unlocking"` (`None` from a server that doesn't report it);
+  `locked` and `access` still say what was chosen. `wait_for_port_lock(pod, workspace, port, timeout=60, interval=1)`
+  reads the pod until the state is `"locked"` or `"unlocked"` and returns the endpoint. Like `wait_for_pod`, it
+  raises `WaitTimeoutError` when the time runs out; the error's `last` is the endpoint as last read. A server that
+  doesn't report lock states returns at once. `meshive port-lock` and `meshive port-unlock` wait by default (up to
+  60 seconds, progress on stderr) and exit with code 1 when the choice isn't confirmed by then, or when the check
+  fails; they still print the state (`access: Locking… (…)`). `--no-wait` skips the wait and exits 0. `meshive pod`
+  shows `Locking…` or `Unlocking…` in the ACCESS column meanwhile.
+- **Expired access keys.** An expired key stays in `list_access_keys` for 30 days, with `AccessKey.expired` set, and
+  it can be rolled or revoked. Rolling an expired key ignores `overlap_seconds`, and `previous_value_valid_until`
+  is `None`. `meshive port-keys` shows `expired 3 days ago (2026-11-13 09:00 UTC)` in the EXPIRES column, and
+  `meshive port-key-roll` says the key has expired instead of the overlap warning.
+- **When a key was last used.** `AccessKey.last_used_at` is when a program last got through with the key (with its
+  previous value too, while that still works after a roll), or `None` when it hasn't been used. It is updated every
+  few minutes, so a key used just now may show an older time. Use it to find keys nobody uses any more, and revoke
+  them.
+- **Pages on other sites (preflight requests).** A browser asks a locked port with a CORS preflight request
+  (`OPTIONS`) before a page on another site calls it, and that request carries no key, so the lock refuses it.
+  `set_port_preflight(pod, workspace, port, True)` lets those preflight requests reach the app without a key;
+  every other request still needs one, and the app's own CORS settings decide which sites may call it. It is off for
+  every port until you turn it on, and it is kept when the port is unlocked and locked again.
+  `PodEndpoint.allow_preflight` says whether it is on (`None` for an internal port and from a server that doesn't
+  report it). On the command line: `meshive port-preflight <workspace> <pod> <port> on|off`; `on` asks first,
+  because a key put in a web page is visible to everyone who opens that page. `meshive pod` lists the locked ports
+  that let preflight requests through, below the endpoint table.
+- **Sign out browser sessions.** Workspace members who open a locked port in a browser stay signed in there for 7
+  days. `revoke_browser_sessions(pod, workspace)` (`meshive pod-browser-sessions-revoke <workspace> <pod>`, which
+  asks first) signs out those sessions on every public port of the pod within seconds; members enter again through
+  the console. Access keys keep working, and connections that are already open stay open. It returns a
+  `BrowserSessionsRevoked` with the number of public ports and when the sessions were cut.
+  `revoke_workspace_browser_sessions(workspace)` (`meshive workspace-browser-sessions-revoke <workspace>`) does the
+  same for every pod in the workspace at once.
+- **Permissions.** Locking, unlocking, the preflight setting, signing out browser sessions, and creating, rolling
+  and revoking keys need a read & write key from a workspace admin or billing member. Listing keys works with a
+  read-only key.
+
+- **Disk warnings for hosts.** `MachineDetail.disk_warnings` lists the disk problems the console shows for a machine,
+  each as `{"kind", "device", "since", "value", "threshold"}`: `stall` (a disk stopped responding; new workloads on
+  the machine are paused and its listing is turned off), `slow` (writes are slow even when the disk is lightly
+  loaded; `value` is milliseconds per write) or `full` (the system disk, device `/`, is almost full; `value` is the
+  percent used). `meshive machine <id>` adds a `disk` line to its Diagnostics block, for example
+  `nvme0n1 not responding` or `/ 92% used`. From a server that doesn't send them yet the list is empty.
+- **Why a pod stopped.** `get_pod` now returns `Pod.recent_exits`: the times the pod's main container ended
+  abnormally, newest first (up to 5), each with `at`, `reason` (as Kubernetes reports it: `OOMKilled`, `Error`,
+  `ContainerCannotRun`, ...), `oom_kind` (`"ram"` when it went over its RAM limit, `"vram"` when the GPU ran out of
+  memory), `exit_code` and `message`. A clean exit (code 0) is listed only when the pod restarted after it. For a GPU out-of-memory error, `message` is
+  the error line the program logged; any `message` can come from the pod, so treat it as untrusted text (credentials
+  and signed URLs are taken out, and it is at most 300 characters). `meshive pod <workspace> <pod>` shows them in an
+  EXITED table. Pods from `list_pods` and from a server that doesn't send them have `recent_exits=None`.
+- **Send feedback.** `send_feedback(summary, kind=..., details=..., tool=..., error_code=...)` and
+  `meshive feedback "one line" [--kind bug|idea|complaint] [--details TEXT]` send a bug report, an idea or a
+  complaint to the Meshive team, as the console's Send feedback does. It needs a key with the write scope. `tool` and
+  `error_code` name a call that failed and the code it returned; the server keeps them only as lowercase
+  identifiers. Leave secrets, environment values, log output and resource names out of the text. The team reviews
+  every report. When the server isn't taking feedback it answers `NotFoundError` (title `Feedback Unavailable`); an
+  account that sends several in a short time gets `RateLimitError` (title `Too Many Reports`; `retry_after` says when
+  to send again).
+- **Scratch disk warnings.** `Pod.scratch_disks` lists the platform disks at the template's workspace folders
+  (`[{"path", "size_gib", "price_per_hour"}]`); a move to another machine deletes them with their files.
+  `PodEstimate` and `PodUpdateEstimate` add `scratch_disk` (the disk after the request: `price_per_hour` for the
+  disks the request creates, `total_price_per_hour` for all of them, `None` from a server that doesn't send it) and
+  `warnings` (`[{"code", "message"}]`, such as a scratch disk the change deletes or erases on spot). `pod-create` and
+  `pod-update` print each as a `warning:` line before asking (on stderr for json and name output), the move and
+  consent messages of `pod-start` and `pod-update` name the scratch disk and its path instead of "unpreserved
+  workspace files", `meshive pod` adds a `scratch` line with each disk's path, size and price per hour, and
+  `pod-watch` shows a folder that overlaps one of your volumes as `blocked (your volume)`.
+  From a server that doesn't send them yet, `scratch_disks` and `scratch_disk` are `None` and `warnings` is empty.
+- **Why a pod keeps restarting or failed.** The server now classifies a failure into a fixed `cause` (such as
+  `gpu_out_of_memory`, `command_not_found` or `image_not_found`) with a `summary` sentence, and gives the line the
+  program printed separately as `output`/`message` (untrusted text, at most 300 characters).
+  - `Pod.restart_count` counts the main container's restarts in the current run, and `Pod.last_exit` (a `PodExit`)
+    is its last exit while that matters: within the last 30 minutes of the current run, while the status is error,
+    shortly before the system stopped the pod for failing repeatedly, or behind a failed creation. Both are on `list_pods` items too. `status` can
+    stay `running` while the container keeps ending, so read these instead.
+  - `PodExit` adds `cause`, `summary` and `current_run` (whether a `recent_exits` item belongs to the current run).
+    `recent_exits` now also lists a clean exit (code 0) that the pod restarted.
+  - `Pod.creation_failure` and `Transaction.failure` are a new `Failure` (`cause`, `summary`, `output`, `exit_code`,
+    `at`, `ref`). `Transaction.failure_reason` uses `failure.summary` when it is there.
+  - `Logs.previous` is a new `PreviousRun`: the main container's last run that ended, kept apart from the current
+    run's `lines` (`ended_at`, `reason`, `exit_code`, `cause`, `summary`, `output`, `lines`, `truncated`,
+    `unavailable`, and `text`).
+  - `PodCreated.pod_name` is set right away, and `get_pod(pod_name)` answers from the start: status `creating` while
+    it is created, `terminated` with `creation_failure` when the creation failed; such a pod has no record yet and
+    carries its create transaction as `Pod.transaction_id`. `list_pods(workspace, name=...)`
+    finds a pod by its display name, including one being created or whose creation failed in the last 24 hours.
+    `wait_for_new_pod(..., pod_name=created.pod_name)` finds the new pod by it, and a pod that isn't found yet while
+    waiting is waited for.
+  - `meshive pod` prints a line under the status, such as `Restarted 3 times · The GPU ran out of memory. · 2
+    minutes ago` or `Create failed: The command was not found (exit code 127).`, with the program's line under it.
+    `meshive logs` prints the run that ended first, between `--- previous run (...) ---` and `--- current run ---`.
+    `meshive pod-create` prints the pod name the server returned.
+
+  From a server that doesn't send them yet, the new fields are `None`, `list_pods(name=...)` filters the full list
+  itself, and `pod_name` stays `None`.
+
+### Fixed
+
+- **CLI: the OWNER column of `meshive workspaces` is the last column.** In 1.9.0 it came between ID and ROLE, so a
+  script that reads the table by position got an email where it read the role, and a workspace with several owners
+  shifted the following columns once more. NAME, ID, ROLE, STATUS, PODS and PRICE/HR are back where they were before
+  1.9.0, and several owners are joined with `,` and no space. `-o json` stays the format meant for scripts.
+
+- **`pod-start` and `pod-update` mention local storage only when the pod has it.** The move and consent messages
+  added "Attached local hostPath storage stays on the old node." for every pod.
+- **`pod-update` previews name a new local volume.** The `volumes` line showed it as `None→/path`; it now reads
+  `name (new local)→/path`.
+
 ## v1.9.0
 
 You can run commands in a running pod and upload files from your computer to Asset Hub, without SSH or the console.

@@ -85,30 +85,37 @@ def _volumes(volumes: Iterable[Mapping[str, Any] | tuple[str, str]] | None) -> l
     return out
 
 
-def _ports(ports: Iterable[int | Mapping[str, Any]] | None) -> list[dict[str, Any]]:
-    """[8888] or [{"port": 8888, "name": "jupyter", "external": True}]."""
+def _ports(ports: Iterable[int | Mapping[str, Any]] | None, lock: bool | None = None) -> list[dict[str, Any]]:
+    """[8888] or [{"port": 8888, "name": "jupyter", "external": True, "locked": True}]. `locked` is sent when the item
+    gives it; otherwise an exposed port gets `lock` (None = nothing is sent, and the server leaves the port open). An
+    internal port never gets the default."""
     out: list[dict[str, Any]] = []
     for item in ports or []:
         if isinstance(item, bool):
             raise ValueError("ports items must be port numbers or mappings")
         if isinstance(item, int):
-            port, name, external = item, None, True
+            port, name, external, locked = item, None, True, None
         elif isinstance(item, Mapping):
             port, name, external = item.get("port"), item.get("name"), item.get("external", True)
+            locked = _flag(item.get("locked"), "ports[].locked")
         else:
             raise ValueError("ports items must be port numbers or mappings")
         entry: dict[str, Any] = {"port": _port_number(port, "ports[].port"), "external": bool(external)}
         if name:
             entry["name"] = str(name)
+        if locked is None and entry["external"]:
+            locked = lock
+        if locked is not None:
+            entry["locked"] = locked
         out.append(entry)
     return out
 
 
 def _template_ports(items: Any) -> list[dict[str, Any]]:
-    """Changes to the ports the template opens — [{"port", "name", "new_port", "external"}], where port is the
-    template's port (its current number) and the rest is what to change: rename it, give it another number, expose or
-    hide it. Only the keys given are sent. Whether the port is the template's and whether the result clashes with
-    another port is the server's check."""
+    """Changes to the ports the template opens — [{"port", "name", "new_port", "external", "locked"}], where port is
+    the template's port (its current number) and the rest is what to change: rename it, give it another number, expose
+    or hide it, lock or unlock it. Only the keys given are sent. Whether the port is the template's and whether the
+    result clashes with another port is the server's check."""
     out: list[dict[str, Any]] = []
     for item in items or []:
         if not isinstance(item, Mapping):
@@ -125,8 +132,77 @@ def _template_ports(items: Any) -> list[dict[str, Any]]:
             entry["newPort"] = _port_number(new_port, "template_ports[].new_port")
         if item.get("external") is not None:
             entry["external"] = bool(item.get("external"))
+        locked = _flag(item.get("locked"), "template_ports[].locked")
+        if locked is not None:
+            entry["locked"] = locked
         out.append(entry)
     return out
+
+
+def lock_template_ports(body: dict[str, Any], endpoints: Any, lock: bool, public_now: Any = ()) -> None:
+    """Give every port of the template that the pod will newly expose a `locked` value, in body["templatePorts"].
+
+    `endpoints` is the template's port list as the API returns it. A port counts as exposed when the template exposes
+    it, or when the request's own templatePorts entry says external=True. An entry that already carries `locked` is
+    left alone. With lock=True the value is the template author's default (isLocked true/false), and locked when the
+    author set none; with lock=False every exposed port is sent as unlocked. The server never applies the template's
+    default by itself, so a port left out here would be created open.
+
+    `public_now` (an update that moves a pod to this template) holds the port numbers the pod exposes today. A port
+    that ends up on one of those numbers keeps the address it has, and its lock: no value is added for it."""
+    changes = list(body.get("templatePorts") or [])
+    by_port = {entry["port"]: entry for entry in changes}
+    public_now = set(public_now)
+    for endpoint in endpoints or []:
+        if not isinstance(endpoint, Mapping):
+            continue
+        port = endpoint.get("containerPort")
+        if isinstance(port, bool) or not isinstance(port, int):
+            continue
+        entry = by_port.get(port)
+        external = entry["external"] if entry is not None and "external" in entry else bool(endpoint.get("isExternal"))
+        if not external or (entry is not None and "locked" in entry):
+            continue
+        if (entry.get("newPort", port) if entry is not None else port) in public_now:
+            continue
+        stored = endpoint.get("isLocked")
+        if entry is None:
+            entry = by_port[port] = {"port": port}
+            changes.append(entry)
+        entry["locked"] = (stored if isinstance(stored, bool) else True) if lock else False
+    if changes:
+        body["templatePorts"] = changes
+
+
+def exposes_ports(body: Mapping[str, Any]) -> bool:
+    """Whether a pod update body may make an existing port public without saying how it is locked: it moves the pod
+    to another template, or a templatePorts entry says external=True and carries no `locked`. Deciding the lock then
+    needs the pod's current ports (a port that is public already keeps its lock)."""
+    return "templateId" in body or any(entry.get("external") is True and "locked" not in entry
+                                       for entry in body.get("templatePorts") or [])
+
+
+def lock_exposed_ports(body: dict[str, Any], public_now: Any, lock: bool) -> None:
+    """Give `lock` to the ports a pod update turns from internal to exposed (a templatePorts entry with
+    external=True and no `locked` of its own). A port in `public_now`, the numbers the pod exposes today, is exposed
+    already: its lock is whatever was chosen for it, and it gets no value."""
+    public_now = set(public_now)
+    for entry in body.get("templatePorts") or []:
+        if entry.get("external") is True and "locked" not in entry and entry["port"] not in public_now:
+            entry["locked"] = lock
+
+
+def port_locks(body: Mapping[str, Any]) -> dict[int, bool]:
+    """{port: locked} for every port a pod create or update body sends a lock value for. A template port that is also
+    renumbered is listed under its new number, the one the pod will have."""
+    locks: dict[int, bool] = {}
+    for entry in body.get("templatePorts") or []:
+        if "locked" in entry:
+            locks[entry.get("newPort", entry["port"])] = entry["locked"]
+    for entry in body.get("ports") or []:
+        if "locked" in entry:
+            locks[entry["port"]] = entry["locked"]
+    return locks
 
 
 def _port_number(value: Any, name: str) -> int:
@@ -209,9 +285,13 @@ def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: i
              harvest_destination: Any = None, local_volumes: Any = None, cpu_line: str | None = None,
              template_ports: Any = None, model_set: str | None = None,
              watched_template_folders: Mapping[str, Any] | None = None,
-             hf_token_id: int | None = None) -> dict[str, Any]:
+             hf_token_id: int | None = None, lock_public_ports: bool = True) -> dict[str, Any]:
+    """POST /pods (and its estimate) body. Every exposed port in `ports` carries `locked`: its own value, or
+    lock_public_ports. The ports the template opens get theirs from lock_template_ports, once the template is read."""
     if isinstance(template_id, bool) or not isinstance(template_id, int) or template_id < 0:
         raise ValueError("template_id must be a non-negative integer")
+    if not isinstance(lock_public_ports, bool):
+        raise ValueError("lock_public_ports must be an explicit boolean")
     # How many GPUs one pod may take is the server's rule; only the type is checked here.
     if isinstance(gpu_count, bool) or not isinstance(gpu_count, int) or gpu_count < 1:
         raise ValueError("gpu_count must be a positive integer")
@@ -239,7 +319,7 @@ def pod_body(name: str, template_id: int, *, gpu_model: str | None, gpu_count: i
         "localVolumes": _local_volumes(local_volumes) or None,
         "env": env_out,
         "secretKeys": secrets,
-        "ports": _ports(ports),
+        "ports": _ports(ports, lock_public_ports),
         "templatePorts": _template_ports(template_ports) or None,
         "command": command if command else None,
         "internetPremium": bool(internet_premium),
@@ -290,9 +370,17 @@ def pod_update_body(*, name: str | None = None, template_id: int | None = None, 
                     local_volumes: Any = None, detach_storages: str | Iterable[str] | None = None,
                     allow_node_migration: bool | None = None, allow_data_loss: bool | None = None,
                     drop_watched_folders: str | Iterable[str] | None = None,
-                    max_price_per_hour: Any = None, enable_folder_saving: bool | None = None) -> dict[str, Any]:
+                    max_price_per_hour: Any = None, enable_folder_saving: bool | None = None,
+                    lock_public_ports: bool = True) -> dict[str, Any]:
     """PATCH /pods/{pod} (and its estimate) body — only what is given is sent, so the rest of the pod stays as it is.
-    command="" is sent (it means "back to the template's command"). Which changes the pod allows is the server's call."""
+    command="" is sent (it means "back to the template's command"). Which changes the pod allows is the server's call.
+    A new exposed port in `ports` carries `locked`: its own value, or lock_public_ports. Ports that the change
+    exposes or takes over from a new template get theirs once the pod is read (lock_exposed_ports,
+    lock_template_ports); a port that is public already never gets a value it wasn't given. lock_public_ports by
+    itself is not a change."""
+    if not isinstance(lock_public_ports, bool):
+        raise ValueError("lock_public_ports must be an explicit boolean")
+    lock = lock_public_ports
     if template_id is not None and (isinstance(template_id, bool) or not isinstance(template_id, int) or template_id < 0):
         raise ValueError("template_id must be a non-negative integer")
     if command is not None and not isinstance(command, str):
@@ -315,7 +403,7 @@ def pod_update_body(*, name: str | None = None, template_id: int | None = None, 
         "env": env_out or None,
         "secretKeys": secrets or None,
         "removeEnv": _strings(remove_env, "remove_env"),
-        "ports": _ports(ports) or None,
+        "ports": _ports(ports, lock) or None,
         "templatePorts": _template_ports(template_ports) or None,
         "removePorts": removed_ports,
         "command": command,
@@ -430,6 +518,47 @@ def _template_folders(template: Mapping[str, Any] | None, name: str, *, allow_pa
             "include": list(toggle["include"]) if toggle.get("include") is not None else None,
             "path": None if moved is None else _require_str(moved, f"{name}[{path!r}].path")})
     return toggles
+
+
+# --- Port locks and access keys -----------------------------------------------
+
+def port_segment(port: Any) -> str:
+    """A container port as a URL path segment."""
+    return str(_port_number(port, "port"))
+
+
+def port_lock_body(locked: Any) -> dict[str, Any]:
+    """PATCH …/ports/{port}/lock body. Only a real bool is taken, so a string such as "false" can't lock or unlock a
+    port by accident."""
+    if not isinstance(locked, bool):
+        raise ValueError("locked must be an explicit boolean (True to lock the port, False to unlock it)")
+    return {"locked": locked}
+
+
+def port_preflight_body(allow: Any) -> dict[str, Any]:
+    """PATCH …/ports/{port}/preflight body. Only a real bool is taken, so a string such as "false" can't let
+    preflight requests through by accident."""
+    if not isinstance(allow, bool):
+        raise ValueError("allow must be an explicit boolean (True to let preflight requests through, False to refuse "
+                         "them)")
+    return {"allowPreflight": allow}
+
+
+def access_key_body(name: Any, expires_in_days: Any) -> dict[str, Any]:
+    """POST …/ports/{port}/keys body. Which lifetimes exist is the server's rule (30, 90 or 365 days, or 0 for a key
+    that never expires), so only the type is checked. None is refused rather than read as "never expires"."""
+    if isinstance(expires_in_days, bool) or not isinstance(expires_in_days, int) or expires_in_days < 0:
+        raise ValueError("expires_in_days must be a whole number of days (30, 90 or 365), or 0 for a key that never "
+                         "expires")
+    return {"name": _require_str(name, "name"), "expiresInDays": expires_in_days}
+
+
+def access_key_roll_body(overlap_seconds: Any) -> dict[str, Any]:
+    """POST …/keys/{id}/roll body. Which overlaps exist is the server's rule (0, 3600, 86400 or 604800 seconds)."""
+    if isinstance(overlap_seconds, bool) or not isinstance(overlap_seconds, int) or overlap_seconds < 0:
+        raise ValueError("overlap_seconds must be a whole number of seconds: 0 (the old value stops now), 3600, 86400 "
+                         "or 604800")
+    return {"overlapSeconds": overlap_seconds}
 
 
 def placement(value: str | None) -> str | None:
@@ -713,6 +842,28 @@ def maintenance_extend_body(*, hours: Any, reason: str, description: str = "") -
 def host_message_body(*, to: str, title: str, content: str = "") -> dict[str, Any]:
     """POST …/messages body. to is a workspace ID or "all"; who may be sent to and the length limits are the server's."""
     return {"to": _require_str(to, "to"), "title": _require_str(title, "title"), "content": _text(content, "content")}
+
+
+FEEDBACK_KINDS = ("bug", "idea", "complaint")
+
+
+def feedback_body(*, summary: str, kind: str | None = None, details: str | None = None, tool: str | None = None,
+                  error_code: str | None = None) -> dict[str, Any]:
+    """POST /feedback body. The length limits (a one-line summary under 200 characters, 4000 with the details) are the
+    server's; so is which `tool` / `error_code` values it keeps."""
+    body: dict[str, Any] = {"summary": _require_str(summary, "summary")}
+    if kind is not None:
+        value = kind.strip().lower() if isinstance(kind, str) else ""
+        if value not in FEEDBACK_KINDS:
+            raise ValueError(f"kind must be one of {', '.join(FEEDBACK_KINDS)}")
+        body["kind"] = value
+    for key, value, name in (("details", details, "details"), ("tool", tool, "tool"),
+                             ("errorCode", error_code, "error_code")):
+        if value is not None:
+            text = _text(value, name)
+            if text.strip():
+                body[key] = text
+    return body
 
 
 def message_ids_body(message_ids: Any) -> dict[str, Any]:

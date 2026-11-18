@@ -39,20 +39,28 @@ from meshive import (
 )
 from meshive import _client, _write
 from tests.test_sdk import (_counting_handler, async_client, isolate_config_dir, slept,  # noqa: F401  (autouse fixtures)
-                            sync_client)
+                            preflight_answer, sync_client, with_preflight)
 
 ESTIMATE = {"pricePerHourUsd": "0.068423", "breakdown": {"gpu": "0.068423"}, "resources": {"gpu_model": "RTX 3060"},
             "availability": {"available_gpus": 2}, "template": {"id": 457}, "volumes": [], "note": "Estimated"}
 
 
 class Recorder:
-    """MockTransport handler that records requests and returns preset responses in order."""
+    """MockTransport handler that records requests and returns preset responses in order. The reads a pod create or
+    estimate makes first (the template, the server's capabilities) are answered apart and kept in `reads`, so
+    `requests` holds what the test is about."""
 
-    def __init__(self, *responses):
+    def __init__(self, *responses, template=None, capabilities=None):
         self.requests: list[httpx.Request] = []
+        self.reads: list[httpx.Request] = []
         self.responses = list(responses)
+        self.template, self.capabilities = template, capabilities
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
+        answer = preflight_answer(request, self.template, self.capabilities)
+        if answer is not None:
+            self.reads.append(request)
+            return answer
         self.requests.append(request)
         status, body = self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
         return httpx.Response(status, json=body)
@@ -85,7 +93,8 @@ def test_estimate_pod_builds_request():
         "rentalType": "spot", "vcpu": 8, "ramGb": 24,
         "volumes": [{"storage": "pv-data", "mountPath": "/data"}, {"storage": "pv-b", "mountPath": "/b"}],
         "env": {"A": "1", "TOKEN": "x"}, "secretKeys": ["TOKEN"],
-        "ports": [{"port": 8888, "external": True}, {"port": 6006, "external": False, "name": "tb"}],
+        "ports": [{"port": 8888, "external": True, "locked": True},
+                  {"port": 6006, "external": False, "name": "tb"}],
         "command": "sleep infinity", "internetPremium": False, "uptimePremium": False, "cpuPremium": False,
         "maxPricePerHourUsd": "0.5",
     }
@@ -828,7 +837,7 @@ def test_get_transaction_not_found_and_older_servers():
     ({"events": [{"type": "Normal", "reason": "Pulled", "message": "pulled"},
                  {"type": "Warning", "reason": "BackOff", "message": "Back-off restarting failed container"}]}, "",
      "failed at step run: Back-off restarting failed container"),
-    ({"events": [{"type": "Normal", "reason": "Scheduled", "message": None}]}, "", "failed at step run: Scheduled"),
+    ({"events": [{"type": "Normal", "reason": "Scheduled", "message": None}]}, "", "failed at step run"),  # Normal: never the reason
     ({}, "node went away", "failed at step run: node went away"),
     (None, "", "failed at step run"),
 ])
@@ -995,7 +1004,8 @@ def test_create_and_estimate_pod_send_template_ports():
     expected = [{"port": 8080, "name": "ide"}, {"port": 8888, "newPort": 9999}, {"port": 22, "external": False},
                 {"port": 7860, "name": "ui", "newPort": 7861, "external": True}, {"port": 3000}]
     c.create_pod("p", 457, workspace="ws", template_ports=ports, ports=[9000])
-    assert rec.body()["templatePorts"] == expected and rec.body()["ports"] == [{"port": 9000, "external": True}]
+    assert rec.body()["templatePorts"] == expected
+    assert rec.body()["ports"] == [{"port": 9000, "external": True, "locked": True}]
     c.estimate_pod("p", 457, workspace="ws", template_ports=ports)
     assert rec.last.url.path == "/v1/sdk/pods/estimate" and rec.body()["templatePorts"] == expected
     c.create_pod("p", 457, workspace="ws", template_ports=[])
@@ -1362,12 +1372,12 @@ def test_create_pod_with_a_model_set_is_not_resent_after_a_timeout(slept):
         raise httpx.ReadTimeout("no answer", request=request)
 
     with pytest.raises(httpx.ReadTimeout) as err:
-        sync_client(timeout).create_pod("p", 457, workspace="ws", model_set="sdxl-basics")
+        sync_client(with_preflight(timeout)).create_pod("p", 457, workspace="ws", model_set="sdxl-basics")
     assert len(seen) == 1 and slept == []
     assert err.value.idempotency_key == seen[0] and err.value.operation_path == "/pods"
     seen.clear()
     with pytest.raises(httpx.ReadTimeout):
-        sync_client(timeout).create_pod("p", 457, workspace="ws")       # without a model set: retried as before
+        sync_client(with_preflight(timeout)).create_pod("p", 457, workspace="ws")   # no model set: retried as before
     assert len(seen) == 3 and len(set(seen)) == 1
 
 
@@ -1401,7 +1411,7 @@ def test_create_pod_with_a_model_set_is_resent_when_no_connection_was_used(slept
             raise failure("no connection", request=request)
         return httpx.Response(202, json={"name": "p", "workspace": "ws", "transactionId": 6, "estimate": ESTIMATE})
 
-    assert sync_client(flaky).create_pod("p", 457, workspace="ws", model_set="s").transaction_id == 6
+    assert sync_client(with_preflight(flaky)).create_pod("p", 457, workspace="ws", model_set="s").transaction_id == 6
     assert len(attempts) == 2 and slept == [0.5]
 
 
@@ -1425,7 +1435,7 @@ def test_async_writes_are_resent_after_a_timeout_or_when_no_connection_was_used(
     async def main():
         async with async_client(stop) as c:
             action = await c.stop_pod("p-0", "ws")
-        async with async_client(create) as c:
+        async with async_client(with_preflight(create)) as c:
             created = await c.create_pod("p", 457, workspace="ws", model_set="s")
         return action, created
 
@@ -1443,11 +1453,11 @@ def test_create_pod_with_a_model_set_cut_off_mid_request_is_not_resent_and_keeps
         raise httpx.RemoteProtocolError("Server disconnected without sending a response.", request=request)
 
     async def run_async():
-        async with async_client(cut_off) as c:
+        async with async_client(with_preflight(cut_off)) as c:
             await c.create_pod("p", 457, workspace="ws", model_set="sdxl-basics")
 
     with pytest.raises(httpx.RemoteProtocolError) as sync_err:
-        sync_client(cut_off).create_pod("p", 457, workspace="ws", model_set="sdxl-basics")
+        sync_client(with_preflight(cut_off)).create_pod("p", 457, workspace="ws", model_set="sdxl-basics")
     with pytest.raises(httpx.RemoteProtocolError) as async_err:
         asyncio.run(run_async())
     assert len(seen) == 2 and slept == []
@@ -1485,7 +1495,7 @@ def test_async_model_sets(slept):
         async with async_client(pod) as c:
             est = await c.estimate_pod("p", 457, workspace="ws", model_set="sdxl-basics")
             await c.create_pod("p", 457, workspace="ws", model_set="sdxl-basics")
-        async with async_client(timeout) as c:
+        async with async_client(with_preflight(timeout)) as c:
             with pytest.raises(httpx.ReadTimeout):
                 await c.create_pod("p", 457, workspace="ws", model_set="sdxl-basics")
         return listed, est
@@ -1524,7 +1534,8 @@ def test_update_pod_sends_every_change_in_the_servers_shape():
         "name": "agent-pod", "templateId": 458, "rentalType": "spot", "gpuModel": "RTX 4090", "gpuVramGb": 24,
         "gpuCount": 2, "vcpu": 16, "ramGb": 64, "cpuLine": "amd-epyc-4-ddr5",
         "env": {"HF_HOME": "/data/hf", "TOKEN": "x"}, "secretKeys": ["TOKEN"], "removeEnv": ["OLD"],
-        "ports": [{"port": 9000, "external": True}, {"port": 7000, "external": False, "name": "api"}],
+        # The new exposed port is locked, like a new pod's; the internal one carries no lock value.
+        "ports": [{"port": 9000, "external": True, "locked": True}, {"port": 7000, "external": False, "name": "api"}],
         "templatePorts": [{"port": 8080, "newPort": 8443}], "removePorts": [6006], "command": "",
         "volumes": [{"storage": "pv-net", "mountPath": "/data"}],
         "localVolumes": [{"name": "scratch", "mountPath": "/scratch", "sizeGb": 50}], "detachStorages": ["pv-old"],
@@ -1581,6 +1592,46 @@ def test_estimate_pod_update():
     assert len(est.changes) == 2 and est.breakdown == {"gpu": "0.31"} and est.note == "The running pod restarts."
     bare = PodUpdateEstimate.from_dict({"podName": "p-0"})          # an older or partial answer
     assert bare.restarts is None and bare.current_price_per_hour is None and bare.changes == []
+    assert bare.scratch_disk is None and bare.warnings == []
+
+
+def test_estimates_read_the_scratch_disk_and_warnings():
+    from meshive import PodEstimate, PodUpdateEstimate
+
+    body = {"pricePerHourUsd": "1.002", "breakdown": {"gpu": "1", "scratch_disk": "0.002"},
+            "scratchDisk": {"paths": ["/workspace"], "newPaths": ["/workspace"], "initialGb": 20,
+                            "pricePerHourUsd": "0.002"},
+            "warnings": [{"code": "deletes_scratch_disk", "message": "Deletes the scratch disk at /mnt and its files."},
+                         {"code": "x"}, "junk"]}
+    for cls in (PodEstimate, PodUpdateEstimate):
+        est = cls.from_dict(body)
+        assert est.scratch_disk == {"paths": ["/workspace"], "new_paths": ["/workspace"], "initial_gb": 20,
+                                    "price_per_hour": "0.002", "total_price_per_hour": None}
+        assert est.warnings == [{"code": "deletes_scratch_disk",
+                                 "message": "Deletes the scratch disk at /mnt and its files."}]
+        assert est.breakdown["scratch_disk"] == "0.002"
+    old = PodEstimate.from_dict({"pricePerHourUsd": "1"})             # a server without scratch disk reporting
+    assert old.scratch_disk is None and old.warnings == []
+
+
+def test_update_estimate_reads_what_a_kept_scratch_disk_costs():
+    """price_per_hour is only what the request creates ("0" for a disk the pod keeps); the server's total says what
+    the disks cost per hour after it."""
+    from meshive import PodUpdateEstimate
+
+    est = PodUpdateEstimate.from_dict({"scratchDisk": {"paths": ["/workspace"], "newPaths": [], "initialGb": 20,
+                                                       "pricePerHourUsd": "0", "totalPricePerHourUsd": "0.00208333"}})
+    assert est.scratch_disk["price_per_hour"] == "0" and est.scratch_disk["total_price_per_hour"] == "0.00208333"
+
+
+def test_pod_scratch_disks():
+    from meshive import Pod
+
+    pod = Pod.from_dict({"podName": "p-0", "hasUnpreservedWorkspace": True,
+                         "scratchDisks": [{"path": "/workspace", "sizeGib": 20.4, "pricePerHour": "0.00208"}]})
+    assert pod.scratch_disks == [{"path": "/workspace", "size_gib": 20.4, "price_per_hour": "0.00208"}]
+    assert Pod.from_dict({"podName": "p-0", "scratchDisks": []}).scratch_disks == []
+    assert Pod.from_dict({"podName": "p-0"}).scratch_disks is None    # a server that doesn't say
 
 
 @pytest.mark.parametrize("kwargs", [

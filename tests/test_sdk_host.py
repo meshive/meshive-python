@@ -60,6 +60,9 @@ MACHINE_DETAIL = {
     "bootReport": {"bootErrors": [], "portCheckResults": [{"port": 22, "protocol": "tcp", "reachable": True}],
                    "isBootSuccessful": True, "isPortCheckPassed": True},
     "networkWarnings": [{"code": "speed_below_max", "interface": "eth0"}],
+    "diskWarnings": [{"kind": "stall", "device": "nvme0n1", "since": "2026-11-17T03:00:00Z", "value": 150.0,
+                      "threshold": 120.0},
+                     {"kind": "full", "device": "/", "since": "2026-11-17T01:00:00Z", "value": 92.4, "threshold": 90.0}],
     "platformFee": 0.2, "promotionalFeeUntil": "2026-12-31T00:00:00Z",
 }
 WINDOW = {"id": 7, "machineId": "mac-1", "reason": "RAM swap", "description": "two DIMMs",
@@ -288,6 +291,8 @@ def test_machine_detail_parses_clients_diagnostics_and_fee():
     assert detail.schedules["upcoming"][0]["id"] == 7 and detail.schedules["ongoing"] is None
     assert detail.boot_report["isBootSuccessful"] is True
     assert detail.network_warnings == [{"code": "speed_below_max", "interface": "eth0"}]
+    assert [(w["kind"], w["device"], w["value"]) for w in detail.disk_warnings] == [("stall", "nvme0n1", 150.0),
+                                                                                    ("full", "/", 92.4)]
     assert detail.platform_fee == 0.2 and detail.promotional_fee_until == datetime(2026, 12, 31, tzinfo=UTC)
     assert detail.raw["ip"] == "10.0.0.1"
 
@@ -297,6 +302,7 @@ def test_machine_detail_from_an_older_server_still_parses():
     assert isinstance(detail, MachineDetail) and detail.status == "ONLINE" and detail.unread_messages == 0
     assert detail.clients.pods == [] and detail.clients.storages == [] and detail.clients.workspaces == []
     assert detail.schedules == {} and detail.boot_report is None and detail.network_warnings == []
+    assert detail.disk_warnings == []
     assert detail.platform_fee is None and detail.promotional_fee_until is None     # not "0% fee"
 
 
@@ -311,6 +317,17 @@ def test_machine_detail_ignores_malformed_nested_values():
                                       "networkWarnings": ["bad", {"code": "half_duplex"}], "platformFee": "n/a"})
     assert detail.clients.pods == [] and detail.schedules == {} and detail.boot_report is None
     assert detail.network_warnings == [{"code": "half_duplex"}] and detail.platform_fee is None
+
+
+@pytest.mark.parametrize("value, expected", [
+    (None, []),
+    ("bad", []),
+    (5, []),                                                   # not a list: dropped, not a crash
+    ({"kind": "slow"}, []),
+    (["bad", None, {"kind": "slow", "device": "nvme0n1"}], [{"kind": "slow", "device": "nvme0n1"}]),
+])
+def test_machine_detail_keeps_only_well_formed_disk_warnings(value, expected):
+    assert MachineDetail.from_dict({**OLD_MACHINE, "diskWarnings": value}).disk_warnings == expected
 
 
 @pytest.mark.parametrize("flags, start, end, status", [
@@ -593,5 +610,5 @@ def test_new_models_are_exported():
         assert name in meshive.__all__ and getattr(meshive, name).__name__ == name
 
 
-def test_version_is_1_9():
-    assert meshive.__version__.startswith("1.9.")
+def test_version_is_1_10():
+    assert meshive.__version__.startswith("1.10.")

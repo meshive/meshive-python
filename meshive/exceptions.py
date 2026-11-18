@@ -15,11 +15,16 @@ class ConfigurationError(MeshiveError):
 
 
 class WaitTimeoutError(MeshiveError, TimeoutError):
-    """wait_for_pod did not reach the target state within the time limit.
+    """A wait_for_* call did not reach the target state within the time limit. The message names the last state
+    read; `last` holds what was read last when the wait has it (wait_for_port_lock: the PodEndpoint), else None.
 
     It is also a built-in TimeoutError, so both `except MeshiveError` and `except TimeoutError`
     catch it.
     """
+
+    def __init__(self, *args: object, last: object = None) -> None:
+        super().__init__(*args)
+        self.last = last
 
 
 class PodCreationFailedError(MeshiveError):
@@ -89,6 +94,35 @@ class ConflictError(MeshiveAPIError):
     """409 — conflicts with the current state: no capacity (No Capacity), duplicate name (Name Taken), price over the cap (Price Exceeds Cap),
     storage in use (Storage In Use), a request with the same Idempotency-Key still in progress (Request In Progress), etc.
     Tell them apart by `title`; `raw["detail"]` carries extra info such as availability/pricePerHourUsd."""
+
+
+class EndpointLockUnavailableError(ConflictError):
+    """A pod create, update or estimate asked for a locked port, and this server can't lock ports: the platform has
+    locking turned off right now (`reason` "disabled", the server's 409), or the server predates port locks (`reason`
+    "unsupported", found by the SDK before anything was sent). Nothing was created or changed, and the SDK never
+    falls back to open ports by itself: pass lock_public_ports=False (or locked=False on a port) to go ahead with
+    the ports open, or try again later."""
+
+    def __init__(self, message: str, *, reason: str, title: str | None = "Endpoint Lock Unavailable",
+                 raw: object = None) -> None:
+        self.reason = reason
+        super().__init__(409, message, title=title, raw=raw)
+
+
+class PortNotLockedError(MeshiveError):
+    """wait_for_new_pod(port_locks=...): the pod is up, but a port that was created to be locked is exposed without
+    the lock, so anyone with its URL gets through. `pod` is the Pod as last read and `ports` the port numbers. Lock
+    them with set_port_lock(pod_name, workspace, port, True), or delete the pod."""
+
+    def __init__(self, pod: object, ports: list[int]):
+        name = getattr(pod, "pod_name", "") or "?"
+        listed = ", ".join(str(port) for port in ports)
+        super().__init__(f"Pod {name} was created, but port {listed} is exposed without the lock that was asked for: "
+                         "anyone with the URL gets through. Lock it with set_port_lock (`meshive port-lock`), or "
+                         "delete the pod.")
+        self.pod = pod
+        self.pod_name = name
+        self.ports = ports
 
 
 class RateLimitError(MeshiveAPIError):

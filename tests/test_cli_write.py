@@ -289,7 +289,7 @@ def test_logs_output_formats(capsys):
 def test_any_node_yes_does_not_imply_data_loss_consent(capsys, non_tty):
     assert cli.main(['pod-start', 'ws', 'p-0', '--any-node', '--yes']) == 2
     assert all(c[0] != 'pod_action' for instance in FakeClient.instances for c in instance.calls)
-    assert 'permanently deletes' in capsys.readouterr().err
+    assert 'deletes its scratch disk' in capsys.readouterr().err
 
 
 def test_pod_create_wait_timeout_is_an_error_but_keeps_the_transaction(capsys):
@@ -301,6 +301,22 @@ def test_pod_create_wait_timeout_is_an_error_but_keeps_the_transaction(capsys):
     assert cli.main(["pod-create", "ws", "late-pod", "--template", "457", "--yes", "--wait", "running", "--wait-timeout", "0",
                      "-o", "name"]) == 1
     assert capsys.readouterr().out.strip() == "99"
+
+
+def test_pod_create_uses_the_pod_name_the_server_returned(monkeypatch, capsys):
+    """Servers that return the new pod's name right away: it is printed, and the wait finds the pod by it."""
+    monkeypatch.setattr(FakeClient, "create_pod", lambda self, *a, **kw: (self._rec("create_pod", *a, **kw), PodCreated.from_dict(
+        {"name": a[0], "workspace": kw["workspace"], "transactionId": 99, "podName": "abc123-0", "estimate": ESTIMATE}))[1])
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--yes"]) == 0
+    assert "abc123-0" in capsys.readouterr().out
+    seen = {}
+
+    def wait(self, *a, **kw):
+        seen.update(kw)
+        raise WaitTimeoutError("Pod 'p' did not appear within 0s.")
+    monkeypatch.setattr(FakeClient, "wait_for_new_pod", wait)
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--yes", "--wait", "running"]) == 1
+    assert seen["pod_name"] == "abc123-0" and seen["transaction_id"] == 99
 
 
 def test_disk_flag_is_gone(capsys):
@@ -655,7 +671,7 @@ def test_pod_start_placement_is_passed_through(capsys, non_tty, placement):
 
 def test_pod_start_wait_any_node_needs_data_loss_consent(capsys, non_tty):
     assert cli.main(["pod-start", "ws", "p-0", "--placement", "wait_any_node", "--yes"]) == 2
-    assert "permanently deletes" in capsys.readouterr().err
+    assert "Moving this pod deletes its scratch disk and its files." in capsys.readouterr().err
     assert all(c[0] != "pod_action" for c in FakeClient.instances[-1].calls)
     assert cli.main(["pod-start", "ws", "p-0", "--placement", "wait_any_node", "--allow-data-loss", "--yes"]) == 0
     assert _last("pod_action")[2] == {"placement": "wait_any_node", "allow_data_loss": True}
@@ -716,7 +732,7 @@ def test_pod_start_server_asks_for_data_loss_consent(capsys, non_tty, monkeypatc
     _start_returns(monkeypatch, error=error)
     assert cli.main(["pod-start", "ws", "p-0", "--yes", "-o", "json"]) == 2
     captured = capsys.readouterr()
-    assert captured.out == "" and "permanently deletes unpreserved workspace files" in captured.err
+    assert captured.out == "" and "Moving this pod deletes its scratch disk and its files." in captured.err
     assert "the server would start this pod with placement wait_any_node" in captured.err
     assert "re-run with --placement wait_any_node --allow-data-loss" in captured.err
 
@@ -1116,9 +1132,11 @@ def _refusal(status, title, **detail):
 
 @pytest.mark.parametrize("step", ["estimate_pod_update", "update_pod"])
 @pytest.mark.parametrize("error, expected", [
-    (_refusal(409, "Node Migration Required"), ["Node Migration Required message", "permanently deletes",
+    (_refusal(409, "Node Migration Required"), ["Node Migration Required message", "deletes its scratch disk",
                                                "re-run with --allow-node-migration"]),
-    (_refusal(409, "Data Loss Consent Required"), ["permanently deletes", "re-run with --allow-data-loss"]),
+    (_refusal(409, "Data Loss Consent Required"), ["deletes its scratch disk", "re-run with --allow-data-loss"]),
+    (_refusal(409, "Data Loss Consent Required", scratchDiskPaths=["/workspace"]),
+     ["Moving this pod deletes its scratch disk at /workspace and its files.", "re-run with --allow-data-loss"]),
     (_refusal(400, "Watched folders would be removed", code="harvest_roots_orphaned",
               paths=["/workspace/out", "/workspace/my logs"]),
      ["removes watched folders of the pod: /workspace/out, /workspace/my logs",
@@ -1130,6 +1148,25 @@ def test_pod_update_consent_refusals_say_what_to_rerun_with(capsys, edit_client,
     assert cli.main(["pod-update", "ws", "p-0", "--gpu", "RTX 4090", "--yes", "-o", "json"]) == 2
     captured = capsys.readouterr()
     assert captured.out == "" and all(text in captured.err for text in expected), captured.err
+
+
+@pytest.mark.parametrize("pod, said, not_said", [
+    ({"scratchDisks": [], "hasUnpreservedWorkspace": False}, [], ["scratch disk", "hostPath"]),
+    ({"scratchDisks": [{"path": "/mnt", "sizeGib": 20.0, "pricePerHour": "0.002"}]},
+     ["Moving this pod deletes its scratch disk at /mnt and its files."], ["hostPath"]),
+    ({"scratchDisks": [], "linkedStorages": [{"pvName": "pv-l", "mountPath": "/data", "storageType": "hostPath"}]},
+     ["Attached local hostPath storage stays on the old node."], ["scratch disk"]),
+])
+def test_pod_update_node_migration_names_only_what_the_pod_has(capsys, edit_client, monkeypatch, pod, said, not_said):
+    """The 'Node Migration Required' 409 says nothing about the pod's disks: the CLI reads the pod and names the
+    scratch disk or the local storage only when the pod has it."""
+    monkeypatch.setattr(FakeClient, "get_pod", lambda self, *a, **kw: Pod.from_dict(
+        {"podName": a[0], "namespaceName": a[1], **pod}))
+    monkeypatch.setattr(FakeClient, "update_pod", _fake("update_pod", _refusal(409, "Node Migration Required")))
+    assert cli.main(["pod-update", "ws", "p-0", "--gpu", "RTX 4090", "--yes", "-o", "json"]) == 2
+    err = capsys.readouterr().err
+    assert "if it then asks, add --allow-data-loss." in err
+    assert all(text in err for text in said) and not any(text in err for text in not_said), err
 
 
 def test_pod_update_other_errors_exit_1(capsys, edit_client, monkeypatch):
@@ -1532,3 +1569,154 @@ def test_workspace_update_and_delete_help_and_epilog(capsys):
     out = " ".join(capsys.readouterr().out.split())
     assert "meshive workspace-update <ws> --name NAME [--estimate]" in out
     assert "meshive workspace-delete <ws> [--check]" in out
+
+
+# --- Scratch disk: warnings on estimates, where a move deletes it, watched folders on a volume inside it -------
+
+SPOT_WARNING = {"code": "spot_scratch_erased",
+                "message": "Spot: the scratch disk at /workspace is erased if the pod is reclaimed."}
+
+
+def test_pod_create_prints_the_estimates_warnings(capsys, non_tty, monkeypatch):
+    estimate = {**ESTIMATE, "pricePerHourUsd": "0.070506",
+                "breakdown": {"gpu": "0.068423", "scratch_disk": "0.002083"},
+                "scratchDisk": {"paths": ["/workspace"], "newPaths": ["/workspace"], "initialGb": 20,
+                                "pricePerHourUsd": "0.002083"},
+                "warnings": [SPOT_WARNING]}
+    monkeypatch.setattr(FakeClient, "estimate_pod", _fake("estimate_pod", lambda: PodEstimate.from_dict(estimate)))
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--spot", "--estimate"]) == 0
+    out = capsys.readouterr().out
+    assert "scratch_disk=$0.002" in out
+    assert out.splitlines()[-1] == "warning: Spot: the scratch disk at /workspace is erased if the pod is reclaimed."
+    # Not in a table (json output): said on stderr before the question, so it is never confirmed unseen.
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--spot", "-o", "json", "--yes"]) == 0
+    assert "warning: Spot: the scratch disk at /workspace" in capsys.readouterr().err
+
+
+def test_pod_create_without_warnings_prints_none(capsys):
+    assert cli.main(["pod-create", "ws", "p", "--template", "457", "--estimate"]) == 0
+    assert "warning:" not in capsys.readouterr().out
+
+
+def test_pod_update_prints_warnings_after_the_changes(capsys, edit_client, monkeypatch):
+    estimate = {**POD_UPDATE_ESTIMATE, "changes": ["Volumes: adds pv-a at /workspace/data",
+                                                   "scratch disk: new at /workspace, from 20 GiB"],
+                "warnings": [{"code": "hides_files",
+                              "message": "Files at /workspace/data on the scratch disk are hidden, not deleted."}]}
+    monkeypatch.setattr(FakeClient, "estimate_pod_update",
+                        _fake("estimate_pod_update", lambda: PodUpdateEstimate.from_dict(estimate)))
+    assert cli.main(["pod-update", "ws", "p-0", "--name", "x", "--estimate"]) == 0
+    out = capsys.readouterr().out
+    assert "  - scratch disk: new at /workspace, from 20 GiB" in out
+    assert out.splitlines()[-1] == "warning: Files at /workspace/data on the scratch disk are hidden, not deleted."
+
+
+def test_pod_start_names_the_scratch_disk_a_move_deletes(capsys, non_tty, monkeypatch):
+    monkeypatch.setattr(FakeClient, "get_pod", lambda self, *a, **kw: Pod.from_dict(
+        {"podName": a[0], "namespaceName": a[1], "hasUnpreservedWorkspace": True,
+         "scratchDisks": [{"path": "/workspace", "sizeGib": 20.4, "pricePerHour": "0.002"}]}))
+    assert cli.main(["pod-start", "ws", "p-0", "--any-node", "--yes"]) == 2
+    assert "Moving this pod deletes its scratch disk at /workspace and its files." in capsys.readouterr().err
+
+
+# The server's fixed note for a pod edit. It no longer says what a move deletes: that is a warning, only when it applies.
+EDIT_NOTE = ("The pod is rebuilt with the new settings: a running pod restarts, a stopped pod uses them at its next "
+             "start. If its machine can't fit the change the server asks for allow_node_migration. Input assets and "
+             "watched folders stay as they are.")
+NO_SCRATCH_POD = {"hasUnpreservedWorkspace": False, "scratchDisks": []}
+SCRATCH_POD = {"hasUnpreservedWorkspace": True,
+               "scratchDisks": [{"path": "/workspace", "sizeGib": 20.4, "pricePerHour": "0.002"}]}
+
+
+def _pod_with(monkeypatch, fields):
+    monkeypatch.setattr(FakeClient, "get_pod", lambda self, *a, **kw: Pod.from_dict(
+        {"podName": a[0], "namespaceName": a[1], **fields}))
+
+
+@pytest.mark.parametrize("flags", [[], ["--allow-node-migration"]])
+def test_pod_update_preview_of_a_pod_without_a_scratch_disk_never_mentions_one(capsys, edit_client, monkeypatch,
+                                                                              flags):
+    _pod_with(monkeypatch, NO_SCRATCH_POD)
+    monkeypatch.setattr(FakeClient, "estimate_pod_update", _fake("estimate_pod_update", lambda: PodUpdateEstimate.from_dict(
+        {**POD_UPDATE_ESTIMATE, "note": EDIT_NOTE})))
+    assert cli.main(["pod-update", "ws", "p-0", "--gpu", "RTX 4090", "--estimate", *flags]) == 0
+    out = capsys.readouterr()
+    assert "scratch disk" not in out.out + out.err
+    assert EDIT_NOTE in out.out                     # the server's note, as sent and only once
+    assert out.out.count("allow_node_migration") == 1
+
+
+def test_pod_update_preview_says_once_that_the_edit_deletes_the_scratch_disk(capsys, edit_client, monkeypatch):
+    _pod_with(monkeypatch, SCRATCH_POD)
+    monkeypatch.setattr(FakeClient, "estimate_pod_update", _fake("estimate_pod_update", lambda: PodUpdateEstimate.from_dict(
+        {**POD_UPDATE_ESTIMATE, "note": EDIT_NOTE, "warnings": [
+            {"code": "deletes_scratch_disk", "message": "Deletes the scratch disk at /workspace and its files."}]})))
+    assert cli.main(["pod-update", "ws", "p-0", "--gpu", "RTX 4090", "--estimate"]) == 0
+    out = capsys.readouterr().out
+    assert out.count("scratch disk") == 1
+    assert out.splitlines()[-1] == "warning: Deletes the scratch disk at /workspace and its files."
+
+
+def test_pod_start_preview_mentions_the_scratch_disk_only_for_a_pod_that_has_one(capsys, non_tty, monkeypatch):
+    _pod_with(monkeypatch, NO_SCRATCH_POD)
+    assert cli.main(["pod-start", "ws", "p-0", "--any-node", "--yes"]) == 0
+    out = capsys.readouterr()
+    assert "scratch disk" not in out.out + out.err
+    _pod_with(monkeypatch, SCRATCH_POD)
+    assert cli.main(["pod-start", "ws", "p-0", "--any-node", "--yes"]) == 2
+    out = capsys.readouterr()
+    assert (out.out + out.err).count("scratch disk") == 1
+
+
+LOCAL_STORAGE = {"linkedStorages": [{"pvName": "pv-l", "mountPath": "/data", "storageType": "hostPath"}]}
+NFS_STORAGE = {"linkedStorages": [{"pvName": "pv-n", "mountPath": "/workspace/data", "storageType": "nfs"}]}
+
+
+@pytest.mark.parametrize("storages, says_local", [(NFS_STORAGE, False), (LOCAL_STORAGE, True)])
+def test_pod_start_move_mentions_local_storage_only_when_the_pod_has_it(capsys, non_tty, monkeypatch, storages,
+                                                                        says_local):
+    _pod_with(monkeypatch, {**SCRATCH_POD, **storages})
+    assert cli.main(["pod-start", "ws", "p-0", "--any-node", "--yes"]) == 2
+    err = capsys.readouterr().err
+    assert "Moving this pod deletes its scratch disk at /workspace and its files." in err
+    assert ("hostPath" in err) is says_local, err
+
+
+@pytest.mark.parametrize("storages, says_local", [(NFS_STORAGE, False), (LOCAL_STORAGE, True)])
+def test_consent_refusals_mention_local_storage_only_when_the_pod_has_it(capsys, non_tty, edit_client, monkeypatch,
+                                                                         storages, says_local):
+    """The 409 names only the scratch disk: the CLI reads the pod for the local-storage sentence."""
+    from meshive.exceptions import ConflictError
+    _pod_with(monkeypatch, {**SCRATCH_POD, **storages})
+    _start_returns(monkeypatch, error=ConflictError(409, "consent required", title="Data Loss Consent Required",
+                                                    raw={"detail": {"placement": "wait_any_node",
+                                                                    "scratchDiskPaths": ["/workspace"]}}))
+    assert cli.main(["pod-start", "ws", "p-0", "--yes"]) == 2
+    assert ("hostPath" in capsys.readouterr().err) is says_local
+    monkeypatch.setattr(FakeClient, "update_pod", _fake("update_pod", _refusal(
+        409, "Data Loss Consent Required", scratchDiskPaths=["/workspace"])))
+    assert cli.main(["pod-update", "ws", "p-0", "--gpu", "RTX 4090", "--yes", "-o", "json"]) == 2
+    assert ("hostPath" in capsys.readouterr().err) is says_local
+
+
+def test_pod_update_preview_names_a_new_local_volume(capsys, edit_client, monkeypatch):
+    estimate = {**POD_UPDATE_ESTIMATE, "volumes": [
+        {"storage": "pv-a", "name": "data", "mount_path": "/workspace/data", "storage_type": "nfs"},
+        {"storage": None, "name": "cli-in", "mount_path": "/workspace/models", "storage_type": "hostPath"}]}
+    monkeypatch.setattr(FakeClient, "estimate_pod_update",
+                        _fake("estimate_pod_update", lambda: PodUpdateEstimate.from_dict(estimate)))
+    assert cli.main(["pod-update", "ws", "p-0", "--local-volume", "cli-in:/workspace/models:10", "--estimate"]) == 0
+    out = capsys.readouterr().out
+    assert "volumes:   pv-a→/workspace/data, cli-in (new local)→/workspace/models" in out.splitlines()
+    assert "None" not in out
+
+
+def test_pod_watch_shows_why_a_folder_is_blocked(capsys, monkeypatch):
+    monkeypatch.setattr(FakeClient, "WATCHED", {"version": "4:cd", "editable": True, "roots": [
+        {"role": "user", "path": "/data/out", "origin": "user", "enabled": False, "blockedReason": "network_storage"},
+        {"role": "user", "path": "/workspace/proj", "origin": "user", "enabled": False,
+         "blockedReason": "nested_volume"}]})
+    assert cli.main(["pod-watch", "ws", "p-0"]) == 0
+    rows = {line.split()[0]: line for line in capsys.readouterr().out.splitlines()[1:] if line.strip()}
+    assert "blocked (network storage)" in rows["/data/out"]
+    assert "blocked (your volume)" in rows["/workspace/proj"]

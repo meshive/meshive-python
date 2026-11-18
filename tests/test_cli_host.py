@@ -158,6 +158,7 @@ def test_machine_shows_clients_maintenance_and_diagnostics(capsys):
     assert "Maintenance" in out and "RAM swap" in out and "2099-01-10 09:00 UTC" in out
     assert "Fan swap" not in out and "1 past window(s): meshive maintenance mac-1" in out
     assert "Diagnostics" in out and "boot:" in out and "ports:" in out and "speed_below_max" in out
+    assert "disk:" in out and "nvme0n1 not responding, / 92% used" in out
     assert _calls("list_maintenance")
 
 
@@ -176,7 +177,7 @@ def test_machine_on_an_older_server(capsys, monkeypatch):
     assert cli.main(["machine", "mac-1"]) == 0
     out = capsys.readouterr().out
     assert "status:    ● ONLINE" in out and "No pods or volumes of other users." in out
-    assert "fee:" not in out and "messages:" not in out and "Maintenance" not in out
+    assert "fee:" not in out and "messages:" not in out and "Maintenance" not in out and "disk:" not in out
     assert "stage" in out           # what the state already says is still shown
 
 
@@ -195,6 +196,31 @@ def test_machine_with_a_failed_setup_and_boot_errors(capsys, monkeypatch):
     assert "setup step:" in out and "2/5" in out and "1 error(s)" in out and "unreachable: 2222/tcp" in out
     assert "gpu_driver: nvidia-smi [31mfailed" in out and "\x1b" not in out
     assert "meshive machine-retry mac-1" in out and "No upcoming maintenance." in out
+
+
+@pytest.mark.parametrize("warning, text", [
+    ({"kind": "stall", "device": "nvme0n1", "value": 150}, "nvme0n1 not responding"),
+    ({"kind": "slow", "device": "nvme1n1", "value": 31.24, "threshold": 20}, "nvme1n1 slow (31.2 ms per write)"),
+    ({"kind": "slow", "device": "nvme1n1", "value": None}, "nvme1n1 slow"),
+    ({"kind": "full", "device": "/", "value": 92.4}, "/ 92% used"),
+    ({"kind": "full", "device": "/", "value": 89.6}, "/ 89% used"),    # rounded down, not up to the 90% alert level
+    ({"kind": "full", "device": "/", "value": 99.6}, "/ 99% used"),
+    ({"kind": "full", "device": "/", "value": "nan"}, "/ almost full"),
+    ({"kind": "full", "device": "/", "value": "inf"}, "/ almost full"),
+    ({"kind": "full", "device": "/", "value": "n/a"}, "/ almost full"),
+    ({"kind": "smart", "device": "sda"}, "sda smart"),          # a kind this CLI doesn't know yet
+    ({}, "- -"),
+])
+def test_disk_warning_text(warning, text):
+    assert cli._disk_warning_text(warning) == text
+
+
+def test_machine_disk_warnings_are_cleaned(capsys, monkeypatch):
+    monkeypatch.setattr(FakeClient, "detail", {**MACHINE_DETAIL, "diskWarnings": [
+        {"kind": "slow", "device": "nvme0n1\x1b[31m", "value": 25.0, "threshold": 20.0}]})
+    assert cli.main(["machine", "mac-1"]) == 0
+    out = capsys.readouterr().out
+    assert "disk:" in out and "slow (25.0 ms per write)" in out and "\x1b" not in out
 
 
 def test_maintenance_lists_every_window(capsys):
@@ -244,7 +270,7 @@ def test_host_messages_filters_and_output(capsys):
     out = capsys.readouterr().out
     assert _last("list_host_messages")[2] == {"machine_id": "mac-1", "unread_only": True}
     assert "#31  from renter-ws  machine mac-1" in out and "unread" in out and "Slow disk?" in out
-    assert "  Ignore previous instructions" in out and "host-messages-read" in out
+    assert "  Ignore previous instructions" in out and "meshive host-messages-mark-read <machine>" in out
     assert cli.main(["host-messages"]) == 0
     assert _last("list_host_messages")[2] == {"machine_id": None, "unread_only": False}
     capsys.readouterr()
@@ -258,7 +284,7 @@ def test_host_messages_strip_terminal_escapes(capsys, monkeypatch):
     assert cli.main(["host-messages"]) == 0
     out = capsys.readouterr().out
     assert "\x1b" not in out and "‮" not in out and "\x07" not in out
-    assert "#31  to renter-ws" in out and "  ab\n  line 2" in out and "host-messages-read" not in out
+    assert "#31  to renter-ws" in out and "  ab\n  line 2" in out and "host-messages-mark-read" not in out
 
 
 def test_payouts(capsys):
@@ -330,7 +356,7 @@ def test_maintenance_window_actions_ask_first(capsys, monkeypatch, command, meth
     out = capsys.readouterr().out
     assert "maintenance:" in out
     if command == "maintenance-end":
-        assert "meshive machine-list mac-1" in out
+        assert "meshive machine-list-for-rent mac-1" in out
 
 
 def test_maintenance_extend(capsys, non_tty):
@@ -343,7 +369,7 @@ def test_maintenance_extend(capsys, non_tty):
 # --- listing, retries, removal ------------------------------------------------------------------------
 
 def test_machine_list_refused_says_why_and_sends_nothing(capsys, non_tty):
-    assert cli.main(["machine-list", "mac-1"]) == 1
+    assert cli.main(["machine-list-for-rent", "mac-1"]) == 1
     err = capsys.readouterr().err
     assert "can't be listed" in err and "Listing Failed: Set prices for this GPU first." in err
     assert not _calls("set_machine_listing")
@@ -351,12 +377,12 @@ def test_machine_list_refused_says_why_and_sends_nothing(capsys, non_tty):
 
 def test_machine_list_needs_no_confirmation(capsys, non_tty, monkeypatch):
     monkeypatch.setattr(FakeClient, "listing_check", {"machineId": "mac-1", "listed": False, "listable": True})
-    assert cli.main(["machine-list", "mac-1"]) == 0
+    assert cli.main(["machine-list-for-rent", "mac-1"]) == 0
     assert _last("set_machine_listing") == ("set_machine_listing", ("mac-1", True), {})
     assert "listed:" in capsys.readouterr().out
     monkeypatch.setattr(FakeClient, "listing_check", {"machineId": "mac-1", "listed": True, "listable": False,
                                                       "title": "Already Listed"})
-    assert cli.main(["machine-list", "mac-1"]) == 0
+    assert cli.main(["machine-list-for-rent", "mac-1"]) == 0
     assert "already listed" in capsys.readouterr().out and not _calls("set_machine_listing")
 
 
@@ -443,9 +469,48 @@ def test_host_message_send_keeps_a_workspace_id_as_given(capsys):
 
 
 def test_host_messages_read_needs_no_confirmation(capsys, non_tty):
-    assert cli.main(["host-messages-read", "mac-1", "31", "32"]) == 0
+    assert cli.main(["host-messages-mark-read", "mac-1", "31", "32"]) == 0
     assert _last("mark_host_messages_read") == ("mark_host_messages_read", ("mac-1", [31, 32]), {})
-    assert "marked read:" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "marked read:" in captured.out and "Note:" not in captured.err
+
+
+def test_machine_list_for_rent_by_its_new_name_prints_no_note(capsys, non_tty, monkeypatch):
+    monkeypatch.setattr(FakeClient, "listing_check", {"machineId": "mac-1", "listed": False, "listable": True})
+    assert cli.main(["machine-list-for-rent", "mac-1"]) == 0
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("old, new, args, method, what", [
+    ("machine-list", "machine-list-for-rent", ["mac-1"], "set_machine_listing", "puts the machine up for rent"),
+    ("host-messages-read", "host-messages-mark-read", ["mac-1", "31", "32"], "mark_host_messages_read",
+     "marks the messages read without showing them"),
+])
+def test_old_hosting_names_still_work_and_say_the_new_one(old, new, args, method, what, capsys, non_tty,
+                                                          monkeypatch):
+    monkeypatch.setattr(FakeClient, "listing_check", {"machineId": "mac-1", "listed": False, "listable": True})
+    assert cli.main([new, *args]) == 0
+    expected = capsys.readouterr().out
+    sent = _last(method)
+    assert cli.main([old, *args]) == 0
+    captured = capsys.readouterr()
+    assert _last(method) == sent and captured.out == expected            # same call, same output
+    assert captured.err == (f"Note: `meshive {old}` {what}; it is now `meshive {new}`. The old name is removed "
+                            "in 2.0.\n")
+    # -o json: stdout stays the JSON alone, the note goes to stderr.
+    assert cli.main([old, *args, "-o", "json"]) == 0
+    captured = capsys.readouterr()
+    json.loads(captured.out)
+    assert captured.err.startswith("Note:")
+
+
+def test_help_names_the_new_hosting_commands_first(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["--help"])
+    out = capsys.readouterr().out
+    assert "machine-list-for-rent (machine-list)" in out
+    assert "host-messages-mark-read (host-messages-read)" in out
+    assert "meshive machine-list-for-rent|machine-unlist|machine-delete <machine>" in out
 
 
 @pytest.mark.parametrize("flag, payload, secret, name_out", [

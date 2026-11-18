@@ -1,6 +1,7 @@
 import argparse
 import getpass
 import json
+import math
 import os
 import sys
 from collections.abc import Callable
@@ -9,6 +10,7 @@ from datetime import datetime, timezone
 import httpx
 
 from . import _format as fmt
+from . import _forward as forward_cli
 from . import _write as write_cli
 from .. import _config, _credentials
 from .._version import __version__
@@ -39,6 +41,7 @@ from ..models import (
     Payout,
     PayoutAccount,
     Pod,
+    PodExit,
     PodMetrics,
     ReadActivity,
     Serving,
@@ -51,6 +54,7 @@ from ..models import (
     WhoAmI,
     Workspace,
     WorkspaceDetail,
+    _as_optional_float,
     _parse_dt,
 )
 
@@ -108,8 +112,11 @@ def build_parser() -> argparse.ArgumentParser:
             "  meshive host-messages          Messages from the workspaces using your machines\n"
             "  meshive earnings               Show your earnings (as a host)\n"
             "  meshive payouts                Show your payout account and payouts (as a host)\n"
+            "  meshive logs <ws> <pod>        A pod's logs (meshive task-logs <task> for a task)\n"
+            "  meshive port-forward <ws> <pod> <port>  (a locked port at http://127.0.0.1:<port>; key in MESHIVE_ACCESS_KEY)\n"
             "\n"
-            "Write commands (need a key with the write scope; they ask for confirmation unless --yes):\n"
+            "Write commands (need a key with the write scope; the ones that spend, open or delete ask first,\n"
+            "  --yes skips that):\n"
             "  meshive workspace-create [name] [--estimate] [--wait]  (free; --wait returns once it is running)\n"
             "  meshive workspace-update <ws> --name NAME [--estimate]  (rename it)\n"
             "  meshive workspace-delete <ws> [--check]  (only an empty workspace; --check changes nothing)\n"
@@ -121,13 +128,15 @@ def build_parser() -> argparse.ArgumentParser:
             "  meshive storage-update <ws> <pv> --size GiB\n"
             "  meshive storage-connect <ws> <pv>  (SSH and SFTP access to a storage)\n"
             "  meshive task-submit <ws> <name> --script FILE --image IMG --cpu-preset micro-2c8g\n"
-            "  meshive logs <ws> <pod>          meshive task-logs <task>\n"
+            "  meshive port-lock|port-unlock <ws> <pod> <port>  (port-keys, port-key-create: its access keys)\n"
             "  meshive maintenance-schedule <machine> --reason R --start ISO --end ISO [--emergency]\n"
-            "  meshive machine-list|machine-unlist|machine-delete <machine>\n"
+            "  meshive machine-list-for-rent|machine-unlist|machine-delete <machine>\n"
             "  meshive host-message-send <machine> --to WORKSPACE|all --title T\n"
+            "  meshive feedback \"one line\" [--kind bug|idea|complaint] [--details TEXT]  (to the Meshive team)\n"
             "\n"
             "Run `meshive <command> --help` for filters and options.\n"
-            "Scripting: `-o name` prints just the IDs, one per line (pipe into xargs).\n"
+            "Scripting: `-o name` prints just the IDs, one per line (pipe into xargs); a few commands print the one\n"
+            "  value a script captures instead, such as a new access key (see -o in `meshive <command> --help`).\n"
             "Auth: `meshive login`, or set MESHIVE_API_KEY / pass --api-key.\n"
             "Docs: https://github.com/meshive/meshive-python"
         ),
@@ -149,7 +158,8 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--base-url", default=None, help="API base URL (overrides MESHIVE_BASE_URL).")
     common.add_argument(
         "-o", "--output", choices=["table", "json", "name"], default=None,
-        help="Output format: table (default), json (raw payload), name (IDs only, one per line).",
+        help="Output format: table (default), json (raw payload), name (the one value a script captures: IDs one "
+             "per line; the balance for `credit`; the key itself for `port-key-create`/`port-key-roll`).",
     )
     # --json is an alias of -o json (an older flag, kept for backward compatibility).
     common.add_argument("--json", action="store_true", dest="as_json", help="Shorthand for -o json.")
@@ -421,9 +431,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- account --------------------------------------------------------------
     write_cli.add_parsers(sub, common)
+    forward_cli.add_parser(sub, common)
 
     sub.add_parser("api-keys", parents=[common], aliases=["keys"],
-                   help="List your API keys (prefixes only; the secret is never shown).")
+                   help="List your account's API keys (prefixes only; the secret is never shown). A port's access "
+                        "keys: `meshive port-keys`.")
     p_activity = sub.add_parser("activity", parents=[common],
                                 help="Show what this account's API keys did, with results (newest first). Request "
                                      "contents are never recorded; activity is kept for 180 days.")
@@ -566,17 +578,18 @@ def _print_workspaces(workspaces: list[Workspace], color: bool) -> None:
         print("No workspaces.")
         return
     # NAME = workspace_name (user label), ID = namespace_name (lookup key).
+    # OWNER is the last column so the columns before it keep the positions they had before 1.9.0, and several owners
+    # are joined without spaces so they never add a field to the row.
     rows = [
-        [ws.workspace_name or "-", ws.namespace_name, ", ".join(ws.owner_emails) or "unknown",
-         ws.member_role or "-", fmt.status_cell(ws.status),
-         str(ws.resources.pod), fmt.money_hourly(ws.price_per_hour)]
+        [ws.workspace_name or "-", ws.namespace_name, ws.member_role or "-", fmt.status_cell(ws.status),
+         str(ws.resources.pod), fmt.money_hourly(ws.price_per_hour), ",".join(ws.owner_emails) or "unknown"]
         for ws in workspaces
     ]
-    colors = [[None, None, None, None, fmt.status_color(ws.status), None, None] for ws in workspaces]
+    colors = [[None, None, None, fmt.status_color(ws.status), None, None, None] for ws in workspaces]
     fmt.render_table(
-        ["NAME", "ID", "OWNER", "ROLE", "STATUS", "PODS", "PRICE/HR"],
+        ["NAME", "ID", "ROLE", "STATUS", "PODS", "PRICE/HR", "OWNER"],
         rows,
-        aligns=["l", "l", "l", "l", "l", "r", "r"],
+        aligns=["l", "l", "l", "l", "r", "r", "l"],
         colors=colors,
         enabled=color,
     )
@@ -644,6 +657,51 @@ def _print_pods(pods: list[Pod], color: bool, show_workspace: bool = False) -> N
     fmt.render_table(headers, rows, aligns=aligns, colors=colors, enabled=color)
 
 
+def _access_label(endpoint) -> str:
+    """ACCESS cell: a lock choice that isn't in effect yet shows as Locking… / Unlocking…."""
+    return {"locking": "Locking…", "unlocking": "Unlocking…"}.get(endpoint.lock_state or "",
+                                                                  endpoint.access.capitalize())
+
+
+_OOM_LABELS = {"ram": "out of RAM", "vram": "out of GPU memory"}
+
+
+def _exit_reason(e: PodExit) -> str:
+    reason = e.reason or "-"
+    return f"{reason} ({_OOM_LABELS[e.oom_kind]})" if e.oom_kind in _OOM_LABELS else reason
+
+
+def _shorten(text: str, width: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= width else text[:width - 1] + "…"
+
+
+def _scratch_disk_cell(disk: dict) -> str:
+    """A pod's scratch disk as '/workspace, 20 GiB, $0.002/hr'."""
+    size = disk.get("size_gib")
+    parts = [str(disk.get("path") or "-")] + ([fmt.gib(size * 1024)] if size is not None else [])
+    return ", ".join(parts + [f"{fmt.money_hourly(disk.get('price_per_hour'))}/hr"])
+
+
+def _print_pod_failure(pod: Pod, color: bool) -> None:
+    """One line under the status while the pod's failure matters (the server decides when), then the line the
+    program printed, indented. A failed creation wins over the last exit."""
+    if pod.creation_failure is not None:
+        headline, output = f"Create failed: {pod.creation_failure.summary}", pod.creation_failure.output
+    elif pod.last_exit is not None:
+        e = pod.last_exit
+        parts = [f"Restarted {pod.restart_count} time{'s' if pod.restart_count != 1 else ''}"] \
+            if pod.restart_count else []
+        parts += [e.summary or _exit_reason(e), fmt.relative_time(e.at)]
+        headline, output = " · ".join(parts), e.message
+    else:
+        return
+    print(fmt.paint(fmt.clean(headline), "red", color))
+    if output:
+        # Printed by the pod's own program: untrusted text.
+        print(fmt.paint(fmt.clean(f"  {_shorten(output, 300)}"), "dim", color))
+
+
 def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
     created = "-"
     if pod.created_at:
@@ -652,11 +710,14 @@ def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
     print(f"id:        {fmt.clean(pod.pod_name)}")           # lookup key
     print(f"workspace: {fmt.clean(pod.workspace_name or pod.namespace_name)}")
     print(f"status:    {fmt.paint(fmt.clean(fmt.status_cell(pod.status)), fmt.status_color(pod.status), color)}")
+    _print_pod_failure(pod, color)
     print(f"rental:    {fmt.clean(pod.rental_type)}")
     print(f"price/hr:  {_pod_price(pod)}")
     print(f"created:   {created}")
     if pod.template_name:
         print(f"template:  {fmt.clean(pod.template_name)}")
+    if pod.scratch_disks:
+        print(fmt.clean("scratch:   " + "; ".join(_scratch_disk_cell(d) for d in pod.scratch_disks)))
     # The lines below are printed only when they apply (only when meaningful, not a list of booleans).
     premiums = [n for n, on in (("cpu", pod.cpu_premium), ("uptime", pod.uptime_premium),
                                 ("internet", pod.internet_premium)) if on]
@@ -673,6 +734,14 @@ def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
     if pod.is_maintenance:
         # The server sets is_maintenance while the host's maintenance window is open, and doesn't bill the pod then.
         print(fmt.paint("⚠ host maintenance: not billed while the window is open", "yellow", color))
+    if pod.recent_exits:
+        print()
+        # Why the main container ended abnormally lately, newest first. DETAIL can come from the pod itself.
+        rows = [[fmt.relative_time(e.at), _exit_reason(e), "-" if e.exit_code is None else str(e.exit_code),
+                 _shorten(e.message or "-", 80)] for e in pod.recent_exits]
+        colors = [[None, "yellow" if e.oom_kind else None, None, "dim"] for e in pod.recent_exits]
+        fmt.render_table(["EXITED", "REASON", "CODE", "DETAIL"], rows, aligns=["l", "l", "r", "l"], colors=colors,
+                         enabled=color)
     if pod.linked_storages:
         print()
         rows = [[s.user_alias or s.pv_name, s.mount_path, fmt.gib(s.capacity), s.storage_type]
@@ -681,11 +750,19 @@ def _print_pod(pod: Pod, color: bool, show_secrets: bool = False) -> None:
                          aligns=["l", "l", "r", "l"], enabled=color)
     if pod.endpoints:
         print()
-        rows = [[e.name or "-", str(e.port), e.external_url or e.internal_url or "-", e.readiness]
-                for e in pod.endpoints]
-        colors = [[None, None, None, "green" if e.readiness == "ready" else "yellow"] for e in pod.endpoints]
-        fmt.render_table(["ENDPOINT", "PORT", "URL", "STATE"], rows, aligns=["l", "r", "l", "l"],
+        # ACCESS: Internal (inside the workspace only), Locked (members' browsers and access keys) or Unlocked
+        # (anyone with the URL). A server that doesn't report locks has none, so its public ports are Unlocked.
+        rows = [[e.name or "-", str(e.port), _access_label(e), e.external_url or e.internal_url or "-",
+                 e.readiness] for e in pod.endpoints]
+        colors = [[None, None, None, None, "green" if e.readiness == "ready" else "yellow"] for e in pod.endpoints]
+        fmt.render_table(["ENDPOINT", "PORT", "ACCESS", "URL", "STATE"], rows, aligns=["l", "r", "l", "l", "l"],
                          colors=colors, enabled=color)
+        # A locked port that lets preflight requests through says so below the table, keeping the table as wide as
+        # before. The setting does nothing while the port is unlocked, so it is shown only for locked ports.
+        preflight = sorted({e.port for e in pod.endpoints if e.allow_preflight is True and e.access == "locked"})
+        if preflight:
+            ports = ", ".join(str(port) for port in preflight)
+            print(fmt.paint(f"Preflight (OPTIONS) requests reach the app without a key on port {ports}.", "dim", color))
     if pod.connect_credentials:
         print()
         hidden = False
@@ -878,6 +955,22 @@ def _print_machine_maintenance(machine_id: str, windows: list[MaintenanceWindow]
         print(fmt.paint(fmt.clean(f"{past} past window(s): meshive maintenance {machine_id}"), "dim", color))
 
 
+def _disk_warning_text(warning: dict) -> str:
+    """One disk warning in a few words: "nvme0n1 not responding", "nvme0n1 slow (31.2 ms per write)", "/ 92% used"."""
+    device, kind = str(warning.get("device") or "-"), str(warning.get("kind") or "-")
+    value = _as_optional_float(warning.get("value"))
+    if kind == "stall":
+        return f"{device} not responding"
+    if kind == "slow":
+        return f"{device} slow ({value:.1f} ms per write)" if value is not None else f"{device} slow"
+    if kind == "full":
+        # Rounded down like the console and the emails, so 89.6% does not read as the 90% alert level.
+        if value is not None and math.isfinite(value):
+            return f"{device} {math.floor(value)}% used"
+        return f"{device} almost full"
+    return f"{device} {kind}"
+
+
 def _print_machine_diagnostics(machine: MachineDetail, color: bool) -> None:
     state = machine.raw.get("state") or {}
     pairs: list[tuple[str, str]] = []
@@ -905,6 +998,8 @@ def _print_machine_diagnostics(machine: MachineDetail, color: bool) -> None:
             pairs.append(("ports", "unreachable: " + ", ".join(unreachable) if unreachable else "failed"))
     if machine.network_warnings:
         pairs.append(("network", ", ".join(str(w.get("code", "-")) for w in machine.network_warnings)))
+    if machine.disk_warnings:
+        pairs.append(("disk", ", ".join(_disk_warning_text(w) for w in machine.disk_warnings)))
     if not pairs:
         return
     print()
@@ -978,7 +1073,7 @@ def _print_host_messages(messages: list[HostMessage], color: bool) -> None:
             print("  " + fmt.clean(line))
     if any(m.direction == "in" and not m.is_read for m in messages):
         print()
-        print(fmt.paint("Mark them read: meshive host-messages-read <machine> ID...", "dim", color))
+        print(fmt.paint("Mark them read: meshive host-messages-mark-read <machine> ID...", "dim", color))
 
 
 def _print_payouts(account: PayoutAccount, payouts: list[Payout], color: bool) -> None:
@@ -2068,6 +2163,7 @@ _HANDLERS: dict[str, Handler] = {
     "credit": _cmd_credit,
     "credit-history": _cmd_credit_history,
     **write_cli.HANDLERS,
+    "port-forward": forward_cli.cmd_forward,
 }
 
 

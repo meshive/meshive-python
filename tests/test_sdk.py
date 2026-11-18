@@ -78,6 +78,32 @@ def async_client(handler, **kwargs):
     return client
 
 
+# What a pod create or estimate reads before it writes: the template (to send a lock value for each port it exposes)
+# and, when a port is to be locked, the server's capabilities (a server that predates locks would drop the value).
+TEMPLATE_WITHOUT_PORTS = {"id": 457, "name": "VSCode", "endpoints": []}
+LOCK_CAPABILITIES = {"schemaVersion": 1, "assets": {}, "pods": {"readinessState": True, "endpointLock": True}}
+
+
+def preflight_answer(request, template=None, capabilities=None):
+    """The answer to one of those two reads, or None for any other request."""
+    if request.method != "GET":
+        return None
+    if request.url.path.startswith("/v1/sdk/templates/"):
+        return httpx.Response(200, json=TEMPLATE_WITHOUT_PORTS if template is None else template)
+    if request.url.path == "/v1/capabilities":
+        return httpx.Response(200, json=LOCK_CAPABILITIES if capabilities is None else capabilities)
+    return None
+
+
+def with_preflight(handler, template=None, capabilities=None):
+    """Wrap a MockTransport handler so the two reads are answered here and it only sees the write."""
+    def wrapped(request):
+        answer = preflight_answer(request, template, capabilities)
+        return handler(request) if answer is None else answer
+
+    return wrapped
+
+
 # --- config -----------------------------------------------------------------
 
 @pytest.fixture(autouse=True)

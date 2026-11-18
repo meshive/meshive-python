@@ -3,8 +3,15 @@ serving-deploy/scale/pause/resume/delete, task-submit/stop, logs, task-logs.
 Also models, hf-tokens, model-detect, model-register, model-delete (model registration for serving), asset-import, civitai-keys.
 Pods: pod-exec runs a command in a running pod (pod-exec-status reads a background one); asset-upload uploads a
 local file or folder as an asset.
-Hosting: maintenance-schedule/update/end/extend/cancel, machine-list/unlist/retry/delete, host-message-send,
-host-messages-read, machine-credentials, host-install.
+Port locks: port-lock / port-unlock switch one public port's lock; port-preflight lets CORS preflight requests to a
+locked port through without a key; port-keys, port-key-create, port-key-roll and port-key-revoke manage the port's
+access keys; pod-browser-sessions-revoke signs out the browser sessions on a pod's locked ports, and
+workspace-browser-sessions-revoke those on every pod of a workspace. port-forward (in _forward.py) reaches a locked
+port through 127.0.0.1.
+Hosting: maintenance-schedule/update/end/extend/cancel, machine-list-for-rent, machine-unlist/retry/delete,
+host-message-send, host-messages-mark-read, machine-credentials, host-install. feedback sends a report to the
+Meshive team (it asks first). The names machine-list and
+host-messages-read still work and print a note on stderr (see _RENAMED); they are removed in 2.0.
 
 Rule: commands that cost money or can't be undone (create/start/deploy/submit/delete, plus serving-scale and
 serving-resume, which can raise cost) first show an estimate or summary and ask for confirmation without `--yes` (exit 2 if not a TTY).
@@ -15,8 +22,14 @@ every member of the workspace sees the new name.
 if that doesn't happen in time. `workspace-delete` checks first: a workspace that isn't empty exits 1 without asking, and
 `--check` stops after the check (exit 0 if it can be deleted, 1 if not).
 Hosting commands that reach other users (maintenance, unlisting, removal, messages) or reveal a secret (machine
-credentials, install commands) ask first; machine-delete asks for the machine ID to be typed. machine-list,
-machine-retry and host-messages-read change only your own machine's state and don't ask, as in the console.
+credentials, install commands) ask first; machine-delete asks for the machine ID to be typed.
+machine-list-for-rent, machine-retry and host-messages-mark-read change only your own machine's state and don't ask,
+as in the console.
+Opening a port asks first: port-unlock, `port-preflight … on`, and pod-create / pod-update (which always ask) say
+which ports would be open, and which would be locked, before the question. port-key-revoke, port-key-roll,
+pod-browser-sessions-revoke and workspace-browser-sessions-revoke ask too, because clients or members using the
+port lose access. port-lock, `port-preflight … off` and port-key-create only add protection and don't ask. A new key's value is printed once.
+port-lock and port-unlock wait until the choice is in effect and exit 1 when it isn't confirmed within 60 seconds.
 """
 from __future__ import annotations
 
@@ -26,16 +39,20 @@ import shlex
 import sys
 import time
 import warnings
+from datetime import timezone
 from pathlib import Path
 from typing import Any, Callable
 
 import httpx
 
 from . import _format as fmt
-from .._client import LONG_RUNNING_READ_TIMEOUT, Meshive
-from ..exceptions import ConflictError, MeshiveAPIError, MeshiveError, PodCreationFailedError, WaitTimeoutError
-from ..models import (ListingResult, Logs, MachineClients, MachineDeleteCheck, MachineDeleted, MaintenanceAction,
-                      MaintenanceEstimate, PodEstimate, PodUpdated, PodUpdateEstimate, ResourceAction,
+from .._client import LONG_RUNNING_READ_TIMEOUT, _NOT_STARTED_EXCEPTIONS, Meshive
+from ..exceptions import (ConflictError, EndpointLockUnavailableError, MeshiveAPIError, MeshiveError,
+                          PodCreationFailedError, PortNotLockedError, WaitTimeoutError)
+from ..models import (AccessKey, AccessKeyCreated, ListingResult, Logs, MachineClients, MachineDeleteCheck,
+                      MachineDeleted, MaintenanceAction,
+                      MaintenanceEstimate, Pod, PodEstimate, PodUpdated, PodUpdateEstimate, PortLock, PreviousRun,
+                      ResourceAction,
                       StorageConnection, StorageEstimate, StorageUpdateEstimate, TaskEstimate, WorkspaceDeleteCheck,
                       WorkspaceEstimate, WorkspaceUpdateEstimate)
 
@@ -189,6 +206,56 @@ def _parse_template_ports(values: list[str] | None) -> list[dict[str, Any]]:
     return out
 
 
+def _apply_port_locks(ports: list[dict[str, Any]], template_ports: list[dict[str, Any]],
+                      lock: list[int] | None, unlock: list[int] | None) -> list[dict[str, Any]]:
+    """--lock-port PORT / --unlock-port PORT → `locked` on that port's entry: a port from --port, a port named by
+    --template-port (by its current or its new number), or otherwise a new template_ports entry for a port the
+    template (or, in pod-update, the pod) already has. Returns the template_ports list."""
+    both = sorted(set(lock or []) & set(unlock or []))
+    if both:
+        raise ValueError(f"--lock-port and --unlock-port both name port {both[0]}")
+    template_ports = list(template_ports)
+    for locked, numbers in ((True, lock), (False, unlock)):
+        for port in numbers or []:
+            entry = (next((e for e in ports if e["port"] == port), None)
+                     or next((e for e in template_ports if port in (e["port"], e.get("new_port"))), None))
+            if entry is None:
+                entry = {"port": port}
+                template_ports.append(entry)
+            entry["locked"] = locked
+    return template_ports
+
+
+def _port_lock_cell(port_locks: dict[int, bool]) -> str:
+    return ", ".join(f"{port} {'locked' if locked else 'unlocked'}" for port, locked in sorted(port_locks.items()))
+
+
+def _warn_open_ports(ports: list[int]) -> None:
+    """Said on stderr before the question, so opening a port to everyone is never confirmed unseen."""
+    if ports:
+        listed = ", ".join(str(port) for port in sorted(ports))
+        print(f"Port {listed} will be open to anyone with the URL (not locked).", file=sys.stderr)
+
+
+def _say_port_locks(port_locks: dict[int, bool]) -> None:
+    """Before the question of a pod-update: which ports the change locks (a new public port is locked unless
+    --no-lock or --unlock-port says otherwise), and which it leaves or makes open to everyone."""
+    locked = sorted(port for port, value in port_locks.items() if value)
+    if locked:
+        print(f"Port {', '.join(str(port) for port in locked)} will be locked: only workspace members signed in to "
+              "the console and programs with an access key (`meshive port-key-create`) get through.", file=sys.stderr)
+    _warn_open_ports([port for port, value in port_locks.items() if not value])
+
+
+def _lock_unavailable(err: EndpointLockUnavailableError, done: str, way_out: str) -> int:
+    """The server can't lock ports: nothing was done. Say so in the CLI's own flags (the SDK's message names Python
+    arguments). The command never falls back to open ports by itself."""
+    why = ("port locking is turned off on this Meshive server right now" if err.reason == "disabled"
+           else "this Meshive server doesn't support locking ports yet")
+    print(fmt.clean(f"Error: {why}, so nothing was {done}. {way_out} Otherwise try again later."), file=sys.stderr)
+    return 1
+
+
 def _usage_warning(value: str | bool | None) -> dict[str, Any]:
     """storage-create --usage-warning [PERCENT] → create_storage arguments. The bare flag (True) turns the warning on
     at the server's default threshold (90%); PERCENT (1-100, as the console shows it) becomes the 0-1 threshold."""
@@ -236,7 +303,19 @@ def _print_pod_estimate(est: PodEstimate, color: bool) -> None:
         print(fmt.clean("volumes:   " + ", ".join(_volume_cell(v) for v in est.volumes if isinstance(v, dict))))
     if est.model_set:
         print(fmt.clean(f"model set: {_model_set_cell(est.model_set)}"))
+    if est.port_locks:
+        print(fmt.clean(f"ports:     {_port_lock_cell(est.port_locks)}"))
     print(fmt.paint(est.note, "dim", color))
+    if any(est.port_locks.values()):
+        print(fmt.paint("Locked ports let in only workspace members signed in to the console and programs with an "
+                        "access key (`meshive port-key-create`).", "dim", color))
+    _print_warnings(est, color)
+
+
+def _print_warnings(est: PodEstimate | PodUpdateEstimate, color: bool, file: Any = None) -> None:
+    """The estimate's warnings that apply to this request, one line each."""
+    for warning in getattr(est, "warnings", None) or []:
+        print(fmt.paint(fmt.clean(f"warning: {warning.get('message', '')}"), "yellow", color), file=file)
 
 
 def _model_set_cell(model_set: dict[str, Any]) -> str:
@@ -268,6 +347,8 @@ def _volume_cell(volume: dict[str, Any]) -> str:
     if volume.get("new"):
         extra = ", encrypted" if volume.get("encrypted") else ""
         return f"{volume.get('name')} (new local, {volume.get('size_gb')} GiB{extra})→{volume.get('mount_path')}"
+    if not volume.get("storage"):      # an edit's new local volume has no storage id yet
+        return f"{volume.get('name') or '-'} (new local)→{volume.get('mount_path')}"
     return f"{volume.get('storage')}→{volume.get('mount_path')}"
 
 
@@ -281,7 +362,27 @@ def _print_action(action: ResourceAction, color: bool) -> None:
         print(fmt.paint("The pod waits until a node has room for it, then starts.", "dim", color))
 
 
+def _previous_run_header(run: PreviousRun) -> str:
+    """'--- previous run (ended 02:01:35Z, exit 1: The GPU ran out of memory.) ---'"""
+    ended = []
+    if run.ended_at is not None:
+        at = run.ended_at if run.ended_at.tzinfo else run.ended_at.replace(tzinfo=timezone.utc)
+        ended.append(f"ended {at.astimezone(timezone.utc).strftime('%H:%M:%SZ')}")
+    if run.exit_code is not None:
+        ended.append(f"exit {run.exit_code}")
+    head = ", ".join(ended)
+    inside = f"{head}: {run.summary}" if head and run.summary else head or run.summary
+    return f"--- previous run ({inside}) ---" if inside else "--- previous run ---"
+
+
 def _print_logs(logs: Logs, color: bool) -> None:
+    if logs.previous is not None:
+        # The main container's last run that ended, before the current run's lines. Its lines are the program's own.
+        print(fmt.paint(fmt.clean(_previous_run_header(logs.previous)), "dim", color))
+        for item in logs.previous.lines:
+            print(fmt.clean(item.line))
+        if logs.lines:
+            print(fmt.paint("--- current run ---", "dim", color))
     if not logs.lines:
         print(fmt.paint(logs.note or "No logs.", "dim", color))
         return
@@ -408,12 +509,18 @@ def cmd_workspace_delete(client: Meshive, args: argparse.Namespace, output: str,
 
 def _pod_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     # --region is accepted but not passed on: the server ignores it (cmd_pod_create prints the deprecation note).
+    ports = _parse_ports(args.port)
+    template_ports = _apply_port_locks(ports, _parse_template_ports(args.template_port), args.lock_port,
+                                       args.unlock_port)
+    # Ports are created locked unless --no-lock is given; the argument is passed only then (the SDK's default locks).
+    lock = {"lock_public_ports": False} if args.no_lock else {}
     return dict(
+        **lock,
         gpu_model=args.gpu, gpu_count=args.gpu_count, gpu_vram_gb=args.vram,
         rental_type="spot" if args.spot else "demand", vcpu=args.vcpu, ram_gb=args.ram, cpu_line=args.cpu_line,
         volumes=_parse_volumes(args.volume), local_volumes=_parse_local_volumes(args.local_volume) or None,
         env=_parse_env(args.env), secret_keys=args.secret or [],
-        ports=_parse_ports(args.port), template_ports=_parse_template_ports(args.template_port) or None,
+        ports=ports, template_ports=template_ports or None,
         command=args.overwrite_command, internet_premium=args.internet_premium,
         uptime_premium=args.uptime_premium, cpu_premium=args.cpu_premium,
         max_price_per_hour=args.max_price,
@@ -495,7 +602,7 @@ def cmd_pod_watch(client: Meshive, args: argparse.Namespace, output: str, color:
         else:
             fmt.render_table(
                 ["FOLDER", "FROM", "STATE", "FILES"],
-                [[f.path, f.origin, "blocked (network storage)" if f.blocked_reason else ("on" if f.enabled else "off"),
+                [[f.path, f.origin, _blocked_label(f.blocked_reason) if f.blocked_reason else ("on" if f.enabled else "off"),
                   ", ".join(f.include_override if f.include_override is not None else f.include) or "all"]
                  for f in current.folders], enabled=color)
         if current.restart_hint:
@@ -505,6 +612,11 @@ def cmd_pod_watch(client: Meshive, args: argparse.Namespace, output: str, color:
 
     _emit(output, current.raw, [f.path for f in current.folders or []], show)
     return 0
+
+
+def _blocked_label(reason: str) -> str:
+    """A watched folder that is never watched, by the server's reason."""
+    return "blocked (your volume)" if reason == "nested_volume" else "blocked (network storage)"
 
 
 def _toggle(template: dict[str, Any], user: list[dict[str, Any]], path: str, enabled: bool) -> None:
@@ -560,6 +672,9 @@ def _explain_model_set_error(err: MeshiveAPIError, args: argparse.Namespace) -> 
 def cmd_pod_create(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
     try:
         return _pod_create(client, args, output, color)
+    except EndpointLockUnavailableError as err:
+        return _lock_unavailable(err, "created", "Re-run with --no-lock to create the pod with its public ports open "
+                                                 "to anyone with the URL (or --unlock-port PORT for one port).")
     except MeshiveAPIError as err:
         if not _explain_model_set_error(err, args):
             raise
@@ -575,6 +690,9 @@ def _pod_create(client: Meshive, args: argparse.Namespace, output: str, color: b
         return 0
     if output == "table":      # show the estimate before asking — not mixed into json/name output
         _print_pod_estimate(estimate, color)
+    else:
+        _print_warnings(estimate, color, sys.stderr)
+    _warn_open_ports([port for port, locked in estimate.port_locks.items() if not locked])
     if not _confirm(args, f"Create pod '{args.name}' at {fmt.money_hourly(estimate.price_per_hour)}/hr?"):
         return 2
     fetches_set = bool(args.model_set or args.hf_token is not None)
@@ -592,22 +710,36 @@ def _pod_create(client: Meshive, args: argparse.Namespace, output: str, color: b
                         f"may still be created: check `meshive pods {args.workspace}` and "
                         f"`meshive transactions {args.workspace}` before trying again."), file=sys.stderr)
         return 1
-    pod_name, timed_out, failed = None, None, None
+    pod_name, timed_out, failed, not_locked = None, None, None, None
     if args.wait:
         try:
             # With the transaction id a failed creation ends the wait at once, with the server's reason. An id that
             # isn't a number can't be looked up, so the wait then watches the pod only (rather than failing after the create).
             txn = created.transaction_id if str(created.transaction_id).isdigit() else None
+            # port_locks: the new pod's ports are checked against the locks that were asked for.
             pod_name = client.wait_for_new_pod(args.name, args.workspace, until=args.wait, timeout=args.wait_timeout,
-                                               transaction_id=txn).pod_name
+                                               transaction_id=txn, port_locks=created.port_locks,
+                                               pod_name=created.pod_name).pod_name
         except WaitTimeoutError as exc:
             timed_out = exc
         except PodCreationFailedError as exc:
             failed = exc
-    _emit(output, created.raw, [pod_name or str(created.transaction_id)], lambda: _kv([
-        ("accepted", fmt.yes_no(created.accepted)), ("name", created.name),
-        ("pod", pod_name or ("(not created)" if failed else "(assigned shortly — see `meshive pods`)")),
-        ("transaction", str(created.transaction_id))]))
+        except PortNotLockedError as exc:
+            pod_name, not_locked = exc.pod_name, exc
+    pairs = [("accepted", fmt.yes_no(created.accepted)), ("name", created.name),
+             ("pod", pod_name or ("(not created)" if failed
+                                  else created.pod_name or "(assigned shortly — see `meshive pods`)")),
+             ("transaction", str(created.transaction_id))]
+    if created.port_locks:
+        pairs.append(("ports", _port_lock_cell(created.port_locks)))
+    _emit(output, created.raw, [pod_name or str(created.transaction_id)], lambda: _kv(pairs))
+    if not_locked:
+        # The pod is up, but a port that should be locked is open: automation must not read this as success.
+        ports = ", ".join(str(port) for port in not_locked.ports)
+        print(fmt.clean(f"Error: port {ports} of pod {pod_name} is exposed without the lock that was asked for: "
+                        f"anyone with the URL gets through. Lock it with `meshive port-lock {args.workspace} "
+                        f"{pod_name} PORT`, or delete the pod."), file=sys.stderr)
+        return 1
     if failed:
         print(fmt.clean(f"Error: {str(failed).rstrip('.')}. "
                         f"See `meshive transaction {args.workspace} {created.transaction_id}`."),
@@ -621,10 +753,57 @@ def _pod_create(client: Meshive, args: argparse.Namespace, output: str, color: b
     return 0
 
 
-# Placements that may start the pod on another node, which deletes its unpreserved workspace files.
+# Placements that may start the pod on another node, which deletes its scratch disk.
 _MOVING_PLACEMENTS = ("any_node", "wait_any_node")
-_MOVE_WARNING = ("Moving this pod to another node permanently deletes unpreserved workspace files. "
-                 "Attached local hostPath storage stays on the old node.")
+_LOCAL_STAYS = "Attached local hostPath storage stays on the old node."
+
+
+def _move_warning(paths: Any, local_stays: bool) -> str:
+    """What a move to another node deletes: the scratch disk at `paths` (a pod's scratch_disks, or the 409's
+    scratchDiskPaths), or the scratch disk without a path when the server doesn't say where. `local_stays` adds the
+    local-storage sentence, only for a pod that has local storage."""
+    names = [str(p.get("path") if isinstance(p, dict) else p) for p in paths or []]
+    where = f" at {', '.join(names)}" if names else ""
+    stays = f" {_LOCAL_STAYS}" if local_stays else ""
+    return fmt.clean(f"Moving this pod deletes its scratch disk{where} and its files.{stays}")
+
+
+def _has_local_storage(pod: Pod) -> bool:
+    return any(s.storage_type == "hostPath" for s in pod.linked_storages or [])
+
+
+def _reads_local_storage(client: Meshive | None, args: argparse.Namespace | None) -> bool:
+    """Whether the pod has attached local storage, for a 409 that names only its scratch disk. False when the pod
+    can't be read."""
+    if client is None or args is None:
+        return False
+    try:
+        return _has_local_storage(client.get_pod(args.pod_name, args.workspace))
+    except MeshiveAPIError:
+        return False
+
+
+def _migration_notes(client: Meshive | None, args: argparse.Namespace | None) -> list[str]:
+    """What a move would cost this pod, for a 'Node Migration Required' refusal (whose 409 says nothing about it):
+    the scratch disk only when the pod has one, the local-storage sentence only when it has local storage.
+    Nothing when the pod can't be read."""
+    if client is None or args is None:
+        return []
+    try:
+        pod = client.get_pod(args.pod_name, args.workspace)
+    except MeshiveAPIError:
+        return []
+    local = _has_local_storage(pod)
+    if pod.scratch_disks:
+        return [_move_warning(pod.scratch_disks, local)]
+    if pod.scratch_disks is None and pod.has_unpreserved_workspace:     # older server: the flag, no paths
+        return [_move_warning(None, local)]
+    return [_LOCAL_STAYS] if local else []
+
+
+def _consent_paths(err: MeshiveAPIError) -> list[str]:
+    paths = _error_detail(err).get("scratchDiskPaths")
+    return [str(p) for p in paths] if isinstance(paths, list) else []
 _CONSENT_REQUIRED = "Data Loss Consent Required"    # the server's 409 title for a move without consent
 
 
@@ -638,12 +817,12 @@ def _start_placement(args: argparse.Namespace) -> str | None:
     return placement or ("any_node" if args.any_node else "")
 
 
-def _start_refused_for_consent(err: ConflictError, given: str) -> int:
-    """The server refused a start that may move the pod because it has unpreserved workspace files. Without
+def _start_refused_for_consent(err: ConflictError, given: str, client: Meshive, args: argparse.Namespace) -> int:
+    """The server refused a start that may move the pod because it has a scratch disk. Without
     --placement the CLI couldn't know in advance, so name the placement the server chose and how to consent to it."""
     detail = err.raw.get("detail") if isinstance(err.raw, dict) else None
     chosen = str((detail.get("placement") if isinstance(detail, dict) else None) or given or "PLACEMENT")
-    print(_MOVE_WARNING, file=sys.stderr)
+    print(_move_warning(_consent_paths(err), _reads_local_storage(client, args)), file=sys.stderr)
     if given:
         print("Error: separate data-loss consent is required: --allow-data-loss (in addition to --yes).", file=sys.stderr)
     else:
@@ -668,14 +847,14 @@ def _pod_action(method: str, needs_confirm: bool, question: str):
             if placement.lower() in _MOVING_PLACEMENTS:
                 current = client.get_pod(args.pod_name, args.workspace)
                 if current.has_unpreserved_workspace is not False:
-                    print(_MOVE_WARNING, file=sys.stderr)
+                    print(_move_warning(current.scratch_disks, _has_local_storage(current)), file=sys.stderr)
                     if not extra["allow_data_loss"]:
                         if not sys.stdin.isatty():
                             print("Error: separate data-loss consent is required: --allow-data-loss (in addition to --yes).",
                                   file=sys.stderr)
                             return 2
                         if not _confirm(argparse.Namespace(yes=False),
-                                        f"Permanently lose unpreserved files for {args.workspace}/{args.pod_name} if it moves?"):
+                                        f"Permanently lose the scratch disk of {args.workspace}/{args.pod_name} if it moves?"):
                             return 2
                         extra["allow_data_loss"] = True
         if method == "delete_pod":
@@ -685,7 +864,7 @@ def _pod_action(method: str, needs_confirm: bool, question: str):
         except ConflictError as err:
             if method != "start_pod" or err.title != _CONSENT_REQUIRED:
                 raise
-            return _start_refused_for_consent(err, placement)
+            return _start_refused_for_consent(err, placement, client, args)
         _emit(output, action.raw, [action.id], lambda: _print_action(action, color))
         return 0
     return handler
@@ -837,16 +1016,22 @@ def cmd_storage_connect(client: Meshive, args: argparse.Namespace, output: str, 
 
 # Pod edit arguments that only qualify a change (consents and the price cap) — on their own they change nothing.
 _POD_UPDATE_QUALIFIERS = frozenset({"allow_node_migration", "allow_data_loss", "drop_watched_folders",
-                                    "max_price_per_hour"})
+                                    "max_price_per_hour", "lock_public_ports"})
 
 
 def _pod_update_kwargs(args: argparse.Namespace) -> dict[str, Any]:
-    """update_pod arguments for the flags given — nothing else is sent, so the rest of the pod stays as it is."""
+    """update_pod arguments for the flags given — nothing else is sent, so the rest of the pod stays as it is.
+    A port the change newly makes public is locked unless --no-lock is given (passed only then: the SDK's default
+    locks); a port that is public already changes its lock only when --lock-port or --unlock-port names it."""
+    ports = _parse_ports(args.port)
+    template_ports = _apply_port_locks(ports, _parse_template_ports(args.template_port), args.lock_port,
+                                       args.unlock_port)
     kwargs = dict(
         name=args.name, template_id=args.template, rental_type=args.rental, gpu_model=args.gpu,
         gpu_count=args.gpu_count, gpu_vram_gb=args.vram, vcpu=args.vcpu, ram_gb=args.ram, cpu_line=args.cpu_line,
         env=_parse_env(args.env) or None, secret_keys=args.secret or None, remove_env=args.remove_env or None,
-        ports=_parse_ports(args.port) or None, template_ports=_parse_template_ports(args.template_port) or None,
+        ports=ports or None, template_ports=template_ports or None,
+        lock_public_ports=False if args.no_lock else None,
         remove_ports=args.remove_port or None, command=args.overwrite_command,
         volumes=_parse_volumes(args.volume) or None, local_volumes=_parse_local_volumes(args.local_volume) or None,
         detach_storages=args.detach or None, max_price_per_hour=args.max_price,
@@ -871,11 +1056,15 @@ def _print_pod_update_estimate(est: PodUpdateEstimate, color: bool) -> None:
         print(fmt.clean(f"  - {change}"))
     if est.volumes:
         print(fmt.clean("volumes:   " + ", ".join(_volume_cell(v) for v in est.volumes if isinstance(v, dict))))
+    if est.port_locks:
+        print(fmt.clean(f"ports:     {_port_lock_cell(est.port_locks)}"))
     if est.note:
         print(fmt.paint(est.note, "dim", color))
+    _print_warnings(est, color)
 
 
-def _pod_update_refused(err: MeshiveAPIError) -> int | None:
+def _pod_update_refused(err: MeshiveAPIError, client: Meshive | None = None,
+                        args: argparse.Namespace | None = None) -> int | None:
     """A change the server holds back until it gets consent: say what to rerun with (exit 2, like pod-start's
     consent paths). None for any other error."""
     detail = _error_detail(err)
@@ -888,12 +1077,13 @@ def _pod_update_refused(err: MeshiveAPIError) -> int | None:
         return 2
     if err.title == "Node Migration Required":
         print(fmt.clean(f"Error: {err}"), file=sys.stderr)
-        print(_MOVE_WARNING, file=sys.stderr)
+        for note in _migration_notes(client, args):
+            print(note, file=sys.stderr)
         print("To let the pod move to another machine, re-run with --allow-node-migration (in addition to --yes); "
-              "add --allow-data-loss to also consent to losing its unpreserved workspace files.", file=sys.stderr)
+              "if it then asks, add --allow-data-loss.", file=sys.stderr)
         return 2
     if err.title == _CONSENT_REQUIRED:
-        print(_MOVE_WARNING, file=sys.stderr)
+        print(_move_warning(_consent_paths(err), _reads_local_storage(client, args)), file=sys.stderr)
         print("Error: separate data-loss consent is required: re-run with --allow-data-loss "
               "(in addition to --allow-node-migration and --yes).", file=sys.stderr)
         return 2
@@ -917,13 +1107,19 @@ def cmd_pod_update(client: Meshive, args: argparse.Namespace, output: str, color
             return 0
         if output == "table":
             _print_pod_update_estimate(estimate, color)
+        else:
+            _print_warnings(estimate, color, sys.stderr)
         price = f"{fmt.money_hourly(estimate.price_per_hour)}/hr"
         restart = " It restarts to apply the change." if estimate.restarts else ""
+        _say_port_locks(estimate.port_locks)
         if not _confirm(args, f"Update pod {args.pod_name} (then {price})?{restart}"):
             return 2
         updated = client.update_pod(args.pod_name, args.workspace, **kwargs)
+    except EndpointLockUnavailableError as err:
+        return _lock_unavailable(err, "changed", "Re-run with --no-lock to make the change with the ports it opens "
+                                                 "open to anyone with the URL (or --unlock-port PORT for one port).")
     except MeshiveAPIError as err:
-        code = _pod_update_refused(err)
+        code = _pod_update_refused(err, client, args)
         if code is None:
             raise
         return code
@@ -939,6 +1135,285 @@ def _print_pod_updated(updated: PodUpdated, args: argparse.Namespace, color: boo
         print(fmt.paint("Renamed in place; the pod did not restart.", "dim", color))
     elif transaction is not None:
         print(fmt.paint(f"Follow it with `meshive transaction {args.workspace} {transaction}`.", "dim", color))
+
+
+# =============================================================================
+# Port locks and access keys
+# =============================================================================
+
+_KEY_USE = ("Send it as `Authorization: Bearer <key>`, or as `X-Meshive-Key: <key>` when the app uses Authorization "
+            "itself.")
+_OVERLAPS = {"now": 0, "1h": 3600, "24h": 86400, "7d": 604800}
+_OVERLAP_WORDS = {0: "at once", 3600: "in 1 hour", 86400: "in 24 hours", 604800: "in 7 days"}
+
+
+_LOCK_WAIT_SECONDS = 60.0
+_STATE_LABELS = {"locked": "Locked", "unlocked": "Unlocked", "locking": "Locking…", "unlocking": "Unlocking…"}
+
+
+def _lock_access(state: str | None, locked: bool, args: argparse.Namespace) -> str:
+    """The `access` line of port-lock / port-unlock. A choice that isn't in effect yet says so, and what to do."""
+    if state in ("locking", "unlocking"):
+        meaning = "the port may still be open" if state == "locking" else "requests may still be refused"
+        return (f"{_STATE_LABELS[state]} (not confirmed yet; {meaning} — check again with "
+                f"`meshive pod {args.workspace} {args.pod_name}`)")
+    return _STATE_LABELS.get(state) or ("Locked" if locked else "Unlocked")
+
+
+def _print_port_lock(result: PortLock, args: argparse.Namespace, color: bool, state: str | None = None) -> None:
+    state = state or result.state
+    _kv([("pod", args.pod_name), ("port", str(result.port or args.port)),
+         ("access", _lock_access(state, result.locked, args))])
+    pending = state in ("locking", "unlocking")
+    if result.locked:
+        print(fmt.paint("Only workspace members signed in to the console and programs with an access key get "
+                        f"through{' once it takes effect' if pending else ''}. Create a key with `meshive "
+                        f"port-key-create {args.workspace} {args.pod_name} {args.port} --name NAME`.", "dim", color))
+    elif pending:
+        print(fmt.paint("Anyone with the URL gets through once it takes effect. The port's access keys are kept and "
+                        "work again when it is locked again.", "dim", color))
+    else:
+        print(fmt.paint("Anyone with the URL gets through now. The port's access keys are kept and work again when "
+                        "it is locked again.", "dim", color))
+
+
+def _set_port_lock(client: Meshive, args: argparse.Namespace, locked: bool, output: str, color: bool) -> int:
+    """Exit code 0 once the choice is in effect (or with --no-wait, or on a server that applies it at once); 1 when
+    the wait ran out, or the check failed, before it was confirmed."""
+    result = client.set_port_lock(args.pod_name, args.workspace, args.port, locked)
+    state = result.state
+    confirmed = True
+    # A server that reports no state has its choice in effect at once. Otherwise wait until it is confirmed, so a
+    # script that runs next can rely on the lock.
+    if state in ("locking", "unlocking") and not args.no_wait:
+        print(f"Waiting for the port to {'lock' if locked else 'open'} (up to {int(_LOCK_WAIT_SECONDS)} seconds)…",
+              file=sys.stderr)
+        try:
+            state = client.wait_for_port_lock(args.pod_name, args.workspace, args.port,
+                                              timeout=_LOCK_WAIT_SECONDS).lock_state or state
+        except WaitTimeoutError as exc:
+            confirmed = False
+            last = getattr(exc.last, "lock_state", None)
+            state = last if last in ("locking", "unlocking") else state
+        except (MeshiveAPIError, httpx.RequestError) as exc:
+            confirmed = False
+            print(fmt.clean(f"Could not check whether it took effect: {exc}"), file=sys.stderr)
+    raw = dict(result.raw)
+    if state:
+        raw["state"] = state
+    _emit(output, raw, [str(result.port or args.port)], lambda: _print_port_lock(result, args, color, state))
+    return 0 if confirmed else 1
+
+
+def cmd_port_lock(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    # Locking only adds protection, so it doesn't ask. Programs calling the port without a key get 401 from now on.
+    return _set_port_lock(client, args, True, output, color)
+
+
+def cmd_port_unlock(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    print(fmt.clean(f"Unlocking opens port {args.port} of pod {args.pod_name} to anyone with its URL."),
+          file=sys.stderr)
+    if not _confirm(args, f"Unlock port {args.port} of pod {args.pod_name}?"):
+        return 2
+    return _set_port_lock(client, args, False, output, color)
+
+
+def cmd_port_preflight(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    allow = args.setting == "on"
+    if allow:
+        # Turning it on opens a way past the lock (for OPTIONS only), so it asks; turning it off only closes it.
+        print(fmt.clean(f"Preflight (OPTIONS) requests to port {args.port} of pod {args.pod_name} will reach the app "
+                        "without a key; other requests still need one, and the app's CORS settings decide which "
+                        "sites may call it. A key in a web page is visible to its visitors: give that page its own "
+                        "key, and roll it if it leaks."), file=sys.stderr)
+        if not _confirm(args, f"Allow preflight requests on port {args.port} of pod {args.pod_name}?"):
+            return 2
+    result = client.set_port_preflight(args.pod_name, args.workspace, args.port, allow)
+    port = str(result.port or args.port)
+
+    def show() -> None:
+        _kv([("pod", args.pod_name), ("port", port),
+             ("preflight", "allowed without a key" if result.allow_preflight else "needs a key, like other requests")])
+        print(fmt.paint("This takes effect within a few seconds. It applies while the port is locked.", "dim", color))
+
+    _emit(output, result.raw, [port], show)
+    return 0
+
+
+def cmd_pod_browser_sessions_revoke(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    print(fmt.clean(f"Workspace members who opened a locked port of pod {args.pod_name} in a browser will have to "
+                    "enter again through the console. Access keys keep working, and connections that are already "
+                    "open stay open. This can't be undone."), file=sys.stderr)
+    if not _confirm(args, f"Sign out all browser sessions of pod {args.pod_name}?"):
+        return 2
+    result = client.revoke_browser_sessions(args.pod_name, args.workspace)
+
+    def show() -> None:
+        _kv([("pod", result.pod_name or args.pod_name), ("public ports", str(result.endpoint_count)),
+             ("signed out", fmt.utc_time(result.revoked_at) if result.revoked_at else "-")])
+        print(fmt.paint("Browser sessions signed out. This takes a few seconds to apply.", "dim", color))
+
+    _emit(output, result.raw, [result.pod_name or args.pod_name], show)
+    return 0
+
+
+def cmd_workspace_browser_sessions_revoke(client: Meshive, args: argparse.Namespace, output: str,
+                                          color: bool) -> int:
+    print(fmt.clean(f"Workspace members who opened a locked port of any pod in workspace {args.workspace} in a "
+                    "browser will have to enter again through the console. Access keys keep working, and "
+                    "connections that are already open stay open. This can't be undone."), file=sys.stderr)
+    if not _confirm(args, f"Sign out all browser sessions in workspace {args.workspace}?"):
+        return 2
+    result = client.revoke_workspace_browser_sessions(args.workspace)
+
+    def show() -> None:
+        _kv([("workspace", args.workspace), ("public ports", str(result.endpoint_count)),
+             ("signed out", fmt.utc_time(result.revoked_at) if result.revoked_at else "-")])
+        print(fmt.paint("Browser sessions signed out. This takes a few seconds to apply.", "dim", color))
+
+    _emit(output, result.raw, [args.workspace], show)
+    return 0
+
+
+def _key_expiry(key: AccessKey) -> str:
+    if key.expires_at is None:
+        return "never"
+    if key.expired:
+        return f"expired {fmt.relative_time(key.expires_at)} ({fmt.utc_time(key.expires_at)})"
+    return f"{fmt.relative_time(key.expires_at)} ({fmt.utc_time(key.expires_at)})"
+
+
+def cmd_port_keys(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    """Lists the port's keys: names and first characters only. A key's value is never listed."""
+    keys = client.list_access_keys(args.pod_name, args.workspace, args.port)
+
+    def show() -> None:
+        if not keys:
+            print(f"No access keys for port {args.port}. Create one with `meshive port-key-create "
+                  f"{args.workspace} {args.pod_name} {args.port} --name NAME`.")
+            return
+        # LAST USED appears only when the server reports it (an older server has no such field on any key).
+        last_used = any("lastUsedAt" in k.raw for k in keys)
+        headers = ["ID", "NAME", "KEY", "EXPIRES", *(["LAST USED"] if last_used else []), "ISSUED BY",
+                   "OLD VALUE WORKS UNTIL"]
+        rows = [[str(k.id), k.name or "-", f"{k.prefix}…" if k.prefix else "-", _key_expiry(k),
+                 *([fmt.relative_time(k.last_used_at) if k.last_used_at else "never"] if last_used else []),
+                 k.created_by or "-",
+                 fmt.utc_time(k.previous_value_valid_until) if k.previous_value_valid_until else "-"] for k in keys]
+        fmt.render_table(headers, rows, aligns=["r"] + ["l"] * (len(headers) - 1), enabled=color)
+
+    _emit(output, [k.raw for k in keys], [str(k.id) for k in keys], show)
+    return 0
+
+
+def _emit_new_key(output: str, key: AccessKeyCreated, color: bool) -> None:
+    """Prints a new key's value, once. json carries it as accessKey, as the server's answer does; name prints only
+    the value, for `KEY=$(meshive port-key-create … -o name)`."""
+    def show() -> None:
+        pairs = [("key", key.access_key), ("id", str(key.id)), ("name", key.name or "-"),
+                 ("port", "-" if key.port is None else str(key.port)), ("expires", _key_expiry(key))]
+        if key.previous_value_valid_until:
+            pairs.append(("old value", f"works until {fmt.utc_time(key.previous_value_valid_until)}"))
+        _kv(pairs)
+        print(fmt.paint(f"This value is shown only now and can't be read again: store it somewhere safe. {_KEY_USE}",
+                        "dim", color))
+
+    _emit(output, {**key.raw, "accessKey": key.access_key}, [key.access_key], show)
+
+
+def _key_outcome_unknown(args: argparse.Namespace, what: str, exc: httpx.RequestError) -> int:
+    """No answer to a request that issues a key value (a timeout, or the connection broke). It isn't sent again: a
+    second request would issue a second value. The first may have gone through, and its value can't be read any
+    more. A request that never reached the server is not this case, and is reported as any connection error."""
+    if isinstance(exc, _NOT_STARTED_EXCEPTIONS):
+        raise exc
+    print(fmt.clean(f"Error: no answer from the server, so it isn't known whether the key was {what}. It was not "
+                    f"sent again. Check `meshive port-keys {args.workspace} {args.pod_name} {args.port}`; a key whose "
+                    "value you don't have can be revoked with `meshive port-key-revoke`."), file=sys.stderr)
+    return 1
+
+
+def _expiry_days(value: str) -> int:
+    """--expires DAYS|never → expires_in_days (0 = never). Which lifetimes exist is the server's rule."""
+    text = value.strip().lower()
+    if text == "never":
+        return 0
+    if not text.isdigit() or int(text) == 0:
+        raise ValueError(f"--expires expects a number of days (30, 90 or 365) or 'never', got {value!r}")
+    return int(text)
+
+
+def _overlap_seconds(value: str) -> int:
+    """--overlap now|1h|24h|7d (or a number of seconds) → overlap_seconds."""
+    text = value.strip().lower()
+    if text in _OVERLAPS:
+        return _OVERLAPS[text]
+    if not text.isdigit():
+        raise ValueError(f"--overlap expects now, 1h, 24h or 7d, got {value!r}")
+    return int(text)
+
+
+def cmd_port_key_create(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    days = _expiry_days(args.expires)
+    try:
+        key = client.create_access_key(args.pod_name, args.workspace, args.port, args.name, expires_in_days=days)
+    except httpx.RequestError as exc:
+        return _key_outcome_unknown(args, "created", exc)
+    _emit_new_key(output, key, color)
+    return 0
+
+
+def _key_to_roll(client: Meshive, args: argparse.Namespace) -> str | None:
+    """How the key being rolled stands, read from the port's key list: "active", "expired", "missing" (not on the
+    list: revoked, or expired more than 30 days ago), or None when the list can't be read (the roll itself then
+    reports a missing key)."""
+    try:
+        keys = client.list_access_keys(args.pod_name, args.workspace, args.port)
+    except (MeshiveAPIError, httpx.RequestError):
+        return None
+    key = next((k for k in keys if k.id == args.key_id), None)
+    if key is None:
+        return "missing"
+    return "expired" if key.expired else "active"
+
+
+def cmd_port_key_roll(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    overlap = _overlap_seconds(args.overlap)
+    state = _key_to_roll(client, args)
+    if state == "missing":
+        # Said before anything else, so no line about the roll reads as if it is about to happen.
+        print(fmt.clean(f"Error: port {args.port} of pod {args.pod_name} has no access key {args.key_id}. A revoked "
+                        "key, or one that expired more than 30 days ago, can't be rolled: create a new one with "
+                        f"`meshive port-key-create {args.workspace} {args.pod_name} {args.port} --name NAME`."),
+              file=sys.stderr)
+        return 1
+    if state == "expired":
+        # An expired key's old value stopped working already, so there is nothing to overlap.
+        overlap = 0
+        print(fmt.clean(f"Key {args.key_id} has expired; rolling issues a new value."), file=sys.stderr)
+    else:
+        when = _OVERLAP_WORDS.get(overlap, f"in {overlap} seconds")
+        print(fmt.clean(f"Rolling issues a new value for key {args.key_id}; its current value stops working {when}. "
+                        "Clients must be moved to the new value by then."), file=sys.stderr)
+    if not _confirm(args, f"Roll access key {args.key_id} of port {args.port} on pod {args.pod_name}?"):
+        return 2
+    try:
+        key = client.roll_access_key(args.pod_name, args.workspace, args.port, args.key_id, overlap_seconds=overlap)
+    except httpx.RequestError as exc:
+        return _key_outcome_unknown(args, "rolled", exc)
+    _emit_new_key(output, key, color)
+    return 0
+
+
+def cmd_port_key_revoke(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    print("A revoked key stops working within seconds, along with an old value still working after a roll. "
+          "This can't be undone.", file=sys.stderr)
+    if not _confirm(args, f"Revoke access key {args.key_id} of port {args.port} on pod {args.pod_name}?"):
+        return 2
+    action = client.revoke_access_key(args.pod_name, args.workspace, args.port, args.key_id)
+    _emit(output, action.raw, [action.id], lambda: _kv([
+        ("pod", args.pod_name), ("port", str(args.port)), ("revoked key", action.id)]))
+    return 0
 
 
 def cmd_serving_deploy(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
@@ -1284,7 +1759,8 @@ def _print_maintenance_estimate(est: MaintenanceEstimate, color: bool) -> None:
 
 
 _ACTION_NOTES = {
-    "end": "The machine comes back unlisted. List it again with `meshive machine-list {machine}` when the work is done.",
+    "end": "The machine comes back unlisted. List it for rent again with `meshive machine-list-for-rent {machine}` "
+           "when the work is done.",
     "cancel": "Workspaces that were notified don't get a cancellation email.",
 }
 
@@ -1366,6 +1842,26 @@ def _print_listing(result: ListingResult, color: bool) -> None:
          ("accepted", fmt.yes_no(result.accepted))])
     if not result.listed:
         print(fmt.paint("New pods aren't placed on it until you list it again.", "dim", color))
+
+
+# Old command names that still work until 2.0: old name -> (new name, what the command does). Their names read like
+# a look at something (a list, reading messages), so a call by the old name says what it did on stderr; stdout, the
+# exit code and -o json/name are unchanged.
+_RENAMED = {
+    "machine-list": ("machine-list-for-rent", "puts the machine up for rent"),
+    "host-messages-read": ("host-messages-mark-read", "marks the messages read without showing them"),
+}
+
+
+def _renamed(old: str, handler: Callable[..., int]) -> Callable[..., int]:
+    new, what = _RENAMED[old]
+
+    def run(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+        print(f"Note: `meshive {old}` {what}; it is now `meshive {new}`. The old name is removed in 2.0.",
+              file=sys.stderr)
+        return handler(client, args, output, color)
+
+    return run
 
 
 def cmd_machine_list(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
@@ -1488,6 +1984,16 @@ def cmd_host_messages_read(client: Meshive, args: argparse.Namespace, output: st
     return 0
 
 
+def cmd_feedback(client: Meshive, args: argparse.Namespace, output: str, color: bool) -> int:
+    """Sends a bug report, idea or complaint to the Meshive team."""
+    kind = f" ({args.kind})" if args.kind else ""
+    if not _confirm(args, fmt.clean(f"Send this{kind} to the Meshive team? \"{args.summary}\"")):
+        return 2
+    sent = client.send_feedback(args.summary, kind=args.kind, details=args.details)
+    _emit(output, sent.raw, [], lambda: print("Sent. The Meshive team reviews every report."))
+    return 0
+
+
 _CREDENTIAL_LABELS = {"ssh": "SSH login (a shell on the machine itself)",
                       "ipmi": "IPMI login (out-of-band power and console)", "grafana": "Grafana dashboard login"}
 
@@ -1601,6 +2107,15 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--secret", action="append", metavar="KEY", help="Mark an --env key as secret (repeatable).")
     p.add_argument("--port", action="append", metavar="PORT[:NAME[:internal]]",
                    help="Open a port the template doesn't (repeatable). To change one it opens, use --template-port.")
+    p.add_argument("--no-lock", action="store_true",
+                   help="Create the pod's public ports unlocked: anyone with the URL gets through. By default they "
+                        "are locked, so only workspace members signed in to the console and programs with an access "
+                        "key (`meshive port-key-create`) get through; a port the template opens follows the template "
+                        "author's choice when there is one.")
+    p.add_argument("--lock-port", action="append", type=int, metavar="PORT",
+                   help="Lock this port whatever the default says (repeatable).")
+    p.add_argument("--unlock-port", action="append", type=int, metavar="PORT",
+                   help="Leave this one port unlocked (repeatable); the others stay locked.")
     p.add_argument("--template-port", action="append", metavar="PORT[:NAME][:NEW_PORT][:internal|external]",
                    help="Change a port the template opens (repeatable), as the console's deploy screen does. PORT is "
                         "its current number; the other fields are positional and an empty one keeps the template's "
@@ -1654,7 +2169,19 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--secret", action="append", metavar="KEY", help="Mark an --env key as secret (repeatable).")
     p.add_argument("--remove-env", action="append", metavar="KEY",
                    help="Remove an environment variable you added (repeatable); the template's can't be removed.")
-    p.add_argument("--port", action="append", metavar="PORT[:NAME[:internal]]", help="Open a new port (repeatable).")
+    p.add_argument("--port", action="append", metavar="PORT[:NAME[:internal]]",
+                   help="Open a new port (repeatable). A public one is locked, as in `pod-create`, unless --no-lock "
+                        "or --unlock-port says otherwise.")
+    p.add_argument("--no-lock", action="store_true",
+                   help="Leave the ports this change newly makes public unlocked: anyone with the URL gets through. "
+                        "By default they are locked — a new public port (--port), an internal port it exposes "
+                        "(--template-port …:external) and, with --template, the public ports the new template adds. "
+                        "Ports that are public already keep their lock either way.")
+    p.add_argument("--lock-port", action="append", type=int, metavar="PORT",
+                   help="Lock this port (repeatable). On a port the pod already exposes it only switches the lock, "
+                        "without a restart, like `meshive port-lock`.")
+    p.add_argument("--unlock-port", action="append", type=int, metavar="PORT",
+                   help="Unlock this port, or leave it unlocked (repeatable): anyone with the URL gets through.")
     p.add_argument("--template-port", action="append", metavar="PORT[:NAME][:NEW_PORT][:internal|external]",
                    help="Rename, renumber, expose or hide a current port (repeatable), as in `pod-create`.")
     p.add_argument("--remove-port", action="append", type=int, metavar="PORT",
@@ -1669,7 +2196,7 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--allow-node-migration", action="store_true",
                    help="Let the pod move to another machine when its machine can't fit the change.")
     p.add_argument("--allow-data-loss", action="store_true",
-                   help="Separately consent to permanent loss of unpreserved workspace files if the pod moves.")
+                   help="Separately consent to permanent loss of the pod's scratch disk if the pod moves.")
     p.add_argument("--drop-watched-folder", action="append", metavar="PATH",
                    help="Agree that the change removes this watched folder (repeatable); the error names them.")
     p.add_argument("--enable-folder-saving", action="store_true",
@@ -1690,12 +2217,12 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
             p.add_argument("--placement", default=None, metavar="PLACEMENT",
                            help="same_node, any_node, wait_same_node or wait_any_node. wait_* keeps the pod waiting "
                                 "until capacity frees up; any_node and wait_any_node may move it to another node, which "
-                                "permanently deletes unpreserved workspace files. Without it the server picks what the "
+                                "permanently deletes any scratch disk it has. Without it the server picks what the "
                                 "console would (same_node, or wait_same_node when its node has no room now; any_node or "
                                 "wait_any_node when its node can no longer run it) and the output shows which.")
             p.add_argument("--any-node", action="store_true", help="Short for --placement any_node.")
             p.add_argument("--allow-data-loss", action="store_true",
-                           help="Separately consent to permanent loss of unpreserved workspace files for this pod's migration.")
+                           help="Separately consent to permanent loss of the pod's scratch disk for this pod's migration.")
             _yes(p)
         if name == "pod-delete":
             p.add_argument("--delete-local-storage", action="append", metavar="PV",
@@ -1718,6 +2245,61 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--tail", type=int, default=100, metavar="N", help="Last N lines of its output (1..1000).")
     p.add_argument("--wait", action="store_true", help="Keep checking until it ends; exit with its exit code.")
     p.add_argument("--interval", type=float, default=10.0, metavar="SECONDS", help="Seconds between checks with --wait.")
+    for name, help_text in (
+            ("port-lock", "Lock a public port of a pod: only workspace members signed in to the console and "
+                         "programs with an access key get through. No restart."),
+            ("port-unlock", "Unlock a public port of a pod: anyone with the URL gets through. No restart.")):
+        p = sub.add_parser(name, parents=[common], help=help_text)
+        p.add_argument("workspace", help="Workspace ID (namespace name).")
+        p.add_argument("pod_name", help="Pod ID (pod name).")
+        p.add_argument("port", type=int, help="Port number, as `meshive pod` lists it.")
+        p.add_argument("--no-wait", action="store_true",
+                       help="Don't wait until the choice is in effect (by default it waits up to 60 seconds).")
+        if name == "port-unlock":
+            _yes(p)
+    p = sub.add_parser("port-preflight", parents=[common],
+                       help="Let CORS preflight requests (OPTIONS) to a locked port reach the app without a key (on), "
+                            "or not (off, the default). Other requests still need a key. No restart.")
+    p.add_argument("workspace", help="Workspace ID (namespace name).")
+    p.add_argument("pod_name", help="Pod ID (pod name).")
+    p.add_argument("port", type=int, help="Port number, as `meshive pod` lists it.")
+    p.add_argument("setting", choices=["on", "off"], help="on asks first (unless --yes); off doesn't ask.")
+    _yes(p)
+    p = sub.add_parser("pod-browser-sessions-revoke", parents=[common],
+                       help="Sign out the browser sessions on a pod's locked ports (browser cookies only; access "
+                            "keys and open connections are not affected). Members enter again through the console.")
+    p.add_argument("workspace", help="Workspace ID (namespace name).")
+    p.add_argument("pod_name", help="Pod ID (pod name).")
+    _yes(p)
+    p = sub.add_parser("workspace-browser-sessions-revoke", parents=[common],
+                       help="Sign out the browser sessions on the locked ports of every pod in a workspace (browser "
+                            "cookies only; access keys and open connections are not affected).")
+    p.add_argument("workspace", help="Workspace ID (namespace name).")
+    _yes(p)
+    p = sub.add_parser("port-keys", parents=[common],
+                       help="List the access keys of a locked port (names and first characters, never the values). "
+                            "LAST USED is updated every few minutes.")
+    p.add_argument("workspace"); p.add_argument("pod_name"); p.add_argument("port", type=int)
+    p = sub.add_parser("port-key-create", parents=[common],
+                       help="Create an access key for a locked port and print its value once (read & write key). "
+                            "With -o name only the value is printed.")
+    p.add_argument("workspace"); p.add_argument("pod_name"); p.add_argument("port", type=int)
+    p.add_argument("--name", required=True, help="A label for the key, such as the program that will use it.")
+    p.add_argument("--expires", default="90", metavar="DAYS|never",
+                   help="Lifetime in days: 30, 90 (default) or 365, or never.")
+    p = sub.add_parser("port-key-roll", parents=[common],
+                       help="Replace an access key's value and print the new one once; the old value keeps working "
+                            "for a while so clients can be moved.")
+    p.add_argument("workspace"); p.add_argument("pod_name"); p.add_argument("port", type=int)
+    p.add_argument("key_id", type=int, help="Key ID, as `meshive port-keys` lists it.")
+    p.add_argument("--overlap", default="1h", metavar="now|1h|24h|7d",
+                   help="How long the old value keeps working (default: 1h; now stops it at once).")
+    _yes(p)
+    p = sub.add_parser("port-key-revoke", parents=[common],
+                       help="Revoke an access key; it stops working within seconds.")
+    p.add_argument("workspace"); p.add_argument("pod_name"); p.add_argument("port", type=int)
+    p.add_argument("key_id", type=int, help="Key ID, as `meshive port-keys` lists it.")
+    _yes(p)
     p = sub.add_parser("pod-watch", parents=[common],
                        help="Show or change a running pod's watched folders (new files become assets; no restart).")
     p.add_argument("workspace"); p.add_argument("pod_name")
@@ -1893,8 +2475,9 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("--reason", required=True, help="Why — the workspaces using the machine see it in their email.")
     p.add_argument("--description", default=None)
     _yes(p)
-    p = sub.add_parser("machine-list", parents=[common],
-                       help="List a machine so new pods can be placed on it (says why when it can't be).")
+    p = sub.add_parser("machine-list-for-rent", parents=[common], aliases=["machine-list"],
+                       help="Put a machine up for rent so new pods can be placed on it (says why when it can't be). "
+                            "To see your machines: `meshive machines`.")
     p.add_argument("machine_id", help=machine_help)
     p = sub.add_parser("machine-unlist", parents=[common],
                        help="Unlist a machine: no new pods are placed on it; running pods keep running.")
@@ -1915,7 +2498,8 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
                    help="A workspace ID from the Clients of `meshive machine <id>`, or all of them.")
     p.add_argument("--title", required=True); p.add_argument("--content", default=None)
     _yes(p)
-    p = sub.add_parser("host-messages-read", parents=[common], help="Mark incoming messages of a machine read.")
+    p = sub.add_parser("host-messages-mark-read", parents=[common], aliases=["host-messages-read"],
+                       help="Mark incoming messages of a machine read (to read them: `meshive host-messages`).")
     p.add_argument("machine_id", help=machine_help)
     p.add_argument("message_ids", type=int, nargs="+", metavar="ID", help="Message IDs from `meshive host-messages`.")
     p = sub.add_parser("machine-credentials", parents=[common],
@@ -1925,6 +2509,13 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     g.add_argument("--ssh", action="store_true", help="SSH login to the machine itself.")
     g.add_argument("--ipmi", action="store_true", help="IPMI login (out-of-band power and console).")
     g.add_argument("--grafana", action="store_true", help="Grafana dashboard login.")
+    _yes(p)
+    p = sub.add_parser("feedback", parents=[common],
+                       help="Send a bug report, idea or complaint to the Meshive team.")
+    p.add_argument("summary", help="One line, under 200 characters.")
+    p.add_argument("--kind", choices=["bug", "idea", "complaint"], default=None)
+    p.add_argument("--details", default=None,
+                   help="More: what you did, what you expected and what happened. Leave out secrets and log output.")
     _yes(p)
     p = sub.add_parser("host-install", parents=[common],
                        help="Print the command that adds a new machine to your account (valid about 10 minutes).")
@@ -1946,6 +2537,15 @@ HANDLERS: dict[str, Handler] = {
     "ssh": cmd_ssh,
     "pod-exec": cmd_pod_exec,
     "pod-exec-status": cmd_pod_exec_status,
+    "port-lock": cmd_port_lock,
+    "port-unlock": cmd_port_unlock,
+    "port-preflight": cmd_port_preflight,
+    "pod-browser-sessions-revoke": cmd_pod_browser_sessions_revoke,
+    "workspace-browser-sessions-revoke": cmd_workspace_browser_sessions_revoke,
+    "port-keys": cmd_port_keys,
+    "port-key-create": cmd_port_key_create,
+    "port-key-roll": cmd_port_key_roll,
+    "port-key-revoke": cmd_port_key_revoke,
     "storage-create": cmd_storage_create,
     "storage-delete": cmd_storage_delete,
     "storage-update": cmd_storage_update,
@@ -1976,12 +2576,15 @@ HANDLERS: dict[str, Handler] = {
         "cancel_maintenance", "Cancel maintenance window #{id}? It is removed for good, and workspaces that were "
                               "notified don't get a cancellation email."),
     "maintenance-extend": cmd_maintenance_extend,
-    "machine-list": cmd_machine_list,
+    "machine-list-for-rent": cmd_machine_list,
+    "machine-list": _renamed("machine-list", cmd_machine_list),
     "machine-unlist": cmd_machine_unlist,
     "machine-retry": cmd_machine_retry,
     "machine-delete": cmd_machine_delete,
     "host-message-send": cmd_host_message_send,
-    "host-messages-read": cmd_host_messages_read,
+    "host-messages-mark-read": cmd_host_messages_read,
+    "host-messages-read": _renamed("host-messages-read", cmd_host_messages_read),
     "machine-credentials": cmd_machine_credentials,
     "host-install": cmd_host_install,
+    "feedback": cmd_feedback,
 }

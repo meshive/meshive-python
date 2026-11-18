@@ -22,6 +22,22 @@ def _parse_dt(value: str | None) -> datetime | None:
         return None
 
 
+LOCK_STATES = ("locked", "locking", "unlocked", "unlocking")
+
+
+def _lock_state(value: object) -> str | None:
+    """A lock state the server reports, or None for a missing or unknown value."""
+    return value if isinstance(value, str) and value in LOCK_STATES else None
+
+
+def _is_past(moment: datetime | None) -> bool:
+    if moment is None:
+        return False
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment <= datetime.now(timezone.utc)
+
+
 def _as_float(value: object) -> float:
     """Number/numeric string → float. 0.0 if it can't be converted (safe when the server sends Numeric as a string)."""
     try:
@@ -117,12 +133,33 @@ class PodEndpoint:
     is_external: bool
     # Same rule as the console: readinessState (preparing|ready|interrupted) if present, otherwise ready|preparing from isReady.
     readiness: str
+    # The lock chosen for this public port (True = locked: only workspace members' browsers and the port's access keys
+    # get through). Whether it is in effect yet is `lock_state`. None from servers that don't report it (they have no
+    # locks, so the port is open).
+    locked: bool | None = None
+    lock_decided_at: datetime | None = None   # when someone last chose locked or unlocked; None = never chosen
+    access_key_count: int | None = None       # access keys that work now (list_access_keys); None if not reported
+    # Whether the lock choice is in effect: "locked", "locking" (chosen, not confirmed yet: the port may still be open),
+    # "unlocked" or "unlocking" (chosen, not confirmed yet: requests may still be refused). None for an internal port
+    # and from servers that don't report it. `locked` and `access` stay the choice itself.
+    lock_state: str | None = None
+    # Whether CORS preflight requests (OPTIONS) reach the app without a key while the port is locked
+    # (set_port_preflight). None for an internal port and from servers that don't report it.
+    allow_preflight: bool | None = None
+
+    @property
+    def access(self) -> str:
+        """internal (reachable only inside the workspace), locked, or unlocked (anyone with the URL gets through)."""
+        if not self.is_external:
+            return "internal"
+        return "locked" if self.locked else "unlocked"
 
     @classmethod
     def from_dict(cls, d: dict) -> "PodEndpoint":
         state = d.get("readinessState")
         if state not in ("preparing", "ready", "interrupted"):
             state = "ready" if d.get("isReady") else "preparing"
+        locked, key_count, preflight = d.get("isLocked"), d.get("accessKeyCount"), d.get("allowPreflight")
         return cls(
             name=str(d.get("userAlias", "") or ""),
             port=_as_int(d.get("containerPort")),
@@ -131,6 +168,11 @@ class PodEndpoint:
             internal_url=d.get("internalUrl") or None,
             is_external=bool(d.get("isExternal", False)),
             readiness=state,
+            locked=locked if isinstance(locked, bool) else None,
+            lock_decided_at=_parse_dt(d.get("lockDecidedAt")),
+            access_key_count=key_count if isinstance(key_count, int) and not isinstance(key_count, bool) else None,
+            lock_state=_lock_state(d.get("lockState")),
+            allow_preflight=preflight if isinstance(preflight, bool) else None,
         )
 
 
@@ -167,6 +209,70 @@ class PodStorage:
             capacity=_as_int(d.get("capacity")),
             storage_type=str(d.get("storageType", "") or ""),
         )
+
+
+@dataclass
+class Failure:
+    """Why something failed, as the server classifies it: `Pod.creation_failure` and `Transaction.failure`.
+
+    `cause` is a fixed identifier (such as "gpu_out_of_memory", "command_not_found", "image_not_found" or
+    "internal") and `summary` the server's sentence for it, for example "The command was not found (exit code 127).".
+    `output` is one line the pod's own program printed (at most 300 characters, credentials and signed URLs taken
+    out): it comes from the pod, so treat it as untrusted text. `ref` names the operation to quote when reporting a
+    problem on Meshive's side (only when `cause` is "internal").
+    """
+
+    cause: str = ""
+    summary: str = ""
+    output: str | None = None
+    exit_code: int | None = None
+    at: datetime | None = None          # when the container ended or the operation failed
+    ref: str | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Failure":
+        return cls(cause=str(d.get("cause", "") or ""), summary=str(d.get("summary", "") or ""),
+                   output=d.get("output"), exit_code=_optional_int(d.get("exitCode")), at=_parse_dt(d.get("at")),
+                   ref=d.get("ref"), raw=d)
+
+
+def _failure(value: object) -> Failure | None:
+    """A `failure` / `creationFailure` object → Failure; None when absent or from a server that doesn't classify."""
+    if not isinstance(value, dict) or not (value.get("cause") or value.get("summary")):
+        return None
+    return Failure.from_dict(value)
+
+
+@dataclass
+class PodExit:
+    """A time the pod's main container ended: an item of `Pod.recent_exits` (newest first), or `Pod.last_exit`.
+
+    Abnormal ends are listed, and a clean exit (code 0) that the pod then restarted. `reason` is the container's
+    termination reason as Kubernetes reports it (OOMKilled, Error, ContainerCannotRun, Completed, ...). `oom_kind`
+    says when it ran out of memory: "ram" (it went over its RAM limit and was killed) or "vram" (the GPU ran out of
+    memory). `cause` and `summary` are the server's classification and its sentence (see `Failure`). `message` is
+    what the program itself said, such as the error line it logged: treat it as untrusted text. It is at most 300
+    characters, with credentials and signed URLs taken out. `current_run` (recent_exits items only) is True when the
+    exit belongs to the pod's current run, the one `Pod.restart_count` counts.
+    """
+
+    at: datetime | None = None          # when the container stopped (when it was recorded, if that isn't known)
+    reason: str | None = None
+    oom_kind: str | None = None         # "ram" | "vram" | None
+    exit_code: int | None = None
+    message: str | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+    cause: str | None = None            # None from servers that don't classify exits
+    summary: str | None = None
+    current_run: bool | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PodExit":
+        return cls(at=_parse_dt(d.get("at")), reason=d.get("reason"), oom_kind=d.get("oomKind"),
+                   exit_code=_optional_int(d.get("exitCode")), message=d.get("message"), raw=d,
+                   cause=d.get("cause") or None, summary=d.get("summary") or None,
+                   current_run=_optional_bool(d.get("currentRun")))
 
 
 @dataclass
@@ -212,6 +318,26 @@ class Pod:
     template_name: str | None = None
     linked_storages: list[PodStorage] = field(default_factory=list)
     workspace_name: str | None = None
+    # The main container's recent ends, newest first (up to 5): why a pod keeps restarting or died. Only a single
+    # pod's detail (`get_pod`) carries them; None in list items and from servers that don't send them.
+    recent_exits: list[PodExit] | None = None
+    # The platform disks at the template's workspace folders: [{"path", "size_gib", "price_per_hour"}]. A move to
+    # another machine deletes them with their files. [] when the pod has none; None from servers that don't say.
+    scratch_disks: list[dict] | None = None
+    # How many times the main container restarted in the pod's current run (0 after the pod is created again). None
+    # when the pod has no current run or the server doesn't know it, and from servers that don't send it.
+    restart_count: int | None = None
+    # The main container's last exit, only while it matters: an exit in the current run within the last 30 minutes,
+    # or while the status is error, the exit shortly before the system stopped the pod for failing repeatedly, or
+    # the exit behind a failed creation.
+    # None otherwise, and from servers that don't send it. `status` can stay running while the container keeps ending.
+    last_exit: PodExit | None = None
+    # Why creating the pod failed (status terminated), as the server classifies it. None when it didn't fail, and from
+    # servers that only send `creation_failure_reason`.
+    creation_failure: Failure | None = None
+    # The create transaction, only on the answer for a pod that has no record yet: one being created, or one whose
+    # creation failed before it existed. None otherwise.
+    transaction_id: int | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Pod":
@@ -253,8 +379,47 @@ class Pod:
             template_name=template.get("name"),
             linked_storages=[PodStorage.from_dict(s) for s in d.get("linkedStorages") or [] if isinstance(s, dict)],
             workspace_name=d.get("workspaceName"),
+            recent_exits=([PodExit.from_dict(e) for e in d["recentExits"] if isinstance(e, dict)]
+                          if isinstance(d.get("recentExits"), list) else None),
+            scratch_disks=_scratch_disks(d.get("scratchDisks")),
+            restart_count=_optional_int(d.get("restartCount")),
+            last_exit=PodExit.from_dict(d["lastExit"]) if isinstance(d.get("lastExit"), dict) else None,
+            creation_failure=_failure(d.get("creationFailure")),
+            transaction_id=_optional_int(d.get("transactionId")),
             raw=d,
         )
+
+
+def _scratch_disks(value: object) -> list[dict] | None:
+    """A pod's `scratchDisks` → [{"path", "size_gib", "price_per_hour"}]; None when the server didn't send it."""
+    if not isinstance(value, list):
+        return None
+    return [{"path": str(s.get("path", "") or ""), "size_gib": _as_optional_float(s.get("sizeGib")),
+             "price_per_hour": str(s.get("pricePerHour", "0") or "0")}
+            for s in value if isinstance(s, dict)]
+
+
+def _scratch_disk(value: object) -> dict | None:
+    """An estimate's `scratchDisk` → {"paths", "new_paths", "initial_gb", "price_per_hour", "total_price_per_hour"},
+    or None (no scratch disk after the request, or a server that doesn't say). price_per_hour covers only the disks
+    the request creates; total_price_per_hour is what all of them cost per hour after it (None from servers that
+    don't send it)."""
+    if not isinstance(value, dict):
+        return None
+    total = value.get("totalPricePerHourUsd")
+    return {"paths": [str(p) for p in value.get("paths") or []],
+            "new_paths": [str(p) for p in value.get("newPaths") or []],
+            "initial_gb": value.get("initialGb"),
+            "price_per_hour": str(value.get("pricePerHourUsd", "0") or "0"),
+            "total_price_per_hour": None if total is None else str(total)}
+
+
+def _warnings(value: object) -> list[dict]:
+    """An estimate's `warnings` → [{"code", "message"}]; [] when there are none or the server doesn't send them."""
+    if not isinstance(value, list):
+        return []
+    return [{"code": str(w.get("code", "") or ""), "message": str(w.get("message", "") or "")}
+            for w in value if isinstance(w, dict) and w.get("message")]
 
 
 @dataclass
@@ -268,7 +433,9 @@ class WatchedFolder:
     include: list[str] = field(default_factory=list)   # the template's include
     include_override: list[str] | None = None          # None = template include, [] = everything, [..] = only these
     since: str | None = None       # user folders: only files created after this time (None = existing files too)
-    blocked_reason: str | None = None   # network_storage = on NFS, so not harvested (can't be turned on)
+    # Why it is never watched (can't be turned on): network_storage = on network storage, nested_volume = contains or
+    # sits on one of your volumes inside the scratch disk.
+    blocked_reason: str | None = None
 
 
 @dataclass
@@ -325,6 +492,123 @@ class SshAccess:
                    web_url=str(d.get("sshWebUrl", "") or ""),
                    expires_at=None if expired is None else datetime.fromtimestamp(_as_int(expired), tz=timezone.utc),
                    raw=d)
+
+
+@dataclass
+class PortLock:
+    """PATCH /v1/sdk/pods/{pod}/ports/{port}/lock response — the lock the port now has."""
+
+    port: int
+    locked: bool                   # the choice that was made
+    raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
+    # Whether the choice is in effect yet: locked | locking | unlocked | unlocking (see PodEndpoint.lock_state).
+    # None from servers that don't report it; their lock is in effect at once.
+    state: str | None = None
+    lock_decided_at: datetime | None = None   # when the choice was made
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PortLock":
+        return cls(port=_as_int(d.get("port")), locked=bool(d.get("locked", False)), raw=d,
+                   replayed=bool(d.get("replayed", False)), state=_lock_state(d.get("state")),
+                   lock_decided_at=_parse_dt(d.get("lockDecidedAt")))
+
+
+@dataclass
+class PortPreflight:
+    """PATCH /v1/sdk/pods/{pod}/ports/{port}/preflight response — whether preflight requests to the port now reach
+    the app without a key."""
+
+    port: int
+    allow_preflight: bool
+    raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PortPreflight":
+        return cls(port=_as_int(d.get("port")), allow_preflight=d.get("allowPreflight") is True, raw=d,
+                   replayed=bool(d.get("replayed", False)))
+
+
+@dataclass
+class BrowserSessionsRevoked:
+    """POST /v1/sdk/pods/{pod}/browser-sessions/revoke and /v1/sdk/workspaces/{workspace}/browser-sessions/revoke
+    response. Browser sessions on the locked ports that began before `revoked_at` are refused within seconds."""
+
+    pod_name: str                  # empty when the whole workspace was signed out
+    endpoint_count: int            # public ports whose browser sessions were signed out
+    revoked_at: datetime | None
+    raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "BrowserSessionsRevoked":
+        return cls(pod_name=str(d.get("podName", "") or ""), endpoint_count=_as_int(d.get("endpointCount")),
+                   revoked_at=_parse_dt(d.get("revokedAt")), raw=d, replayed=bool(d.get("replayed", False)))
+
+
+@dataclass
+class AccessKey:
+    """An access key of a locked port (GET /v1/sdk/pods/{pod}/ports/{port}/keys item). Programs send the key's value as
+    `Authorization: Bearer <key>`, or as `X-Meshive-Key: <key>` when the app uses Authorization itself.
+
+    The value is shown once, when the key is created or rolled (AccessKeyCreated); afterwards only `prefix`, its first
+    characters, tells keys apart."""
+
+    id: int
+    name: str
+    prefix: str                    # e.g. "mshv_Xc4dbbbb"
+    port: int | None = None
+    port_name: str = ""
+    pod_name: str | None = None
+    created_by: str | None = None  # who issued this value: the creator, or whoever rolled it last
+    created_at: datetime | None = None    # when the key was first created; a roll keeps it
+    issued_at: datetime | None = None     # when this value was issued (the creation, or the last roll)
+    expires_at: datetime | None = None    # None = never expires
+    # After a roll: until when the previous value still works. None when no previous value works.
+    previous_value_valid_until: datetime | None = None
+    # True once the key has expired. An expired key stays in the list for 30 days, and can be rolled or revoked.
+    # Read when the key was listed; servers that don't report it get it worked out from `expires_at`.
+    expired: bool = False
+    # When a program last got through with this key (with the previous value too, while it still works after a roll).
+    # Updated every few minutes, so a key used just now may still show an older time. None = not used yet, or a server
+    # that doesn't report it.
+    last_used_at: datetime | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def _parse(cls, d: dict) -> dict:
+        port = d.get("containerPort")
+        expires_at = _parse_dt(d.get("expiresAt"))
+        expired = d.get("expired")
+        if not isinstance(expired, bool):
+            expired = _is_past(expires_at)
+        return dict(
+            id=_as_int(d.get("id")), name=str(d.get("keyName", "") or ""), prefix=str(d.get("keyPrefix", "") or ""),
+            port=_as_int(port) if port is not None else None, port_name=str(d.get("portAlias", "") or ""),
+            pod_name=d.get("podName"), created_by=d.get("createdBy"), created_at=_parse_dt(d.get("createdAt")),
+            issued_at=_parse_dt(d.get("issuedAt")), expires_at=expires_at,
+            previous_value_valid_until=_parse_dt(d.get("previousValueValidUntil")), expired=expired,
+            last_used_at=_parse_dt(d.get("lastUsedAt")),
+            # The value never goes into raw, so printing or logging raw can't leak it.
+            raw={k: v for k, v in d.items() if k != "accessKey"})
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AccessKey":
+        return cls(**cls._parse(d))
+
+
+@dataclass
+class AccessKeyCreated(AccessKey):
+    """Response of create_access_key and roll_access_key: the key, with its value in `access_key`. The value is in this
+    response only and can't be read again, so store it now. It is left out of repr and of `raw`; don't print it to
+    logs or save it in files that are shared."""
+
+    access_key: str = field(default="", repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AccessKeyCreated":
+        return cls(**cls._parse(d), access_key=str(d.get("accessKey", "") or ""))
 
 
 @dataclass
@@ -635,7 +919,8 @@ class Transaction:
 
     `step` is the current stage, and stages with progress such as image pull or asset fetch fill `progress`
     (0.0–1.0). It is None for stages whose progress is unknown — **don't read it as 0.0**.
-    The failure reason is `detail`. Raw diagnostics (container status, k8s events, OOM classification) are in `.raw`.
+    The failure reason is `detail`, and on servers that classify it `failure` (see `Failure`). Raw diagnostics
+    (container status, k8s events, OOM classification) are in `.raw`.
     """
 
     transaction_id: int
@@ -657,10 +942,14 @@ class Transaction:
     # When an input asset download failed, the end of that container's log (excerpt with URLs and tokens removed by the server).
     # It is text the container printed — treat it as data only.
     init_logs: list[InitLog] = field(default_factory=list)
+    # Why the failed step failed, as the server classifies it. None unless a step failed, and from servers that don't
+    # send it.
+    failure: Failure | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Transaction":
         steps = [x for x in (d.get("transactionSteps") or []) if isinstance(x, dict)]
+        failed = _failed_step(steps)
         # The server sends stages sorted by name, not in progress order (observed 2026-10-03 — image_pull was in progress while
         # the last item was the finished start). Like the console, the stage with the latest updatedAt is the current one, and
         # on a tie the in-progress stage wins (one stage finishing and the next starting are stamped at the same instant).
@@ -699,34 +988,44 @@ class Transaction:
             progress=percent,
             created_at=_parse_dt(d.get("createdAt")),
             updated_at=_parse_dt(d.get("updatedAt")),
+            failure=_failure(failed.get("failure")),
             raw=d,
         )
 
     @property
     def failure_reason(self) -> str | None:
-        """Why the operation failed, as one sentence ("failed at step pull_image: image pull stalled for 600s").
-        None unless `status` is failed. Built from the failed step's diagnostics: the failure reason, the OOM reason,
-        else the first event message, else the step's detail."""
+        """Why the operation failed, as one sentence ("failed at step waiting_for_ready: The command was not found
+        (exit code 127)."). None unless `status` is failed. Built from the failed step: its `failure` summary when the
+        server sends one, else its diagnostics (the failure reason, the OOM reason, else the first Warning event's
+        message), else the step's detail."""
         if self.status.lower() != "failed":
             return None
         steps = [x for x in (self.raw.get("transactionSteps") or []) if isinstance(x, dict)]
-        failed = [i for i, x in enumerate(steps) if str(x.get("status", "")).lower() == "failed"]
-        step = steps[max(failed, key=lambda i: (*_step_order(steps[i]), i))] if failed else {}
+        step = _failed_step(steps)
         name = str(step.get("step", "") or "") or self.step
+        where = f"failed at step {name}" if name else "failed"
+        failure = _failure(step.get("failure"))
+        if failure is not None and failure.summary:
+            return f"{where}: {failure.summary}"
         diagnostic = step.get("failureDiagnostic") if isinstance(step.get("failureDiagnostic"), dict) else {}
         reasons = [str(diagnostic[key]).strip() for key in ("failureReason", "oomReason") if diagnostic.get(key)]
         if not reasons:
-            events = [e for e in diagnostic.get("events") or []
-                      if isinstance(e, dict) and (e.get("message") or e.get("reason"))]
-            # The first Warning event says what went wrong; Normal ones only narrate.
-            event = next((e for e in events if str(e.get("type", "")).lower() == "warning"), events[0] if events else None)
+            # The first Warning event says what went wrong; Normal ones only narrate, so they are never the reason.
+            event = next((e for e in diagnostic.get("events") or []
+                          if isinstance(e, dict) and (e.get("message") or e.get("reason"))
+                          and str(e.get("type", "")).lower() == "warning"), None)
             if event:
                 reasons = [str(event.get("message") or event.get("reason")).strip()]
         if not reasons:
             detail = str(step.get("detail", "") or "") if step else self.detail
             reasons = [detail.strip()] if detail.strip() else []
-        where = f"failed at step {name}" if name else "failed"
         return f"{where}: {'; '.join(reasons)}" if reasons else where
+
+
+def _failed_step(steps: list[dict]) -> dict:
+    """The step that failed (the latest one, as the current step is chosen); {} when none did."""
+    failed = [i for i, x in enumerate(steps) if str(x.get("status", "")).lower() == "failed"]
+    return steps[max(failed, key=lambda i: (*_step_order(steps[i]), i))] if failed else {}
 
 
 @dataclass
@@ -1855,6 +2154,16 @@ class PodEstimate:
     # The model set the pod starts with: {"slug", "name", "file_count", "total_size_bytes", "min_vram_gb",
     # "min_vram_estimated"}. None without one, and from servers that don't report it.
     model_set: dict | None = None
+    # {port: locked} — the lock value this request sends for each public port (worked out by the SDK, not the server).
+    port_locks: dict = field(default_factory=dict)
+    # The platform disk at the template's workspace folder after the request: {"paths", "new_paths", "initial_gb",
+    # "price_per_hour", "total_price_per_hour"}. price_per_hour is USD/h of the disks this request creates (included
+    # in price_per_hour as breakdown["scratch_disk"]; "0" when none is new); total_price_per_hour is what every disk
+    # in paths costs per hour after the request (None from servers that don't send it). None when there is none, and
+    # from servers that don't report it.
+    scratch_disk: dict | None = None
+    # Short warnings that apply to this request: [{"code", "message"}], most severe first. Show them before going ahead.
+    warnings: list = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict) -> "PodEstimate":
@@ -1862,14 +2171,17 @@ class PodEstimate:
         return cls(price_per_hour=str(d.get("pricePerHourUsd", "0")), breakdown=d.get("breakdown") or {},
                    resources=d.get("resources") or {}, availability=d.get("availability") or {},
                    template=d.get("template") or {}, volumes=list(d.get("volumes") or []),
-                   note=d.get("note") or "", raw=d, model_set=model_set if isinstance(model_set, dict) else None)
+                   note=d.get("note") or "", raw=d, model_set=model_set if isinstance(model_set, dict) else None,
+                   scratch_disk=_scratch_disk(d.get("scratchDisk")), warnings=_warnings(d.get("warnings")))
 
 
 @dataclass
 class PodCreated:
-    """POST /v1/sdk/pods response (202). pod_name is assigned asynchronously, so it is None right after creation —
-    `wait_for_new_pod(name, workspace, transaction_id=created.transaction_id)` finds it by name once it shows up,
-    waits until it is running, and reports a failed creation as soon as the server records it."""
+    """POST /v1/sdk/pods response (202). Servers from this release on set `pod_name` right away: `get_pod(pod_name)`
+    answers from the first second (status creating, or terminated with `creation_failure` when the creation failed).
+    Older servers leave it None. `wait_for_new_pod(name, workspace, transaction_id=created.transaction_id,
+    pod_name=created.pod_name)` finds the pod once it shows up (by `pod_name` when known, else by name), waits until
+    it is running, and reports a failed creation as soon as the server records it."""
 
     name: str
     workspace: str
@@ -1879,6 +2191,9 @@ class PodCreated:
     accepted: bool = True
     raw: dict = field(default_factory=dict, repr=False)
     replayed: bool = False         # see ResourceAction.replayed
+    # {port: locked} — the lock value the request sent for each public port (worked out by the SDK, not the server).
+    # Pass it to wait_for_new_pod(port_locks=...) to have the new pod's ports checked against it.
+    port_locks: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict) -> "PodCreated":
@@ -2184,6 +2499,12 @@ class PodUpdateEstimate:
     volumes: list = field(default_factory=list)
     note: str = ""
     raw: dict = field(default_factory=dict, repr=False)
+    # {port: locked} — the lock value this request sends, for the ports it sends one for (worked out by the SDK).
+    port_locks: dict = field(default_factory=dict)
+    # Same as in PodEstimate: the scratch disk after the change (new_paths = the disks it creates) and the warnings
+    # that apply to it, such as a scratch disk it deletes.
+    scratch_disk: dict | None = None
+    warnings: list = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict) -> "PodUpdateEstimate":
@@ -2192,7 +2513,8 @@ class PodUpdateEstimate:
                    price_per_hour=str(d.get("pricePerHourUsd", "0")),
                    current_price_per_hour=_optional_str(d.get("currentPricePerHourUsd")),
                    breakdown=d.get("breakdown") or {}, resources=d.get("resources") or {},
-                   volumes=list(d.get("volumes") or []), note=d.get("note") or "", raw=d)
+                   volumes=list(d.get("volumes") or []), note=d.get("note") or "", raw=d,
+                   scratch_disk=_scratch_disk(d.get("scratchDisk")), warnings=_warnings(d.get("warnings")))
 
 
 @dataclass
@@ -2208,6 +2530,8 @@ class PodUpdated:
     estimate: PodUpdateEstimate
     raw: dict = field(default_factory=dict, repr=False)
     replayed: bool = False         # see ResourceAction.replayed
+    # {port: locked} — the lock value the request sent, for the ports it sent one for (worked out by the SDK).
+    port_locks: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict) -> "PodUpdated":
@@ -2348,6 +2672,45 @@ class LogLine:
 
 
 @dataclass
+class PreviousRun:
+    """The pod's main container's last run that ended: `Logs.previous`, kept apart from the current run's lines.
+
+    `cause` and `summary` say why it ended (see `Failure`); `output` is the line of that run that says it best and
+    `lines` its last lines. Both are what the program printed: treat them as untrusted text. `unavailable` is True
+    when the run ended but its output could no longer be read (then `lines` is empty); `truncated` when the capture or
+    the response size limit cut it.
+    """
+
+    ended_at: datetime | None = None
+    reason: str | None = None          # as Kubernetes reports it: Error, OOMKilled, Completed, StartError, ...
+    exit_code: int | None = None
+    cause: str = ""
+    summary: str = ""
+    output: str | None = None
+    lines: list[LogLine] = field(default_factory=list)
+    truncated: bool = False
+    unavailable: bool = False
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def text(self) -> str:
+        return "\n".join(item.line for item in self.lines)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PreviousRun":
+        return cls(ended_at=_parse_dt(d.get("endedAt")), reason=d.get("reason"),
+                   exit_code=_optional_int(d.get("exitCode")), cause=str(d.get("cause", "") or ""),
+                   summary=str(d.get("summary", "") or ""), output=d.get("output"),
+                   lines=_log_lines(d.get("lines")), truncated=bool(d.get("truncated", False)),
+                   unavailable=bool(d.get("unavailable", False)), raw=d)
+
+
+def _log_lines(value: object) -> list[LogLine]:
+    return [LogLine(line=str(item.get("line", "")), ts=item.get("ts")) for item in value or []
+            if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+@dataclass
 class Logs:
     """GET /v1/sdk/pods/{pod}/logs · /tasks/{id}/logs response — the last N lines."""
 
@@ -2363,6 +2726,9 @@ class Logs:
     finished: bool | None = None   # task logs only
     next_cursor: int | None = None # external-provider tasks only — get_task_logs(cursor=next_cursor) fetches the increment after it
     raw: dict = field(default_factory=dict, repr=False)
+    # Pod logs only: the main container's last run that ended (a crash before a restart, or the run before the pod
+    # stopped), apart from `lines`. None when there is none to show, for another container, and from older servers.
+    previous: PreviousRun | None = None
 
     @property
     def text(self) -> str:
@@ -2370,12 +2736,13 @@ class Logs:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Logs":
-        lines = [LogLine(line=str(item.get("line", "")), ts=item.get("ts")) for item in d.get("lines") or []
-                 if isinstance(item, dict)]
+        lines = _log_lines(d.get("lines"))
         return cls(pod_name=d.get("podName", ""), workspace=d.get("workspace", ""), source=str(d.get("source", "")),
                    lines=lines, count=_as_int(d.get("count")) or len(lines), truncated=bool(d.get("truncated", False)),
                    note=d.get("note"), container=d.get("container"), task_id=d.get("taskId"),
-                   finished=d.get("finished"), next_cursor=d.get("nextCursor"), raw=d)
+                   finished=d.get("finished"), next_cursor=d.get("nextCursor"),
+                   previous=PreviousRun.from_dict(d["previous"]) if isinstance(d.get("previous"), dict) else None,
+                   raw=d)
 
 
 # =============================================================================
@@ -2472,8 +2839,12 @@ class MachineDetail(Machine):
     """GET /v1/sdk/machines/{machine_id} response — a Machine with what the console's machine view shows.
 
     clients is who uses the machine (other users' workspaces). schedules is the maintenance summary
-    ({"upcoming": [...], "ongoing": ...}); list_maintenance has every window with its status. boot_report and
-    network_warnings are the diagnostics the console shows (None / [] when there are none). platform_fee is the
+    ({"upcoming": [...], "ongoing": ...}); list_maintenance has every window with its status. boot_report,
+    network_warnings and disk_warnings are the diagnostics the console shows (None / [] when there are none).
+    A disk warning is {"kind", "device", "since", "value", "threshold"}: kind "stall" (the disk stopped responding;
+    value is seconds without progress, new workloads are paused), "slow" (writes are slow while the disk is lightly
+    loaded; value is milliseconds per write) or "full" (the system disk, device "/", is almost full; value is the
+    percent used). threshold is the alert level for that kind. platform_fee is the
     current platform fee as a fraction (0.2 = 20%) and promotional_fee_until is when a promotional fee ends. Fields
     an older server doesn't send stay empty (platform_fee None), so the detail of an older server still parses.
     """
@@ -2484,6 +2855,7 @@ class MachineDetail(Machine):
     network_warnings: list[dict] = field(default_factory=list)
     platform_fee: float | None = None
     promotional_fee_until: datetime | None = None
+    disk_warnings: list[dict] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict) -> "MachineDetail":
@@ -2493,6 +2865,8 @@ class MachineDetail(Machine):
         detail.schedules = schedules if isinstance(schedules, dict) else {}
         detail.boot_report = boot if isinstance(boot, dict) else None
         detail.network_warnings = [w for w in d.get("networkWarnings") or [] if isinstance(w, dict)]
+        disk = d.get("diskWarnings")
+        detail.disk_warnings = [w for w in disk if isinstance(w, dict)] if isinstance(disk, list) else []
         detail.platform_fee = _as_optional_float(d.get("platformFee"))
         detail.promotional_fee_until = _parse_dt(d.get("promotionalFeeUntil"))
         return detail
@@ -2798,6 +3172,24 @@ class MessageSent:
         return cls(machine_id=str(d.get("machineId", "") or ""), to=str(d.get("to", "") or ""),
                    message_ids=[_as_int(i) for i in d.get("messageIds") or []],
                    accepted=bool(d.get("accepted", True)), raw=d, replayed=bool(d.get("replayed", False)))
+
+
+@dataclass
+class FeedbackSent:
+    """POST /v1/sdk/feedback response. `tool` and `error_code` are what the server kept: a value that isn't a plain
+    identifier (lowercase letters, digits and underscores) is left out and comes back as None."""
+
+    received: bool = True
+    kind: str | None = None
+    tool: str | None = None
+    error_code: str | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+    replayed: bool = False         # see ResourceAction.replayed
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "FeedbackSent":
+        return cls(received=bool(d.get("received", True)), kind=d.get("kind"), tool=d.get("tool"),
+                   error_code=d.get("errorCode"), raw=d, replayed=bool(d.get("replayed", False)))
 
 
 @dataclass

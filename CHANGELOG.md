@@ -12,87 +12,15 @@ Upgrade with:
 pip install -U meshive
 ```
 
-## Unreleased
-
-### What's new
-
-- **Disk warnings for hosts.** `MachineDetail.disk_warnings` lists the disk problems the console shows for a machine,
-  each as `{"kind", "device", "since", "value", "threshold"}`: `stall` (a disk stopped responding; new workloads on
-  the machine are paused and its listing is turned off), `slow` (writes are slow even when the disk is lightly
-  loaded; `value` is milliseconds per write) or `full` (the system disk, device `/`, is almost full; `value` is the
-  percent used). `meshive machine <id>` adds a `disk` line to its Diagnostics block, for example
-  `nvme0n1 not responding` or `/ 92% used`. From a server that doesn't send them yet the list is empty.
-- **Why a pod stopped.** `get_pod` now returns `Pod.recent_exits`: the times the pod's main container ended
-  abnormally, newest first (up to 5), each with `at`, `reason` (as Kubernetes reports it: `OOMKilled`, `Error`,
-  `ContainerCannotRun`, ...), `oom_kind` (`"ram"` when it went over its RAM limit, `"vram"` when the GPU ran out of
-  memory), `exit_code` and `message`. A clean exit (code 0) isn't listed. For a GPU out-of-memory error, `message` is
-  the error line the program logged; any `message` can come from the pod, so treat it as untrusted text (credentials
-  and signed URLs are taken out, and it is at most 300 characters). `meshive pod <workspace> <pod>` shows them in an
-  EXITED table. Pods from `list_pods` and from a server that doesn't send them have `recent_exits=None`.
-- **Send feedback.** `send_feedback(summary, kind=..., details=..., tool=..., error_code=...)` and
-  `meshive feedback "one line" [--kind bug|idea|complaint] [--details TEXT]` send a bug report, an idea or a
-  complaint to the Meshive team, as the console's Send feedback does. It needs a key with the write scope. `tool` and
-  `error_code` name a call that failed and the code it returned; the server keeps them only as lowercase
-  identifiers. Leave secrets, environment values, log output and resource names out of the text. The team reviews
-  every report. When the server isn't taking feedback it answers `NotFoundError` (title `Feedback Unavailable`); an
-  account that sends several in a short time gets `RateLimitError` (title `Too Many Reports`; `retry_after` says when
-  to send again).
-- **Scratch disk warnings.** `Pod.scratch_disks` lists the platform disks at the template's workspace folders
-  (`[{"path", "size_gib", "price_per_hour"}]`); a move to another machine deletes them with their files.
-  `PodEstimate` and `PodUpdateEstimate` add `scratch_disk` (the disk after the request: `price_per_hour` for the
-  disks the request creates, `total_price_per_hour` for all of them, `None` from a server that doesn't send it) and
-  `warnings` (`[{"code", "message"}]`, such as a scratch disk the change deletes or erases on spot). `pod-create` and
-  `pod-update` print each as a `warning:` line before asking (on stderr for json and name output), the move and
-  consent messages of `pod-start` and `pod-update` name the scratch disk and its path instead of "unpreserved
-  workspace files", `meshive pod` adds a `scratch` line with each disk's path, size and price per hour, and
-  `pod-watch` shows a folder that overlaps one of your volumes as `blocked (your volume)`.
-  From a server that doesn't send them yet, `scratch_disks` and `scratch_disk` are `None` and `warnings` is empty.
-- **Why a pod keeps restarting or failed.** The server now classifies a failure into a fixed `cause` (such as
-  `gpu_out_of_memory`, `command_not_found` or `image_not_found`) with a `summary` sentence, and gives the line the
-  program printed separately as `output`/`message` (untrusted text, at most 300 characters).
-  - `Pod.restart_count` counts the main container's restarts in the current run, and `Pod.last_exit` (a `PodExit`)
-    is its last exit while that matters: within the last 30 minutes of the current run, while the status is error,
-    shortly before the system stopped the pod for failing repeatedly, or behind a failed creation. Both are on `list_pods` items too. `status` can
-    stay `running` while the container keeps ending, so read these instead.
-  - `PodExit` adds `cause`, `summary` and `current_run` (whether a `recent_exits` item belongs to the current run).
-    `recent_exits` now also lists a clean exit (code 0) that the pod restarted.
-  - `Pod.creation_failure` and `Transaction.failure` are a new `Failure` (`cause`, `summary`, `output`, `exit_code`,
-    `at`, `ref`). `Transaction.failure_reason` uses `failure.summary` when it is there.
-  - `Logs.previous` is a new `PreviousRun`: the main container's last run that ended, kept apart from the current
-    run's `lines` (`ended_at`, `reason`, `exit_code`, `cause`, `summary`, `output`, `lines`, `truncated`,
-    `unavailable`, and `text`).
-  - `PodCreated.pod_name` is set right away, and `get_pod(pod_name)` answers from the start: status `creating` while
-    it is created, `terminated` with `creation_failure` when the creation failed; such a pod has no record yet and
-    carries its create transaction as `Pod.transaction_id`. `list_pods(workspace, name=...)`
-    finds a pod by its display name, including one being created or whose creation failed in the last 24 hours.
-    `wait_for_new_pod(..., pod_name=created.pod_name)` finds the new pod by it, and a pod that isn't found yet while
-    waiting is waited for.
-  - `meshive pod` prints a line under the status, such as `Restarted 3 times · The GPU ran out of memory. · 2
-    minutes ago` or `Create failed: The command was not found (exit code 127).`, with the program's line under it.
-    `meshive logs` prints the run that ended first, between `--- previous run (...) ---` and `--- current run ---`.
-    `meshive pod-create` prints the pod name the server returned.
-
-  From a server that doesn't send them yet, the new fields are `None`, `list_pods(name=...)` filters the full list
-  itself, and `pod_name` stays `None`.
-
-### Changed
-
-- **`Transaction.failure_reason` no longer quotes a Normal event.** When a failed step has no failure reason, only a
-  Warning event's message is used, then the step's detail; a Normal event only narrates what happened.
-
-### Fixed
-
-- **`pod-start` and `pod-update` mention local storage only when the pod has it.** The move and consent messages
-  added "Attached local hostPath storage stays on the old node." for every pod.
-- **`pod-update` previews name a new local volume.** The `volumes` line showed it as `None→/path`; it now reads
-  `name (new local)→/path`.
-
 ## v1.10.0
 
 A pod's public ports can be locked, and from this release new pods are created with them locked. A locked port lets
 in only workspace members signed in to the console, and programs that send one of the port's access keys. Code
 written for 1.0 to 1.9 keeps running, but read "Changed" below: the public ports it creates are now locked. The new
 calls need a Meshive API server that has them; an older server answers with an error that says so.
+
+This release also shows why a pod keeps restarting or failed to be created, lists disk warnings for hosts and the
+scratch disks a pod create, edit or move affects, and lets you send feedback to the Meshive team.
 
 ### Changed
 
@@ -127,6 +55,9 @@ calls need a Meshive API server that has them; an older server answers with an e
   turned off or the server predates it, `create_pod`, `estimate_pod`, `update_pod` and `estimate_pod_update` raise
   `EndpointLockUnavailableError` (a `ConflictError`) and nothing is created or changed. The message says how to go
   ahead with open ports. The SDK does not retry with open ports by itself.
+
+- **`Transaction.failure_reason` no longer quotes a Normal event.** When a failed step has no failure reason, only a
+  Warning event's message is used, then the step's detail; a Normal event only narrates what happened.
 
 ### What's new
 
@@ -201,12 +132,76 @@ calls need a Meshive API server that has them; an older server answers with an e
   and revoking keys need a read & write key from a workspace admin or billing member. Listing keys works with a
   read-only key.
 
+- **Disk warnings for hosts.** `MachineDetail.disk_warnings` lists the disk problems the console shows for a machine,
+  each as `{"kind", "device", "since", "value", "threshold"}`: `stall` (a disk stopped responding; new workloads on
+  the machine are paused and its listing is turned off), `slow` (writes are slow even when the disk is lightly
+  loaded; `value` is milliseconds per write) or `full` (the system disk, device `/`, is almost full; `value` is the
+  percent used). `meshive machine <id>` adds a `disk` line to its Diagnostics block, for example
+  `nvme0n1 not responding` or `/ 92% used`. From a server that doesn't send them yet the list is empty.
+- **Why a pod stopped.** `get_pod` now returns `Pod.recent_exits`: the times the pod's main container ended
+  abnormally, newest first (up to 5), each with `at`, `reason` (as Kubernetes reports it: `OOMKilled`, `Error`,
+  `ContainerCannotRun`, ...), `oom_kind` (`"ram"` when it went over its RAM limit, `"vram"` when the GPU ran out of
+  memory), `exit_code` and `message`. A clean exit (code 0) is listed only when the pod restarted after it. For a GPU out-of-memory error, `message` is
+  the error line the program logged; any `message` can come from the pod, so treat it as untrusted text (credentials
+  and signed URLs are taken out, and it is at most 300 characters). `meshive pod <workspace> <pod>` shows them in an
+  EXITED table. Pods from `list_pods` and from a server that doesn't send them have `recent_exits=None`.
+- **Send feedback.** `send_feedback(summary, kind=..., details=..., tool=..., error_code=...)` and
+  `meshive feedback "one line" [--kind bug|idea|complaint] [--details TEXT]` send a bug report, an idea or a
+  complaint to the Meshive team, as the console's Send feedback does. It needs a key with the write scope. `tool` and
+  `error_code` name a call that failed and the code it returned; the server keeps them only as lowercase
+  identifiers. Leave secrets, environment values, log output and resource names out of the text. The team reviews
+  every report. When the server isn't taking feedback it answers `NotFoundError` (title `Feedback Unavailable`); an
+  account that sends several in a short time gets `RateLimitError` (title `Too Many Reports`; `retry_after` says when
+  to send again).
+- **Scratch disk warnings.** `Pod.scratch_disks` lists the platform disks at the template's workspace folders
+  (`[{"path", "size_gib", "price_per_hour"}]`); a move to another machine deletes them with their files.
+  `PodEstimate` and `PodUpdateEstimate` add `scratch_disk` (the disk after the request: `price_per_hour` for the
+  disks the request creates, `total_price_per_hour` for all of them, `None` from a server that doesn't send it) and
+  `warnings` (`[{"code", "message"}]`, such as a scratch disk the change deletes or erases on spot). `pod-create` and
+  `pod-update` print each as a `warning:` line before asking (on stderr for json and name output), the move and
+  consent messages of `pod-start` and `pod-update` name the scratch disk and its path instead of "unpreserved
+  workspace files", `meshive pod` adds a `scratch` line with each disk's path, size and price per hour, and
+  `pod-watch` shows a folder that overlaps one of your volumes as `blocked (your volume)`.
+  From a server that doesn't send them yet, `scratch_disks` and `scratch_disk` are `None` and `warnings` is empty.
+- **Why a pod keeps restarting or failed.** The server now classifies a failure into a fixed `cause` (such as
+  `gpu_out_of_memory`, `command_not_found` or `image_not_found`) with a `summary` sentence, and gives the line the
+  program printed separately as `output`/`message` (untrusted text, at most 300 characters).
+  - `Pod.restart_count` counts the main container's restarts in the current run, and `Pod.last_exit` (a `PodExit`)
+    is its last exit while that matters: within the last 30 minutes of the current run, while the status is error,
+    shortly before the system stopped the pod for failing repeatedly, or behind a failed creation. Both are on `list_pods` items too. `status` can
+    stay `running` while the container keeps ending, so read these instead.
+  - `PodExit` adds `cause`, `summary` and `current_run` (whether a `recent_exits` item belongs to the current run).
+    `recent_exits` now also lists a clean exit (code 0) that the pod restarted.
+  - `Pod.creation_failure` and `Transaction.failure` are a new `Failure` (`cause`, `summary`, `output`, `exit_code`,
+    `at`, `ref`). `Transaction.failure_reason` uses `failure.summary` when it is there.
+  - `Logs.previous` is a new `PreviousRun`: the main container's last run that ended, kept apart from the current
+    run's `lines` (`ended_at`, `reason`, `exit_code`, `cause`, `summary`, `output`, `lines`, `truncated`,
+    `unavailable`, and `text`).
+  - `PodCreated.pod_name` is set right away, and `get_pod(pod_name)` answers from the start: status `creating` while
+    it is created, `terminated` with `creation_failure` when the creation failed; such a pod has no record yet and
+    carries its create transaction as `Pod.transaction_id`. `list_pods(workspace, name=...)`
+    finds a pod by its display name, including one being created or whose creation failed in the last 24 hours.
+    `wait_for_new_pod(..., pod_name=created.pod_name)` finds the new pod by it, and a pod that isn't found yet while
+    waiting is waited for.
+  - `meshive pod` prints a line under the status, such as `Restarted 3 times · The GPU ran out of memory. · 2
+    minutes ago` or `Create failed: The command was not found (exit code 127).`, with the program's line under it.
+    `meshive logs` prints the run that ended first, between `--- previous run (...) ---` and `--- current run ---`.
+    `meshive pod-create` prints the pod name the server returned.
+
+  From a server that doesn't send them yet, the new fields are `None`, `list_pods(name=...)` filters the full list
+  itself, and `pod_name` stays `None`.
+
 ### Fixed
 
 - **CLI: the OWNER column of `meshive workspaces` is the last column.** In 1.9.0 it came between ID and ROLE, so a
   script that reads the table by position got an email where it read the role, and a workspace with several owners
   shifted the following columns once more. NAME, ID, ROLE, STATUS, PODS and PRICE/HR are back where they were before
   1.9.0, and several owners are joined with `,` and no space. `-o json` stays the format meant for scripts.
+
+- **`pod-start` and `pod-update` mention local storage only when the pod has it.** The move and consent messages
+  added "Attached local hostPath storage stays on the old node." for every pod.
+- **`pod-update` previews name a new local volume.** The `volumes` line showed it as `None→/path`; it now reads
+  `name (new local)→/path`.
 
 ## v1.9.0
 

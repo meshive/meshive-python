@@ -1,6 +1,7 @@
 import importlib
 import json
 import os
+import ssl
 import stat
 
 import httpx
@@ -121,6 +122,24 @@ def test_login_invalid_key_not_saved(monkeypatch, capsys):
     assert cli.main(["login", "--api-key", "meshive_bad"]) == 1
     assert "could not verify" in capsys.readouterr().err
     assert _credentials.load() == {}  # nothing persisted
+
+
+
+def test_login_untrusted_certificate_says_what_to_do(monkeypatch, capsys):
+    def untrusted(request):
+        try:
+            raise ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+        except ssl.SSLError as exc:
+            raise httpx.ConnectError(str(exc), request=request) from exc
+
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    monkeypatch.setattr("meshive._client.time.sleep", lambda seconds: None)     # the connection error is retried
+    _patch_client(monkeypatch, untrusted)
+    assert cli.main(["login", "--api-key", "meshive_xyz"]) == 1
+    err = capsys.readouterr().err
+    assert "could not verify API key" in err and "set SSL_CERT_FILE to that file" in err
+    assert _credentials.load() == {}
 
 
 def test_login_empty_key_errors(monkeypatch, capsys):

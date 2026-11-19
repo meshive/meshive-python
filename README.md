@@ -219,6 +219,7 @@ The API key is looked up in this order: the `--api-key` option (or `Meshive(api_
 | A pod stays `creating` for minutes | `meshive transactions <workspace>` shows the current step, such as an image download and its progress. |
 | A script stops with exit code `2` | A command needed confirmation. Add `--yes`, or check first with `--estimate` (`--check` for `workspace-delete`). |
 | "could not reach the Meshive API" | Check your network, and `MESHIVE_BASE_URL` if you set it. |
+| `CERTIFICATE_VERIFY_FAILED`, or another message about a certificate that isn't trusted | Something between you and the API (an antivirus, a company proxy) inspects HTTPS and signs with its own root. Upgrade with `pip install -U meshive`: the roots your operating system trusts are trusted from 1.10.1 on. If it still fails, see [Certificate errors](https://docs.meshive.ai/sdk-cli/cli/#certificate-errors). |
 
 ### Exit codes
 

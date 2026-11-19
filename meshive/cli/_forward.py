@@ -34,7 +34,8 @@ connection when the kept one turns out to have been closed; any other request ge
 A client that closes its connection while its request is being answered ends that request at the endpoint too. An
 answer the endpoint cuts short is never passed off as a whole one. The number of client connections is limited.
 
-Only the standard library is used, so the command runs wherever the package does.
+Only the standard library is used, so the command runs wherever the package does. The one thing taken from the
+SDK is which certificate roots are trusted: the same ones as for its API calls.
 """
 from __future__ import annotations
 
@@ -54,7 +55,7 @@ from typing import Callable, Iterable
 from urllib.parse import urlsplit
 
 from . import _format as fmt
-from .._client import Meshive
+from .._client import Meshive, _build_ssl_context
 
 ENV_ACCESS_KEY = "MESHIVE_ACCESS_KEY"
 
@@ -409,7 +410,7 @@ class Forwarder:
         self._allow_origins = frozenset(_normal_origin(origin) for origin in allow_origins)
         self._connect_to = connect_to or (host, port)
         if ssl_context is None:
-            ssl_context = ssl.create_default_context()
+            ssl_context = _build_ssl_context()      # the roots the SDK trusts for the API, on a context of its own
         try:
             ssl_context.set_alpn_protocols(["http/1.1"])
         except NotImplementedError:

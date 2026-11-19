@@ -1,12 +1,15 @@
 """Clients sharing one transport (`transport=`), and the SSL context default clients reuse."""
 import asyncio
 import ssl
+import sys
 import threading
 import types
+from pathlib import Path
 
 import certifi
 import httpx
 import pytest
+import truststore
 
 from meshive import AsyncMeshive, Meshive
 from meshive import _client
@@ -147,7 +150,7 @@ def test_a_shared_transport_sends_the_same_request_as_a_default_client():
 
 @pytest.fixture
 def ssl_builds(monkeypatch):
-    """Starts from an empty per-thread cache and records every SSL context httpx builds, whether the SDK asks for it
+    """Starts from an empty per-thread cache and records every SSL context that is built, whether the SDK builds it
     or an httpx transport makes its own. A context passed in as verify= is handed back as is, so it isn't counted."""
     monkeypatch.setattr(_client, "_ssl_contexts", threading.local())
     for name in _client._SSL_ENV:
@@ -162,7 +165,7 @@ def ssl_builds(monkeypatch):
             return ctx
         return build
 
-    monkeypatch.setattr(httpx, "create_ssl_context", counting(httpx.create_ssl_context))
+    monkeypatch.setattr(_client, "_build_ssl_context", counting(_client._build_ssl_context))
     monkeypatch.setattr(httpx._transports.default, "create_ssl_context",
                         counting(httpx._transports.default.create_ssl_context))
     return built
@@ -209,6 +212,73 @@ def test_default_ssl_context_follows_the_certificate_variables(ssl_builds, monke
     # setters look the name up), so the SDK's view of it is swapped instead.
     monkeypatch.setattr(_client, "ssl", types.SimpleNamespace(SSLContext=type("Injected", (), {})))
     assert _client._default_ssl_context() is ssl_builds[2] and len(ssl_builds) == 3
+
+
+def test_default_ssl_context_trusts_the_systems_roots_and_certifi(ssl_builds, monkeypatch):
+    added = []
+    real = truststore.SSLContext.load_verify_locations
+
+    def load_verify_locations(self, cafile=None, capath=None, cadata=None):
+        added.append((self, cafile, capath, cadata))
+        return real(self, cafile=cafile, capath=capath, cadata=cadata)
+
+    monkeypatch.setattr(truststore.SSLContext, "load_verify_locations", load_verify_locations)
+    ctx = _client._default_ssl_context()
+    assert isinstance(ctx, truststore.SSLContext)                  # the operating system checks the certificate
+    assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname
+    assert added == [(ctx, certifi.where(), None, None)]           # and certifi's roots stay trusted next to its own
+    usual = ssl.create_default_context(cafile=certifi.where()).verify_flags
+    assert ctx.verify_flags & usual == usual                       # no check Python's default context makes is dropped
+
+
+@pytest.mark.parametrize("name", ["SSL_CERT_FILE", "SSL_CERT_DIR"])
+def test_certificate_variables_name_the_only_trusted_roots(ssl_builds, monkeypatch, tmp_path, name):
+    ca = Path(__file__).parent / "data" / "forward_ca.pem"
+    if name == "SSL_CERT_FILE":
+        monkeypatch.setenv(name, str(ca))
+    else:
+        monkeypatch.setenv(name, str(tmp_path))
+    ctx = _client._default_ssl_context()
+    assert type(ctx) is ssl.SSLContext and ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname
+    pem = ca.read_text()
+    expected = [ssl.PEM_cert_to_DER_cert(pem[pem.index("-----BEGIN"):])] if name == "SSL_CERT_FILE" else []
+    # Certificates loaded from a file are listed (a directory's are read when needed): certifi's bundle isn't there.
+    assert ctx.get_ca_certs(binary_form=True) == expected
+
+
+def test_without_truststore_the_systems_roots_are_added_to_certifi(ssl_builds, monkeypatch):
+    monkeypatch.setitem(sys.modules, "truststore", None)           # importing it now raises ImportError
+    loaded = []
+    real = httpx.create_ssl_context
+
+    class Recording(ssl.SSLContext):
+        def load_default_certs(self, *args, **kwargs):
+            loaded.append(self)
+            return super().load_default_certs(*args, **kwargs)
+
+    def build(*args, **kwargs):
+        ctx = Recording(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.load_verify_locations(cafile=certifi.where())
+        return ctx
+
+    monkeypatch.setattr(httpx, "create_ssl_context", build)
+    ctx = _client._default_ssl_context()
+    assert loaded == [ctx] and ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname
+    bundled = real().get_ca_certs(binary_form=True)
+    assert set(bundled) <= set(ctx.get_ca_certs(binary_form=True))
+
+    def unreadable(self, *args, **kwargs):
+        raise OSError("the system store can't be read")
+
+    monkeypatch.setattr(Recording, "load_default_certs", unreadable)
+    monkeypatch.setattr(_client, "_ssl_contexts", threading.local())
+    assert set(_client._default_ssl_context().get_ca_certs(binary_form=True)) == set(bundled)   # certifi, as before
+
+
+def test_ssl_key_log_file_is_kept(ssl_builds, monkeypatch, tmp_path):
+    assert _client._default_ssl_context().keylog_filename is None
+    monkeypatch.setenv("SSLKEYLOGFILE", str(tmp_path / "keys.log"))
+    assert _client._default_ssl_context().keylog_filename == str(tmp_path / "keys.log")
 
 
 def test_shared_transport_builds_no_ssl_context(ssl_builds):

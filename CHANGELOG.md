@@ -12,6 +12,38 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## Unreleased
+
+### Fixes
+
+- **The CLI and SDK connect on computers where HTTPS is inspected.** An antivirus or a company proxy that inspects
+  HTTPS answers in the server's place with a certificate signed by its own root, which it adds to the operating
+  system's certificate store. Only the roots in the `certifi` bundle were trusted, so every command failed with
+  `CERTIFICATE_VERIFY_FAILED ... unable to get local issuer certificate` while browsers on the same computer worked.
+  The roots your operating system trusts are now trusted as well: the Windows certificate store, the macOS keychain
+  and the system CA files on Linux. The `certifi` roots stay trusted next to them, so a setup that worked keeps
+  working, and the certificate and host name are checked as before.
+
+### Changes
+
+- **`truststore` is a new dependency**, and `certifi` (which `httpx` already installed) is now named as one. The
+  operating system checks the certificate through `truststore`. Where it can't be loaded, the roots Python's `ssl`
+  module reads from the system are added to the `certifi` bundle instead; that covers Windows and Linux, not the
+  macOS keychain.
+- **`SSL_CERT_FILE` and `SSL_CERT_DIR` work as before**: when one is set, only the certificates it names are
+  trusted. A client given its own `transport=` still takes its certificate settings from that transport.
+- **`meshive port-forward` trusts the same roots for the pod's address** as the SDK does for the API. It used
+  Python's default, which finds no roots on a macOS Python whose certificates were never installed. With
+  `SSL_CERT_FILE` or `SSL_CERT_DIR` set it now also trusts only what they name.
+- **A certificate error says what to do.** When a command fails because the certificate isn't trusted, the CLI adds
+  what usually causes it and how to fix it (add the inspecting program's root to the computer's certificate store,
+  or point `SSL_CERT_FILE` at it), or names the variable that narrowed the trusted roots. When the certificate's
+  dates or host name are what is wrong, it says that instead. On Windows and macOS the text of the error itself
+  now comes from the operating system, so it no longer reads `CERTIFICATE_VERIFY_FAILED` there.
+- **On Windows and macOS the operating system checks each new connection's certificate.** That can take longer
+  than the in-memory check did when the system looks a certificate up over the network, and a client shared
+  between threads opens its connections one at a time.
+
 ## v1.10.0
 
 A pod's public ports can be locked, and from this release new pods are created with them locked. A locked port lets

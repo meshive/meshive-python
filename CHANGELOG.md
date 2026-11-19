@@ -12,7 +12,10 @@ Upgrade with:
 pip install -U meshive
 ```
 
-## Unreleased
+## v1.10.3
+
+One fix: `meshive port-forward` now tells an HTTP/1.0 client when an answer sent in chunks broke off. Code
+written for 1.10 keeps running.
 
 ### Fixes
 

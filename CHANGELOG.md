@@ -12,7 +12,10 @@ Upgrade with:
 pip install -U meshive
 ```
 
-## Unreleased
+## v1.10.2
+
+Fixes only: `meshive port-forward` no longer takes a cut connection for the end of an answer, and a refused
+certificate is reported at once instead of after retries. Code written for 1.10 keeps running.
 
 ### Fixes
 

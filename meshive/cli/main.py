@@ -3,6 +3,7 @@ import getpass
 import json
 import math
 import os
+import ssl
 import sys
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -2167,6 +2168,44 @@ _HANDLERS: dict[str, Handler] = {
 }
 
 
+_CERTIFICATE_DOCS = "https://docs.meshive.ai/sdk-cli/cli/#certificate-errors"
+
+
+def _certificate_hint(err: BaseException) -> str:
+    """What to do when a request failed because a server's certificate wasn't accepted; "" for any other failure.
+
+    The usual cause is a program that inspects HTTPS (an antivirus, a company proxy): it answers in the server's
+    place with a certificate signed by its own root. The roots this computer trusts are trusted here too, so the
+    error is left for a root that isn't among them, or for SSL_CERT_FILE / SSL_CERT_DIR naming other roots. Where
+    OpenSSL says the certificate's dates or name are what is wrong, that is said instead.
+    """
+    chain: list[BaseException] = []
+    link: BaseException | None = err
+    while link is not None and link not in chain:
+        chain.append(link)
+        link = link.__cause__ or link.__context__
+    refusal = next((exc for exc in chain if isinstance(exc, ssl.SSLCertVerificationError)), None)
+    if refusal is None and not any("CERTIFICATE_VERIFY_FAILED" in str(exc) for exc in chain):
+        return ""
+    # OpenSSL's reason, when it did the checking. Windows and macOS report in their own words, without a code.
+    code = getattr(refusal, "verify_code", None)
+    named = [name for name in ("SSL_CERT_FILE", "SSL_CERT_DIR") if os.environ.get(name)]
+    if code in (9, 10):         # not yet valid, expired
+        fix = "Its dates don't include the time on this computer: check this computer's clock."
+    elif code == 62:            # issued for another host name
+        fix = ("It was issued for another host name: check MESHIVE_BASE_URL or --base-url, and whether something "
+               "on this network answers in the server's place.")
+    elif named:
+        fix = (f"{' and '.join(named)} {'are' if len(named) > 1 else 'is'} set, so only the certificates named there "
+               "are trusted: check that they include the root that signed this certificate, or unset "
+               f"{'them' if len(named) > 1 else 'it'} to trust the roots this computer trusts.")
+    else:
+        fix = ("If an antivirus or a company proxy inspects HTTPS here, it answers with a certificate signed by its "
+               "own root. Add that root to this computer's certificate store, or save it as a PEM file and set "
+               "SSL_CERT_FILE to that file.")
+    return f"The server's certificate was not accepted. {fix}\nSee {_CERTIFICATE_DOCS}"
+
+
 def _cmd_login(args: argparse.Namespace) -> int:
     api_key = args.api_key or getpass.getpass("Meshive API key: ").strip()
     if not api_key:
@@ -2180,6 +2219,9 @@ def _cmd_login(args: argparse.Namespace) -> int:
         me = client.me()  # validate the key before saving.
     except (MeshiveError, httpx.HTTPError) as err:
         print(fmt.clean(f"Error: could not verify API key against {base_url}: {err}"), file=sys.stderr)
+        hint = _certificate_hint(err)
+        if hint:
+            print(hint, file=sys.stderr)
         return 1
     finally:
         client.close()
@@ -2250,6 +2292,9 @@ def main(argv: list[str] | None = None) -> int:
         target = getattr(getattr(err, "request", None), "url", None)
         where = f" {target}" if target else ""
         print(fmt.clean(f"Error: could not reach the Meshive API{where}: {err}"), file=sys.stderr)
+        hint = _certificate_hint(err)
+        if hint:
+            print(hint, file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print(file=sys.stderr)

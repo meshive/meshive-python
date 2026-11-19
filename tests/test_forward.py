@@ -23,6 +23,7 @@ import httpx
 import pytest
 
 from meshive.cli import _forward as forward_cli
+from meshive._client import _build_ssl_context
 from meshive.cli._forward import Forwarder
 from tests.test_sdk import isolate_config_dir, sync_client  # noqa: F401  (autouse fixture)
 
@@ -744,6 +745,37 @@ async def test_the_certificate_must_come_from_a_trusted_authority():
     async with forwarding(trust=False) as (forwarder, endpoint, _):     # the system's authorities, not the test's
         answer = await ask(forwarder, "GET", "/echo")
         assert answer.status == 502 and endpoint.arrivals == []
+
+
+@needs_untouched_traffic
+@scenario
+async def test_the_default_context_checks_the_name_and_trusts_a_root_added_to_it(monkeypatch):
+    """The context the forwarder and the SDK build when given none, against the stand-in endpoint. A root loaded
+    from a file is trusted next to the system's own (the certifi bundle is added this way), the name is checked
+    all the same, and without that root the endpoint is refused.
+
+    macOS refuses the test certificate whatever signed it (it is valid for a century, and macOS accepts no server
+    certificate valid for more than 825 days), so there only the refusal is checked."""
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    endpoint = Endpoint()
+    await endpoint.start()
+
+    async def handshake(context, name):
+        _, writer = await asyncio.open_connection("127.0.0.1", endpoint.port, ssl=context, server_hostname=name)
+        writer.close()
+
+    try:
+        with pytest.raises(ssl.SSLCertVerificationError):
+            await handshake(_build_ssl_context(), HOST)
+        trusting = _build_ssl_context()
+        trusting.load_verify_locations(cafile=str(DATA / "forward_ca.pem"))
+        if sys.platform != "darwin":
+            await handshake(trusting, HOST)
+        with pytest.raises(ssl.SSLCertVerificationError):
+            await handshake(trusting, "ffffffffffffffff.test-cluster.meshive.test")
+    finally:
+        await endpoint.close()
 
 
 @scenario

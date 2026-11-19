@@ -2,6 +2,7 @@ import argparse
 import importlib
 from pathlib import Path
 import json
+import ssl
 from datetime import date, datetime, timedelta, timezone
 
 import httpx
@@ -675,6 +676,81 @@ def test_network_error_is_reported_not_raised(monkeypatch, capsys):
     assert cli.main(["me"]) == 1
     err = capsys.readouterr().err
     assert "could not reach" in err and "https://api.test/v1/sdk/me" in err
+
+
+
+def _refused_certificate(code=20, reason="unable to get local issuer certificate"):
+    """What httpx raises when a server's certificate isn't accepted: the ssl error is the cause of the cause.
+    `code` is OpenSSL's reason (20: the root isn't trusted); None stands for Windows and macOS, which give none."""
+    def raise_it(self):
+        request = httpx.Request("GET", "https://api.test/v1/sdk/me")
+        refusal = ssl.SSLCertVerificationError(1, f"[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: {reason}")
+        if code is not None:
+            refusal.verify_code, refusal.verify_message = code, reason
+        try:
+            try:
+                raise refusal
+            except ssl.SSLError as exc:
+                raise ConnectionError(str(exc)) from exc
+        except ConnectionError as exc:
+            raise httpx.ConnectError(str(exc), request=request) from exc
+    return raise_it
+
+
+_untrusted_certificate = _refused_certificate()
+
+
+def test_untrusted_certificate_says_what_to_do(capsys, monkeypatch):
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    monkeypatch.setattr(FakeClient, "me", _untrusted_certificate)
+    assert cli.main(["me"]) == 1
+    err = capsys.readouterr().err
+    assert "could not reach" in err and "CERTIFICATE_VERIFY_FAILED" in err
+    assert "antivirus or a company proxy" in err and "set SSL_CERT_FILE to that file" in err
+    assert "https://docs.meshive.ai/sdk-cli/cli/#certificate-errors" in err
+    assert "verify=False" not in err and "disable" not in err.lower()      # never suggests turning the check off
+    assert "nothing was sent" not in err                                    # an upload may be part of the way through
+
+
+def test_untrusted_certificate_reported_by_the_operating_system_gets_the_same_advice(capsys, monkeypatch):
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    monkeypatch.setattr(FakeClient, "me", _refused_certificate(None, "terminated in a root certificate"))
+    assert cli.main(["me"]) == 1
+    assert "set SSL_CERT_FILE to that file" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("code, reason, advice", [
+    (10, "certificate has expired", "check this computer's clock"),
+    (9, "certificate is not yet valid", "check this computer's clock"),
+    (62, "Hostname mismatch", "issued for another host name"),
+])
+def test_a_certificate_refused_for_its_dates_or_name_is_not_blamed_on_a_root(capsys, monkeypatch, code, reason, advice):
+    monkeypatch.setenv("SSL_CERT_FILE", "/somewhere/roots.pem")             # not the cause either
+    monkeypatch.setattr(FakeClient, "me", _refused_certificate(code, reason))
+    assert cli.main(["me"]) == 1
+    err = capsys.readouterr().err
+    assert advice in err and "antivirus" not in err and "SSL_CERT_FILE" not in err
+
+
+def test_untrusted_certificate_names_the_variable_that_narrows_trust(capsys, monkeypatch):
+    monkeypatch.setenv("SSL_CERT_FILE", "/somewhere/roots.pem")
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    monkeypatch.setattr(FakeClient, "me", _untrusted_certificate)
+    assert cli.main(["me"]) == 1
+    err = capsys.readouterr().err
+    assert "SSL_CERT_FILE is set, so only the certificates named there are trusted" in err and "unset it" in err
+    assert "antivirus" not in err
+
+
+def test_other_connection_failures_get_no_certificate_hint(capsys, monkeypatch):
+    def refused(self):
+        raise httpx.ConnectError("Connection refused", request=httpx.Request("GET", "https://api.test/v1/sdk/me"))
+
+    monkeypatch.setattr(FakeClient, "me", refused)
+    assert cli.main(["me"]) == 1
+    assert "certificate" not in capsys.readouterr().err
 
 
 def test_keyboard_interrupt_exits_130(monkeypatch):

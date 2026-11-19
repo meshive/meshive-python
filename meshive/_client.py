@@ -21,6 +21,7 @@ import math
 import os
 import re
 import ssl
+import sys
 import threading
 import time
 import uuid
@@ -31,6 +32,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+import certifi
 import httpx
 
 from . import _config
@@ -688,11 +690,51 @@ def _replayed(response: httpx.Response) -> bool:
     return response.headers.get("Idempotent-Replayed", "").strip().lower() == "true"
 
 
-# Building an SSL context loads the whole CA bundle, which was most of the cost of creating a client. The context
-# httpx would build for verify=True is kept per thread instead, so clients created on different threads get different
-# contexts (httpcore sets ALPN on the context at every connect). It is rebuilt when the variables httpx reads for it
-# change, or when ssl.SSLContext itself is replaced (truststore.inject_into_ssl()). The CA files are read only then.
+def _build_ssl_context() -> ssl.SSLContext:
+    """A new context that verifies the server's certificate and host name, and decides which roots are trusted.
+
+    Trusted are the roots this computer trusts (the Windows certificate store, the macOS keychain, the system CA
+    files on Linux) and, as before, the certifi bundle. Only certifi used to be trusted, so on a computer where an
+    antivirus or a company proxy inspects HTTPS, and answers with a certificate signed by its own root, every
+    request failed with CERTIFICATE_VERIFY_FAILED while browsers worked. The operating system does the checking
+    through `truststore`; where that package can't be loaded, the roots the `ssl` module can read from the system
+    are added to the certifi bundle instead, which covers Windows and Linux but not the macOS keychain.
+
+    SSL_CERT_FILE or SSL_CERT_DIR, when set, name the only roots that are trusted, as they did before.
+    """
+    if os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR"):
+        return httpx.create_ssl_context(verify=True, trust_env=True)
+    try:
+        import truststore
+
+        ctx = truststore.SSLContext(_PROTOCOL_TLS_CLIENT)
+    except Exception:  # noqa: BLE001 - not installed, or it can't reach this system's verifier (ImportError, OSError)
+        ctx = httpx.create_ssl_context(verify=True, trust_env=True)
+        try:
+            ctx.load_default_certs()
+        except Exception:  # noqa: BLE001 - an unreadable system store leaves the certifi bundle, as before
+            pass
+        return ctx
+    ctx.load_verify_locations(cafile=certifi.where())
+    # What ssl.create_default_context() adds to a bare context, so that nothing is checked less than before: the
+    # strict X.509 rules from Python 3.13 on (they count where OpenSSL does the verifying, which is Linux), and the
+    # key log file.
+    ctx.verify_flags |= _DEFAULT_VERIFY_FLAGS
+    keylog = os.environ.get("SSLKEYLOGFILE")
+    if keylog and not sys.flags.ignore_environment and hasattr(ctx, "keylog_filename"):
+        ctx.keylog_filename = keylog
+    return ctx
+
+
+# Building an SSL context loads the whole CA bundle, which was most of the cost of creating a client. One context is
+# kept per thread instead, so clients created on different threads get different contexts (httpcore sets ALPN on the
+# context at every connect). It is rebuilt when the variables read for it change, or when ssl.SSLContext itself is
+# replaced (truststore.inject_into_ssl()). The certifi bundle is read only then; on Linux the system's CA files are
+# read again for each new connection.
 _SSL_ENV = ("SSL_CERT_FILE", "SSL_CERT_DIR", "SSLKEYLOGFILE")
+# Taken from the ssl module once, at import: the cache key above compares ssl.SSLContext, which a program may replace.
+_PROTOCOL_TLS_CLIENT = ssl.PROTOCOL_TLS_CLIENT
+_DEFAULT_VERIFY_FLAGS = (ssl.VERIFY_X509_PARTIAL_CHAIN | ssl.VERIFY_X509_STRICT) if sys.version_info >= (3, 13) else 0
 _ssl_contexts = threading.local()
 
 
@@ -700,7 +742,7 @@ def _default_ssl_context() -> ssl.SSLContext:
     key = (ssl.SSLContext, *(os.environ.get(name) for name in _SSL_ENV))
     cached = getattr(_ssl_contexts, "entry", None)
     if cached is None or cached[0] != key:
-        cached = _ssl_contexts.entry = (key, httpx.create_ssl_context(verify=True, trust_env=True))
+        cached = _ssl_contexts.entry = (key, _build_ssl_context())
     return cached[1]
 
 

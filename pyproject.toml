@@ -17,6 +17,10 @@ dynamic = ["version"]
 dependencies = [
     # httpx 1.0 changes the API (its development releases drop names this SDK uses), so stay below it.
     "httpx>=0.27,<1",
+    # The roots trusted for HTTPS: the operating system's own store, checked through truststore, and the certifi
+    # bundle next to it. httpx installs certifi as well; it is named here because this package imports it.
+    "certifi",
+    "truststore>=0.10.5",
 ]
 keywords = ["meshive", "gpu", "cloud", "ai", "ml", "sdk", "cli"]
 classifiers = [
@@ -66,5 +70,6 @@ testpaths = ["tests"]
 markers = [
     "live: tests that hit the real Meshive API (require MESHIVE_API_KEY)",
     "integration: integration tests requiring API credentials and fixtures",
+    "network: tests that open a connection to the internet (a TLS handshake, nothing sent)",
 ]
-addopts = "-m 'not live and not integration' --tb=short -ra"
+addopts = "-m 'not live and not integration and not network' --tb=short -ra"

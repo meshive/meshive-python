@@ -38,10 +38,10 @@ An answer the endpoint cuts short is not passed off as a whole one. Cut short me
 Content-Length, a chunked body without its last chunk, or, for an answer that runs until the connection closes, a
 connection that was reset or that ended without TLS's closing message (anyone on the network path can end a TCP
 connection; only the endpoint can send that message). The client is told by the framing where there is one, and
-by a reset of its own connection where there is none: an HTTP/1.0 client reading an answer that runs until the
-connection closes. That reset can't be relied on on Windows, whose event loop ends a connection in the ordinary
-way before closing it, so there such a client may not be able to tell; the forwarder's own log line still says
-"cut short".
+by a reset of its own connection where there is none: an HTTP/1.0 client can't read chunks, so an answer that
+came in chunks, or that runs until the connection closes, reaches it as plain data that ends when its connection
+does. That reset can't be relied on on Windows, whose event loop ends a connection in the ordinary way before
+closing it, so there such a client may not be able to tell; the forwarder's own log line still says "cut short".
 
 Only the standard library is used, so the command runs wherever the package does. The one thing taken from the
 SDK is which certificate roots are trusted: the same ones as for its API calls.
@@ -979,21 +979,22 @@ class Forwarder:
             out.append(("Connection", "close"))
         try:
             client_writer.write(_serialize(status_line, out))
+            # An answer without a length reaches a client that doesn't read chunks (HTTP/1.0) as plain data that
+            # ends when its connection does. If the answer breaks off, only a reset of that connection says so.
+            conn.reset = framed in ("chunked", "close") and not chunks
             if framed == "length":
                 await _copy_exact(conn.upstream, client_writer, stated or 0)
             elif framed == "chunked":
                 await _copy_chunked(conn.upstream, client_writer, framed=chunks)
             elif framed == "close":
-                # Whether this answer ended or broke off, the client can tell only from its last chunk; a client
-                # that doesn't read chunks (HTTP/1.0) only from its connection being reset.
-                conn.reset = not chunks
+                # Whether this answer ended or broke off, a client that reads chunks can tell from its last one.
                 await _copy_all(conn.upstream, client_writer, as_chunks=chunks)
                 if conn.upstream.failed or conn.gone or not _said_goodbye(conn.upstream_writer):
                     raise _Eof()
-                conn.reset = False
                 await _push(client_writer, b"0\r\n\r\n" if chunks else b"")
             else:
                 await _push(client_writer, b"")
+            conn.reset = False
         except (_Eof, _Malformed, _SinkClosed):
             # The answer's head is out already, so the only way to say "incomplete" is to break the connection.
             self._log(method, target, f"{status} (cut short)")

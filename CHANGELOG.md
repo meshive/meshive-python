@@ -12,6 +12,20 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## v1.10.3
+
+One fix: `meshive port-forward` now tells an HTTP/1.0 client when an answer sent in chunks broke off. Code
+written for 1.10 keeps running.
+
+### Fixes
+
+- **`meshive port-forward`: an HTTP/1.0 client is told when an answer sent in chunks broke off.** Such a client
+  can't read chunks, so it gets the data without them and reads until its connection closes. 1.10.2 reset that
+  connection only for an answer that runs until the endpoint's own connection closes. An answer in chunks that
+  ended without its last chunk was still closed in the ordinary way, so the client took it for whole (the
+  forwarder's log line said `(cut short)`). The connection is now reset in both cases. As before, the reset can't
+  be relied on on Windows; the log line says so there. Clients that speak HTTP/1.1 were never affected.
+
 ## v1.10.2
 
 Fixes only: `meshive port-forward` no longer takes a cut connection for the end of an answer, and a refused

@@ -328,6 +328,12 @@ class Endpoint:
             await asyncio.sleep(0.1)
             _raw_socket(writer).shutdown(socket.SHUT_WR)
             return await reader.read(1) != b""      # ... and stays as it is until the other side leaves
+        elif path == "/chunks-cut":         # an answer in chunks that ends without its last chunk
+            writer.write(_answer(200, [("Transfer-Encoding", "chunked")], length=False))
+            writer.write(b"e\r\nthe first part\r\n")
+            await writer.drain()
+            await asyncio.sleep(0.1)
+            return False
         elif path == "/hop":
             writer.write(_answer(200, [("Connection", "X-Internal"), ("X-Internal", "1"), ("Keep-Alive", "timeout=5"),
                                        ("Proxy-Authenticate", "Basic"), ("X-Kept", "1")], b"ok"))
@@ -1378,12 +1384,13 @@ async def test_an_answer_whose_connection_closes_without_tls_saying_so_is_cut_sh
 
 @needs_untouched_traffic       # an inspecting antivirus was seen to turn the reset into a proper close
 @scenario
-@pytest.mark.parametrize("path", ["/until-reset", "/until-cut"])
+@pytest.mark.parametrize("path", ["/until-reset", "/until-cut", "/chunks-cut"])
 async def test_a_client_without_chunks_is_told_of_a_cut_answer_by_a_reset(path):
     """An HTTP/1.0 client reads an answer of unknown length until its connection closes, so the only way to
-    tell it the answer broke off is to break its connection instead of closing it. On Windows that can't be
-    relied on (the event loop ends the connection in the ordinary way before closing it); there the forwarder's
-    log is what says so."""
+    tell it the answer broke off is to break its connection instead of closing it. That holds for an answer the
+    endpoint sent in chunks too: the client gets the data without them. On Windows the reset can't be relied on
+    (the event loop ends the connection in the ordinary way before closing it); there the forwarder's log is
+    what says so."""
     async with forwarding() as (forwarder, _, said):
         client = await Raw.connect(forwarder)
         client.send(f"GET {path} HTTP/1.0\r\nHost: 127.0.0.1:{client.port}\r\n\r\n")

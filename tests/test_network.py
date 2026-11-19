@@ -32,4 +32,3 @@ def _handshake(context: ssl.SSLContext, name: str) -> None:
 
 def test_the_apis_certificate_is_trusted(context):
     _handshake(context, HOST)
-

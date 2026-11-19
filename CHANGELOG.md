@@ -12,7 +12,10 @@ Upgrade with:
 pip install -U meshive
 ```
 
-## Unreleased
+## v1.10.1
+
+The CLI and SDK now connect on computers where an antivirus or a company proxy inspects HTTPS. Code written for
+1.10.0 keeps running. Installing this release adds one package, `truststore`.
 
 ### Fixes
 

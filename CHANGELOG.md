@@ -12,6 +12,26 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## v1.10.2
+
+Fixes only: `meshive port-forward` no longer takes a cut connection for the end of an answer, and a refused
+certificate is reported at once instead of after retries. Code written for 1.10 keeps running.
+
+### Fixes
+
+- **`meshive port-forward` no longer takes a cut connection for the end of an answer.** An answer without a
+  `Content-Length` and without chunks runs until the endpoint closes its connection. The forwarder passed such an
+  answer on as complete whenever the connection closed in the ordinary way, also when TLS's closing message was
+  missing. Anyone on the network path can close a TCP connection; only the endpoint can send that message. Without
+  it the answer now counts as cut short: it is not given its last chunk, and the log line says `(cut short)`.
+  Answers with a length or in chunks were never affected.
+- **An HTTP/1.0 client is told when such an answer broke off.** It reads until its connection closes, so the
+  forwarder now resets its connection instead of closing it. That can't be relied on on Windows, where a
+  connection is ended in the ordinary way before it is closed; the forwarder's log line says so there.
+- **A refused certificate is reported at once.** The SDK and CLI treated it like any other connection failure and
+  tried again, with the usual waits, before giving up. The same certificate would be refused each time, so the
+  first refusal is now the answer.
+
 ## v1.10.1
 
 The CLI and SDK now connect on computers where an antivirus or a company proxy inspects HTTPS. Code written for

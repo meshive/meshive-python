@@ -650,6 +650,9 @@ def _complete_body(files: Iterable[dict[str, Any]]) -> dict[str, Any]:
 # Idempotency-Key (the server replays the first response), so they can be retried without double creation.
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 _RETRY_EXCEPTIONS = (httpx.ConnectError, httpx.TimeoutException)
+# One connection failure that trying again can't change: the server's certificate was refused. httpx reports it as a
+# ConnectError with the ssl error behind it. (Taken from the ssl module at import; see _PROTOCOL_TLS_CLIENT.)
+_CERTIFICATE_REFUSED = ssl.SSLCertVerificationError
 _RETRY_BACKOFF = 0.5  # 0.5s → 1s → 2s ...
 # If Retry-After is longer than this, don't wait — raise RateLimitError as-is.
 # A script silently stuck for minutes is worse than an error.
@@ -675,6 +678,22 @@ def _may_resend(only_if_not_started: bool, *, exc: BaseException | None = None,
     if exc is not None:
         return isinstance(exc, _NOT_STARTED_EXCEPTIONS)
     return response is not None and response.status_code in _NOT_STARTED_STATUSES
+
+
+def _certificate_refused(exc: BaseException) -> bool:
+    """Whether a failed attempt ended because the server's certificate was refused: the ssl error is what the
+    failure was made from. httpx raises its error `from` the one of the layer below, and that layer raises its own
+    `from None` while it handles the ssl error, which leaves the ssl error as a context marked as replaced. An
+    error that merely was being handled when the request was made (a program calling the SDK inside its own
+    `except`) is a context that was not replaced, and doesn't count."""
+    seen: list[BaseException] = []
+    link: BaseException | None = exc
+    while link is not None and link not in seen:
+        if isinstance(link, _CERTIFICATE_REFUSED):
+            return True
+        seen.append(link)
+        link = link.__cause__ or (link.__context__ if link.__suppress_context__ else None)
+    return False
 
 
 def _mark_operation(exc: BaseException, key: str, method: str, path: str) -> None:
@@ -798,13 +817,16 @@ class _BaseClient:
         read = None if self._timeout is None else max(float(self._timeout), LONG_RUNNING_READ_TIMEOUT)
         return httpx.Timeout(self._timeout, read=read)
 
-    def _retry_delay(self, attempt: int, response: httpx.Response | None = None) -> float | None:
+    def _retry_delay(self, attempt: int, response: httpx.Response | None = None, *,
+                     exc: BaseException | None = None) -> float | None:
         """Retry wait time (seconds). None when it shouldn't retry.
 
-        response=None means a network exception (no response at all).
+        response=None means a network exception (no response at all); `exc` is that exception.
         """
         if attempt >= self._max_retries:
             return None
+        if exc is not None and _certificate_refused(exc):
+            return None         # the same certificate would be refused again
         if response is None:
             return _RETRY_BACKOFF * 2 ** attempt
         if response.status_code not in _RETRY_STATUSES:
@@ -989,8 +1011,8 @@ class Meshive(_BaseClient):
         while True:
             try:
                 response = self._client.get(url, params=params, headers=headers)
-            except _RETRY_EXCEPTIONS:
-                delay = self._retry_delay(attempt)
+            except _RETRY_EXCEPTIONS as exc:
+                delay = self._retry_delay(attempt, exc=exc)
                 if delay is None:
                     raise
             else:
@@ -1018,7 +1040,7 @@ class Meshive(_BaseClient):
                 response = self._client.request(method, url, params=params, json=json, headers=headers,
                                                 timeout=timeout)
             except _RETRY_EXCEPTIONS as exc:
-                delay = self._retry_delay(attempt) if _may_resend(long_running or once, exc=exc) else None
+                delay = self._retry_delay(attempt, exc=exc) if _may_resend(long_running or once, exc=exc) else None
                 if delay is None:
                     _mark_operation(exc, headers["Idempotency-Key"], method, path)
                     raise
@@ -2698,8 +2720,8 @@ class AsyncMeshive(_BaseClient):
         while True:
             try:
                 response = await self._client.get(url, params=params, headers=headers)
-            except _RETRY_EXCEPTIONS:
-                delay = self._retry_delay(attempt)
+            except _RETRY_EXCEPTIONS as exc:
+                delay = self._retry_delay(attempt, exc=exc)
                 if delay is None:
                     raise
             else:
@@ -2727,7 +2749,7 @@ class AsyncMeshive(_BaseClient):
                 response = await self._client.request(method, url, params=params, json=json, headers=headers,
                                                 timeout=timeout)
             except _RETRY_EXCEPTIONS as exc:
-                delay = self._retry_delay(attempt) if _may_resend(long_running or once, exc=exc) else None
+                delay = self._retry_delay(attempt, exc=exc) if _may_resend(long_running or once, exc=exc) else None
                 if delay is None:
                     _mark_operation(exc, headers["Idempotency-Key"], method, path)
                     raise

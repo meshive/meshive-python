@@ -1,6 +1,8 @@
 import asyncio
 import json
+import ssl
 
+import httpcore
 import httpx
 import pytest
 
@@ -689,6 +691,65 @@ def test_connect_errors_propagate_after_retries():
     with pytest.raises(httpx.ConnectError):
         sync_client(handler).me()
     assert calls["n"] == 3
+
+
+def _refused_certificate(request):
+    """What httpx raises when the server's certificate isn't accepted, link for link: its ConnectError is raised
+    from the one of the layer below, which was raised `from None` while the ssl error was being handled."""
+    try:
+        try:
+            raise ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+        except ssl.SSLError as exc:
+            raise httpcore.ConnectError(str(exc)) from None
+    except httpcore.ConnectError as exc:
+        raise httpx.ConnectError(str(exc), request=request) from exc
+
+
+def test_a_refused_certificate_is_not_retried(slept):
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        _refused_certificate(request)
+
+    with pytest.raises(httpx.ConnectError):
+        sync_client(handler).me()                           # a read
+    assert calls["n"] == 1 and slept == []
+    with pytest.raises(httpx.ConnectError) as err:
+        sync_client(handler).stop_pod("p-0", "ws")          # a write: not resent either, and it can be looked up
+    assert calls["n"] == 2 and slept == [] and err.value.idempotency_key
+
+    async def run():
+        async with async_client(handler) as client:
+            with pytest.raises(httpx.ConnectError):
+                await client.me()
+
+    asyncio.run(run())
+    assert calls["n"] == 3 and slept == []
+
+
+def test_a_refused_certificate_that_was_only_being_handled_does_not_stop_retries(slept):
+    """A program that calls the SDK while it handles a certificate error of its own: the connection failure that
+    follows has that error as its context, not as its cause, and is retried like any other."""
+    calls = {"n": 0}
+
+    def handler(request):       # the first attempt can't connect, the way httpx reports it; the second answers
+        calls["n"] += 1
+        if calls["n"] > 1:
+            return httpx.Response(200, json=WHOAMI)
+        try:
+            try:
+                raise ConnectionRefusedError(111, "Connection refused")
+            except OSError as exc:
+                raise httpcore.ConnectError(str(exc)) from None
+        except httpcore.ConnectError as exc:
+            raise httpx.ConnectError(str(exc), request=request) from exc
+
+    try:
+        raise ssl.SSLCertVerificationError(1, "another connection's certificate")
+    except ssl.SSLCertVerificationError:
+        assert sync_client(handler).me().email == "a@b.com"
+    assert calls["n"] == 2
 
 
 def test_async_retries(slept):

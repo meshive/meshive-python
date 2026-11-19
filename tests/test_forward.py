@@ -101,6 +101,25 @@ def _answer(status, headers=(), body=b"", *, length=True, version="HTTP/1.1"):
     return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body
 
 
+def _raw_socket(writer):
+    """The socket under a connection's transport (a TLS transport sits on the one that owns the socket)."""
+    transport = writer.transport
+    below = getattr(transport, "_ssl_protocol", None)
+    return (below._transport if below is not None else transport)._sock
+
+
+def _reset(writer):
+    """Ends a connection the way a crashed server or a dropped link does: the other side reads an error, not the
+    ordinary end of the stream. SO_LINGER with a zero timeout makes closing the socket send a reset. The socket
+    under the transport is closed here, right after the abort: left to itself, the Windows event loop shuts the
+    connection down before closing it, and the other side then sees an ordinary close."""
+    raw = _raw_socket(writer)
+    raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                   struct.pack("hh", 1, 0) if sys.platform == "win32" else struct.pack("ii", 1, 0))
+    writer.transport.abort()
+    raw.close()
+
+
 class Endpoint:
     """What a locked port's public address does, as far as the forwarder can tell: it speaks HTTP/1.1 over TLS,
     turns a request without the key away with 401 before reading its body, and passes the others on to the app
@@ -301,10 +320,14 @@ class Endpoint:
             writer.write(_answer(200, body=b"the first part", length=False))
             await writer.drain()
             await asyncio.sleep(0.1)
-            writer.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("hh", 1, 0)
-                                                       if sys.platform == "win32" else struct.pack("ii", 1, 0))
-            writer.transport.abort()
+            _reset(writer)
             return False
+        elif path == "/until-cut":          # ... and one whose connection is closed without TLS saying so
+            writer.write(_answer(200, body=b"the first part", length=False))
+            await writer.drain()
+            await asyncio.sleep(0.1)
+            _raw_socket(writer).shutdown(socket.SHUT_WR)
+            return await reader.read(1) != b""      # ... and stays as it is until the other side leaves
         elif path == "/hop":
             writer.write(_answer(200, [("Connection", "X-Internal"), ("X-Internal", "1"), ("Keep-Alive", "timeout=5"),
                                        ("Proxy-Authenticate", "Basic"), ("X-Kept", "1")], b"ok"))
@@ -1331,6 +1354,50 @@ async def test_an_answer_that_breaks_off_before_the_connection_closes_properly()
         with pytest.raises((asyncio.IncompleteReadError, ConnectionError)):
             await client.answer()                           # no last chunk: the client knows it is not whole
         assert any("cut short" in line for line in said)
+
+
+@needs_untouched_traffic       # without TLS there is no closing message to miss
+@scenario
+async def test_an_answer_whose_connection_closes_without_tls_saying_so_is_cut_short():
+    """Anyone on the network path can end a TCP connection in the ordinary way; only the endpoint can send
+    TLS's closing message. An answer that runs until the connection closes, and ends without that message, may
+    have been cut: it is not given its last chunk."""
+    async with forwarding() as (forwarder, _, said):
+        client = await Raw.connect(forwarder)
+        client.request("GET", "/until-cut")
+        with pytest.raises((asyncio.IncompleteReadError, ConnectionError)):
+            await client.answer()
+        assert any("cut short" in line for line in said)
+        # The same answer, ended with the closing message, is whole (and the test above this file's middle
+        # shows the client keeps its connection).
+        client = await Raw.connect(forwarder)
+        client.request("GET", "/until-close")
+        assert (await client.answer()).body == b"runs until the connection closes"
+        assert sum("cut short" in line for line in said) == 1
+
+
+@needs_untouched_traffic       # an inspecting antivirus was seen to turn the reset into a proper close
+@scenario
+@pytest.mark.parametrize("path", ["/until-reset", "/until-cut"])
+async def test_a_client_without_chunks_is_told_of_a_cut_answer_by_a_reset(path):
+    """An HTTP/1.0 client reads an answer of unknown length until its connection closes, so the only way to
+    tell it the answer broke off is to break its connection instead of closing it. On Windows that can't be
+    relied on (the event loop ends the connection in the ordinary way before closing it); there the forwarder's
+    log is what says so."""
+    async with forwarding() as (forwarder, _, said):
+        client = await Raw.connect(forwarder)
+        client.send(f"GET {path} HTTP/1.0\r\nHost: 127.0.0.1:{client.port}\r\n\r\n")
+        if sys.platform == "win32":
+            with contextlib.suppress(ConnectionError):
+                await client.reader.read()
+        else:
+            with pytest.raises(ConnectionError):
+                await client.reader.read()
+        assert any("cut short" in line for line in said)
+        # An answer that ended properly ends the client's connection in the ordinary way.
+        client = await Raw.connect(forwarder)
+        client.send(f"GET /until-close HTTP/1.0\r\nHost: 127.0.0.1:{client.port}\r\n\r\n")
+        assert (await client.reader.read()).endswith(b"runs until the connection closes")
 
 
 @scenario

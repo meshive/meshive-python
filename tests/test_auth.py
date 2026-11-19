@@ -50,6 +50,7 @@ def test_save_omits_base_url_when_none():
     assert _credentials.load() == {"api_key": "meshive_abc"}
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows has no permission bits; the profile folder's ACL protects the file")
 def test_saved_file_is_0600():
     path = _credentials.save("meshive_abc")
     mode = stat.S_IMODE(os.stat(path).st_mode)

@@ -31,8 +31,17 @@ a two-way pipe. Addresses of the endpoint written inside a page's HTML or script
 Connections. One connection to the endpoint per client connection, kept open between requests and let go after a
 short idle time. A request without a body that is safe to repeat (GET, HEAD, OPTIONS) is sent once more on a new
 connection when the kept one turns out to have been closed; any other request gets 502 instead of being repeated.
-A client that closes its connection while its request is being answered ends that request at the endpoint too. An
-answer the endpoint cuts short is never passed off as a whole one. The number of client connections is limited.
+A client that closes its connection while its request is being answered ends that request at the endpoint too.
+The number of client connections is limited.
+
+An answer the endpoint cuts short is not passed off as a whole one. Cut short means: fewer bytes than its
+Content-Length, a chunked body without its last chunk, or, for an answer that runs until the connection closes, a
+connection that was reset or that ended without TLS's closing message (anyone on the network path can end a TCP
+connection; only the endpoint can send that message). The client is told by the framing where there is one, and
+by a reset of its own connection where there is none: an HTTP/1.0 client reading an answer that runs until the
+connection closes. That reset can't be relied on on Windows, whose event loop ends a connection in the ordinary
+way before closing it, so there such a client may not be able to tell; the forwarder's own log line still says
+"cut short".
 
 Only the standard library is used, so the command runs wherever the package does. The one thing taken from the
 SDK is which certificate roots are trusted: the same ones as for its API calls.
@@ -49,6 +58,7 @@ import re
 import signal
 import socket
 import ssl
+import struct
 import sys
 import time
 from typing import Callable, Iterable
@@ -77,6 +87,8 @@ _MAX_TRAILERS = 64 * 1024
 _PER_CONNECTION = frozenset({"connection", "keep-alive", "proxy-connection", "te", "trailer", "upgrade",
                              "proxy-authorization", "proxy-authenticate", "content-length", "transfer-encoding"})
 _SAFE_TO_REPEAT = frozenset({"GET", "HEAD", "OPTIONS"})
+# SO_LINGER switched on with a timeout of zero: struct linger is two shorts on Windows, two ints elsewhere.
+_RESET_ON_CLOSE = struct.pack("hh" if sys.platform == "win32" else "ii", 1, 0)
 
 _CONTINUE_PAGE = (
     "<!doctype html><meta charset=\"utf-8\"><title>meshive port-forward</title>"
@@ -315,9 +327,37 @@ async def _copy_chunked(source: _Stream, writer: asyncio.StreamWriter, *, framed
         await _push(writer, b"\r\n" if framed else b"")
 
 
-def _close(writer: asyncio.StreamWriter | None, *, abort: bool = False) -> None:
+def _said_goodbye(writer: asyncio.StreamWriter | None) -> bool:
+    """Whether a TLS connection that has reached its end was ended by the other side's closing message
+    (close_notify), and not just by the TCP connection closing under it. asyncio reports both as the end of the
+    stream. They differ in what the TLS object answers when asked for more: "the other side closed" in the first
+    case, "nothing has arrived yet" in the second. A connection without TLS has no such message, and counts as
+    ended properly."""
+    tls = writer.get_extra_info("ssl_object") if writer is not None else None
+    if tls is None:
+        return True
+    try:
+        return tls.read(1) == b""
+    except ssl.SSLZeroReturnError:
+        return True
+    except Exception:  # noqa: BLE001 - SSLWantReadError (nothing more came), or a connection in no state to say
+        return False
+
+
+def _close(writer: asyncio.StreamWriter | None, *, abort: bool = False, reset: bool = False) -> None:
+    """Closes a connection: after what was written has gone out, or at once (abort). With reset, the other side
+    is to read an error instead of the ordinary end of the stream, as far as this system allows: a zero linger
+    time makes closing the socket send a reset. (The Windows event loop shuts a connection down before closing
+    it, so the other side usually sees an ordinary end there all the same.)"""
     if writer is None:
         return
+    if reset:
+        try:
+            sock = writer.get_extra_info("socket")
+            if sock is not None:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, _RESET_ON_CLOSE)
+        except OSError:      # the socket is gone already; it is still closed below
+            pass
     try:
         if abort:
             writer.transport.abort()
@@ -361,7 +401,8 @@ def _keep_alive(sock: socket.socket | None) -> None:
 class _Connection:
     """One client connection and, while it has one, its connection to the endpoint."""
 
-    __slots__ = ("client", "writer", "upstream", "upstream_writer", "client_task", "body_sent", "gone", "linger")
+    __slots__ = ("client", "writer", "upstream", "upstream_writer", "client_task", "body_sent", "gone", "linger",
+                 "reset")
 
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         self.client = _Stream(reader)
@@ -372,6 +413,7 @@ class _Connection:
         self.body_sent = True   # the request's body has all gone out
         self.gone = False       # the client closed its connection while its request was being answered
         self.linger = False     # the client may still be sending: read what it sends for a moment before closing
+        self.reset = False      # an answer broke off where only a reset of the client's connection can say so
 
 
 class Forwarder:
@@ -666,7 +708,7 @@ class Forwarder:
                 conn.client_task.cancel()
             # Dropped at once when something went wrong; otherwise what is still buffered goes out first.
             self._drop_upstream(conn, abort=aborted)
-            _close(writer, abort=aborted)
+            _close(writer, abort=aborted, reset=aborted and conn.reset)
 
     def _write_reply(self, conn: _Connection, reply: _Reply, method: str | None) -> None:
         """Writes the forwarder's own answer. The connection is closed after it."""
@@ -942,9 +984,13 @@ class Forwarder:
             elif framed == "chunked":
                 await _copy_chunked(conn.upstream, client_writer, framed=chunks)
             elif framed == "close":
+                # Whether this answer ended or broke off, the client can tell only from its last chunk; a client
+                # that doesn't read chunks (HTTP/1.0) only from its connection being reset.
+                conn.reset = not chunks
                 await _copy_all(conn.upstream, client_writer, as_chunks=chunks)
-                if conn.upstream.failed or conn.gone:
+                if conn.upstream.failed or conn.gone or not _said_goodbye(conn.upstream_writer):
                     raise _Eof()
+                conn.reset = False
                 await _push(client_writer, b"0\r\n\r\n" if chunks else b"")
             else:
                 await _push(client_writer, b"")

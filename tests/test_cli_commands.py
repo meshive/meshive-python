@@ -1343,9 +1343,10 @@ def test_asset_download_saves_under_asset_id_by_default(tmp_path, monkeypatch, c
     assert cli.main(["asset-download", "asset_data", "--path", "config/*"]) == 0
     out = capsys.readouterr().out
     assert FakeClient.last_call == ("download_asset", ("asset_data", "asset_data"), {"paths": ["config/*"]})
-    assert "asset_data/config/a.json" in out and "5 B" in out and "1 file downloaded." in out
+    # Paths are printed the way this system writes them (backslashes on Windows).
+    assert str(Path("asset_data", "config", "a.json")) in out and "5 B" in out and "1 file downloaded." in out
     assert cli.main(["asset-download", "asset_data", "-d", "out", "-o", "name"]) == 0
-    assert capsys.readouterr().out.splitlines() == ["out/config/a.json"]
+    assert capsys.readouterr().out.splitlines() == [str(Path("out", "config", "a.json"))]
 
 
 def test_task_outputs_lists_and_downloads(tmp_path, capsys):

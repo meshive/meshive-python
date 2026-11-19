@@ -21,14 +21,16 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install -e ".[dev]"
       - run: python -m pytest
+      - run: python -m pytest -m network tests/test_network.py
 
-  # Which certificate roots are trusted depends on the operating system, so these tests run on each one.
-  trust:
+  # Which certificate roots are trusted, how a connection ends and how files are named depend on the operating
+  # system, so the tests run on Windows and macOS as well (the test job above is Linux).
+  platforms:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [windows-latest, macos-latest]
         python-version: ["3.10", "3.13"]
     steps:
       - uses: actions/checkout@v4
@@ -36,11 +38,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install -e ".[dev]"
-      # Left out here: the test of an answer cut off by a connection reset. It fails on Windows runners, where the
-      # test's client isn't shown that the answer broke off. It runs in the test job above, on Linux.
-      - run: >-
-          python -m pytest tests/test_transport.py tests/test_forward.py
-          --deselect tests/test_forward.py::test_an_answer_that_breaks_off_before_the_connection_closes_properly
+      - run: python -m pytest
       - run: python -m pytest -m network tests/test_network.py
 
   audit:

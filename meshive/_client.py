@@ -2664,8 +2664,8 @@ class Meshive(_BaseClient):
 
     def get_task_logs(self, task_id: str, *, tail: int = 200, wait: float | None = None,
                       cursor: int | None = None) -> Logs:
-        """The last tail lines of a task's log. For external-provider tasks, cursor=None/0 returns the last tail lines, and passing the response's
-        next_cursor as cursor returns only lines added since (incremental). Internal tasks always return the last tail lines (no next_cursor)."""
+        """The last tail lines of a task's log. When a response has next_cursor, cursor=None/0 returns the last tail lines, and passing the response's
+        next_cursor as cursor returns only lines added since (incremental). Without next_cursor, every call returns the last tail lines."""
         params = _write.logs_params(tail=tail, wait=wait, cursor=cursor)
         return Logs.from_dict(self._get(f"/tasks/{_path_segment(task_id, 'task_id')}/logs", params))
 
@@ -4089,8 +4089,8 @@ class AsyncMeshive(_BaseClient):
 
     async def get_task_logs(self, task_id: str, *, tail: int = 200, wait: float | None = None,
                       cursor: int | None = None) -> Logs:
-        """The last tail lines of a task's log. For external-provider tasks, cursor=None/0 returns the last tail lines, and passing the response's
-        next_cursor as cursor returns only lines added since (incremental). Internal tasks always return the last tail lines (no next_cursor)."""
+        """The last tail lines of a task's log. When a response has next_cursor, cursor=None/0 returns the last tail lines, and passing the response's
+        next_cursor as cursor returns only lines added since (incremental). Without next_cursor, every call returns the last tail lines."""
         params = _write.logs_params(tail=tail, wait=wait, cursor=cursor)
         return Logs.from_dict(await self._get(f"/tasks/{_path_segment(task_id, 'task_id')}/logs", params))
 

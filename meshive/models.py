@@ -2724,7 +2724,7 @@ class Logs:
     container: str | None = None
     task_id: str | None = None
     finished: bool | None = None   # task logs only
-    next_cursor: int | None = None # external-provider tasks only — get_task_logs(cursor=next_cursor) fetches the increment after it
+    next_cursor: int | None = None # set when the log can be read incrementally — get_task_logs(cursor=next_cursor) fetches the increment after it
     raw: dict = field(default_factory=dict, repr=False)
     # Pod logs only: the main container's last run that ended (a crash before a restart, or the run before the pod
     # stopped), apart from `lines`. None when there is none to show, for another container, and from older servers.

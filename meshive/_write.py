@@ -906,7 +906,7 @@ def host_messages_params(machine_id: str | None, unread_only: bool) -> dict[str,
 
 def logs_params(*, tail: int, wait: float | None, container: str | None = None,
                 cursor: int | None = None) -> dict[str, Any]:
-    """cursor is for external-provider tasks only: None/0 = last tail lines, a previous response's next_cursor = the increment after it."""
+    """cursor applies when a response gave next_cursor: None/0 = last tail lines, a previous response's next_cursor = the increment after it."""
     if isinstance(tail, bool) or not isinstance(tail, int) or not 1 <= tail <= 1000:
         raise ValueError("tail must be an integer between 1 and 1000")
     params: dict[str, Any] = {"tail": tail}

@@ -19,9 +19,14 @@ Install the `meshive` command with [uv](https://docs.astral.sh/uv/getting-starte
 uv tool install meshive
 ```
 
-or with [pipx](https://pipx.pypa.io/): `pipx install meshive`. Either one keeps the CLI in its own environment, and
-uv downloads a suitable Python if you don't have 3.10 or newer. Check it with `meshive --version`. If the command
-isn't found, run `uv tool update-shell` (or `pipx ensurepath`) and open a new terminal. Upgrade with
+or with [pipx](https://pipx.pypa.io/):
+
+```bash
+pipx install meshive
+```
+
+Either one keeps the CLI in its own environment, and uv downloads a suitable Python if you don't have 3.10 or
+newer. Check it with `meshive --version`. If the command isn't found, run `uv tool update-shell` (or `pipx ensurepath`) and open a new terminal. Upgrade with
 `uv tool upgrade meshive` (or `pipx upgrade meshive`).
 
 To use the Python SDK, install the package in your project's virtual environment:

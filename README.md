@@ -13,12 +13,25 @@ tasks, serve models and manage your files: the same things you can do in the con
 
 ## Install
 
+Install the `meshive` command with [uv](https://docs.astral.sh/uv/getting-started/installation/):
+
 ```bash
-pip install meshive
+uv tool install meshive
 ```
 
-Requires Python 3.10 or newer (tested on 3.10 to 3.13). This installs the `meshive` command and the `meshive`
-Python package. Check it with `meshive --version`.
+or with [pipx](https://pipx.pypa.io/): `pipx install meshive`. Either one keeps the CLI in its own environment, and
+uv downloads a suitable Python if you don't have 3.10 or newer. Check it with `meshive --version`. If the command
+isn't found, run `uv tool update-shell` (or `pipx ensurepath`) and open a new terminal. Upgrade with
+`uv tool upgrade meshive` (or `pipx upgrade meshive`).
+
+To use the Python SDK, install the package in your project's virtual environment:
+
+```bash
+pip install "meshive>=1,<2"
+```
+
+Requires Python 3.10 or newer (tested on 3.10 to 3.13). A `pip install` outside a virtual environment fails with
+`externally-managed-environment` on Homebrew Python and on recent Debian and Ubuntu releases; use the commands above.
 
 In a requirements file, pin the major version so you get fixes but nothing that breaks your code:
 

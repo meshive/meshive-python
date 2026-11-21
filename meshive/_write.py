@@ -684,6 +684,39 @@ def asset_import_body(target: str, *, name: str | None = None, asset_type: str |
     })
 
 
+MAX_ASSET_FILE_DELETE = 1000   # the server's per-call limit on files to delete
+
+
+def asset_update_body(*, name: str | None = None, asset_type: str | None = None) -> dict[str, Any]:
+    """Body for renaming or retyping an asset: only what changes, at least one of the two. No asset can be made an
+    output (outputs only come from a task or a pod's watched folder), so asset_type="output" is refused here."""
+    if name is None and asset_type is None:
+        raise ValueError("pass name or asset_type (or both)")
+    kind = _require_str(asset_type, "asset_type").lower() if asset_type is not None else None
+    if kind == "output":
+        raise ValueError("asset_type can't be 'output': output assets only come from tasks and pods")
+    return _drop_none({"name": _require_str(name, "name") if name is not None else None, "assetType": kind})
+
+
+def asset_file_delete_body(*, file_ids: str | Iterable[str] | None = None, asset_id: str | None = None,
+                           paths: str | Iterable[str] | None = None,
+                           expected_file_count: int | None = None) -> dict[str, Any]:
+    """Body for previewing or deleting asset files. Exactly one selection: `file_ids` ("file_..." ids, any assets of
+    one workspace, up to 1000), or `asset_id` with `paths` (globs over that asset's file paths)."""
+    ids = _strings(file_ids, "file_ids")
+    globs = _strings(paths, "paths")
+    if ids is not None and (asset_id is not None or globs is not None):
+        raise ValueError("pass either file_ids or asset_id with paths, not both")
+    if ids is None:
+        if asset_id is None or globs is None:
+            raise ValueError("pass file_ids, or asset_id together with paths")
+        asset_id = _require_str(asset_id, "asset_id")
+    elif len(ids) > MAX_ASSET_FILE_DELETE:
+        raise ValueError(f"at most {MAX_ASSET_FILE_DELETE} file_ids per call")
+    return _drop_none({"fileIds": ids, "assetId": asset_id, "paths": globs,
+                       "expectedFileCount": _optional_int(expected_file_count, "expected_file_count", minimum=0)})
+
+
 def serving_deploy_body(model_registration_id: int, *, price_cap_per_hour: Any, min_replicas: int,
                         max_replicas: int, autoscale: bool, max_context_tokens: int | None,
                         share_idle_capacity: bool) -> dict[str, Any]:

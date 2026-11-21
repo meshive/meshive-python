@@ -12,6 +12,79 @@ Upgrade with:
 pip install -U meshive
 ```
 
+## v1.11.0
+
+Assets can be renamed, retyped and deleted, whole or file by file, and asset reads say much more: where an asset
+came from, what it holds and which of its files can run code when loaded. Tasks, servings, workspaces, machines,
+API keys, storages, templates and serving models type what was only in `.raw` before. Code written for 1.10 keeps
+running. The new calls need a Meshive API server that has them; an older server answers with an error that says so,
+except the new `list_assets` filters, which an older server ignores (see below).
+
+### New
+
+- **Rename or retype an asset.** `update_asset(asset_id, name=..., asset_type=...)` changes only what you pass and
+  returns an `AssetUpdated`. Output assets keep their type, and no asset can be made an output (`asset_type="output"`
+  raises `ValueError` before any request). A name another live asset has is a `ConflictError`.
+- **Delete an asset.** `delete_asset(asset_id)` deletes the whole asset. Files kept in Meshive storage are removed for
+  good and stop being billed; a linked asset only loses the link. An asset in use by a pod or an unfinished task, one
+  a running pod still saves files into, and one the platform froze are refused.
+- **Delete some files of assets.** `preview_asset_file_delete(workspace, ...)` shows what would go and changes
+  nothing; `delete_asset_files(workspace, ...)` deletes. Pick the files with `file_ids` (up to 1000, from any assets of
+  the workspace) or with `asset_id` and `paths` globs over that asset's files (`"renders/*"`, `"*.png"`). Pass the
+  preview's `deletable_file_count` as `expected_file_count` so that nothing is deleted when the files matching the
+  selection changed in between. Selecting every file of a collection is refused: delete the asset instead. The result
+  lists every file with its path and outcome (`AssetFilesDeleted.deleted`, `.blocked`, `.failed`).
+- **Filter the asset list.** `list_assets(..., collection=True)` lists only folder (collection) assets, `False` only
+  single files. Assets a model set or catalog import added on its own are left out as before; `include_catalog=True`
+  lists them too, and `AssetPage.catalog_hidden` (page 1) counts the ones left out. `Asset.from_catalog` marks them.
+  An older server ignores `collection` and `include_catalog` without an error and returns the unfiltered list.
+- **More about each asset.** `Asset` gains `source` (`AssetSource`: Hugging Face repo and pinned commit, the CivitAI or
+  download URL without its query string, the pod and folder it was saved from, or the asset it was copied out of),
+  `reference` (`AssetReference`, for an asset that points at its source instead of holding copies), `active_upload`,
+  `child_type_summary`, `weight_formats`, `has_root_config`, `pickle_flag` and `has_unverified_format`. Each
+  `AssetFile` gains `ext`, `file_type`, `media_kind`, `detected_format`, `pickle_flag` and `format_unverified`.
+  `pickle_flag` ("detected" or "suspected") marks pickle files, which can run code when they are loaded. Against an
+  older server the new fields keep their defaults.
+- **How a task was submitted.** `get_task` now types what was in `.raw`: `script`, `requirements`, `args`, `env`
+  (secret values come as `"***"`) and `secret_env_keys`, `project` (`TaskProject`), `output_bucket_id` (None =
+  Meshive storage), the split of the hourly price (`compute_rate_per_hour`, `storage_rate_per_hour`,
+  `total_rate_per_hour`, `task_storage_gb`, `disk_billed_separately`) and `log_retention_days`; these are None in
+  `list_tasks` items. `script`, `requirements` and `env` are read-only properties over `.raw`, not dataclass fields,
+  so `repr()` and serializers built on `dataclasses.fields()` don't carry them. Every `Task` also gains `template_id`, `gpu_vram_gb`, `cpu_preset`, `max_duration_seconds`,
+  `webhook_url`, `refunded_amount`, `fault_class`, `failure_stage` ("fetch" or "run"), `live_metrics` and the input
+  download's `fetch_started_at`, `fetch_completed_at` and `fetch_progress`. `TaskInputAsset` gains `paths`,
+  `strip_prefix` and `is_project`.
+- **Serving replicas, failures and metrics.** `Serving.replicas` is a list of `ServingReplica` (status, stage,
+  GPU, price, model download progress, live `metrics`, and `pod_name` for a replica whose log `get_pod_logs` reads),
+  `Serving.metrics` the serving's live numbers, and `Serving.failure` / `ServingReplica.failure`
+  (`ServingFailure`: OOM kind, reason, container states, events, download log) why a deployment or replica failed.
+  The two `failure` attributes are read-only properties over `.raw` (they can hold the program's own output), so
+  `repr()` and serializers built on `dataclasses.fields()` don't carry them.
+  `failed_replica` and `stopped_replicas` name the replica whose last run can still be read. `Serving` also gains
+  `registration_id`, `model_retiring`, `is_official`, `endpoint_type`, `modality`, `input_modalities`,
+  `output_bucket_id`, `output_bucket_label`, idle-capacity sharing (`share_idle_capacity`, `sharing_state`,
+  `shared_earned_this_month`), `scale_up_blocked` with its reason and target, `cap_migration`, and the properties
+  `has_failure` and `replica(index)`.
+- **Workspace maintenance and host conversations.** `WorkspaceDetail.maintenance` lists the hosts' maintenance
+  windows that touch the workspace's pods and volumes (`WorkspaceMaintenance`, with `status` and, from servers that
+  send them, `machine_id` and `is_emergency`), and `WorkspaceDetail.host_messages` its messages with hosts
+  (`WorkspaceMessage`, with `machine_id` and `direction` "in" or "out").
+- **Machine price, setup and specs.** `Machine` gains `price` (`MachinePrice`), `setup` (`MachineSetupState`: stage,
+  stage state, step of steps, the agent's log), `specs` (`MachineSpecs` with `MachineDisk` and `MachineGpuSlot`),
+  `ip`, `gpu_supported`, `earning_daily` and `pending_payout` (earned but not paid out yet). `MachineMetrics` gains
+  `disk_temperatures`, `network_interface` and `network_ip`.
+- **Which API key is in use.** `ApiKey.is_current` is True for the key the client is using (None from a server
+  that doesn't say), and `ApiKey.expired` says a listed key is past its expiry.
+- **Storage details.** `Storage` gains `usage_warning`, `usage_warning_threshold`, `maintenance_start`,
+  `maintenance_end`, `upcoming_maintenance` (`MaintenanceWindowInfo`), `location`, `downloader_state` and
+  `downloader_restarts` (`StorageAccessRestart`).
+- **Template spec.** `Template` gains `envs` (`TemplateEnv`; a secret value is never returned: `value` is None and
+  `value_set` says one is stored), `ports` (`TemplatePort`, with the author's `locked` default), `volume_mounts`,
+  `semantic_paths`, `command`, `command_argv`, `args`, `volume_required` and `registry_login` (`RegistryLogin`).
+- **Serving model details.** `ServingModel` gains `modality`, `input_modalities`, `is_official`, `workspace`,
+  `endpoint_type`, `recommended_context_length`, `display_vram_gb`, the image and video model limits, and the
+  properties `takes_image` and `can_share_idle_capacity`.
+
 ## v1.10.3
 
 One fix: `meshive port-forward` now tells an HTTP/1.0 client when an answer sent in chunks broke off. Code

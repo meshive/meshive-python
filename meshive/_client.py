@@ -4,8 +4,8 @@ Both clients share the request building and response parsing logic (_build_heade
 only the transport differs (httpx.Client vs httpx.AsyncClient).
 
 Authentication: Meshive API key, `Authorization: Bearer meshive_...`. Reads, estimates, logs and downloads need the
-read scope; creating, changing or deleting workspaces, pods, storage, servings, tasks, model registrations and asset
-imports, SSH access, port locks and access keys (listing keys is a read), and changes to hosted machines (maintenance,
+read scope; creating, changing or deleting workspaces, pods, storage, servings, tasks, model registrations and assets
+(imports, edits, deletions), SSH access, port locks and access keys (listing keys is a read), and changes to hosted machines (maintenance,
 listing, setup retries, removal, messages, machine credentials, install commands) need the write scope.
 Read surface: account (me/api-keys/credit/earnings/payouts, the API-key activity log), workspaces (list/detail/members), pods (list/single/metrics,
 transactions), storage, machines (list/detail/metrics, maintenance windows, downtime and stress tests, host messages),
@@ -70,9 +70,12 @@ from .models import (
     ApiKey,
     Asset,
     AssetDownload,
+    AssetFileDeletePlan,
+    AssetFilesDeleted,
     AssetImported,
     AssetPage,
     AssetStorage,
+    AssetUpdated,
     CpuLine,
     DownloadFile,
     TaskOutputs,
@@ -280,16 +283,25 @@ def _templates_params(workspace: str | None, app_type: str | None) -> dict[str, 
 
 
 def _assets_params(workspace: str, asset_type: str | None, status: str | None,
-                   page: int, page_size: int) -> dict[str, Any]:
+                   page: int, page_size: int, collection: bool | None = None,
+                   include_catalog: bool = False) -> dict[str, Any]:
     if isinstance(page, bool) or not isinstance(page, int) or page < 1:
         raise ValueError("page must be a positive integer")
     if isinstance(page_size, bool) or not isinstance(page_size, int) or not 1 <= page_size <= 100:
         raise ValueError("page_size must be an integer between 1 and 100")
+    if collection is not None and not isinstance(collection, bool):
+        raise ValueError("collection must be True, False or None")
+    if not isinstance(include_catalog, bool):
+        raise ValueError("include_catalog must be a boolean")
     params: dict[str, Any] = {"workspace": workspace, "page": page, "pageSize": page_size}
     if asset_type:
         params["assetType"] = asset_type.strip().lower()
     if status:
         params["status"] = status.strip().lower()
+    if collection is not None:
+        params["kind"] = "collection" if collection else "file"
+    if include_catalog:
+        params["includeCatalogAdded"] = "true"
     return params
 
 
@@ -1369,14 +1381,19 @@ class Meshive(_BaseClient):
         return [Task.from_dict(d) for d in data]
 
     def get_task(self, task_id: str) -> Task:
-        """A single task — script/settings/cost breakdown are in `.raw` (GET /tasks/{task_id})."""
+        """A single task with how it was submitted (script, args, env with secret values masked, input assets) and
+        the split of its hourly price (GET /tasks/{task_id})."""
         return Task.from_dict(self._get(f"/tasks/{_path_segment(task_id, 'task_id')}"))
 
     def list_assets(self, workspace: str, *, asset_type: str | None = None, status: str | None = None,
+                    collection: bool | None = None, include_catalog: bool = False,
                     page: int = 1, page_size: int = 20) -> AssetPage:
-        """One page of workspace assets (GET /assets?workspace=&assetType=&status=&page=&pageSize=).
-        Without status, deleted/purged/merged are excluded."""
-        data = self._get("/assets", params=_assets_params(workspace, asset_type, status, page, page_size))
+        """One page of workspace assets (GET /assets?workspace=&assetType=&status=&kind=&includeCatalogAdded=&page=&pageSize=).
+        Without status, deleted/purged/merged are excluded. collection=True lists only folder (collection) assets,
+        False only single-file assets. Assets a model set or catalog import added on its own are left out unless
+        include_catalog=True; page 1 counts them in `catalog_hidden`. An older server ignores both filters."""
+        data = self._get("/assets", params=_assets_params(workspace, asset_type, status, page, page_size,
+                                                          collection, include_catalog))
         return AssetPage.from_dict(data, namespace_name=workspace)
 
     def get_asset(self, asset_id: str) -> Asset:
@@ -2282,6 +2299,72 @@ class Meshive(_BaseClient):
         except MeshiveAPIError as err:
             raise _not_supported(err, "asset import") from None
 
+    # --- Asset changes and deletion (write scope; admin or billing role) ------------------------------
+
+    def update_asset(self, asset_id: str, *, name: str | None = None, asset_type: str | None = None,
+                     idempotency_key: str | None = None) -> AssetUpdated:
+        """Rename an asset or change its type (dataset, model, adapter, checkpoint, config or file); pass only what
+        changes. Output assets keep their type, and no asset can be made an output. Names are unique among a
+        workspace's live assets: a taken one is a ConflictError ('Asset Name Conflict'), possibly held by an asset the
+        catalog added (list_assets(include_catalog=True) shows it). Renaming or retyping an asset the catalog added
+        makes it show in list_assets. Renaming an asset that collects a pod's watched folder makes the pod's later
+        uploads go to a new asset named after the folder, unless the name is changed back."""
+        body = _write.asset_update_body(name=name, asset_type=asset_type)
+        try:
+            data = self._send("PATCH", f"/assets/{_path_segment(asset_id, 'asset_id')}", json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "asset editing") from None
+        return AssetUpdated.from_dict(data)
+
+    def delete_asset(self, asset_id: str, *, idempotency_key: str | None = None) -> ResourceAction:
+        """Delete a whole asset. Files kept in Meshive storage are removed for good shortly after and their storage
+        charge stops; a linked asset (Hugging Face, CivitAI, a URL, the user's own bucket) only loses the link.
+        Deleting a task's output asset also ends the task's output links. Refused while a pod or an unfinished task
+        uses the asset (ConflictError 'Asset In Use'), while a running pod still saves files into it (ConflictError
+        'Upload Session Active') and for an asset the platform froze (PermissionDeniedError 'Asset Frozen').
+        To delete only some files, use delete_asset_files."""
+        try:
+            data = self._send("DELETE", f"/assets/{_path_segment(asset_id, 'asset_id')}",
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "asset deletion") from None
+        return ResourceAction.from_dict(data, resource="asset")
+
+    def preview_asset_file_delete(self, workspace: str, *, file_ids: str | Iterable[str] | None = None,
+                                  asset_id: str | None = None,
+                                  paths: str | Iterable[str] | None = None) -> AssetFileDeletePlan:
+        """What delete_asset_files would delete — changes nothing (read scope is enough, but the admin or billing role is
+        still needed). Select the files with `file_ids` ("file_..." ids from any assets of the workspace, up to 1000)
+        or with `asset_id` and `paths`, globs over that asset's file paths ("renders/*" is that folder and everything
+        in it; `*` also crosses folders). See AssetFileDeletePlan for `action`."""
+        body = _write.asset_file_delete_body(file_ids=file_ids, asset_id=asset_id, paths=paths)
+        try:
+            data = self._send("POST", "/assets/files/delete/preflight",
+                              params={"workspace": _query_value(workspace, "workspace")}, json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "asset file deletion") from None
+        return AssetFileDeletePlan.from_dict(data)
+
+    def delete_asset_files(self, workspace: str, *, file_ids: str | Iterable[str] | None = None,
+                           asset_id: str | None = None, paths: str | Iterable[str] | None = None,
+                           expected_file_count: int | None = None,
+                           idempotency_key: str | None = None) -> AssetFilesDeleted:
+        """Delete some files of assets (same selection as preview_asset_file_delete). Files kept in Meshive storage
+        can't be recovered. Files of an asset that is frozen or in use are skipped (status "blocked"). Selecting every
+        file of a collection is refused (ConflictError 'Whole Collection Delete Required'): delete the asset with
+        delete_asset instead. The selection is matched again when this runs; pass the preview's deletable_file_count
+        as `expected_file_count` and, if the match changed since, nothing is deleted (ConflictError 'Selection
+        Changed'). An asset whose last file goes is deleted with it (`retired_asset_ids`)."""
+        body = _write.asset_file_delete_body(file_ids=file_ids, asset_id=asset_id, paths=paths,
+                                             expected_file_count=expected_file_count)
+        try:
+            data = self._send("POST", "/assets/files/delete", params={"workspace": _query_value(workspace, "workspace")},
+                              json=body, idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "asset file deletion") from None
+        return AssetFilesDeleted.from_dict(data)
+
     # --- Serving model registration ---------------------------------------------------------------
 
     def list_models(self, workspace: str) -> list[ServingModel]:
@@ -3028,13 +3111,17 @@ class AsyncMeshive(_BaseClient):
         return [Task.from_dict(d) for d in data]
 
     async def get_task(self, task_id: str) -> Task:
-        """A single task — script/settings/cost breakdown are in `.raw` (GET /tasks/{task_id})."""
+        """A single task with how it was submitted (script, args, env with secret values masked, input assets) and
+        the split of its hourly price (GET /tasks/{task_id})."""
         return Task.from_dict(await self._get(f"/tasks/{_path_segment(task_id, 'task_id')}"))
 
     async def list_assets(self, workspace: str, *, asset_type: str | None = None,
-                          status: str | None = None, page: int = 1, page_size: int = 20) -> AssetPage:
-        """One page of workspace assets (GET /assets?...). Without status, deleted/purged/merged are excluded."""
-        data = await self._get("/assets", params=_assets_params(workspace, asset_type, status, page, page_size))
+                          status: str | None = None, collection: bool | None = None, include_catalog: bool = False,
+                          page: int = 1, page_size: int = 20) -> AssetPage:
+        """One page of workspace assets (GET /assets?...; see Meshive.list_assets). Without status,
+        deleted/purged/merged are excluded."""
+        data = await self._get("/assets", params=_assets_params(workspace, asset_type, status, page, page_size,
+                                                                collection, include_catalog))
         return AssetPage.from_dict(data, namespace_name=workspace)
 
     async def get_asset(self, asset_id: str) -> Asset:
@@ -3739,6 +3826,55 @@ class AsyncMeshive(_BaseClient):
             return [HfToken.from_dict(d) for d in await self._get("/civitai-keys", params={"workspace": workspace})]
         except MeshiveAPIError as err:
             raise _not_supported(err, "asset import") from None
+
+    # --- Asset changes and deletion (write scope; admin or billing role) ------------------------------
+
+    async def update_asset(self, asset_id: str, *, name: str | None = None, asset_type: str | None = None,
+                           idempotency_key: str | None = None) -> AssetUpdated:
+        """Rename an asset or change its type (see Meshive.update_asset)."""
+        body = _write.asset_update_body(name=name, asset_type=asset_type)
+        try:
+            data = await self._send("PATCH", f"/assets/{_path_segment(asset_id, 'asset_id')}", json=body,
+                                    idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "asset editing") from None
+        return AssetUpdated.from_dict(data)
+
+    async def delete_asset(self, asset_id: str, *, idempotency_key: str | None = None) -> ResourceAction:
+        """Delete a whole asset (see Meshive.delete_asset)."""
+        try:
+            data = await self._send("DELETE", f"/assets/{_path_segment(asset_id, 'asset_id')}",
+                                    idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "asset deletion") from None
+        return ResourceAction.from_dict(data, resource="asset")
+
+    async def preview_asset_file_delete(self, workspace: str, *, file_ids: str | Iterable[str] | None = None,
+                                        asset_id: str | None = None,
+                                        paths: str | Iterable[str] | None = None) -> AssetFileDeletePlan:
+        """What delete_asset_files would delete — changes nothing (see Meshive.preview_asset_file_delete)."""
+        body = _write.asset_file_delete_body(file_ids=file_ids, asset_id=asset_id, paths=paths)
+        try:
+            data = await self._send("POST", "/assets/files/delete/preflight",
+                                    params={"workspace": _query_value(workspace, "workspace")}, json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "asset file deletion") from None
+        return AssetFileDeletePlan.from_dict(data)
+
+    async def delete_asset_files(self, workspace: str, *, file_ids: str | Iterable[str] | None = None,
+                                 asset_id: str | None = None, paths: str | Iterable[str] | None = None,
+                                 expected_file_count: int | None = None,
+                                 idempotency_key: str | None = None) -> AssetFilesDeleted:
+        """Delete some files of assets (see Meshive.delete_asset_files)."""
+        body = _write.asset_file_delete_body(file_ids=file_ids, asset_id=asset_id, paths=paths,
+                                             expected_file_count=expected_file_count)
+        try:
+            data = await self._send("POST", "/assets/files/delete",
+                                    params={"workspace": _query_value(workspace, "workspace")}, json=body,
+                                    idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "asset file deletion") from None
+        return AssetFilesDeleted.from_dict(data)
 
     # --- Serving model registration ---------------------------------------------------------------
 

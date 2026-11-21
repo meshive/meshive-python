@@ -1311,6 +1311,102 @@ def test_async_assets_mirror_sync():
     assert seen["params"] == {"workspace": "team-ns"}
 
 
+def test_list_assets_collection_and_catalog_filters_sent_only_when_set():
+    seen = {}
+    client = sync_client(_capture({**ASSET_PAGE, "catalogAddedTotal": 4}, seen))
+    page = client.list_assets("team-ns", collection=True, include_catalog=True)
+    assert seen["params"] == {"workspace": "team-ns", "page": "1", "pageSize": "20", "kind": "collection",
+                              "includeCatalogAdded": "true"}
+    assert page.catalog_hidden == 4
+    client.list_assets("team-ns", collection=False)
+    assert seen["params"]["kind"] == "file" and "includeCatalogAdded" not in seen["params"]
+    client.list_assets("team-ns", collection=None, include_catalog=False)
+    assert "kind" not in seen["params"] and "includeCatalogAdded" not in seen["params"]
+    for bad in ({"collection": "yes"}, {"collection": 1}, {"include_catalog": "true"}, {"include_catalog": None}):
+        with pytest.raises(ValueError):
+            client.list_assets("team-ns", **bad)
+    assert sync_client(_capture(ASSET_PAGE, seen)).list_assets("team-ns").catalog_hidden == 0   # older server
+
+    async def run():
+        async with async_client(_capture(ASSET_PAGE, seen)) as aclient:
+            await aclient.list_assets("team-ns", collection=False, include_catalog=True)
+
+    asyncio.run(run())
+    assert seen["params"]["kind"] == "file" and seen["params"]["includeCatalogAdded"] == "true"
+
+
+def test_asset_from_dict_reads_source_composition_and_flags():
+    a = Asset.from_dict({**ASSET_DETAIL, "addedFromCatalog": True, "pickleFlag": "suspected",
+                         "hasUnverifiedFormat": True, "weightFormats": ["safetensors"], "hasRootConfig": True,
+                         "childTypeSummary": {"model": 2, "config": 1},
+                         "hfRepo": "Qwen/Qwen3-0.6B", "hfRevision": "main", "resolvedCommit": "c0ffee",
+                         "importSourceRef": "Qwen/Qwen3-0.6B@main",
+                         "activeBatch": {"purpose": "harvest_sync", "fileCount": 3, "totalBytes": 900,
+                                         "createdAt": "2026-08-03T00:00:00Z"},
+                         "files": [{"fileExternalId": "file_a", "relativePath": "w/model.ckpt", "sizeBytes": 10,
+                                    "ext": "ckpt", "status": "ready", "fileType": "model", "mediaKind": None,
+                                    "detectedFormat": "pickle", "pickleFlag": "detected",
+                                    "formatUnverified": False},
+                                   {"fileExternalId": "file_b", "relativePath": "README", "sizeBytes": 1,
+                                    "ext": "", "status": "ready", "formatUnverified": True}]})
+    assert a.from_catalog is True and a.pickle_flag == "suspected" and a.has_unverified_format is True
+    assert a.weight_formats == ["safetensors"] and a.has_root_config is True
+    assert a.child_type_summary == {"model": 2, "config": 1}
+    s = a.source
+    assert (s.ingest_source, s.hf_repo, s.hf_revision, s.resolved_commit) == ("hf_import", "Qwen/Qwen3-0.6B", "main",
+                                                                              "c0ffee")
+    assert s.url is None and s.from_asset_id is None and s.pod_name is None   # HF ref is not a URL the user gave
+    assert a.reference is None
+    u = a.active_upload
+    assert (u.purpose, u.file_count, u.total_bytes, u.created_at.day) == ("harvest_sync", 3, 900, 3)
+    f1, f2 = a.files
+    assert (f1.ext, f1.file_type, f1.detected_format, f1.pickle_flag, f1.format_unverified) == (
+        "ckpt", "model", "pickle", "detected", False)
+    assert (f2.ext, f2.file_type, f2.media_kind, f2.pickle_flag, f2.format_unverified) == ("", None, None, None, True)
+
+
+def test_asset_source_url_pod_and_subset_lineage():
+    def source(**extra):
+        return Asset.from_dict({**ASSET_ROW, **extra}).source
+
+    civitai = source(ingestSource="civitai_import",
+                     importSourceRef="https://civitai.com/api/download/models/1?token=SECRET&type=Model#frag")
+    assert civitai.url == "https://civitai.com/api/download/models/1"            # query and fragment stripped
+    assert source(ingestSource="url_import", importSourceRef="https://example.com/a.bin").url == \
+        "https://example.com/a.bin"
+    assert source(ingestSource="url_import", importSourceRef="https://user:pw@example.com:8443/a.bin").url == \
+        "https://example.com:8443/a.bin"                                            # user:password dropped too
+    assert source(ingestSource="hf_import", importSourceRef="https://example.com/x?y=1").url is None
+
+    harvested = source(ingestSource="harvest", sourceStatefulsetName="sts-abc", sourceUserAlias="trainer",
+                       sourcePath="/workspace/outputs")
+    assert (harvested.pod_name, harvested.pod_label, harvested.pod_path) == (
+        "sts-abc-0", "trainer", "/workspace/outputs")
+
+    assert source(ingestSource="s3_subset_fetch", importSourceRef="s3subset:asset_src@v1").from_asset_id == "asset_src"
+    for garbage in ("s3subset:@v1", "s3subset:asset_src", "other:asset_src@v1", None, 7):
+        assert source(ingestSource="s3_subset_fetch", importSourceRef=garbage).from_asset_id is None
+    # the subset ref only counts for a subset fetch
+    assert source(ingestSource="web_upload", importSourceRef="s3subset:asset_src@v1").from_asset_id is None
+
+
+def test_asset_reference_and_missing_keys_default():
+    ref = Asset.from_dict({**ASSET_ROW, "storageProvider": "user_s3", "referenceMode": "prefix",
+                           "referencePrefix": "data/", "credentialLabel": "lab bucket", "credentialStatus": "ok",
+                           "sizeNotice": "approximate"}).reference
+    assert (ref.mode, ref.prefix, ref.credential_label, ref.credential_status, ref.size_notice) == (
+        "prefix", "data/", "lab bucket", "ok", "approximate")
+
+    bare = Asset.from_dict({"assetExternalId": "asset_x", "name": "x"})    # a server that sends none of the new keys
+    assert (bare.from_catalog, bare.pickle_flag, bare.has_unverified_format) == (False, None, False)
+    assert (bare.weight_formats, bare.has_root_config, bare.child_type_summary) == (None, None, None)
+    assert (bare.source, bare.reference, bare.active_upload) == (None, None, None)
+    assert Asset.from_dict({**ASSET_ROW, "childTypeSummary": {}}).child_type_summary == {}   # known zero, not None
+    f = Asset.from_dict({**ASSET_DETAIL, "files": [{"relativePath": "a"}]}).files[0]
+    assert (f.ext, f.file_type, f.media_kind, f.detected_format, f.pickle_flag, f.format_unverified) == (
+        "", None, None, None, None, False)
+
+
 def test_format_gib_uses_mib_below_one_gibibyte():
     from meshive.cli import _format as fmt
 

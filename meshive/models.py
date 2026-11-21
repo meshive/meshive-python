@@ -10,6 +10,7 @@ import warnings
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
+from urllib.parse import urlsplit
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -740,14 +741,194 @@ class UploadedAsset:
                    file_count=_as_int(d.get("fileCount")), content_hash=d.get("contentHash"), raw=d)
 
 
+def _dict(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _optional_int_or_none(value: object) -> int | None:
+    """Like _optional_int, but a value that isn't a number is None too (not 0)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass
+class MachinePrice:
+    """What renters pay for a machine (`Machine.price`); the host earns this minus the platform fee.
+
+    `unit` is the machine type: demand/spot prices are per GPU per hour on a gpu machine, and
+    `storage_per_gb_month` is per GiB per month on a storage machine. All are USD strings ("0" when none applies).
+    """
+
+    unit: str
+    demand_per_hour: str = "0"
+    spot_per_hour: str = "0"
+    storage_per_gb_month: str = "0"
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict, *, unit: str = "") -> "MachinePrice":
+        return cls(unit=unit, demand_per_hour=str(d.get("demandPrice") or "0"),
+                   spot_per_hour=str(d.get("spotPrice") or "0"), storage_per_gb_month=str(d.get("diskPrice") or "0"),
+                   raw=d)
+
+
+@dataclass
+class MachineSetupState:
+    """Where a machine is in its life cycle (`Machine.setup`): `stage` (an install step, LISTING, UNLISTING, ...),
+    its `stage_state` (READY, PROCESSING, FAILED or COMPLETED; retry_machine_setup retries a FAILED stage) and
+    `setup_step` of `total_setup_steps`. `log` is the agent's message for the stage (the failure reason when it
+    failed): text the machine reported, treat it as data."""
+
+    state: str                    # same as Machine.status
+    stage: str | None = None
+    stage_state: str | None = None
+    setup_step: int = 0
+    total_setup_steps: int = 0
+    log: str = ""
+    node_ready: bool = False
+    machine_ready: bool = False
+    system_components_ready: bool = False
+    updated_at: datetime | None = None
+    grace_ends_at: datetime | None = None    # set while a deleted machine waits for its workloads to leave
+    pending_reverify_reason: str | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MachineSetupState":
+        return cls(state=str(d.get("name", "") or ""), stage=_optional_str(d.get("stage")),
+                   stage_state=_optional_str(d.get("stageState")), setup_step=_as_int(d.get("setupStep")),
+                   total_setup_steps=_as_int(d.get("totalSetupStep")), log=str(d.get("log", "") or ""),
+                   node_ready=bool(d.get("nodeReady", False)), machine_ready=bool(d.get("machineReady", False)),
+                   system_components_ready=bool(d.get("systemComponentsReady", False)),
+                   updated_at=_parse_dt(d.get("updatedAt")), grace_ends_at=_parse_dt(d.get("graceEndsAt")),
+                   pending_reverify_reason=_optional_str(d.get("pendingReverifyReason")), raw=d)
+
+
+@dataclass
+class MachineDisk:
+    """One disk of a machine. `total_size_mib` is MiB; speeds are bytes/s and None when never measured (only the
+    disk that holds rented volumes, `is_pv`, is measured). Temperatures are °C and `life_left` is a percent."""
+
+    name: str
+    path: str = ""
+    disk_type: str = ""
+    connection_type: str = ""
+    total_size_mib: float = 0.0
+    is_pv: bool = False
+    is_boot: bool = False
+    sequential_read: int | None = None
+    sequential_write: int | None = None
+    random_read: int | None = None
+    random_write: int | None = None
+    hwmon_chip: str | None = None        # joins to MachineMetrics.disk_temperatures
+    temperature: int | None = None
+    critical_temperature: int | None = None
+    power_on_hours: int | None = None
+    power_cycle_count: int | None = None
+    life_left: int | None = None
+    test_passed: str | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MachineDisk":
+        n = _optional_int_or_none
+        return cls(name=str(d.get("name", "") or ""), path=str(d.get("diskPath", "") or ""),
+                   disk_type=str(d.get("diskType", "") or ""), connection_type=str(d.get("connectionType", "") or ""),
+                   total_size_mib=_as_float(d.get("totalSize")), is_pv=bool(d.get("isPv", False)),
+                   is_boot=bool(d.get("isBoot", False)), sequential_read=n(d.get("sequentialRead")),
+                   sequential_write=n(d.get("sequentialWrite")), random_read=n(d.get("randomRead")),
+                   random_write=n(d.get("randomWrite")), hwmon_chip=_optional_str(d.get("hwmonChip")),
+                   temperature=n(d.get("temperature")), critical_temperature=n(d.get("criticalTemperature")),
+                   power_on_hours=n(d.get("powerOnHours")), power_cycle_count=n(d.get("powerCycleCount")),
+                   life_left=n(d.get("lifeLeft")), test_passed=_optional_str(d.get("testPassed")), raw=d)
+
+
+@dataclass
+class MachineGpuSlot:
+    """The PCIe slot of one GPU: lanes and PCIe version now and at most, and its NVLink state."""
+
+    pcie_slot: str
+    current_pcie_lanes: int | None = None
+    max_pcie_lanes: int | None = None
+    pcie_version: int | None = None
+    max_pcie_version: int | None = None
+    nvlink_connected: bool | None = None
+    nvlink_link_count: int | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MachineGpuSlot":
+        n = _optional_int_or_none
+        nvlink = d.get("nvlinkConnected")
+        return cls(pcie_slot=str(d.get("pcieSlot", "") or ""), current_pcie_lanes=n(d.get("currentPcieLane")),
+                   max_pcie_lanes=n(d.get("limitPcieLane")), pcie_version=n(d.get("pcieVersion")),
+                   max_pcie_version=n(d.get("latestPcieVersion")),
+                   nvlink_connected=None if nvlink is None else bool(nvlink),
+                   nvlink_link_count=n(d.get("nvlinkLinkCount")))
+
+
+@dataclass
+class MachineSpecs:
+    """A machine's hardware as its agent reported it. Sizes are MiB; internet speeds are bits per second
+    (`internet_link_mbps` is the network card's link speed in Mbit/s); `ram_type` is the DDR generation.
+    `rentable_disk_mib` is the space for rented volumes, `allocatable_*` what pods can get (None if unknown)."""
+
+    cpu: str = ""
+    cpu_cores: int = 0
+    cpu_threads: int = 0
+    ram_mib: int = 0
+    ram_type: int = 0
+    ram_speed: int = 0
+    motherboard: str = ""
+    gpu: str = ""
+    gpu_count: int = 0
+    nvlink_capable: bool = False
+    gpu_slots: list[MachineGpuSlot] = field(default_factory=list)
+    disks: list[MachineDisk] = field(default_factory=list)
+    rentable_disk_mib: int = 0
+    rentable_disk_available_mib: int = 0
+    internet_download_bps: int = 0
+    internet_upload_bps: int = 0
+    internet_link_mbps: int | None = None
+    internet_speed_measured_at: datetime | None = None
+    allocatable_cpu: int | None = None
+    allocatable_ram_mib: int | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MachineSpecs":
+        disks, slots = d.get("disks"), d.get("gpuPcieLanes")
+        link = _optional_int_or_none(d.get("internetLinkSpeed"))
+        return cls(cpu=str(d.get("cpu", "") or ""), cpu_cores=_as_int(d.get("cpuCores")),
+                   cpu_threads=_as_int(d.get("cpuThreads")), ram_mib=_as_int(d.get("ram")),
+                   ram_type=_as_int(d.get("ramType")), ram_speed=_as_int(d.get("ramSpeed")),
+                   motherboard=str(d.get("motherboard", "") or ""), gpu=str(d.get("gpu", "") or ""),
+                   gpu_count=_as_int(d.get("gpuNumber")), nvlink_capable=bool(d.get("nvlinkCapable", False)),
+                   gpu_slots=[MachineGpuSlot.from_dict(s) for s in slots if isinstance(s, dict)]
+                   if isinstance(slots, list) else [],
+                   disks=[MachineDisk.from_dict(x) for x in disks if isinstance(x, dict)]
+                   if isinstance(disks, list) else [],
+                   rentable_disk_mib=_as_int(d.get("volumeGroupTotalSize")),
+                   rentable_disk_available_mib=_as_int(d.get("volumeGroupAvailableSize")),
+                   internet_download_bps=_as_int(d.get("internetDownloadSpeed")),
+                   internet_upload_bps=_as_int(d.get("internetUploadSpeed")),
+                   internet_link_mbps=None if link is None else link // 1_000_000,
+                   internet_speed_measured_at=_parse_dt(d.get("internetSpeedMeasuredAt")),
+                   allocatable_cpu=_optional_int_or_none(d.get("allocatableCpu")),
+                   allocatable_ram_mib=_optional_int_or_none(d.get("allocatableRam")), raw=d)
+
+
 @dataclass
 class Machine:
     """GET /v1/sdk/machines item — a machine registered by a host (get_machine returns a MachineDetail).
 
     Same schema (camelCase) as the web console's machine data, but the SDK read surface
     gets a trimmed DTO without credentials (SSH, IPMI, Grafana) — reveal_machine_credentials returns those.
-    Only commonly used scalars are typed — display fields that were nested, such as
-    status/gpu/earning, are lifted up — and the rest (specs, the whole state, price, ...) is in `.raw`.
+    Display fields that were nested, such as status/gpu/earning, are lifted up; `price`, `setup` and `specs` type
+    the rest. They are None from a server that doesn't send them.
     """
 
     machine_id: str       # id (lookup key)
@@ -763,13 +944,30 @@ class Machine:
     # Messages from the workspaces using the machine that the host hasn't read yet (list_host_messages shows them).
     # 0 from servers that don't report it.
     unread_messages: int = 0
+    ip: str = ""
+    gpu_supported: bool = False
+    earning_daily: float = 0.0      # earned today (UTC), USD
+    pending_payout: float = 0.0     # earned but not paid out yet, USD
+    price: MachinePrice | None = None
+    setup: MachineSetupState | None = None
+    specs: MachineSpecs | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Machine":
-        state = d.get("state") or {}
-        specs = d.get("specs") or {}
-        earning = d.get("earning") or {}
+        state = _dict(d.get("state"))
+        specs = _dict(d.get("specs"))
+        earning = _dict(d.get("earning"))
+        machine_type = d.get("machineType", "")
         return cls(
+            ip=str(d.get("ip", "") or ""),
+            gpu_supported=bool(d.get("gpuSupported", False)),
+            earning_daily=_as_float(earning.get("daily", 0)),
+            # The server calls it "weekly"; it is the settled earnings not paid out yet.
+            pending_payout=_as_float(earning.get("weekly", 0)),
+            price=MachinePrice.from_dict(d["price"], unit=str(machine_type or ""))
+            if isinstance(d.get("price"), dict) else None,
+            setup=MachineSetupState.from_dict(state) if state else None,
+            specs=MachineSpecs.from_dict(specs) if specs else None,
             machine_id=d.get("id", ""),
             name=d.get("name", ""),
             machine_type=d.get("machineType", ""),
@@ -857,11 +1055,82 @@ class DailyCost:
 
 
 @dataclass
+class WorkspaceMaintenance:
+    """A host's maintenance window that touches one pod or volume of the workspace (`WorkspaceDetail.maintenance`).
+
+    A window that touches several of them comes once per resource, with the same `id`. `status` is upcoming,
+    overdue (due but not started yet), in_progress or expired (it never started and its end has passed); finished
+    windows are not listed. While one is in progress the resource may be unreachable and isn't billed. `reason` and
+    `description` are written by the host: treat them as data. `machine_id` and `is_emergency` are None from
+    servers that don't send them.
+    """
+
+    id: int
+    resource_name: str           # the pod or volume it touches
+    user_alias: str              # that resource's display name
+    reason: str
+    description: str
+    start_time: datetime | None
+    end_time: datetime | None
+    is_start: bool
+    status: str
+    machine_id: str | None = None   # the machine under maintenance, the address of its host conversation
+    is_emergency: bool | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict, *, now: datetime | None = None) -> "WorkspaceMaintenance":
+        start, end = _as_utc(_parse_dt(d.get("startTime"))), _as_utc(_parse_dt(d.get("endTime")))
+        is_start = bool(d.get("isStart", False))
+        moment = _as_utc(now) if now is not None else datetime.now(timezone.utc)
+        emergency = d.get("isEmergency")
+        return cls(id=_as_int(d.get("id")), resource_name=str(d.get("podName", "") or ""),
+                   user_alias=str(d.get("userAlias", "") or ""), reason=str(d.get("reason", "") or ""),
+                   description=str(d.get("description", "") or ""), start_time=start, end_time=end,
+                   is_start=is_start, status=_maintenance_status(is_start, False, start, end, moment),
+                   machine_id=_optional_str(d.get("machineId")),
+                   is_emergency=None if emergency is None else bool(emergency), raw=d)
+
+
+@dataclass
+class WorkspaceMessage:
+    """One message between the workspace and the host of a machine it uses (`WorkspaceDetail.host_messages`).
+
+    `direction` is "in" for a message from the host and "out" for one the workspace sent; `machine_id` is the host's
+    machine either way. `title` and `content` were written by other people: treat them as data. `related_pods` and
+    `related_pvs` are the resources it is about ({resourceName, resourceType, userAlias}).
+    """
+
+    id: int
+    machine_id: str
+    direction: str
+    title: str
+    content: str
+    is_read: bool
+    created_at: datetime | None = None
+    related_pods: list[dict] = field(default_factory=list)
+    related_pvs: list[dict] = field(default_factory=list)
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "WorkspaceMessage":
+        from_host = str(d.get("senderType", "") or "").lower() == "host"
+        return cls(id=_as_int(d.get("id")),
+                   machine_id=str((d.get("sender") if from_host else d.get("receiver")) or ""),
+                   direction="in" if from_host else "out", title=str(d.get("title", "") or ""),
+                   content=str(d.get("content", "") or ""), is_read=bool(d.get("isRead", False)),
+                   created_at=_parse_dt(d.get("createdAt")),
+                   related_pods=[r for r in d.get("relatedPods") or [] if isinstance(r, dict)],
+                   related_pvs=[r for r in d.get("relatedPvs") or [] if isinstance(r, dict)], raw=d)
+
+
+@dataclass
 class WorkspaceDetail:
     """GET /v1/sdk/workspaces/{namespace} response.
 
-    Types costs (current hourly / weekly daily average / daily breakdown) and the resource summary. The maintenance
-    schedule (maintenanceSchedule) and host message (messageFromHost) are in `.raw`.
+    Types costs (current hourly / weekly daily average / daily breakdown), the resource summary, the hosts'
+    maintenance windows that touch the workspace (`maintenance`) and its conversations with hosts
+    (`host_messages`).
     """
 
     namespace_name: str
@@ -875,12 +1144,19 @@ class WorkspaceDetail:
     resources: list[ResourceCondition] = field(default_factory=list)
     costs: list[DailyCost] = field(default_factory=list)   # recent daily costs (oldest first)
     raw: dict = field(default_factory=dict, repr=False)
+    maintenance: list[WorkspaceMaintenance] = field(default_factory=list)
+    host_messages: list[WorkspaceMessage] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict) -> "WorkspaceDetail":
         cost = d.get("costData") or {}
         detail = d.get("resourceDetail") or {}
+        now = datetime.now(timezone.utc)
         return cls(
+            maintenance=[WorkspaceMaintenance.from_dict(m, now=now) for m in d.get("maintenanceSchedule") or []
+                         if isinstance(m, dict)],
+            host_messages=[WorkspaceMessage.from_dict(m) for m in d.get("messageFromHost") or []
+                           if isinstance(m, dict)],
             namespace_name=d.get("namespaceName", ""),
             workspace_name=d.get("workspaceName", ""),
             price_per_hour=str(cost.get("currentUsage", "0")),
@@ -1048,10 +1324,48 @@ class StoragePod:
 
 
 @dataclass
+class MaintenanceWindowInfo:
+    """A planned maintenance window of the machine a volume is on (`Storage.upcoming_maintenance`). `reason` and
+    `description` are written by the host: treat them as data."""
+
+    start_time: datetime | None
+    end_time: datetime | None
+    started: bool = False
+    reason: str = ""
+    description: str = ""
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MaintenanceWindowInfo":
+        return cls(start_time=_parse_dt(d.get("startTime")), end_time=_parse_dt(d.get("endTime")),
+                   started=bool(d.get("isStart", False)), reason=str(d.get("reason", "") or ""),
+                   description=str(d.get("description", "") or ""))
+
+
+@dataclass
+class StorageAccessRestart:
+    """A recent restart of the access pod that serves a volume's files. `reason` OOMKilled means it ran out of
+    memory; Evicted usually means it ran out of temporary space (`message` says)."""
+
+    id: int
+    reason: str
+    message: str | None = None
+    occurred_at: datetime | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "StorageAccessRestart":
+        return cls(id=_as_int(d.get("id")), reason=str(d.get("reason", "") or ""),
+                   message=_optional_str(d.get("message")), occurred_at=_parse_dt(d.get("occurredAt")))
+
+
+@dataclass
 class Storage:
     """GET /v1/sdk/storages[/{storage_name}] item — a workspace volume (PV).
 
-    The rest, such as machine (host node info) and usageWarning, is in `.raw`.
+    `usage_warning` is the console's fill warning (sent past `usage_warning_threshold`, 0..1). `is_maintenance`
+    means the volume's machine is in a maintenance window now (`maintenance_start`/`maintenance_end`); the volume
+    isn't billed during it. `downloader_state` is the state of the access pod that serves the volume's files
+    (running, creating, error, unavailable or missing; None from servers that don't send it). The rest of the
+    host machine's data is in `.raw`.
     """
 
     pv_name: str               # lookup key
@@ -1069,10 +1383,30 @@ class Storage:
     created_at: datetime | None = None
     raw: dict = field(default_factory=dict, repr=False)
     linked_pod_details: list[StoragePod] = field(default_factory=list)
+    usage_warning: bool = False
+    usage_warning_threshold: float = 0.9
+    maintenance_start: datetime | None = None
+    maintenance_end: datetime | None = None
+    upcoming_maintenance: list[MaintenanceWindowInfo] = field(default_factory=list)
+    location: str | None = None          # where the volume's machine is
+    downloader_state: str | None = None
+    downloader_restarts: list[StorageAccessRestart] = field(default_factory=list)   # newest first
 
     @classmethod
     def from_dict(cls, d: dict) -> "Storage":
+        machine = _dict(d.get("machine"))
+        threshold = _as_optional_float(d.get("usageWarningThreshold"))
         return cls(
+            usage_warning=bool(d.get("usageWarning", False)),
+            usage_warning_threshold=0.9 if threshold is None else threshold,
+            maintenance_start=_parse_dt(d.get("maintenanceStart")),
+            maintenance_end=_parse_dt(d.get("maintenanceEnd")),
+            upcoming_maintenance=[MaintenanceWindowInfo.from_dict(m) for m in machine.get("maintenanceSchedule") or []
+                                  if isinstance(m, dict)],
+            location=_optional_str(machine.get("location")),
+            downloader_state=_optional_str(d.get("downloaderState")),
+            downloader_restarts=[StorageAccessRestart.from_dict(r) for r in d.get("downloaderRestarts") or []
+                                 if isinstance(r, dict)],
             pv_name=d.get("pvName", ""),
             namespace_name=d.get("namespaceName", ""),
             user_alias=d.get("userAlias", "") or "",
@@ -1155,8 +1489,8 @@ class PodMetrics:
 class MachineMetrics:
     """GET /v1/sdk/machines/{machine_id}/metrics response — live metrics of a host machine.
 
-    *_allocated is what the current pods have reserved. Disk temperatures (diskTemperatures) and network
-    interface names are in `.raw`.
+    *_allocated is what the current pods have reserved. disk_temperatures is °C per disk sensor (the key joins to
+    MachineDisk.hwmon_chip); network_interface and network_ip are the interface the network numbers are for.
 
     Units: only ram_size is **bytes** (node MemTotal — the server passes the Prometheus value through). ram_allocated,
     root/pv_volume_size and gpus[].vram_size are MiB; network_receive/transmit are bytes/sec.
@@ -1177,6 +1511,9 @@ class MachineMetrics:
     network_receive: float = 0.0
     network_transmit: float = 0.0
     raw: dict = field(default_factory=dict, repr=False)
+    disk_temperatures: dict[str, float] = field(default_factory=dict)
+    network_interface: str = ""
+    network_ip: str = ""
 
     @classmethod
     def from_dict(cls, d: dict) -> "MachineMetrics":
@@ -1185,7 +1522,12 @@ class MachineMetrics:
         root = d.get("rootVolume") or {}
         pv = d.get("pvVolume") or {}
         net = d.get("networkIo") or {}
+        temps = d.get("diskTemperatures")
         return cls(
+            disk_temperatures={str(k): float(v) for k, v in temps.items() if _as_optional_float(v) is not None}
+            if isinstance(temps, dict) else {},
+            network_interface=str(net.get("interface", "") or ""),
+            network_ip=str(net.get("ip", "") or ""),
             machine_id=d.get("machineId", ""),
             cpu_cores=_as_float(cpu.get("core")),
             cpu_usage_rate=_as_float(cpu.get("usageRate")),
@@ -1304,10 +1646,18 @@ class ApiKey:
     last_used_at: datetime | None = None
     expires_at: datetime | None = None
     raw: dict = field(default_factory=dict, repr=False)
+    # True for the key this client is using. None from a server that doesn't say.
+    is_current: bool | None = None
+
+    @property
+    def expired(self) -> bool:
+        """The key is past `expires_at`: it no longer works even though it is still listed."""
+        return _is_past(self.expires_at)
 
     @classmethod
     def from_dict(cls, d: dict) -> "ApiKey":
         return cls(
+            is_current=_optional_bool(d.get("isCurrent")),
             key_id=_as_int(d.get("id")),
             name=d.get("keyName"),
             prefix=d.get("keyPrefix", ""),
@@ -1432,10 +1782,118 @@ class Member:
 
 
 @dataclass
+class RegistryLogin:
+    """A container registry login saved in a workspace, for pulling private images. Never carries the password."""
+
+    registry_login_id: int
+    label: str
+    server: str
+    username: str
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RegistryLogin":
+        return cls(registry_login_id=_as_int(d.get("id")), label=str(d.get("userAlias", "") or ""),
+                   server=str(d.get("server", "") or ""), username=str(d.get("username", "") or ""), raw=d)
+
+
+# The value the API sends in place of a secret env value.
+_SECRET_MASK = "***"
+
+
+@dataclass
+class TemplateEnv:
+    """One environment variable a template sets. A secret value is never returned: `value` is None and
+    `value_set` says whether one is stored. `from_image` marks a variable the image itself declares,
+    `auto_generated` one the platform fills in, and `show_on_connect` one the console shows in the Connect tab."""
+
+    key: str
+    value: str | None = None
+    secret: bool = False
+    auto_generated: bool = False
+    from_image: bool = False
+    show_on_connect: bool = False
+    masked: bool = field(default=False, repr=False)   # the server hid the value
+
+    @property
+    def value_set(self) -> bool:
+        return self.masked or bool(self.value)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TemplateEnv":
+        secret = bool(d.get("isSecret", False))
+        value = d.get("value")
+        masked = secret and value == _SECRET_MASK
+        return cls(key=str(d.get("key", "") or ""), value=None if masked or value is None else str(value),
+                   secret=secret, auto_generated=bool(d.get("isAutoGenerated", False)),
+                   from_image=bool(d.get("isBase", False)), show_on_connect=bool(d.get("showOnConnect", False)),
+                   masked=masked)
+
+
+@dataclass
+class TemplatePort:
+    """One port a template opens. `external` ports get a public HTTPS URL; `connect` marks the port the console's
+    Connect button opens. `locked` is the author's lock default for a public port (None = not decided, or an
+    internal port)."""
+
+    port: int
+    name: str = ""
+    external: bool = False
+    connect: bool = False
+    locked: bool | None = None
+    template_port_id: int | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TemplatePort":
+        locked = d.get("isLocked")
+        return cls(port=_as_int(d.get("containerPort")), name=str(d.get("userAlias", "") or ""),
+                   external=bool(d.get("isExternal", False)), connect=d.get("portType") == "connect",
+                   locked=None if locked is None else bool(locked),
+                   template_port_id=_optional_int(d.get("templatePortId")))
+
+
+@dataclass
+class TemplateVolumeMount:
+    """A folder of the template that should be on a volume."""
+
+    name: str
+    mount_path: str
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TemplateVolumeMount":
+        return cls(name=str(d.get("userAlias", "") or ""), mount_path=str(d.get("mountPath", "") or ""))
+
+
+@dataclass
+class TemplateSemanticPath:
+    """A folder with a meaning for assets: an input folder where attached assets go, or a folder whose files become
+    assets (`role`). `expect` is the asset type it takes, `include` the file globs, `cardinality` how many assets
+    it takes and `placement` how they are laid out."""
+
+    role: str
+    path: str
+    expect: str | None = None
+    include: list[str] = field(default_factory=list)
+    required: bool = False
+    cardinality: str | None = None
+    placement: str | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TemplateSemanticPath":
+        return cls(role=str(d.get("role", "") or ""), path=str(d.get("path", "") or ""),
+                   expect=_optional_str(d.get("expect")), include=[str(x) for x in d.get("include") or []],
+                   required=bool(d.get("required", False)), cardinality=_optional_str(d.get("cardinality")),
+                   placement=_optional_str(d.get("placement")))
+
+
+@dataclass
 class Template:
     """GET /v1/sdk/templates[/{template_id}] item.
 
-    The deployment spec (envs/endpoints/volumeMounts/semanticPaths, ...) is in `.raw`.
+    The deployment spec is typed: `envs` (secret values are never returned), `ports`, `volume_mounts`,
+    `semantic_paths`, `command` (the command line the template overrides, "" = the image's own) or `command_argv`
+    and `args`, and `registry_login` (None when the image is public). Names, descriptions and env values are written
+    by template authors.
     """
 
     template_id: int           # lookup key
@@ -1451,10 +1909,34 @@ class Template:
     framework: str = ""
     framework_version: str = ""
     raw: dict = field(default_factory=dict, repr=False)
+    envs: list[TemplateEnv] = field(default_factory=list)
+    ports: list[TemplatePort] = field(default_factory=list)
+    volume_mounts: list[TemplateVolumeMount] = field(default_factory=list)
+    semantic_paths: list[TemplateSemanticPath] = field(default_factory=list)
+    command: str = ""
+    command_argv: list[str] = field(default_factory=list)
+    args: list[str] = field(default_factory=list)
+    volume_required: bool = False     # the template's volume mounts must be covered by a volume of the pod
+    registry_login: RegistryLogin | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Template":
+        auth = d.get("auth")
+
+        def items(key: str) -> list[dict]:
+            value = d.get(key)
+            return [x for x in value if isinstance(x, dict)] if isinstance(value, list) else []
+
         return cls(
+            envs=[TemplateEnv.from_dict(e) for e in items("envs")],
+            ports=[TemplatePort.from_dict(e) for e in items("endpoints")],
+            volume_mounts=[TemplateVolumeMount.from_dict(v) for v in items("volumeMounts")],
+            semantic_paths=[TemplateSemanticPath.from_dict(p) for p in items("semanticPaths")],
+            command=str(d.get("overwriteCommand", "") or ""),
+            command_argv=_str_list(d.get("command")) or [],
+            args=_str_list(d.get("args")) or [],
+            volume_required=bool(d.get("volumeRequired", False)),
+            registry_login=RegistryLogin.from_dict(auth) if isinstance(auth, dict) else None,
             template_id=_as_int(d.get("id")),
             name=d.get("name", ""),
             description=d.get("description", "") or "",
@@ -1472,10 +1954,247 @@ class Template:
 
 
 @dataclass
+class ServingFailureContainer:
+    """One container's state in a serving failure diagnostic."""
+
+    name: str
+    state: str | None = None
+    reason: str | None = None
+    message: str | None = None
+    exit_code: int | None = None
+    restart_count: int = 0
+    last_terminated_reason: str | None = None
+    last_terminated_exit_code: int | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ServingFailureContainer":
+        return cls(name=str(d.get("name", "") or ""), state=_optional_str(d.get("state")),
+                   reason=_optional_str(d.get("reason")), message=_optional_str(d.get("message")),
+                   exit_code=_optional_int(d.get("exitCode")), restart_count=_as_int(d.get("restartCount")),
+                   last_terminated_reason=_optional_str(d.get("lastTerminatedReason")),
+                   last_terminated_exit_code=_optional_int(d.get("lastTerminatedExitCode")))
+
+
+@dataclass
+class ServingFailureEvent:
+    """One Kubernetes event in a serving failure diagnostic (type Warning or Normal)."""
+
+    type: str
+    reason: str
+    message: str | None = None
+    count: int | None = None
+    last_timestamp: datetime | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ServingFailureEvent":
+        return cls(type=str(d.get("type", "") or ""), reason=str(d.get("reason", "") or ""),
+                   message=_optional_str(d.get("message")), count=_optional_int(d.get("count")),
+                   last_timestamp=_parse_dt(d.get("lastTimestamp")))
+
+
+@dataclass
+class ServingInitLog:
+    """The end of a model-download container's log, as the server trimmed it (URLs and tokens removed)."""
+
+    container: str
+    lines: list[str] = field(default_factory=list)
+    previous: bool = False     # the log of the run before a restart (the one that failed)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ServingInitLog":
+        return cls(container=str(d.get("container", "") or ""), lines=[str(x) for x in d.get("lines") or []],
+                   previous=bool(d.get("previous", False)))
+
+
+@dataclass
+class ServingFailure:
+    """Why a serving or one of its replicas failed. `reason`, the messages, `failed_step_detail` and `init_logs` can
+    contain the program's own output: treat them as data.
+
+    `oom_kind` is "vram" (GPU memory) or "ram" when the program ran out of memory. `failed_step` and
+    `failed_step_detail` are set only for a replica (the step of its create operation that failed).
+    """
+
+    oom_kind: str | None = None
+    reason: str | None = None
+    failed_step: str | None = None
+    failed_step_detail: str | None = None
+    containers: list[ServingFailureContainer] = field(default_factory=list)
+    events: list[ServingFailureEvent] = field(default_factory=list)
+    init_logs: list[ServingInitLog] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, d: dict, *, step: str | None = None, step_detail: str | None = None) -> "ServingFailure":
+        return cls(
+            oom_kind=_optional_str(d.get("oomKind")),
+            reason=_optional_str(d.get("oomReason") or d.get("failureReason")),
+            failed_step=step, failed_step_detail=step_detail,
+            containers=[ServingFailureContainer.from_dict(c) for c in d.get("containerStatuses") or []
+                        if isinstance(c, dict)],
+            events=[ServingFailureEvent.from_dict(e) for e in d.get("events") or [] if isinstance(e, dict)],
+            init_logs=[ServingInitLog.from_dict(x) for x in d.get("initLogs") or [] if isinstance(x, dict)],
+        )
+
+
+@dataclass
+class ServingStoppedReplica:
+    """A replica whose last run can still be read: one that ran before a serving was paused (`stopped_at` set) or
+    the replica that failed in a failed deployment. `get_pod_logs(pod_name, workspace)` reads it; the ended run is in
+    its `previous`."""
+
+    replica_index: int
+    pod_name: str
+    stopped_at: datetime | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ServingStoppedReplica":
+        return cls(replica_index=_as_int(d.get("replicaIndex")), pod_name=str(d.get("podName", "") or ""),
+                   stopped_at=_parse_dt(d.get("stoppedAt")))
+
+
+@dataclass
+class ServingReplicaMetrics:
+    """Live numbers of one replica. A value the server couldn't measure is None. Rates are 0.0–1.0."""
+
+    concurrency: int | None = None      # requests in flight
+    reachable: bool | None = None       # its health check answered
+    gpu_util: float | None = None
+    kv_cache_usage: float | None = None   # text models only
+    queue: float | None = None          # requests waiting in the engine
+    tokens_per_s: float | None = None   # text models only
+    ttft_ms: float | None = None        # time to first token, text models only
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ServingReplicaMetrics | None":
+        keys = ("concurrency", "reachable", "gpuUtil", "kvCacheUsage", "queue", "tokensPerS", "ttftMs")
+        if all(d.get(k) is None for k in keys):
+            return None
+        reachable = d.get("reachable")
+        return cls(concurrency=_optional_int(d.get("concurrency")),
+                   reachable=None if reachable is None else bool(reachable),
+                   gpu_util=_as_optional_float(d.get("gpuUtil")), kv_cache_usage=_as_optional_float(d.get("kvCacheUsage")),
+                   queue=_as_optional_float(d.get("queue")), tokens_per_s=_as_optional_float(d.get("tokensPerS")),
+                   ttft_ms=_as_optional_float(d.get("ttftMs")))
+
+
+@dataclass
+class ServingMetrics:
+    """Live numbers of a serving. `bucket` says what `throughput` counts: llm (tokens/s), embedding (queries/s),
+    image (images/s) or video (frames/s). `latency_p95_ms` is time to first token for text models. Rates are 0.0–1.0;
+    a value the server couldn't measure is None."""
+
+    bucket: str | None = None
+    throughput: float | None = None
+    latency_p95_ms: float | None = None
+    concurrent: int | None = None
+    error_rate: float | None = None
+    queue_depth: int | None = None
+    in_flight: int | None = None        # image and video models
+    gpu_util: float | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ServingMetrics | None":
+        keys = ("bucket", "throughput", "latencyP95Ms", "concurrent", "errorRate", "queueDepth", "inFlight",
+                "gpuUtil")
+        if all(d.get(k) is None for k in keys):
+            return None
+        return cls(bucket=_optional_str(d.get("bucket")), throughput=_as_optional_float(d.get("throughput")),
+                   latency_p95_ms=_as_optional_float(d.get("latencyP95Ms")),
+                   concurrent=_optional_int(d.get("concurrent")), error_rate=_as_optional_float(d.get("errorRate")),
+                   queue_depth=_optional_int(d.get("queueDepth")), in_flight=_optional_int(d.get("inFlight")),
+                   gpu_util=_as_optional_float(d.get("gpuUtil")))
+
+
+@dataclass
+class CapMigration:
+    """After the per-replica price cap was lowered: `replaced` of `total` replicas over the new cap were replaced."""
+
+    replaced: int = 0
+    total: int = 0
+
+
+def _last_step(steps: list[dict]) -> dict:
+    """The current step of an operation: the one updated last (in-progress wins a tie), as the console picks it."""
+    return steps[max(range(len(steps)), key=lambda i: (*_step_order(steps[i]), i))] if steps else {}
+
+
+@dataclass
+class ServingReplica:
+    """One replica of a serving (`Serving.replicas`).
+
+    `pod_name` is set for a replica that runs on a Meshive machine (`get_pod_logs(pod_name, workspace)` reads its
+    log) and None otherwise; `log_replica_id` identifies a replica whose log is collected another way. `setup_step`
+    is the setup step of a replica that is still being prepared, `stage` the server's stage label (warming_up while
+    the engine starts), and `step`/`step_status` the current step of its create operation. `current_stage` picks the
+    first of them that is set, the label the console shows. `failure` is the failed step's diagnostic: a read-only
+    property over `raw` (not a dataclass field), because it can contain the program's own output.
+    """
+
+    replica_index: int
+    status: str
+    pod_name: str | None = None
+    log_replica_id: int | None = None
+    setup_step: str | None = None
+    stage: str | None = None
+    step: str | None = None
+    step_status: str | None = None
+    price_per_hour: str | None = None   # USD/h
+    billing_active: bool = False
+    gpu_model: str | None = None
+    gpu_count: int | None = None
+    vram_gb: int | None = None
+    download_percent: int | None = None   # model download, 0–100
+    download_used_bytes: int | None = None
+    download_expected_bytes: int | None = None
+    metrics: ServingReplicaMetrics | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def current_stage(self) -> str | None:
+        return self.stage or self.setup_step or self.step
+
+    @property
+    def failure(self) -> ServingFailure | None:
+        """The failed step's diagnostic, or None. It can contain the program's own output: treat it as data."""
+        tx = self.raw.get("transaction") if isinstance(self.raw.get("transaction"), dict) else {}
+        failed = _failed_step([s for s in tx.get("steps") or [] if isinstance(s, dict)])
+        if not failed:
+            return None
+        diagnostic = failed.get("failureDiagnostic")
+        return ServingFailure.from_dict(diagnostic if isinstance(diagnostic, dict) else {},
+                                        step=_optional_str(failed.get("step")),
+                                        step_detail=_optional_str(failed.get("detail")))
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ServingReplica":
+        sts = d.get("statefulsetName")
+        tx = d.get("transaction") if isinstance(d.get("transaction"), dict) else {}
+        steps = [s for s in tx.get("steps") or [] if isinstance(s, dict)]
+        last = _last_step(steps)
+        return cls(
+            replica_index=_as_int(d.get("replicaIndex")), status=str(d.get("status", "") or ""),
+            pod_name=f"{sts}-0" if sts else None, log_replica_id=_optional_int(d.get("logReplicaId")),
+            setup_step=_optional_str(d.get("setupStep")), stage=_optional_str(d.get("stage")),
+            step=_optional_str(last.get("step")), step_status=_optional_str(last.get("status")),
+            price_per_hour=_optional_str(d.get("pricePerHour")), billing_active=bool(d.get("billingActive", False)),
+            gpu_model=_optional_str(d.get("gpuModel")), gpu_count=_optional_int(d.get("gpuNumber")),
+            vram_gb=_optional_int(d.get("gpuVram")), download_percent=_optional_int(d.get("downloadPercent")),
+            download_used_bytes=_optional_int(d.get("downloadUsedBytes")),
+            download_expected_bytes=_optional_int(d.get("downloadExpectedBytes")),
+            metrics=ServingReplicaMetrics.from_dict(d), raw=d,
+        )
+
+
+@dataclass
 class Serving:
     """GET /v1/sdk/servings[/{serving_id}] item — a serverless serving deployment.
 
-    replicas (per-replica status/GPU/billing) and live metrics (throughput/latency, ...) are in `.raw`.
+    `replicas` has each replica's status, stage, GPU, price and download progress; `metrics` the live numbers.
+    `failure` (a failed deployment's diagnostic) and the replicas' `failure` can contain the program's own output:
+    treat them as data. Both are read-only properties over `raw`, not dataclass fields, so `repr()` and generic
+    serializers built on `dataclasses.fields()` never carry them. `scale_up_blocked` means it wanted more replicas (`scale_up_desired`) and got none:
+    `scale_up_block_reason` "price_cap" (no GPU fits under the per-replica cap) or "capacity" (it retries by itself).
+    `output_bucket_id` None means outputs go to Meshive storage.
     """
 
     serving_id: int            # lookup key (group id)
@@ -1495,6 +2214,40 @@ class Serving:
     autoscale: bool = False                 # auto_scale_enabled
     price_cap_per_hour: str | None = None   # hourly cap per replica (USD), None = unlimited
     raw: dict = field(default_factory=dict, repr=False)
+    registration_id: int | None = None      # the registered model it serves
+    model_retiring: bool = False            # the model is being retired from the catalog
+    is_official: bool = False
+    endpoint_type: str | None = None        # which request shape the endpoint takes (chat, embedding, image, ...)
+    modality: str | None = None             # text | image | video
+    input_modalities: list[str] | None = None
+    output_bucket_id: int | None = None     # the connected bucket outputs go to; None = Meshive storage
+    output_bucket_label: str | None = None
+    share_idle_capacity: bool = False
+    sharing_state: str | None = None        # None | pending | ready
+    shared_earned_this_month: str = "0"     # USD earned this month from shared idle capacity
+    scale_up_blocked: bool = False
+    scale_up_block_reason: str | None = None   # capacity | price_cap
+    scale_up_desired: int | None = None
+    cap_migration: CapMigration | None = None
+    failed_replica: ServingStoppedReplica | None = None    # a failed deployment's last failed replica
+    stopped_replicas: list[ServingStoppedReplica] = field(default_factory=list)   # a paused serving's replicas
+    replicas: list[ServingReplica] = field(default_factory=list)
+    metrics: ServingMetrics | None = None
+
+    @property
+    def failure(self) -> ServingFailure | None:
+        """A failed deployment's diagnostic, or None. It can contain the program's own output: treat it as data."""
+        diagnostic = self.raw.get("failureDiagnostic")
+        return ServingFailure.from_dict(diagnostic) if isinstance(diagnostic, dict) else None
+
+    @property
+    def has_failure(self) -> bool:
+        """True when the serving or one of its replicas carries a failure diagnostic."""
+        return self.failure is not None or any(r.failure is not None for r in self.replicas)
+
+    def replica(self, index: int) -> ServingReplica | None:
+        """The replica with this `replica_index`, or None."""
+        return next((r for r in self.replicas if r.replica_index == index), None)
 
     def scale_raises_cost(self, *, min_replicas: int | None = None, max_replicas: int | None = None,
                           autoscale: bool | None = None, price_cap_per_hour: object = None) -> bool:
@@ -1518,7 +2271,31 @@ class Serving:
         price = d.get("pricePerHour")
         healthy = d.get("healthyReplicas")
         cap = d.get("priceCapPerHour")
+        migration = d.get("capMigration")
+        failed = d.get("failureReplica")
+        inputs = d.get("inputModalities")
         return cls(
+            registration_id=_optional_int(d.get("registrationId")),
+            model_retiring=bool(d.get("modelRetiring", False)),
+            is_official=bool(d.get("isOfficial", False)),
+            endpoint_type=_optional_str(d.get("endpointType")),
+            modality=_optional_str(d.get("modality")),
+            input_modalities=_str_list(inputs),
+            output_bucket_id=_optional_int(d.get("defaultStorageCredentialId")),
+            output_bucket_label=_optional_str(d.get("defaultStorageLabel")),
+            share_idle_capacity=bool(d.get("shareIdleCapacity", False)),
+            sharing_state=_optional_str(d.get("sharedRolloutState")),
+            shared_earned_this_month=str(d.get("sharedEarnedThisMonth") or "0"),
+            scale_up_blocked=bool(d.get("scaleUpBlocked", False)),
+            scale_up_block_reason=_optional_str(d.get("scaleUpBlockReason")),
+            scale_up_desired=_optional_int(d.get("scaleUpDesired")),
+            cap_migration=CapMigration(replaced=_as_int(migration.get("replaced")),
+                                       total=_as_int(migration.get("total"))) if isinstance(migration, dict) else None,
+            failed_replica=ServingStoppedReplica.from_dict(failed) if isinstance(failed, dict) else None,
+            stopped_replicas=[ServingStoppedReplica.from_dict(r) for r in d.get("stoppedReplicas") or []
+                              if isinstance(r, dict)],
+            replicas=[ServingReplica.from_dict(r) for r in d.get("replicas") or [] if isinstance(r, dict)],
+            metrics=ServingMetrics.from_dict(d),
             serving_id=_as_int(d.get("id")),
             namespace_name=d.get("namespaceName", ""),
             model_name=d.get("modelName"),
@@ -1548,6 +2325,38 @@ class TaskInputAsset:
     target_dir: str
     reference_mode: str | None = None   # None = managed / "external" = fetched from the source again on every run
     ingest_source: str | None = None    # hf_import | civitai_import | web_upload | ...
+    # Only these files of the asset were attached (globs over its paths); None = all of it.
+    paths: list[str] | None = None
+    # This leading folder was removed from the files' paths under target_dir; None = paths kept as they are.
+    strip_prefix: str | None = None
+    # The asset holds the task's project code (see `Task.project`).
+    is_project: bool = False
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TaskInputAsset":
+        return cls(asset_id=str(d.get("assetExternalId", "") or ""), name=str(d.get("name", "") or ""),
+                   target_dir=str(d.get("targetDir", "") or ""), reference_mode=d.get("referenceMode"),
+                   ingest_source=d.get("ingestSource"), paths=_str_list(d.get("includePaths")),
+                   strip_prefix=_optional_str(d.get("stripPrefix")), is_project=bool(d.get("isProject", False)))
+
+
+@dataclass
+class TaskProject:
+    """A task run in project mode: the code is an asset, unpacked at `target_dir`, and the server runs `entrypoint`
+    (a file) or `module` (with `python -m`). In this mode `Task.script` is the server's launcher, not user code."""
+
+    asset_id: str
+    name: str
+    target_dir: str
+    entrypoint: str
+    requirements_path: str | None = None   # a requirements file inside the project, installed before the run
+    module: str | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TaskProject":
+        return cls(asset_id=str(d.get("assetExternalId", "") or ""), name=str(d.get("name", "") or ""),
+                   target_dir=str(d.get("targetDir", "") or ""), entrypoint=str(d.get("entrypoint", "") or ""),
+                   requirements_path=_optional_str(d.get("requirementsPath")), module=_optional_str(d.get("module")))
 
 
 @dataclass
@@ -1593,10 +2402,41 @@ class ServingModel:
     parameter_count_b: float | None = None
     min_vram_gb: int | None = None
     raw: dict = field(default_factory=dict, repr=False)
+    modality: str | None = None              # text | image | video
+    input_modalities: list[str] = field(default_factory=lambda: ["text"])
+    is_official: bool = False
+    workspace: str | None = None             # the workspace that registered it; None for an official model
+    endpoint_type: str | None = None         # which request shape a serving of it takes
+    recommended_context_length: int | None = None   # the deploy default for max context
+    display_vram_gb: int | None = None       # GPU memory per card at an 8K context (text models)
+    supported_sizes: list[str] | None = None        # image models ("512x512", ...)
+    supported_resolutions: list[str] | None = None  # video models
+    native_num_frames: int | None = None     # video models
+    native_fps: int | None = None
+
+    @property
+    def takes_image(self) -> bool:
+        """The model accepts image input."""
+        return "image" in self.input_modalities
+
+    @property
+    def can_share_idle_capacity(self) -> bool:
+        """deploy_serving may share this model's idle capacity (official text models served with vLLM)."""
+        return self.is_official and self.modality == "text" and self.framework == "vllm"
 
     @classmethod
     def from_dict(cls, d: dict) -> "ServingModel":
-        return cls(registration_id=_as_int(d.get("id")), name=str(d.get("displayName") or d.get("modelName") or ""),
+        inputs = _str_list(d.get("inputModalities"))
+        return cls(modality=_optional_str(d.get("modality")), input_modalities=inputs if inputs else ["text"],
+                   is_official=bool(d.get("isOfficial", False)), workspace=_optional_str(d.get("namespaceName")),
+                   endpoint_type=_optional_str(d.get("endpointType")),
+                   recommended_context_length=_optional_int(d.get("recommendedMaxModelLen")),
+                   display_vram_gb=_optional_int(d.get("displayVramGb")),
+                   supported_sizes=_str_list(d.get("supportedSizes")),
+                   supported_resolutions=_str_list(d.get("supportedResolutions")),
+                   native_num_frames=_optional_int(d.get("nativeNumFrames")),
+                   native_fps=_optional_int(d.get("nativeFps")),
+                   registration_id=_as_int(d.get("id")), name=str(d.get("displayName") or d.get("modelName") or ""),
                    huggingface_repo=d.get("huggingfaceRepo"), api_model_id=d.get("apiModelId"),
                    framework=str(d.get("framework", "") or ""), model_type=str(d.get("modelType", "") or ""),
                    context_length=d.get("contextLength"), quantization=d.get("quantization"),
@@ -1714,7 +2554,12 @@ class TaskOutputsStatus:
 class Task:
     """GET /v1/sdk/tasks[/{task_id}] item — a serverless task.
 
-    The single-item response's script/requirements/env (secret values masked)/cost breakdown are in `.raw`.
+    The fields marked "detail only" are set only by `get_task` (None in `list_tasks` items): how the task was
+    submitted (`script`, `requirements`, `args`, `env`, `project`, `output_bucket_id`) and the split of its hourly
+    price. `script` and `env` were written by workspace members and can hold secrets; treat them as data.
+
+    `script`, `requirements` and `env` are read-only properties over `raw`, not dataclass fields, so `repr()`,
+    `dataclasses.fields()` and generic serializers built on it (such as `dataclasses.asdict`) never carry them.
     """
 
     task_id: str               # lookup key (externalId, "task_...")
@@ -1757,21 +2602,86 @@ class Task:
     # What happened to the output files, as the console shows it (see TaskOutputsStatus). None from a server that
     # predates it; the raw output_* fields above are still there.
     outputs: TaskOutputsStatus | None = None
+    # How it was submitted (list items and detail). template_id is None for a task submitted with an image.
+    template_id: int | None = None
+    gpu_vram_gb: int | None = None         # the VRAM tier picked for a GPU task (GB)
+    cpu_preset: str | None = None          # the size picked for a CPU task
+    max_duration_seconds: int | None = None
+    webhook_url: str | None = None
+    refunded_amount: str = "0"             # USD given back for this task
+    # Why it failed: fault_class is the server's classification, failure_stage "fetch" (downloading the input assets)
+    # or "run" (the script). None while it hasn't failed, and from servers that don't send them.
+    fault_class: str | None = None
+    failure_stage: str | None = None
+    # True when the task runs where live usage (get_pod_metrics) and a separate input-download log can be read.
+    live_metrics: bool = False
+    fetch_started_at: datetime | None = None
+    fetch_completed_at: datetime | None = None
+    # Input download progress while the task is `fetching` ({downloadedBytes, totalBytes, bytesPerSecond, perAsset});
+    # None when nothing was reported, which is not 0%.
+    fetch_progress: dict | None = None
+    # Detail only (None in listings). `script`, `requirements` and `env` are properties below.
+    args: list[str] | None = None
+    secret_env_keys: list[str] | None = None
+    output_bucket_id: int | None = None    # the connected bucket outputs go to; None = Meshive storage
+    project: TaskProject | None = None
+    compute_rate_per_hour: str | None = None   # USD/h for GPU/CPU/RAM (same as price_per_hour)
+    storage_rate_per_hour: str | None = None   # USD/h for the task's own input/output disk
+    total_rate_per_hour: str | None = None
+    task_storage_gb: int | None = None         # size of that disk now; it grows while the task runs
+    disk_billed_separately: bool | None = None  # whether the task has its own billed disk
+    log_retention_days: int | None = None
+
+    @property
+    def script(self) -> str | None:
+        """The submitted script (detail only; in project mode, the server's launcher). Can hold secrets."""
+        return _optional_str(self.raw.get("scriptContent"))
+
+    @property
+    def requirements(self) -> str | None:
+        """The submitted requirements.txt content (detail only)."""
+        return _optional_str(self.raw.get("requirementsContent"))
+
+    @property
+    def env(self) -> dict[str, str] | None:
+        """The submitted environment (detail only). Secret values come as "***" (`secret_env_keys` names them);
+        empty for workspace viewers."""
+        env = self.raw.get("env")
+        return {str(k): str(v) for k, v in env.items()} if isinstance(env, dict) else None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Task":
         exit_code = d.get("exitCode")
         include = d.get("outputInclude")
         outputs = d.get("outputs")
+        project = d.get("project")
+        fetch = d.get("fetchProgress")
         return cls(
+            template_id=_optional_int(d.get("templateId")),
+            gpu_vram_gb=_optional_int(d.get("gpuVramGb")),
+            cpu_preset=_optional_str(d.get("cpuPreset")),
+            max_duration_seconds=_optional_int(d.get("maxDurationSeconds")),
+            webhook_url=_optional_str(d.get("webhookUrl")),
+            refunded_amount=str(d.get("refundedAmount") or "0"),
+            fault_class=_optional_str(d.get("faultClass")),
+            failure_stage=_optional_str(d.get("failureStage")),
+            live_metrics=bool(d.get("liveMetrics", False)),
+            fetch_started_at=_parse_dt(d.get("fetchStartedAt")),
+            fetch_completed_at=_parse_dt(d.get("fetchCompletedAt")),
+            fetch_progress=fetch if isinstance(fetch, dict) else None,
+            args=_str_list(d.get("commandArgs")),
+            secret_env_keys=_str_list(d.get("secretEnvKeys")),
+            output_bucket_id=_optional_int(d.get("storageCredentialId")),
+            project=TaskProject.from_dict(project) if isinstance(project, dict) else None,
+            compute_rate_per_hour=_optional_str(d.get("computeRatePerHour")),
+            storage_rate_per_hour=_optional_str(d.get("storageRatePerHour")),
+            total_rate_per_hour=_optional_str(d.get("totalRatePerHour")),
+            task_storage_gb=_optional_int(d.get("taskStorageCapacityGb")),
+            disk_billed_separately=_optional_bool(d.get("usesEphemeralLv")),
+            log_retention_days=_optional_int(d.get("retentionDays")),
             outputs=TaskOutputsStatus.from_dict(outputs) if isinstance(outputs, dict) else None,
             failed_asset_id=d.get("failedAssetExternalId"),
-            input_assets=[TaskInputAsset(asset_id=str(a.get("assetExternalId", "") or ""),
-                                         name=str(a.get("name", "") or ""),
-                                         target_dir=str(a.get("targetDir", "") or ""),
-                                         reference_mode=a.get("referenceMode"),
-                                         ingest_source=a.get("ingestSource"))
-                          for a in d.get("inputAssets") or [] if isinstance(a, dict)],
+            input_assets=[TaskInputAsset.from_dict(a) for a in d.get("inputAssets") or [] if isinstance(a, dict)],
             output_upload_state=d.get("outputUploadState"),
             output_files_declared=d.get("outputFilesDeclared"),
             output_files_completed=d.get("outputFilesCompleted"),
@@ -1862,12 +2772,120 @@ class AssetFile:
     file_id: str | None = None  # fileExternalId
     content_hash: str | None = None
     created_at: datetime | None = None
+    ext: str = ""                       # file extension without the dot, "" if none
+    file_type: str | None = None        # the file's kind inside a collection (older servers don't send it)
+    media_kind: str | None = None       # image | video | audio | text | ... as the console previews it
+    detected_format: str | None = None  # format read from the file's contents (e.g. safetensors, pickle)
+    # "detected" (the contents are a pickle) | "suspected" (the extension says so) | None. Pickle files can run code
+    # when they are loaded.
+    pickle_flag: str | None = None
+    format_unverified: bool = False     # no extension, so the format could not be checked
 
     @classmethod
     def from_dict(cls, d: dict) -> "AssetFile":
         return cls(path=str(d.get("relativePath", "") or ""), size_bytes=_as_int(d.get("sizeBytes")),
                    status=str(d.get("status", "") or ""), file_id=d.get("fileExternalId"),
-                   content_hash=d.get("contentHash"), created_at=_parse_dt(d.get("createdAt")))
+                   content_hash=d.get("contentHash"), created_at=_parse_dt(d.get("createdAt")),
+                   ext=str(d.get("ext") or ""), file_type=_optional_str(d.get("fileType")),
+                   media_kind=_optional_str(d.get("mediaKind")), detected_format=_optional_str(d.get("detectedFormat")),
+                   pickle_flag=_optional_str(d.get("pickleFlag")),
+                   format_unverified=bool(d.get("formatUnverified", False)))
+
+
+# Ingest sources whose importSourceRef is a URL the user gave (other sources keep internal references there).
+_URL_INGEST_SOURCES = ("civitai_import", "url_import")
+_SUBSET_PREFIX = "s3subset:"
+
+
+def _source_url(ingest_source: str, ref: object) -> str | None:
+    """The source URL of a CivitAI or direct-link import, without the parts that can carry a token: query string,
+    fragment and user:password. None for other sources."""
+    if ingest_source not in _URL_INGEST_SOURCES or not isinstance(ref, str) or not ref.strip():
+        return None
+    parts = urlsplit(ref.strip())
+    host = parts.netloc.rpartition("@")[2]
+    return parts._replace(netloc=host, query="", fragment="").geturl()
+
+
+def _subset_source_asset_id(ingest_source: str, ref: object) -> str | None:
+    """The asset a reference subset was copied from: importSourceRef is "s3subset:<asset_id>@v<n>". Anything else → None."""
+    if ingest_source != "s3_subset_fetch" or not isinstance(ref, str) or not ref.startswith(_SUBSET_PREFIX):
+        return None
+    rest = ref[len(_SUBSET_PREFIX):]
+    at = rest.find("@v")
+    return rest[:at] if at > 0 else None
+
+
+@dataclass
+class AssetSource:
+    """Where an asset came from (Asset.source)."""
+
+    ingest_source: str                  # web_upload | hf_import | civitai_import | url_import | harvest | task_output | ...
+    hf_repo: str | None = None
+    hf_revision: str | None = None
+    resolved_commit: str | None = None  # Hugging Face: the commit the asset is pinned to
+    url: str | None = None              # CivitAI / direct link only, without query string and fragment
+    pod_name: str | None = None         # the pod it was saved from (the name the pod methods take)
+    pod_label: str | None = None        # that pod's display name
+    pod_path: str | None = None         # the folder in that pod
+    from_asset_id: str | None = None    # copied out of this reference asset
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AssetSource":
+        ingest = str(d.get("ingestSource", "") or "")
+        ref = d.get("importSourceRef")
+        sts = d.get("sourceStatefulsetName")
+        return cls(ingest_source=ingest, hf_repo=d.get("hfRepo"), hf_revision=d.get("hfRevision"),
+                   resolved_commit=d.get("resolvedCommit"), url=_source_url(ingest, ref),
+                   pod_name=f"{sts}-0" if isinstance(sts, str) and sts else None,
+                   pod_label=d.get("sourceUserAlias"), pod_path=d.get("sourcePath"),
+                   from_asset_id=_subset_source_asset_id(ingest, ref))
+
+
+@dataclass
+class AssetReference:
+    """An asset that points at its source instead of holding copies (Asset.reference)."""
+
+    # prefix = a whole folder of a connected bucket, its files not listed one by one; external = a Hugging Face or
+    # CivitAI source whose file list was recorded when it was linked
+    mode: str
+    prefix: str | None = None
+    credential_label: str | None = None  # the bucket connection or token it reads through
+    credential_status: str | None = None
+    size_notice: str | None = None      # why the size is not exact, when it isn't
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AssetReference | None":
+        mode = d.get("referenceMode")
+        if not mode:
+            return None
+        return cls(mode=str(mode), prefix=d.get("referencePrefix"), credential_label=d.get("credentialLabel"),
+                   credential_status=d.get("credentialStatus"), size_notice=d.get("sizeNotice"))
+
+
+@dataclass
+class AssetActiveUpload:
+    """An upload into the asset that is still open (Asset.active_upload), e.g. a pod saving its watched folder."""
+
+    purpose: str                        # initial | add_files | harvest_sync
+    file_count: int
+    total_bytes: int
+    created_at: datetime | None = None
+
+    @classmethod
+    def from_dict(cls, d: object) -> "AssetActiveUpload | None":
+        if not isinstance(d, dict):
+            return None
+        return cls(purpose=str(d.get("purpose", "") or ""), file_count=_as_int(d.get("fileCount")),
+                   total_bytes=_as_int(d.get("totalBytes")), created_at=_parse_dt(d.get("createdAt")))
+
+
+def _str_list(value: object) -> list[str] | None:
+    return [str(v) for v in value] if isinstance(value, list) else None
+
+
+def _count_map(value: object) -> dict[str, int] | None:
+    return {str(k): _as_int(v) for k, v in value.items()} if isinstance(value, dict) else None
 
 
 @dataclass
@@ -1886,8 +2904,8 @@ class Asset:
     """A row of GET /v1/sdk/assets or the detail of /assets/{id}.
 
     Assets have no versions — size, file count and upload status are values of the asset itself. The file list (files) and
-    where it's in use (active_usage_contexts) come only with the detail. The rest, such as the pickle badge, is in `.raw`.
-    `version_count`, `latest_version` and `versions` are deprecated (removed in 2.0).
+    where it's in use (active_usage_contexts) come only with the detail. Fields an older server doesn't send keep their
+    defaults. `version_count`, `latest_version` and `versions` are deprecated (removed in 2.0).
     """
 
     asset_id: str              # assetExternalId ("asset_…", lookup key)
@@ -1913,10 +2931,24 @@ class Asset:
     semantic_type: str | None = None   # only in list rows
     files: list[AssetFile] = field(default_factory=list)                   # detail only
     active_usage_contexts: list[AssetUsage] = field(default_factory=list)  # detail only
+    # Added on its own by a model set or catalog import (list_assets hides these unless include_catalog=True).
+    from_catalog: bool = False
+    pickle_flag: str | None = None     # "detected" | "suspected" when a file is a pickle, which can run code when loaded
+    has_unverified_format: bool = False  # a file without an extension, whose format could not be checked
+    # What the asset holds, for serving: weight file formats and whether a config sits at its top level.
+    # None = not known (still uploading, a bucket folder reference, no files).
+    weight_formats: list[str] | None = None
+    has_root_config: bool | None = None
+    # File count per file type (model, config, ...). None = not known; {} = no files.
+    child_type_summary: dict[str, int] | None = None
+    source: AssetSource | None = None
+    reference: AssetReference | None = None        # None for an asset that holds its own files
+    active_upload: AssetActiveUpload | None = None
 
     @classmethod
     def from_dict(cls, d: dict, *, namespace_name: str = "") -> "Asset":
         measured = d.get("sizeMeasured") is not False
+        has_source = any(d.get(k) for k in ("ingestSource", "hfRepo", "importSourceRef", "sourceStatefulsetName"))
         return cls(
             asset_id=d.get("assetExternalId", ""),
             name=d.get("name", ""),
@@ -1944,6 +2976,15 @@ class Asset:
                            role=c.get("role"))
                 for c in d.get("activeUsageContexts") or [] if isinstance(c, dict)],
             raw=d,
+            from_catalog=bool(d.get("addedFromCatalog", False)),
+            pickle_flag=_optional_str(d.get("pickleFlag")),
+            has_unverified_format=bool(d.get("hasUnverifiedFormat", False)),
+            weight_formats=_str_list(d.get("weightFormats")),
+            has_root_config=_optional_bool(d.get("hasRootConfig")),
+            child_type_summary=_count_map(d.get("childTypeSummary")),
+            source=AssetSource.from_dict(d) if has_source else None,
+            reference=AssetReference.from_dict(d),
+            active_upload=AssetActiveUpload.from_dict(d.get("activeBatch")),
         )
 
     # --- deprecated: version fields the server echoes back for older SDKs (removed in 2.0) -----------------
@@ -2074,6 +3115,9 @@ class AssetPage:
     page: int
     page_size: int
     raw: dict = field(default_factory=dict, repr=False)
+    # Assets a model set or catalog import added that the filters leave out of this list (counted on page 1 only,
+    # 0 on later pages): pass include_catalog=True to list them.
+    catalog_hidden: int = 0
 
     def __iter__(self):
         return iter(self.items)
@@ -2096,6 +3140,7 @@ class AssetPage:
             page=_as_int(d.get("page")) or 1,
             page_size=_as_int(d.get("pageSize")) or (len(items) or 1),
             raw=d,
+            catalog_hidden=_as_int(d.get("catalogAddedTotal")),
         )
 
 
@@ -2132,6 +3177,131 @@ class AssetStorage:
             paid_balance_available=bool(d.get("paidBalanceAvailable", True)),
             raw=d,
         )
+
+
+def _snake(value: object) -> str:
+    """A server enum value in camelCase ("deleteAsset", "alreadyDeleted") in snake_case ("delete_asset")."""
+    text = str(value or "")
+    return "".join(f"_{c.lower()}" if c.isupper() else c for c in text).lstrip("_")
+
+
+@dataclass
+class AssetUpdated:
+    """PATCH /v1/sdk/assets/{id} response — the asset's name and type after update_asset."""
+
+    asset_id: str
+    name: str
+    asset_type: str
+    replayed: bool = False         # see ResourceAction.replayed
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AssetUpdated":
+        result = d.get("result") if isinstance(d.get("result"), dict) else {}
+        return cls(asset_id=str(result.get("assetExternalId") or d.get("id") or ""),
+                   name=str(result.get("name", "") or ""), asset_type=str(result.get("assetType", "") or ""),
+                   replayed=bool(d.get("replayed", False)), raw=d)
+
+
+@dataclass
+class AssetFileDeletePlan:
+    """POST /v1/sdk/assets/files/delete/preflight response — what delete_asset_files would do. Deletes nothing.
+
+    `action`: "delete_files" (the deletable files go), "delete_asset" (the selection is every file of one collection,
+    which the file delete refuses: deleting the asset is a separate call, delete_asset) or "blocked" (the selection
+    holds every file of several collections; requires_asset_delete names them). Files of an asset that is frozen or
+    in use are counted in blocked_file_count and skipped.
+    """
+
+    action: str
+    requested_file_count: int      # files the selection named
+    active_file_count: int         # of those, files that still exist
+    deletable_file_count: int      # pass this as expected_file_count when you delete
+    blocked_file_count: int
+    stale_file_count: int          # already deleted, or not found
+    active_total_size_bytes: int   # size of every selected file that exists, skipped (blocked) ones included
+    # Size of the files a delete would really remove. None from a server that doesn't send it: then
+    # active_total_size_bytes is that size only when blocked_file_count is 0.
+    deletable_total_size_bytes: int | None = None
+    # The asset the selection is in, whenever every selected file is in one asset (also for an ordinary
+    # "delete_files" selection of some of its files). Only action == "delete_asset" means delete it instead.
+    asset_id: str | None = None
+    asset_name: str | None = None
+    sample_paths: list[str] = field(default_factory=list)   # the first paths a delete would remove (up to 20)
+    requires_asset_delete: list[str] = field(default_factory=list)  # assets whose every file is selected
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AssetFileDeletePlan":
+        return cls(action=_snake(d.get("action")), requested_file_count=_as_int(d.get("requestedFileCount")),
+                   active_file_count=_as_int(d.get("activeFileCount")),
+                   deletable_file_count=_as_int(d.get("deletableFileCount")),
+                   blocked_file_count=_as_int(d.get("blockedFileCount")),
+                   stale_file_count=_as_int(d.get("staleFileCount")),
+                   active_total_size_bytes=_as_int(d.get("activeTotalSizeBytes")),
+                   deletable_total_size_bytes=(_as_int(d.get("deletableTotalSizeBytes"))
+                                               if d.get("deletableTotalSizeBytes") is not None else None),
+                   asset_id=_optional_str(d.get("assetExternalId")), asset_name=_optional_str(d.get("assetName")),
+                   sample_paths=_str_list(d.get("samplePaths")) or [],
+                   requires_asset_delete=_str_list(d.get("requiresAssetDelete")) or [], raw=d)
+
+
+@dataclass
+class AssetFileDeleteResult:
+    """One file of a delete_asset_files call."""
+
+    file_id: str | None
+    path: str | None
+    status: str                    # deleted | already_deleted | blocked | failed
+    reason: str | None = None      # why it was blocked or failed
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AssetFileDeleteResult":
+        return cls(file_id=_optional_str(d.get("fileExternalId")), path=_optional_str(d.get("relativePath")),
+                   status=_snake(d.get("status")), reason=_optional_str(d.get("reason")))
+
+
+@dataclass
+class AssetFilesDeleted:
+    """POST /v1/sdk/assets/files/delete response — one result per selected file.
+
+    `retired_asset_ids` are assets that went with their last file (a single-file or output asset); they no longer
+    appear in list_assets.
+    """
+
+    results: list[AssetFileDeleteResult]
+    retired_asset_ids: list[str] = field(default_factory=list)
+    replayed: bool = False         # see ResourceAction.replayed
+    raw: dict = field(default_factory=dict, repr=False)
+
+    def _with(self, status: str) -> list[AssetFileDeleteResult]:
+        return [r for r in self.results if r.status == status]
+
+    @property
+    def deleted(self) -> list[AssetFileDeleteResult]:
+        return self._with("deleted")
+
+    @property
+    def blocked(self) -> list[AssetFileDeleteResult]:
+        return self._with("blocked")
+
+    @property
+    def failed(self) -> list[AssetFileDeleteResult]:
+        return self._with("failed")
+
+    @property
+    def deleted_count(self) -> int:
+        return len(self.deleted)
+
+    @property
+    def already_deleted_count(self) -> int:
+        return len(self._with("already_deleted"))
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AssetFilesDeleted":
+        return cls(results=[AssetFileDeleteResult.from_dict(r) for r in d.get("results") or [] if isinstance(r, dict)],
+                   retired_asset_ids=_str_list(d.get("retiredAssetExternalIds")) or [],
+                   replayed=bool(d.get("replayed", False)), raw=d)
 
 
 # =============================================================================

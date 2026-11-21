@@ -1033,6 +1033,150 @@ def task_delete_body(task_ids: str | Iterable[str]) -> dict[str, Any]:
     return {"taskIds": ids}
 
 
+# --- Webhooks and inference keys ----------------------------------------------------
+
+def _event_types(values: Any) -> list[str]:
+    """A list of event type names. Which names exist, and whether an empty list is allowed, is the server's rule."""
+    if isinstance(values, str):
+        values = [values]
+    if values is None or isinstance(values, Mapping) or not isinstance(values, Iterable):
+        raise ValueError("event_types must be a list of event type names")
+    return [_require_str(v, "event_types[]") for v in values]
+
+
+def webhook_create_body(url: Any, event_types: Any, *, label: Any = None) -> dict[str, Any]:
+    """POST /webhooks body {url, eventTypes, label?}."""
+    body: dict[str, Any] = {"url": _require_str(url, "url"), "eventTypes": _event_types(event_types)}
+    if label is not None:
+        body["label"] = _require_str(label, "label")
+    return body
+
+
+def webhook_update_body(*, url: Any = None, label: Any = None, event_types: Any = None,
+                        enabled: Any = None) -> dict[str, Any]:
+    """PATCH /webhooks/{id} body: only what is given, at least one of them."""
+    body: dict[str, Any] = {}
+    if url is not None:
+        body["url"] = _require_str(url, "url")
+    if label is not None:
+        body["label"] = _require_str(label, "label")
+    if event_types is not None:
+        body["eventTypes"] = _event_types(event_types)
+    flag = _flag(enabled, "enabled")
+    if flag is not None:
+        body["enabled"] = flag
+    if not body:
+        raise ValueError("update_webhook needs at least one of url, label, event_types or enabled")
+    return body
+
+
+def inference_key_body(name: Any = None, expires_in_days: Any = None) -> dict[str, Any]:
+    """POST /inference-keys body {name?, expiresInDays?}. Left out, the key gets the server's default name and never
+    expires; 0 is refused rather than read as either."""
+    body: dict[str, Any] = {}
+    if name is not None:
+        body["name"] = _require_str(name, "name")
+    if expires_in_days is not None:
+        if isinstance(expires_in_days, bool) or not isinstance(expires_in_days, int) or expires_in_days < 1:
+            raise ValueError("expires_in_days must be a whole number of days >= 1; leave it out for a key that does "
+                             "not expire")
+        body["expiresInDays"] = expires_in_days
+    return body
+
+
+# --- Assets from a connected bucket, reference subsets, the default output bucket -------------
+
+def _asset_type(value: Any) -> str | None:
+    return _require_str(value, "asset_type").lower() if value is not None else None
+
+
+def _object_key(value: Any, name: str) -> str:
+    """A bucket object key or folder, sent exactly as given: spaces are valid in S3 keys, so nothing is stripped."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value
+
+
+def _object_keys(values: str | Iterable[str] | None, name: str) -> list[str]:
+    if values is None:
+        return []
+    items = [values] if isinstance(values, str) else list(values)
+    return [_object_key(v, f"{name}[]") for v in items]
+
+
+def bucket_register_body(object_keys: str | Iterable[str], *, name: str, asset_type: str | None = None,
+                         base_prefix: str | None = None) -> dict[str, Any]:
+    """POST /storage-credentials/{id}/register body {objects: [{objectKey, relativePath?}], name, assetType?}.
+    With base_prefix, a key that starts with it is stored under the rest of the key (keeps the folder layout);
+    other keys, and every key without base_prefix, get the server's default (the key's last segment). How many
+    objects one call may register is the server's limit."""
+    keys = _object_keys(object_keys, "object_keys")
+    if not keys:
+        raise ValueError("object_keys needs at least one object key")
+    folder = _object_key(base_prefix, "base_prefix") if base_prefix is not None else None
+    if folder is not None and not folder.endswith("/"):
+        folder += "/"   # a folder: "models" must not match the key "models2/a.bin"
+    objects: list[dict[str, Any]] = []
+    for key in keys:
+        item: dict[str, Any] = {"objectKey": key}
+        if folder and key.startswith(folder) and key[len(folder):]:
+            item["relativePath"] = key[len(folder):]
+        objects.append(item)
+    return _drop_none({"objects": objects, "name": _require_str(name, "name"),
+                       "assetType": _asset_type(asset_type)})
+
+
+def bucket_register_prefix_body(prefix: str, *, name: str | None = None,
+                                asset_type: str | None = None) -> dict[str, Any]:
+    """POST /storage-credentials/{id}/register-prefix body {prefix, name?, assetType?}. The bucket's root can't be
+    registered, so an empty prefix is refused."""
+    folder = _object_key(prefix, "prefix")
+    if not folder.strip("/ "):
+        raise ValueError("prefix must name a folder in the bucket (the bucket's root can't be registered)")
+    return _drop_none({"prefix": folder, "name": _require_str(name, "name") if name is not None else None,
+                       "assetType": _asset_type(asset_type)})
+
+
+def _patterns(values: str | Iterable[str] | None, name: str) -> list[str]:
+    return _strings(values, name) or []
+
+
+def reference_preview_body(include: str | Iterable[str] | None = (),
+                           exclude: str | Iterable[str] | None = ()) -> dict[str, Any]:
+    """POST /assets/{id}/reference/preview body {include, exclude} — globs over paths inside the reference asset;
+    no include = every file."""
+    return {"include": _patterns(include, "include"), "exclude": _patterns(exclude, "exclude")}
+
+
+def reference_fetch_body(include: str | Iterable[str] | None = (), exclude: str | Iterable[str] | None = (),
+                         object_keys: str | Iterable[str] | None = (), name: str | None = None,
+                         asset_type: str | None = None) -> dict[str, Any]:
+    """POST /assets/{id}/reference/fetch body {include, exclude, objectKeys, name?, assetType?}. Object keys, when
+    given, pick the files and the globs are ignored (server rule)."""
+    return _drop_none({**reference_preview_body(include, exclude), "objectKeys": _object_keys(object_keys, "object_keys"),
+                       "name": _require_str(name, "name") if name is not None else None,
+                       "assetType": _asset_type(asset_type)})
+
+
+def asset_storage_setting_body(credential_id: Any) -> dict[str, Any]:
+    """PUT /workspaces/{ws}/asset-storage body {bucketId}: a connected bucket's credential_id, or None for Meshive
+    storage (sent as an explicit null)."""
+    if credential_id is None:
+        return {"bucketId": None}
+    if isinstance(credential_id, bool) or not isinstance(credential_id, int) or credential_id < 0:
+        raise ValueError("credential_id must be a non-negative integer (a credential_id from "
+                         "list_storage_credentials), or None for Meshive storage")
+    return {"bucketId": credential_id}
+
+
+# --- Account ------------------------------------------------------------------------
+
+def profile_body(username: Any) -> dict[str, Any]:
+    """PATCH /me body {username}: the name is stripped and must not be blank. Its length and characters are the
+    server's rule (its 422 'Invalid Name' says what is allowed)."""
+    return {"username": _require_str(username, "username")}
+
+
 # --- Host machines ----------------------------------------------------------------
 
 # The kinds of machine login reveal_machine_credentials can reveal, and the agents issue_install_command installs.
@@ -1175,6 +1319,46 @@ def message_to_host_body(*, title: str, content: str = "", pod: str | None = Non
     else:
         body["machineId"] = _require_str(machine_id, "machine_id")
     return body
+
+
+# How a GPU machine's fans are driven: Meshive's default curve, a custom curve, or left to the NVIDIA driver.
+FAN_CURVE_MODES = ("default", "custom", "driver")
+
+
+def _fan_value(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+    return value
+
+
+def _fan_point(point: Any) -> dict[str, int]:
+    """One curve point: a (temperature, fan_percent) pair or a dict with temperature and fan_percent (or fanPercent)."""
+    if isinstance(point, Mapping):
+        percent = point.get("fan_percent", point.get("fanPercent"))
+        temperature = point.get("temperature")
+    elif isinstance(point, (list, tuple)) and len(point) == 2:
+        temperature, percent = point
+    else:
+        raise ValueError("each point must be a (temperature, fan_percent) pair or a dict with temperature and "
+                         "fan_percent")
+    return {"temperature": _fan_value(temperature, "point temperature"),
+            "fanPercent": _fan_value(percent, "point fan_percent")}
+
+
+def fan_curve_body(mode: Any, points: Any = None) -> dict[str, Any]:
+    """PUT …/fan-curve (and its estimate) body {mode, points}. A custom curve needs its points; with another mode the
+    points given are kept as the saved custom curve. The number of points, the temperature and fan ranges and the
+    curve's shape are the server's rules (its 400 'Invalid fan curve' says what is wrong)."""
+    value = mode.strip().lower() if isinstance(mode, str) else ""
+    if value not in FAN_CURVE_MODES:
+        raise ValueError(f"mode must be one of {', '.join(FAN_CURVE_MODES)}")
+    if points is None:
+        if value == "custom":
+            raise ValueError("a custom fan curve needs its points")
+        return {"mode": value, "points": None}
+    if isinstance(points, (str, bytes, Mapping)) or not isinstance(points, Iterable):
+        raise ValueError("points must be a list of (temperature, fan_percent) pairs")
+    return {"mode": value, "points": [_fan_point(point) for point in points]}
 
 
 # --- Image inspection and custom templates -------------------------------------

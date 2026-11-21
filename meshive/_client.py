@@ -5,12 +5,13 @@ only the transport differs (httpx.Client vs httpx.AsyncClient).
 
 Authentication: Meshive API key, `Authorization: Bearer meshive_...`. Reads, estimates, logs and downloads need the
 read scope; creating, changing or deleting workspaces, pods, storage, servings, tasks, model registrations and assets
-(imports, edits, deletions, exports, added files, assets added to or removed from pods), SSH access, port locks and access keys (listing keys is a read), custom templates, messages from a workspace to hosts, and changes to hosted machines (maintenance,
-listing, setup retries, removal, messages, machine credentials, install commands) need the write scope.
+(imports, edits, deletions, exports, added files, assets added to or removed from pods), SSH access, port locks and access keys (listing keys is a read), custom templates, messages from a workspace to hosts, inference keys, webhooks, canceling inference requests, and changes to hosted machines (maintenance,
+listing, setup retries, removal, messages, machine credentials, install commands, fan curves) need the write scope.
 Read surface: account (me/api-keys/credit/earnings/payouts, the API-key activity log, platform notices), workspaces (list/detail/members), pods (list/single/metrics,
-transactions, input assets), storage (and its operations), machines (list/detail/metrics, maintenance windows, downtime and stress tests, host messages),
+transactions, input assets), storage (and its operations), machines (list/detail/metrics, maintenance windows, downtime and stress tests, host messages, fan curves and fan status),
 GPU and CPU availability, templates and their model sets, image inspection, serverless (servings and their replica
-logs, tasks with their counts and GPUs, the official model catalog, model GPU availability), assets (Asset Hub).
+logs, tasks with their counts and GPUs, the official model catalog, model GPU availability, the shared catalog,
+inference requests, webhook endpoints and deliveries, inference keys), assets (Asset Hub).
 Retries are safe for both: GETs are idempotent, and writes resend the same Idempotency-Key, so the
 server replays the first response instead of creating twice. The writes the server does not deduplicate (running a
 command, issuing an access key) are resent only when the server surely never started on them.
@@ -59,6 +60,12 @@ from .models import (
     ACTIVITY_OUTCOMES,
     AccessKey,
     AccessKeyCreated,
+    AssetSubsetCopy,
+    BucketAssetRegistered,
+    CredentialUsage,
+    RegistryLoginUsage,
+    StorageCredentialDeleteCheck,
+    SubsetPreview,
     PortLock,
     PortPreflight,
     BrowserSessionsRevoked,
@@ -78,7 +85,13 @@ from .models import (
     AssetFilesDeleted,
     AssetHfUpload,
     AssetStorageSetting,
+    AssetSubsetCopy,
+    BucketAssetRegistered,
     BucketListing,
+    CredentialUsage,
+    RegistryLoginUsage,
+    StorageCredentialDeleteCheck,
+    SubsetPreview,
     ComfyLayout,
     AssetInjection,
     AssetServeFacts,
@@ -106,6 +119,10 @@ from .models import (
     HfToken,
     HostMessage,
     InstallCommand,
+    FanCurve,
+    FanCurveEstimate,
+    FanCurveUpdate,
+    FanStatus,
     ListingCheck,
     ListingResult,
     Logs,
@@ -155,6 +172,14 @@ from .models import (
     TaskOutputsDiscarded,
     TasksDeleted,
     ModelAvailability,
+    InferenceKey,
+    InferenceKeyCreated,
+    InferenceRequest,
+    SharedModelList,
+    WebhookDelivery,
+    WebhookEndpoint,
+    WebhookEventType,
+    WebhookTestResult,
     Template,
     WhoAmI,
     Workspace,
@@ -170,6 +195,17 @@ from .models import (
     StorageTransaction,
     TemplateSaved,
     WorkspaceMessagesRead,
+    POD_HISTORY_EVENT_TYPES,
+    AccountUpdated,
+    EmailPreferences,
+    Invite,
+    MemberRemovalCheck,
+    PodAlert,
+    PodHistoryPage,
+    PodTimeline,
+    Referral,
+    SharedEarnings,
+    WorkspaceBilling,
 )
 
 
@@ -207,6 +243,48 @@ def _asset_literal_not_supported(err: MeshiveAPIError, what: str) -> MeshiveAPIE
         return NotFoundError(404, f"This Meshive API server does not support {what} yet (it predates this SDK "
                                   "release). Use the console for now.", raw=err.raw)
     return _not_supported(err, what)
+
+def _items(data: Any, *keys: str) -> list:
+    """The rows of a list response: the list itself, or the first list under one of `keys`."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in keys:
+            if isinstance(data.get(key), list):
+                return data[key]
+    return []
+
+
+def _inference_requests_params(workspace: str, status: str | None, modality: str | None,
+                               limit: int) -> dict[str, Any]:
+    params: dict[str, Any] = {"workspace": _query_value(workspace, "workspace"), "limit": _positive_int(limit, "limit")}
+    if status is not None:
+        params["status"] = _query_value(status, "status").lower()
+    if modality is not None:
+        params["modality"] = _query_value(modality, "modality").lower()
+    return params
+
+
+def _webhook_deliveries_params(workspace: str, webhook_id: int | None, request_id: str | None,
+                               limit: int) -> dict[str, Any]:
+    params: dict[str, Any] = {"workspace": _query_value(workspace, "workspace"), "limit": _positive_int(limit, "limit")}
+    if webhook_id is not None:
+        params["endpointId"] = _int_segment(webhook_id, "webhook_id")
+    if request_id is not None:
+        params["requestId"] = _query_value(request_id, "request_id")
+    return params
+
+
+def _resource_action(data: Any, resource: str, resource_id: str, action: str, *,
+                     workspace: str | None = None) -> ResourceAction:
+    """ResourceAction for a write whose answer is only a title and a message. Without `workspace` the server's own
+    `workspace` is used (a route that takes no workspace argument, such as a webhook delete, still names it)."""
+    data = data if isinstance(data, dict) else {}
+    if workspace is None:
+        server = data.get("workspace")
+        workspace = str(server) if server not in (None, "") else None
+    return ResourceAction(resource=resource, id=resource_id, action=action, workspace=workspace, raw=data,
+                          replayed=bool(data.get("replayed", False)))
 
 
 def _check_output_include(body: dict[str, Any], submitted: TaskSubmitted) -> TaskSubmitted:
@@ -410,6 +488,109 @@ def _bucket_params(workspace: str, prefix: str, continuation_token: str | None) 
     if continuation_token is not None:
         params["continuationToken"] = _query_value(continuation_token, "continuation_token")
     return params
+
+
+def _reference_objects_params(sub_prefix: str, continuation_token: str | None) -> dict[str, Any]:
+    if not isinstance(sub_prefix, str):
+        raise ValueError("sub_prefix must be a string ('' = the reference asset's root)")
+    params: dict[str, Any] = {"subPrefix": sub_prefix}
+    if continuation_token is not None:
+        params["continuationToken"] = _query_value(continuation_token, "continuation_token")
+    return params
+
+
+def _credential_usage(data: Any) -> list[CredentialUsage]:
+    """The assets a saved token or key is used by: a list, or the list under `assets` / `items`."""
+    return [CredentialUsage.from_dict(d) for d in _items(data, "assets", "items") if isinstance(d, dict)]
+
+
+def _credential_deleted(data: Any, credential_id: int | str, workspace: str) -> ResourceAction:
+    """ResourceAction for a credential delete; `result` holds the server's {"kind", "label"} when it sends them."""
+    data = data if isinstance(data, dict) else {}
+    if data.get("id") is None:
+        return _resource_action(data, "credential", str(credential_id), "delete", workspace=workspace)
+    return ResourceAction.from_dict(data, resource="credential")
+
+
+def _time_bound(value: date | datetime | str, name: str, *, end: bool) -> str:
+    """A time bound for a query the server reads as a time: a datetime (one without an offset is UTC) is sent as is,
+    in UTC; a date or 'YYYY-MM-DD' is that day's start, or for an end bound the last moment of that day."""
+    if isinstance(value, str) and value.strip():
+        text = value.strip()
+        try:
+            if _DATE_ONLY.fullmatch(text):
+                value = date.fromisoformat(text)
+            else:
+                value = datetime.fromisoformat(text.replace("Z", "+00:00").replace("z", "+00:00"))
+        except ValueError:
+            raise ValueError(f"{name} must be a date, a datetime, or an ISO 8601 string") from None
+    if isinstance(value, datetime):
+        moment = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+        return moment.isoformat()
+    if isinstance(value, date):
+        day = datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+        return (day + timedelta(days=1, microseconds=-1) if end else day).isoformat()
+    raise ValueError(f"{name} must be a date, a datetime, or an ISO 8601 string")
+
+
+def _pod_history_params(workspace: str, event_type: str | None, limit: int, offset: int) -> dict[str, Any]:
+    params: dict[str, Any] = {"workspace": _query_value(workspace, "workspace"), "limit": _positive_int(limit, "limit"),
+                              "offset": _positive_int(offset, "offset", minimum=0)}
+    if event_type is not None:
+        value = event_type.strip().lower() if isinstance(event_type, str) else ""
+        if value not in POD_HISTORY_EVENT_TYPES:
+            raise ValueError(f"event_type must be one of {', '.join(POD_HISTORY_EVENT_TYPES)}")
+        params["eventType"] = value
+    return params
+
+
+def _pod_timeline_params(workspace: str, start: date | datetime | str | None,
+                         end: date | datetime | str | None) -> dict[str, Any]:
+    params: dict[str, Any] = {"workspace": _query_value(workspace, "workspace")}
+    if start is not None:
+        params["startTime"] = _time_bound(start, "start", end=False)
+    if end is not None:
+        params["endTime"] = _time_bound(end, "end", end=True)
+    return params
+
+
+def _pod_alerts_params(workspace: str | None, unread_only: bool, limit: int) -> dict[str, Any]:
+    if not isinstance(unread_only, bool):
+        raise ValueError("unread_only must be a boolean")
+    params: dict[str, Any] = {"limit": _positive_int(limit, "limit")}
+    if workspace is not None:
+        params["workspace"] = _query_value(workspace, "workspace")
+    if unread_only:
+        params["unreadOnly"] = "true"
+    return params
+
+
+def _shared_earnings_params(start_date: date | datetime | str | None,
+                            end_date: date | datetime | str | None) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    if start_date is not None:
+        params["startDate"] = _time_bound(start_date, "start_date", end=False)
+    if end_date is not None:
+        params["endDate"] = _time_bound(end_date, "end_date", end=True)
+    return params
+
+
+def _member_params(workspace: str, user: str) -> dict[str, Any]:
+    return {"workspace": _query_value(workspace, "workspace"), "user": _query_value(user, "user")}
+
+
+def _member_removed(data: Any, user: str, workspace: str) -> ResourceAction:
+    data = data if isinstance(data, dict) else {}
+    if data.get("id") is None:
+        return _resource_action(data, "member", user, "remove", workspace=workspace)
+    return ResourceAction.from_dict(data, resource="member")
+
+
+def _invite_cancelled(data: Any, invite_id: str, workspace: str) -> ResourceAction:
+    data = data if isinstance(data, dict) else {}
+    if data.get("id") is None:
+        return _resource_action(data, "invite", invite_id, "cancel", workspace=workspace)
+    return ResourceAction.from_dict(data, resource="invite")
 
 
 _UPLOAD_TOKEN_HEADER = "X-Asset-Upload-Token"
@@ -815,6 +996,19 @@ def _may_resend(only_if_not_started: bool, *, exc: BaseException | None = None,
     return response is not None and response.status_code in _NOT_STARTED_STATUSES
 
 
+def _live_read_may_resend(live: bool, *, exc: BaseException | None = None,
+                          response: httpx.Response | None = None) -> bool:
+    """Whether a failed GET may be resent at all (the retry budget and backoff are decided separately).
+    live: a read that makes the server ask a machine now (a fan status). A 503 from it means that ask already ran and
+    timed out, and every resend would hold the machine's request queue for another full timeout, so it is resent only
+    when the request surely never reached the server: a connection that was never made, or a 429."""
+    if not live:
+        return True
+    if exc is not None:
+        return isinstance(exc, _NOT_STARTED_EXCEPTIONS)
+    return response is not None and response.status_code == 429
+
+
 def _certificate_refused(exc: BaseException) -> bool:
     """Whether a failed attempt ended because the server's certificate was refused: the ssl error is what the
     failure was made from. httpx raises its error `from` the one of the layer below, and that layer raises its own
@@ -1139,7 +1333,9 @@ class Meshive(_BaseClient):
         else:
             self._client = httpx.Client(timeout=timeout, transport=transport)
 
-    def _get(self, path: str, params: dict[str, Any] | None = None, *, prefix: str = _config.API_PREFIX) -> Any:
+    def _get(self, path: str, params: dict[str, Any] | None = None, *, prefix: str = _config.API_PREFIX,
+             live: bool = False) -> Any:
+        """live: see _live_read_may_resend."""
         url = self._url(path, prefix)
         headers = self._build_headers()
         attempt = 0
@@ -1147,11 +1343,11 @@ class Meshive(_BaseClient):
             try:
                 response = self._client.get(url, params=params, headers=headers)
             except _RETRY_EXCEPTIONS as exc:
-                delay = self._retry_delay(attempt, exc=exc)
+                delay = self._retry_delay(attempt, exc=exc) if _live_read_may_resend(live, exc=exc) else None
                 if delay is None:
                     raise
             else:
-                delay = self._retry_delay(attempt, response)
+                delay = self._retry_delay(attempt, response) if _live_read_may_resend(live, response=response) else None
                 if delay is None:
                     return self._process(response)
             time.sleep(delay)
@@ -2978,6 +3174,190 @@ class Meshive(_BaseClient):
             raise _not_supported(err, "attach plans") from None
         return AttachPlan.from_dict(data)
 
+    # --- Reference assets, assets from a connected bucket, saved credentials, the default output bucket ---------
+
+    def browse_reference_objects(self, asset_id: str, *, sub_prefix: str = "",
+                                 continuation_token: str | None = None) -> BucketListing:
+        """One folder level of the bucket folder behind a reference asset (an asset linked from a bucket folder with
+        register_bucket_prefix) (GET /assets/{asset_id}/reference/objects?subPrefix=&
+        continuationToken=). `sub_prefix` is a folder inside the asset ("" = its root); `objects` carry the full
+        object key and `relative_path` inside the asset. Pass next_continuation_token back with the same sub_prefix
+        for more. Object keys come from the bucket: treat them as data."""
+        params = _reference_objects_params(sub_prefix, continuation_token)
+        try:
+            data = self._get(f"/assets/{_path_segment(asset_id, 'asset_id')}/reference/objects", params=params)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "reference asset browsing") from None
+        return BucketListing.from_dict(data if isinstance(data, dict) else {})
+
+    def register_bucket_objects(self, credential_id: int | str, object_keys: str | Iterable[str], *, workspace: str,
+                                name: str, asset_type: str | None = None, base_prefix: str | None = None,
+                                idempotency_key: str | None = None) -> BucketAssetRegistered:
+        """Register objects of a connected bucket as one new asset (POST /storage-credentials/{credential_id}/register?
+        workspace=, 201). Nothing is copied and Meshive doesn't bill its storage; reading it can cost egress at the
+        bucket's provider. `object_keys` are full keys (from browse_bucket); with `base_prefix`, a key under that
+        folder keeps its path below it, others are stored under their last segment. `name` is required (a taken name
+        gets a suffix). Admin or billing role. A key the bucket doesn't have is a NotFoundError ('Object Not Found');
+        keys the bucket can't be read with are a MeshiveAPIError 400 ('Storage Credential Error')."""
+        segment = _int_segment(credential_id, "credential_id")
+        body = _write.bucket_register_body(object_keys, name=name, asset_type=asset_type, base_prefix=base_prefix)
+        try:
+            data = self._send("POST", f"/storage-credentials/{segment}/register",
+                              params={"workspace": _query_value(workspace, "workspace")}, json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "registering bucket objects") from None
+        return BucketAssetRegistered.from_dict(data)
+
+    def register_bucket_prefix(self, credential_id: int | str, prefix: str, *, workspace: str,
+                               name: str | None = None, asset_type: str | None = None,
+                               idempotency_key: str | None = None) -> BucketAssetRegistered:
+        """Link a folder of a connected bucket as one reference asset (POST /storage-credentials/{credential_id}/
+        register-prefix?workspace=, 201). Nothing is copied and Meshive doesn't bill its storage. A linked folder can
+        be browsed (browse_reference_objects) and copied into Meshive storage (preview_reference_subset,
+        fetch_reference_subset), but it can't be used as a pod or task input directly; use the copy, or
+        register_bucket_objects, whose asset can be. The bucket's root can't be
+        linked. Without `name` the server names it after the folder. Admin or billing role. An empty folder is a
+        NotFoundError ('Prefix Is Empty')."""
+        segment = _int_segment(credential_id, "credential_id")
+        body = _write.bucket_register_prefix_body(prefix, name=name, asset_type=asset_type)
+        try:
+            data = self._send("POST", f"/storage-credentials/{segment}/register-prefix",
+                              params={"workspace": _query_value(workspace, "workspace")}, json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "registering bucket folders") from None
+        return BucketAssetRegistered.from_dict(data)
+
+    def preview_reference_subset(self, asset_id: str, *, include: str | Iterable[str] | None = (),
+                                 exclude: str | Iterable[str] | None = ()) -> SubsetPreview:
+        """Which files of a reference asset fetch_reference_subset would copy (POST /assets/{asset_id}/reference/
+        preview). `include` / `exclude` are globs over the paths inside the asset (no include = every file). Changes
+        nothing (read scope is enough)."""
+        body = _write.reference_preview_body(include, exclude)
+        try:
+            data = self._send("POST", f"/assets/{_path_segment(asset_id, 'asset_id')}/reference/preview", json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "copying from reference assets") from None
+        return SubsetPreview.from_dict(data)
+
+    def fetch_reference_subset(self, asset_id: str, *, include: str | Iterable[str] | None = (),
+                               exclude: str | Iterable[str] | None = (),
+                               object_keys: str | Iterable[str] | None = (), name: str | None = None,
+                               asset_type: str | None = None,
+                               idempotency_key: str | None = None) -> AssetSubsetCopy:
+        """Copy files of a reference asset into a new asset kept in Meshive storage (POST /assets/{asset_id}/reference/
+        fetch, 202), billed per GiB-month like other files there. Pick the files with `include` / `exclude` globs, or
+        with `object_keys` (full keys; the globs are then ignored). Without `name` the copy is named after the source.
+        It copies in the background: the new asset is "uploading" until done. Admin or billing role. A selection over
+        the server's limits is refused: check preview_reference_subset first."""
+        body = _write.reference_fetch_body(include, exclude, object_keys, name=name, asset_type=asset_type)
+        try:
+            data = self._send("POST", f"/assets/{_path_segment(asset_id, 'asset_id')}/reference/fetch", json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "copying from reference assets") from None
+        return AssetSubsetCopy.from_dict(data)
+
+    def get_hf_token_usage(self, token_id: int | str, workspace: str) -> list[CredentialUsage]:
+        """The assets linked with a saved Hugging Face token (GET /hf-tokens/{token_id}/usage?workspace=), with how
+        many pods use each now. Admin or billing role."""
+        try:
+            data = self._get(f"/hf-tokens/{_int_segment(token_id, 'token_id')}/usage",
+                             params={"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "credential usage") from None
+        return _credential_usage(data)
+
+    def get_civitai_key_usage(self, key_id: int | str, workspace: str) -> list[CredentialUsage]:
+        """The assets linked with a saved CivitAI key (GET /civitai-keys/{key_id}/usage?workspace=), with how many pods
+        use each now. Admin or billing role."""
+        try:
+            data = self._get(f"/civitai-keys/{_int_segment(key_id, 'key_id')}/usage",
+                             params={"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "credential usage") from None
+        return _credential_usage(data)
+
+    def get_registry_login_usage(self, registry_login_id: int | str, workspace: str) -> RegistryLoginUsage:
+        """What uses a registry login (GET /registry-logins/{registry_login_id}/usage?workspace=): the workspace's
+        custom templates that pull with it, and the active pods from them and tasks with it. Any member."""
+        segment = _int_segment(registry_login_id, "registry_login_id")
+        try:
+            data = self._get(f"/registry-logins/{segment}/usage",
+                             params={"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "credential usage") from None
+        return RegistryLoginUsage.from_dict(data if isinstance(data, dict) else {}, registry_login_id=int(segment))
+
+    def delete_hf_token(self, token_id: int | str, workspace: str, *,
+                        idempotency_key: str | None = None) -> ResourceAction:
+        """Delete a saved Hugging Face token (DELETE /hf-tokens/{token_id}?workspace=). Assets linked with it stay
+        listed but can't be downloaded again until a new token is saved; get_hf_token_usage lists them. Can't be
+        undone. Admin or billing role."""
+        return self._delete_credential("/hf-tokens", token_id, "token_id", workspace,
+                                       idempotency_key)
+
+    def delete_civitai_key(self, key_id: int | str, workspace: str, *,
+                           idempotency_key: str | None = None) -> ResourceAction:
+        """Delete a saved CivitAI key (DELETE /civitai-keys/{key_id}?workspace=); like delete_hf_token."""
+        return self._delete_credential("/civitai-keys", key_id, "key_id", workspace,
+                                       idempotency_key)
+
+    def delete_registry_login(self, registry_login_id: int | str, workspace: str, *,
+                              idempotency_key: str | None = None) -> ResourceAction:
+        """Delete a saved container registry login (DELETE /registry-logins/{registry_login_id}?workspace=).
+        Templates that use it lose the login, so new pods and tasks from them can fail to pull a private image. Can't
+        be undone. Admin or billing role."""
+        return self._delete_credential("/registry-logins", registry_login_id, "registry_login_id", workspace,
+                                       idempotency_key)
+
+    def check_storage_credential_delete(self, credential_id: int | str,
+                                        workspace: str) -> StorageCredentialDeleteCheck:
+        """What removing a bucket connection touches (GET /storage-credentials/{credential_id}/delete-check?
+        workspace=): the assets registered from it, whether it is the default output bucket, and the pods and tasks
+        using it now. Changes nothing. Admin or billing role."""
+        try:
+            data = self._get(f"/storage-credentials/{_int_segment(credential_id, 'credential_id')}/delete-check",
+                             params={"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "removing bucket connections") from None
+        return StorageCredentialDeleteCheck.from_dict(data if isinstance(data, dict) else {})
+
+    def delete_storage_credential(self, credential_id: int | str, workspace: str, *,
+                                  idempotency_key: str | None = None) -> ResourceAction:
+        """Remove a bucket connection (DELETE /storage-credentials/{credential_id}?workspace=). Nothing in the bucket
+        is deleted and jobs already uploading finish. It has to be connected again in the console to be used for new
+        work; if it was the default output bucket, task outputs go back to Meshive storage. Check the impact with
+        check_storage_credential_delete first. Admin or billing role."""
+        return self._delete_credential("/storage-credentials", credential_id, "credential_id", workspace,
+                                       idempotency_key, what="removing bucket connections")
+
+    def _delete_credential(self, collection: str, credential_id: int | str, name: str, workspace: str,
+                           idempotency_key: str | None, *,
+                           what: str = "deleting saved credentials") -> ResourceAction:
+        segment = _int_segment(credential_id, name)
+        try:
+            data = self._send("DELETE", f"{collection}/{segment}", params={"workspace": _query_value(workspace, "workspace")},
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, what) from None
+        return _credential_deleted(data, segment, workspace)
+
+    def set_asset_storage_setting(self, workspace: str, credential_id: int | None, *,
+                                  idempotency_key: str | None = None) -> AssetStorageSetting:
+        """Choose where the workspace's task outputs go by default (PUT /workspaces/{workspace}/asset-storage): a
+        verified connected bucket's credential_id, or None for Meshive storage (billed per GiB-month). Tasks that pass
+        their own output bucket, tasks already running, console uploads and pod watched folders are not affected.
+        Admin or billing role. An unverified bucket is a MeshiveAPIError 400 ('Storage Not Verified')."""
+        body = _write.asset_storage_setting_body(credential_id)
+        try:
+            data = self._send("PUT", f"/workspaces/{_path_segment(workspace, 'workspace')}/asset-storage", json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "changing the default output bucket") from None
+        return AssetStorageSetting.from_dict(data)
+
     # --- Serving model registration ---------------------------------------------------------------
 
     def list_models(self, workspace: str) -> list[ServingModel]:
@@ -3143,6 +3523,330 @@ class Meshive(_BaseClient):
             raise _not_supported(err, "discarding task outputs") from None
         return TaskOutputsDiscarded.from_dict(data)
 
+    # --- Serverless: shared catalog, inference requests, webhooks, inference keys ------------------------
+
+    def list_shared_models(self) -> SharedModelList:
+        """The shared catalog (GET /shared-models): models other workspaces opened up, billed per million tokens, with
+        the `base_url` to call them at. Calling one needs an inference key (create_inference_key); send
+        `SharedModel.model` as the OpenAI `model` name."""
+        try:
+            data = self._get("/shared-models")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "the shared model catalog") from None
+        return SharedModelList.from_dict(data)
+
+    def list_inference_requests(self, workspace: str, *, status: str | None = None, modality: str | None = None,
+                                limit: int = 50) -> list[InferenceRequest]:
+        """A workspace's inference requests, newest first (GET /inference-requests?workspace=&status=&modality=&limit=).
+        `status` is one of INFERENCE_REQUEST_STATUSES, `modality` text, image, video, embedding or audio; `limit` is at
+        most 200 (the server's rule). Any member can read them. Download links come only with get_inference_request."""
+        try:
+            data = self._get("/inference-requests", _inference_requests_params(workspace, status, modality, limit))
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "inference requests") from None
+        return [InferenceRequest.from_dict(d) for d in _items(data, "items", "requests") if isinstance(d, dict)]
+
+    def get_inference_request(self, request_id: str) -> InferenceRequest:
+        """One inference request (GET /inference-requests/{request_id}). For a succeeded request whose result is still
+        kept, `download_urls` are signed links to it that expire in about an hour; call again for fresh ones. A request
+        of a workspace you aren't a member of is a NotFoundError."""
+        try:
+            data = self._get(f"/inference-requests/{_path_segment(request_id, 'request_id')}")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "inference requests") from None
+        return InferenceRequest.from_dict(data)
+
+    def cancel_inference_request(self, request_id: str, *, idempotency_key: str | None = None) -> InferenceRequest:
+        """Cancel a queued inference request (POST /inference-requests/{request_id}/cancel): nothing runs and the
+        credit held for it is refunded. Only queued requests can be canceled (409 ConflictError otherwise). The member
+        who sent it, or a workspace admin or billing member, can cancel it (403 PermissionDeniedError otherwise)."""
+        try:
+            data = self._send("POST", f"/inference-requests/{_path_segment(request_id, 'request_id')}/cancel",
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "canceling inference requests") from None
+        return InferenceRequest.from_dict(data if isinstance(data, dict) else {})
+
+    def list_webhooks(self, workspace: str) -> list[WebhookEndpoint]:
+        """The workspace's webhook endpoints (GET /webhooks?workspace=). Needs the admin or billing role."""
+        try:
+            data = self._get("/webhooks", {"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "webhooks") from None
+        return [WebhookEndpoint.from_dict(d) for d in _items(data, "items", "endpoints") if isinstance(d, dict)]
+
+    def list_webhook_deliveries(self, workspace: str, *, webhook_id: int | None = None, request_id: str | None = None,
+                                limit: int = 50) -> list[WebhookDelivery]:
+        """Events sent, or tried, to the workspace's webhook endpoints, newest first (GET
+        /webhooks/deliveries?workspace=&endpointId=&requestId=&limit=), optionally of one endpoint or one inference
+        request. `limit` is at most 200 (the server's rule). Needs the admin or billing role."""
+        params = _webhook_deliveries_params(workspace, webhook_id, request_id, limit)
+        try:
+            data = self._get("/webhooks/deliveries", params)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "webhooks") from None
+        return [WebhookDelivery.from_dict(d) for d in _items(data, "items", "deliveries") if isinstance(d, dict)]
+
+    def list_webhook_event_types(self) -> list[WebhookEventType]:
+        """The events a webhook endpoint can subscribe to (GET /webhooks/event-types), each with a sample payload."""
+        try:
+            data = self._get("/webhooks/event-types")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "webhooks") from None
+        return [WebhookEventType.from_dict(d) for d in _items(data, "events", "items") if isinstance(d, dict)]
+
+    def create_webhook(self, workspace: str, url: str, event_types: str | Iterable[str], *, label: str | None = None,
+                       idempotency_key: str | None = None) -> WebhookEndpoint:
+        """Add a webhook endpoint (POST /webhooks?workspace=, 201): Meshive POSTs each event of `event_types` (names
+        from list_webhook_event_types) to `url` (the request or task id, its status, where the output is and live
+        download links) until the endpoint is deleted, also after the API key that made it is revoked. Generic
+        endpoints are signed with the workspace's signing secret, which is copied from the console. Needs the admin or
+        billing role; an unusable URL is a 400 ('Invalid webhook URL'). A replayed result (`replayed=True`) shows the
+        URL cut to scheme and host (`https://host/…`), since the URL path can be a secret."""
+        body = _write.webhook_create_body(url, event_types, label=label)
+        try:
+            data = self._send("POST", "/webhooks", params={"workspace": _query_value(workspace, "workspace")},
+                              json=body, idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "webhooks") from None
+        return WebhookEndpoint.from_dict(data if isinstance(data, dict) else {})
+
+    def update_webhook(self, webhook_id: int | str, *, url: str | None = None, label: str | None = None,
+                       event_types: str | Iterable[str] | None = None, enabled: bool | None = None,
+                       idempotency_key: str | None = None) -> WebhookEndpoint:
+        """Change a webhook endpoint (PATCH /webhooks/{webhook_id}): only what is passed changes. enabled=True turns an
+        endpoint that was turned off back on; event_types replaces the subscribed events. An endpoint of a workspace
+        you aren't a member of is a NotFoundError. Needs the admin or billing role. A replayed result
+        (`replayed=True`) shows the URL cut to scheme and host (`https://host/…`)."""
+        body = _write.webhook_update_body(url=url, label=label, event_types=event_types, enabled=enabled)
+        try:
+            data = self._send("PATCH", f"/webhooks/{_int_segment(webhook_id, 'webhook_id')}", json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "webhooks") from None
+        return WebhookEndpoint.from_dict(data if isinstance(data, dict) else {})
+
+    def delete_webhook(self, webhook_id: int | str, *, idempotency_key: str | None = None) -> ResourceAction:
+        """Delete a webhook endpoint (DELETE /webhooks/{webhook_id}): events stop going to it at once. It can't be
+        undone; its delivery history stays. The answer's `workspace` is the endpoint's. Needs the admin or billing
+        role."""
+        webhook = _int_segment(webhook_id, "webhook_id")
+        try:
+            data = self._send("DELETE", f"/webhooks/{webhook}", idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "webhooks") from None
+        return _resource_action(data, "webhook", webhook, "delete")
+
+    def test_webhook(self, webhook_id: int | str, *, idempotency_key: str | None = None) -> WebhookTestResult:
+        """Send the fixed test event to a saved webhook endpoint (POST /webhooks/{webhook_id}/test). A failed test
+        doesn't turn the endpoint off. A turned-off endpoint is a 400 ('Endpoint disabled'), and test sends are
+        rate-limited (RateLimitError). Resending with the same idempotency_key replays the answer instead of sending
+        again. Needs the admin or billing role."""
+        try:
+            data = self._send("POST", f"/webhooks/{_int_segment(webhook_id, 'webhook_id')}/test",
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "webhooks") from None
+        return WebhookTestResult.from_dict(data if isinstance(data, dict) else {})
+
+    def list_inference_keys(self, workspace: str) -> list[InferenceKey]:
+        """The workspace's inference keys (GET /inference-keys?workspace=): your own, or every key of the workspace for
+        an admin or billing member. A key's value is never listed; it is shown once, by create_inference_key or
+        roll_inference_key. These are not port access keys (list_access_keys) nor Meshive API keys."""
+        try:
+            data = self._get("/inference-keys", {"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "inference keys") from None
+        return [InferenceKey.from_dict(d) for d in _items(data, "items", "keys") if isinstance(d, dict)]
+
+    def create_inference_key(self, workspace: str, *, name: str | None = None,
+                             expires_in_days: int | None = None) -> InferenceKeyCreated:
+        """Create an inference key (POST /inference-keys?workspace=, write scope, admin or billing role). Any program
+        with its value can call every serving of the workspace, billed to it, sending `Authorization: Bearer <key>`.
+        `inference_key` on the result is the value: it is returned this once and can't be read again.
+        The key doesn't expire unless `expires_in_days` is given, and it keeps working after the Meshive API key used
+        to create it is revoked or expires; revoke it with revoke_inference_key.
+        Not idempotent: every call creates another key, so a failed call is resent only when the server surely never
+        started on it. After a timeout, check list_inference_keys before calling again, and revoke a key you can't
+        use."""
+        body = _write.inference_key_body(name, expires_in_days)
+        try:
+            data = self._send("POST", "/inference-keys", params={"workspace": _query_value(workspace, "workspace")},
+                              json=body, once=True)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "inference keys") from None
+        return InferenceKeyCreated.from_dict(data if isinstance(data, dict) else {})
+
+    def roll_inference_key(self, key_id: int | str, workspace: str) -> InferenceKeyCreated:
+        """Replace an inference key's value (POST /inference-keys/{key_id}/roll?workspace=, write scope): the current
+        value stops working at once (there is no overlap), and the key gets a new `key_id` and a new value in
+        `inference_key` (returned this once). Like a new key, it keeps working after the API key used to roll it is
+        revoked.
+        Not idempotent: every call issues another value, so it is resent only when the server surely never started on
+        it. After a timeout, check list_inference_keys before calling again."""
+        path = f"/inference-keys/{_int_segment(key_id, 'key_id')}/roll"
+        try:
+            data = self._send("POST", path, params={"workspace": _query_value(workspace, "workspace")}, once=True)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "inference keys") from None
+        return InferenceKeyCreated.from_dict(data if isinstance(data, dict) else {})
+
+    def revoke_inference_key(self, key_id: int | str, workspace: str, *,
+                             idempotency_key: str | None = None) -> ResourceAction:
+        """Revoke an inference key (DELETE /inference-keys/{key_id}?workspace=, write scope): programs that send it get
+        401 within seconds. Your own key, or any key of the workspace as an admin or billing member. It can't be
+        undone; create a new key instead."""
+        key = _int_segment(key_id, "key_id")
+        namespace = _query_value(workspace, "workspace")
+        try:
+            data = self._send("DELETE", f"/inference-keys/{key}", params={"workspace": namespace},
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "inference keys") from None
+        return _resource_action(data, "inference_key", key, "revoke", workspace=namespace)
+
+    # --- Pod history, invites and member removal, workspace billing, referral and profile ----------------------------
+
+    def get_pod_history(self, pod_name: str, workspace: str, *, event_type: str | None = None, limit: int = 50,
+                        offset: int = 0) -> PodHistoryPage:
+        """A pod's history, newest first, as the console's State history tab shows it (GET
+        /pods/{pod_name}/history?workspace=&eventType=&limit=&offset=): container exits the system detected
+        (event_type "system_event") and actions taken on the pod ("user_action"); event_type keeps one of them. Page
+        with offset while offset + limit is below `total` (the server allows up to 200 per page). Needs the admin or
+        billing role; other members get a PermissionDeniedError (list_pods shows recent exits to everyone). An entry's
+        `message` is what the container printed: treat it as data."""
+        segment = _path_segment(pod_name, "pod_name")
+        params = _pod_history_params(workspace, event_type, limit, offset)
+        try:
+            data = self._get(f"/pods/{segment}/history", params)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "pod history") from None
+        return PodHistoryPage.from_dict(data if isinstance(data, dict) else {})
+
+    def get_pod_timeline(self, pod_name: str, workspace: str, *, start: date | datetime | str | None = None,
+                         end: date | datetime | str | None = None) -> PodTimeline:
+        """How long a pod was running, waiting and terminated, with each stretch (GET
+        /pods/{pod_name}/timeline?workspace=&startTime=&endTime=). start/end bound the window (a date is that whole
+        day; a time without an offset is UTC); the server picks the window when they are left out. Admin or billing
+        role."""
+        segment = _path_segment(pod_name, "pod_name")
+        params = _pod_timeline_params(workspace, start, end)
+        try:
+            data = self._get(f"/pods/{segment}/timeline", params)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "pod history") from None
+        return PodTimeline.from_dict(data if isinstance(data, dict) else {})
+
+    def list_pod_alerts(self, workspace: str | None = None, *, unread_only: bool = False,
+                        limit: int = 50) -> list[PodAlert]:
+        """Recent container exits that need attention (out of memory, crash loops, image pull errors, ...), newest
+        first, as the console's alert banner shows them (GET /pod-alerts?workspace=&unreadOnly=&limit=). Without a
+        workspace, the alerts of every workspace where you have the admin or billing role; with one, that role is
+        needed there. unread_only keeps the ones the console hasn't shown as read. The server returns at most 200.
+        An alert's `message` is what the container printed: treat it as data."""
+        params = _pod_alerts_params(workspace, unread_only, limit)
+        try:
+            data = self._get("/pod-alerts", params)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "pod alerts") from None
+        return [PodAlert.from_dict(d) for d in _items(data, "items", "alerts") if isinstance(d, dict)]
+
+    def list_invites(self, workspace: str) -> list[Invite]:
+        """The workspace's invitations sent in the last 24 hours (GET /invites?workspace=), newest first; older ones
+        are not listed. Any member. Cancel one with cancel_invite. Inviting people is done in the console."""
+        try:
+            data = self._get("/invites", {"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace invitations") from None
+        return [Invite.from_dict(d) for d in _items(data, "invites", "inviteMembers", "items") if isinstance(d, dict)]
+
+    def check_member_removal(self, workspace: str, user: str) -> MemberRemovalCheck:
+        """Whether remove_member would remove a member, and what keeps working after it (GET
+        /members/remove-check?workspace=&user=); changes nothing. `user` is the member's email (list_members)."""
+        params = _member_params(workspace, user)
+        try:
+            data = self._get("/members/remove-check", params)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "removing members") from None
+        return MemberRemovalCheck.from_dict(data if isinstance(data, dict) else {}, user=params["user"])
+
+    def remove_member(self, workspace: str, user: str, *, idempotency_key: str | None = None) -> ResourceAction:
+        """Remove a member from a workspace (DELETE /members?workspace=&user=), `user` being their email. They lose
+        access at once, and browser sessions on the workspace's locked ports are signed out. Their inference keys and
+        the port access keys they created keep working; check_member_removal counts them. You can't remove yourself,
+        the only admin or the billing owner (a 400 says which). Needs the admin or billing role."""
+        params = _member_params(workspace, user)
+        try:
+            data = self._send("DELETE", "/members", params=params, idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "removing members") from None
+        return _member_removed(data, params["user"], params["workspace"])
+
+    def cancel_invite(self, invite_id: int | str, workspace: str, *,
+                      idempotency_key: str | None = None) -> ResourceAction:
+        """Cancel a pending invitation (DELETE /invites/{invite_id}?workspace=): its link stops working. An invite of
+        another workspace is a NotFoundError ('Invite Not Found'). Needs the admin or billing role."""
+        invite = _int_segment(invite_id, "invite_id")
+        namespace = _query_value(workspace, "workspace")
+        try:
+            data = self._send("DELETE", f"/invites/{invite}", params={"workspace": namespace},
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "canceling invitations") from None
+        return _invite_cancelled(data, invite, namespace)
+
+    def get_workspace_billing(self, workspace: str) -> WorkspaceBilling:
+        """The console's workspace Billing page (GET /workspaces/{workspace}/billing): the hourly price now, the 7-day
+        daily average, the charges per day for the workspace's whole life, and this month's shared-model spend and
+        credits. Any member."""
+        try:
+            data = self._get(f"/workspaces/{_path_segment(workspace, 'workspace')}/billing")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace billing") from None
+        return WorkspaceBilling.from_dict(data if isinstance(data, dict) else {})
+
+    def get_shared_earnings(self, workspace: str, *, start_date: date | datetime | str | None = None,
+                            end_date: date | datetime | str | None = None) -> SharedEarnings:
+        """What the workspace earned by sharing its servings' idle capacity (GET
+        /workspaces/{workspace}/shared-earnings?startDate=&endDate=): settlements newest first and totals per model.
+        A date bound is that whole day; without bounds, the last 90 days. Any member."""
+        path = f"/workspaces/{_path_segment(workspace, 'workspace')}/shared-earnings"
+        params = _shared_earnings_params(start_date, end_date)
+        try:
+            data = self._get(path, params)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "shared earnings") from None
+        return SharedEarnings.from_dict(data if isinstance(data, dict) else {})
+
+    def get_referral(self) -> Referral:
+        """Your referral link, how many people signed up with it, what it earned, and the reward rule (GET /referral).
+        The first call creates the account's referral code if it has none yet."""
+        try:
+            data = self._get("/referral")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "referrals") from None
+        return Referral.from_dict(data if isinstance(data, dict) else {})
+
+    def get_email_preferences(self) -> EmailPreferences:
+        """Whether the account gets product update mail (GET /me/email-preferences). It is changed in the console or
+        with the unsubscribe link in an update mail."""
+        try:
+            data = self._get("/me/email-preferences")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "email preferences") from None
+        return EmailPreferences.from_dict(data if isinstance(data, dict) else {})
+
+    def update_profile(self, *, username: str, idempotency_key: str | None = None) -> AccountUpdated:
+        """Change the account's display name (PATCH /me, write scope), shown in the console's account menu and Profile
+        page. Only the name changes; the sign-in email, workspaces, keys and billing stay. A name the server doesn't
+        allow (too long, line breaks or control characters) is a 422 ('Invalid Name')."""
+        body = _write.profile_body(username)
+        try:
+            data = self._send("PATCH", "/me", json=body, idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "renaming the account") from None
+        return AccountUpdated.from_dict(data if isinstance(data, dict) else {})
+
     # --- Hosting: maintenance windows --------------------------------------------------
     # Machines you host. Reads need the read scope; everything that changes a machine, sends a message or reveals a
     # secret needs the write scope. A machine that isn't yours is a NotFoundError, as for a missing one.
@@ -3297,6 +4001,62 @@ class Meshive(_BaseClient):
         except MeshiveAPIError as err:
             raise _not_supported(err, "machine removal") from None
         return MachineDeleted.from_dict(data)
+
+    # --- Hosting: fan curves -----------------------------------------------------------
+    # GPU machines only: any other machine is refused with 400 'Not a GPU machine'.
+
+    def get_fan_curve(self, machine_id: str) -> FanCurve:
+        """A GPU machine's fan curve: its mode, the curve it follows, the saved custom curve, Meshive's default curve
+        and the limits a custom curve must keep (GET /machines/{machine_id}/fan-curve). A machine that was never set
+        gets the default curve with revision 0."""
+        try:
+            data = self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}/fan-curve")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "fan curves") from None
+        return FanCurve.from_dict(data)
+
+    def get_fan_status(self, machine_id: str) -> FanStatus:
+        """Each GPU's temperature and fan speeds, read from the machine now (GET
+        /machines/{machine_id}/fan-curve/status). Every call asks the machine, so don't call it in a loop. An offline
+        machine is a ConflictError ('Machine offline'); a machine that doesn't answer in time is a 503 ('Fan status
+        unavailable'), raised at once: it isn't resent, since every resend would ask the machine again."""
+        try:
+            data = self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}/fan-curve/status", live=True)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "fan curves") from None
+        return FanStatus.from_dict(data)
+
+    def estimate_fan_curve(self, machine_id: str, *, mode: str,
+                           points: Iterable[Any] | None = None) -> FanCurveEstimate:
+        """What set_fan_curve would save, with the server's checks: an invalid curve is a 400 ('Invalid fan curve')
+        here, before anything is saved. Also says what the machine has now and whether its agent is reachable. Saves
+        nothing (read scope is enough). Same arguments as set_fan_curve."""
+        body = _write.fan_curve_body(mode, points)
+        try:
+            data = self._send("POST", f"/machines/{_path_segment(machine_id, 'machine_id')}/fan-curve/estimate",
+                              json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "fan curves") from None
+        return FanCurveEstimate.from_dict(data)
+
+    def set_fan_curve(self, machine_id: str, *, mode: str, points: Iterable[Any] | None = None,
+                      idempotency_key: str | None = None) -> FanCurveUpdate:
+        """Set how a GPU machine's fans are driven, as the console's Fan curve tab does. mode is "default" (Meshive's
+        curve), "custom" (points, required: (temperature_c, fan_percent) pairs or dicts with temperature and
+        fan_percent) or "driver" (Meshive stops controlling the fans; the NVIDIA driver or the host's own tool takes
+        over). Points given with another mode are kept as the saved custom curve. A custom curve that runs the GPUs
+        hotter than the default can throttle the pods on the machine. The number of points and their ranges are the
+        server's rules (FanCurve.limits; 400 'Invalid fan curve'); check with estimate_fan_curve first.
+
+        The curve is saved even when the machine can't take it now (applied=False, apply_error says why): the machine
+        picks it up within about 5 minutes or when it reconnects, so don't call again for that."""
+        body = _write.fan_curve_body(mode, points)
+        try:
+            data = self._send("PUT", f"/machines/{_path_segment(machine_id, 'machine_id')}/fan-curve", json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "fan curves") from None
+        return FanCurveUpdate.from_dict(data)
 
     # --- Hosting: history, messages, credentials, install, payouts -------------------------
 
@@ -3518,7 +4278,8 @@ class AsyncMeshive(_BaseClient):
             self._client = httpx.AsyncClient(timeout=timeout, transport=transport)
 
     async def _get(self, path: str, params: dict[str, Any] | None = None, *,
-                   prefix: str = _config.API_PREFIX) -> Any:
+                   prefix: str = _config.API_PREFIX, live: bool = False) -> Any:
+        """live: see _live_read_may_resend."""
         url = self._url(path, prefix)
         headers = self._build_headers()
         attempt = 0
@@ -3526,11 +4287,11 @@ class AsyncMeshive(_BaseClient):
             try:
                 response = await self._client.get(url, params=params, headers=headers)
             except _RETRY_EXCEPTIONS as exc:
-                delay = self._retry_delay(attempt, exc=exc)
+                delay = self._retry_delay(attempt, exc=exc) if _live_read_may_resend(live, exc=exc) else None
                 if delay is None:
                     raise
             else:
-                delay = self._retry_delay(attempt, response)
+                delay = self._retry_delay(attempt, response) if _live_read_may_resend(live, response=response) else None
                 if delay is None:
                     return self._process(response)
             await asyncio.sleep(delay)
@@ -4960,6 +5721,154 @@ class AsyncMeshive(_BaseClient):
             raise _not_supported(err, "attach plans") from None
         return AttachPlan.from_dict(data)
 
+    # --- Reference assets, assets from a connected bucket, saved credentials, the default output bucket ---------
+
+    async def browse_reference_objects(self, asset_id: str, *, sub_prefix: str = "",
+                                       continuation_token: str | None = None) -> BucketListing:
+        """One folder level of the bucket folder behind a reference asset (see Meshive.browse_reference_objects)."""
+        params = _reference_objects_params(sub_prefix, continuation_token)
+        try:
+            data = await self._get(f"/assets/{_path_segment(asset_id, 'asset_id')}/reference/objects", params=params)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "reference asset browsing") from None
+        return BucketListing.from_dict(data if isinstance(data, dict) else {})
+
+    async def register_bucket_objects(self, credential_id: int | str, object_keys: str | Iterable[str], *, workspace: str,
+                                      name: str, asset_type: str | None = None, base_prefix: str | None = None,
+                                      idempotency_key: str | None = None) -> BucketAssetRegistered:
+        """Register objects of a connected bucket as one new asset (see Meshive.register_bucket_objects)."""
+        segment = _int_segment(credential_id, "credential_id")
+        body = _write.bucket_register_body(object_keys, name=name, asset_type=asset_type, base_prefix=base_prefix)
+        try:
+            data = await self._send("POST", f"/storage-credentials/{segment}/register",
+                                    params={"workspace": _query_value(workspace, "workspace")}, json=body,
+                                    idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "registering bucket objects") from None
+        return BucketAssetRegistered.from_dict(data)
+
+    async def register_bucket_prefix(self, credential_id: int | str, prefix: str, *, workspace: str,
+                                     name: str | None = None, asset_type: str | None = None,
+                                     idempotency_key: str | None = None) -> BucketAssetRegistered:
+        """Link a folder of a connected bucket as one reference asset (see Meshive.register_bucket_prefix)."""
+        segment = _int_segment(credential_id, "credential_id")
+        body = _write.bucket_register_prefix_body(prefix, name=name, asset_type=asset_type)
+        try:
+            data = await self._send("POST", f"/storage-credentials/{segment}/register-prefix",
+                                    params={"workspace": _query_value(workspace, "workspace")}, json=body,
+                                    idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "registering bucket folders") from None
+        return BucketAssetRegistered.from_dict(data)
+
+    async def preview_reference_subset(self, asset_id: str, *, include: str | Iterable[str] | None = (),
+                                       exclude: str | Iterable[str] | None = ()) -> SubsetPreview:
+        """Which files of a reference asset fetch_reference_subset would copy (see Meshive.preview_reference_subset)."""
+        body = _write.reference_preview_body(include, exclude)
+        try:
+            data = await self._send("POST", f"/assets/{_path_segment(asset_id, 'asset_id')}/reference/preview", json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "copying from reference assets") from None
+        return SubsetPreview.from_dict(data)
+
+    async def fetch_reference_subset(self, asset_id: str, *, include: str | Iterable[str] | None = (),
+                                     exclude: str | Iterable[str] | None = (),
+                                     object_keys: str | Iterable[str] | None = (), name: str | None = None,
+                                     asset_type: str | None = None,
+                                     idempotency_key: str | None = None) -> AssetSubsetCopy:
+        """Copy files of a reference asset into a new asset kept in Meshive storage (see Meshive.fetch_reference_subset)."""
+        body = _write.reference_fetch_body(include, exclude, object_keys, name=name, asset_type=asset_type)
+        try:
+            data = await self._send("POST", f"/assets/{_path_segment(asset_id, 'asset_id')}/reference/fetch", json=body,
+                                    idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "copying from reference assets") from None
+        return AssetSubsetCopy.from_dict(data)
+
+    async def get_hf_token_usage(self, token_id: int | str, workspace: str) -> list[CredentialUsage]:
+        """The assets linked with a saved Hugging Face token (see Meshive.get_hf_token_usage)."""
+        try:
+            data = await self._get(f"/hf-tokens/{_int_segment(token_id, 'token_id')}/usage",
+                                   params={"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "credential usage") from None
+        return _credential_usage(data)
+
+    async def get_civitai_key_usage(self, key_id: int | str, workspace: str) -> list[CredentialUsage]:
+        """The assets linked with a saved CivitAI key (see Meshive.get_civitai_key_usage)."""
+        try:
+            data = await self._get(f"/civitai-keys/{_int_segment(key_id, 'key_id')}/usage",
+                                   params={"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "credential usage") from None
+        return _credential_usage(data)
+
+    async def get_registry_login_usage(self, registry_login_id: int | str, workspace: str) -> RegistryLoginUsage:
+        """What uses a registry login (see Meshive.get_registry_login_usage)."""
+        segment = _int_segment(registry_login_id, "registry_login_id")
+        try:
+            data = await self._get(f"/registry-logins/{segment}/usage",
+                                   params={"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "credential usage") from None
+        return RegistryLoginUsage.from_dict(data if isinstance(data, dict) else {}, registry_login_id=int(segment))
+
+    async def delete_hf_token(self, token_id: int | str, workspace: str, *,
+                              idempotency_key: str | None = None) -> ResourceAction:
+        """Delete a saved Hugging Face token (see Meshive.delete_hf_token)."""
+        return await self._delete_credential("/hf-tokens", token_id, "token_id", workspace,
+                                             idempotency_key)
+
+    async def delete_civitai_key(self, key_id: int | str, workspace: str, *,
+                                 idempotency_key: str | None = None) -> ResourceAction:
+        """Delete a saved CivitAI key (see Meshive.delete_civitai_key)."""
+        return await self._delete_credential("/civitai-keys", key_id, "key_id", workspace,
+                                             idempotency_key)
+
+    async def delete_registry_login(self, registry_login_id: int | str, workspace: str, *,
+                                    idempotency_key: str | None = None) -> ResourceAction:
+        """Delete a saved container registry login (see Meshive.delete_registry_login)."""
+        return await self._delete_credential("/registry-logins", registry_login_id, "registry_login_id", workspace,
+                                             idempotency_key)
+
+    async def check_storage_credential_delete(self, credential_id: int | str,
+                                              workspace: str) -> StorageCredentialDeleteCheck:
+        """What removing a bucket connection touches (see Meshive.check_storage_credential_delete)."""
+        try:
+            data = await self._get(f"/storage-credentials/{_int_segment(credential_id, 'credential_id')}/delete-check",
+                                   params={"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "removing bucket connections") from None
+        return StorageCredentialDeleteCheck.from_dict(data if isinstance(data, dict) else {})
+
+    async def delete_storage_credential(self, credential_id: int | str, workspace: str, *,
+                                        idempotency_key: str | None = None) -> ResourceAction:
+        """Remove a bucket connection (see Meshive.delete_storage_credential)."""
+        return await self._delete_credential("/storage-credentials", credential_id, "credential_id", workspace,
+                                             idempotency_key, what="removing bucket connections")
+
+    async def _delete_credential(self, collection: str, credential_id: int | str, name: str, workspace: str,
+                                 idempotency_key: str | None, *,
+                                 what: str = "deleting saved credentials") -> ResourceAction:
+        segment = _int_segment(credential_id, name)
+        try:
+            data = await self._send("DELETE", f"{collection}/{segment}", params={"workspace": _query_value(workspace, "workspace")},
+                                    idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, what) from None
+        return _credential_deleted(data, segment, workspace)
+
+    async def set_asset_storage_setting(self, workspace: str, credential_id: int | None, *,
+                                        idempotency_key: str | None = None) -> AssetStorageSetting:
+        """Choose where the workspace's task outputs go by default (see Meshive.set_asset_storage_setting)."""
+        body = _write.asset_storage_setting_body(credential_id)
+        try:
+            data = await self._send("PUT", f"/workspaces/{_path_segment(workspace, 'workspace')}/asset-storage", json=body,
+                                    idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "changing the default output bucket") from None
+        return AssetStorageSetting.from_dict(data)
+
     # --- Serving model registration ---------------------------------------------------------------
 
     async def list_models(self, workspace: str) -> list[ServingModel]:
@@ -5126,6 +6035,331 @@ class AsyncMeshive(_BaseClient):
             raise _not_supported(err, "discarding task outputs") from None
         return TaskOutputsDiscarded.from_dict(data)
 
+    # --- Serverless: shared catalog, inference requests, webhooks, inference keys ------------------------
+
+    async def list_shared_models(self) -> SharedModelList:
+        """The shared catalog (GET /shared-models): models other workspaces opened up, billed per million tokens, with
+        the `base_url` to call them at. Calling one needs an inference key (create_inference_key); send
+        `SharedModel.model` as the OpenAI `model` name."""
+        try:
+            data = await self._get("/shared-models")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "the shared model catalog") from None
+        return SharedModelList.from_dict(data)
+
+    async def list_inference_requests(self, workspace: str, *, status: str | None = None, modality: str | None = None,
+                                      limit: int = 50) -> list[InferenceRequest]:
+        """A workspace's inference requests, newest first (GET /inference-requests?workspace=&status=&modality=&limit=).
+        `status` is one of INFERENCE_REQUEST_STATUSES, `modality` text, image, video, embedding or audio; `limit` is at
+        most 200 (the server's rule). Any member can read them. Download links come only with get_inference_request."""
+        try:
+            params = _inference_requests_params(workspace, status, modality, limit)
+            data = await self._get("/inference-requests", params)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "inference requests") from None
+        return [InferenceRequest.from_dict(d) for d in _items(data, "items", "requests") if isinstance(d, dict)]
+
+    async def get_inference_request(self, request_id: str) -> InferenceRequest:
+        """One inference request (GET /inference-requests/{request_id}). For a succeeded request whose result is still
+        kept, `download_urls` are signed links to it that expire in about an hour; call again for fresh ones. A request
+        of a workspace you aren't a member of is a NotFoundError."""
+        try:
+            data = await self._get(f"/inference-requests/{_path_segment(request_id, 'request_id')}")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "inference requests") from None
+        return InferenceRequest.from_dict(data)
+
+    async def cancel_inference_request(self, request_id: str, *,
+                                       idempotency_key: str | None = None) -> InferenceRequest:
+        """Cancel a queued inference request (POST /inference-requests/{request_id}/cancel): nothing runs and the
+        credit held for it is refunded. Only queued requests can be canceled (409 ConflictError otherwise). The member
+        who sent it, or a workspace admin or billing member, can cancel it (403 PermissionDeniedError otherwise)."""
+        try:
+            data = await self._send("POST", f"/inference-requests/{_path_segment(request_id, 'request_id')}/cancel",
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "canceling inference requests") from None
+        return InferenceRequest.from_dict(data if isinstance(data, dict) else {})
+
+    async def list_webhooks(self, workspace: str) -> list[WebhookEndpoint]:
+        """The workspace's webhook endpoints (GET /webhooks?workspace=). Needs the admin or billing role."""
+        try:
+            data = await self._get("/webhooks", {"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "webhooks") from None
+        return [WebhookEndpoint.from_dict(d) for d in _items(data, "items", "endpoints") if isinstance(d, dict)]
+
+    async def list_webhook_deliveries(self, workspace: str, *, webhook_id: int | None = None,
+                                      request_id: str | None = None, limit: int = 50) -> list[WebhookDelivery]:
+        """Events sent, or tried, to the workspace's webhook endpoints, newest first (GET
+        /webhooks/deliveries?workspace=&endpointId=&requestId=&limit=), optionally of one endpoint or one inference
+        request. `limit` is at most 200 (the server's rule). Needs the admin or billing role."""
+        params = _webhook_deliveries_params(workspace, webhook_id, request_id, limit)
+        try:
+            data = await self._get("/webhooks/deliveries", params)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "webhooks") from None
+        return [WebhookDelivery.from_dict(d) for d in _items(data, "items", "deliveries") if isinstance(d, dict)]
+
+    async def list_webhook_event_types(self) -> list[WebhookEventType]:
+        """The events a webhook endpoint can subscribe to (GET /webhooks/event-types), each with a sample payload."""
+        try:
+            data = await self._get("/webhooks/event-types")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "webhooks") from None
+        return [WebhookEventType.from_dict(d) for d in _items(data, "events", "items") if isinstance(d, dict)]
+
+    async def create_webhook(self, workspace: str, url: str, event_types: str | Iterable[str], *,
+                             label: str | None = None, idempotency_key: str | None = None) -> WebhookEndpoint:
+        """Add a webhook endpoint (POST /webhooks?workspace=, 201): Meshive POSTs each event of `event_types` (names
+        from list_webhook_event_types) to `url` (the request or task id, its status, where the output is and live
+        download links) until the endpoint is deleted, also after the API key that made it is revoked. Generic
+        endpoints are signed with the workspace's signing secret, which is copied from the console. Needs the admin or
+        billing role; an unusable URL is a 400 ('Invalid webhook URL'). A replayed result (`replayed=True`) shows the
+        URL cut to scheme and host (`https://host/…`), since the URL path can be a secret."""
+        body = _write.webhook_create_body(url, event_types, label=label)
+        try:
+            data = await self._send("POST", "/webhooks", params={"workspace": _query_value(workspace, "workspace")},
+                              json=body, idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "webhooks") from None
+        return WebhookEndpoint.from_dict(data if isinstance(data, dict) else {})
+
+    async def update_webhook(self, webhook_id: int | str, *, url: str | None = None, label: str | None = None,
+                             event_types: str | Iterable[str] | None = None, enabled: bool | None = None,
+                             idempotency_key: str | None = None) -> WebhookEndpoint:
+        """Change a webhook endpoint (PATCH /webhooks/{webhook_id}): only what is passed changes. enabled=True turns an
+        endpoint that was turned off back on; event_types replaces the subscribed events. An endpoint of a workspace
+        you aren't a member of is a NotFoundError. Needs the admin or billing role. A replayed result
+        (`replayed=True`) shows the URL cut to scheme and host (`https://host/…`)."""
+        body = _write.webhook_update_body(url=url, label=label, event_types=event_types, enabled=enabled)
+        try:
+            data = await self._send("PATCH", f"/webhooks/{_int_segment(webhook_id, 'webhook_id')}", json=body,
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "webhooks") from None
+        return WebhookEndpoint.from_dict(data if isinstance(data, dict) else {})
+
+    async def delete_webhook(self, webhook_id: int | str, *, idempotency_key: str | None = None) -> ResourceAction:
+        """Delete a webhook endpoint (DELETE /webhooks/{webhook_id}): events stop going to it at once. It can't be
+        undone; its delivery history stays. Needs the admin or billing role."""
+        webhook = _int_segment(webhook_id, "webhook_id")
+        try:
+            data = await self._send("DELETE", f"/webhooks/{webhook}", idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "webhooks") from None
+        return _resource_action(data, "webhook", webhook, "delete")
+
+    async def test_webhook(self, webhook_id: int | str, *, idempotency_key: str | None = None) -> WebhookTestResult:
+        """Send the fixed test event to a saved webhook endpoint (POST /webhooks/{webhook_id}/test). A failed test
+        doesn't turn the endpoint off. A turned-off endpoint is a 400 ('Endpoint disabled'), and test sends are
+        rate-limited (RateLimitError). Resending with the same idempotency_key replays the answer instead of sending
+        again. Needs the admin or billing role."""
+        try:
+            data = await self._send("POST", f"/webhooks/{_int_segment(webhook_id, 'webhook_id')}/test",
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "webhooks") from None
+        return WebhookTestResult.from_dict(data if isinstance(data, dict) else {})
+
+    async def list_inference_keys(self, workspace: str) -> list[InferenceKey]:
+        """The workspace's inference keys (GET /inference-keys?workspace=): your own, or every key of the workspace for
+        an admin or billing member. A key's value is never listed; it is shown once, by create_inference_key or
+        roll_inference_key. These are not port access keys (list_access_keys) nor Meshive API keys."""
+        try:
+            data = await self._get("/inference-keys", {"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "inference keys") from None
+        return [InferenceKey.from_dict(d) for d in _items(data, "items", "keys") if isinstance(d, dict)]
+
+    async def create_inference_key(self, workspace: str, *, name: str | None = None,
+                                   expires_in_days: int | None = None) -> InferenceKeyCreated:
+        """Create an inference key (POST /inference-keys?workspace=, write scope, admin or billing role). Any program
+        with its value can call every serving of the workspace, billed to it, sending `Authorization: Bearer <key>`.
+        `inference_key` on the result is the value: it is returned this once and can't be read again.
+        The key doesn't expire unless `expires_in_days` is given, and it keeps working after the Meshive API key used
+        to create it is revoked or expires; revoke it with revoke_inference_key.
+        Not idempotent: every call creates another key, so a failed call is resent only when the server surely never
+        started on it. After a timeout, check list_inference_keys before calling again, and revoke a key you can't
+        use."""
+        body = _write.inference_key_body(name, expires_in_days)
+        try:
+            data = await self._send("POST", "/inference-keys",
+                                    params={"workspace": _query_value(workspace, "workspace")}, json=body, once=True)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "inference keys") from None
+        return InferenceKeyCreated.from_dict(data if isinstance(data, dict) else {})
+
+    async def roll_inference_key(self, key_id: int | str, workspace: str) -> InferenceKeyCreated:
+        """Replace an inference key's value (POST /inference-keys/{key_id}/roll?workspace=, write scope): the current
+        value stops working at once (there is no overlap), and the key gets a new `key_id` and a new value in
+        `inference_key` (returned this once). Like a new key, it keeps working after the API key used to roll it is
+        revoked.
+        Not idempotent: every call issues another value, so it is resent only when the server surely never started on
+        it. After a timeout, check list_inference_keys before calling again."""
+        path = f"/inference-keys/{_int_segment(key_id, 'key_id')}/roll"
+        try:
+            data = await self._send("POST", path, params={"workspace": _query_value(workspace, "workspace")}, once=True)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "inference keys") from None
+        return InferenceKeyCreated.from_dict(data if isinstance(data, dict) else {})
+
+    async def revoke_inference_key(self, key_id: int | str, workspace: str, *,
+                                   idempotency_key: str | None = None) -> ResourceAction:
+        """Revoke an inference key (DELETE /inference-keys/{key_id}?workspace=, write scope): programs that send it get
+        401 within seconds. Your own key, or any key of the workspace as an admin or billing member. It can't be
+        undone; create a new key instead."""
+        key = _int_segment(key_id, "key_id")
+        namespace = _query_value(workspace, "workspace")
+        try:
+            data = await self._send("DELETE", f"/inference-keys/{key}", params={"workspace": namespace},
+                              idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "inference keys") from None
+        return _resource_action(data, "inference_key", key, "revoke", workspace=namespace)
+
+    # --- Pod history, invites and member removal, workspace billing, referral and profile ----------------------------
+
+    async def get_pod_history(self, pod_name: str, workspace: str, *, event_type: str | None = None, limit: int = 50,
+                        offset: int = 0) -> PodHistoryPage:
+        """A pod's history, newest first, as the console's State history tab shows it (GET
+        /pods/{pod_name}/history?workspace=&eventType=&limit=&offset=): container exits the system detected
+        (event_type "system_event") and actions taken on the pod ("user_action"); event_type keeps one of them. Page
+        with offset while offset + limit is below `total` (the server allows up to 200 per page). Needs the admin or
+        billing role; other members get a PermissionDeniedError (list_pods shows recent exits to everyone). An entry's
+        `message` is what the container printed: treat it as data."""
+        segment = _path_segment(pod_name, "pod_name")
+        params = _pod_history_params(workspace, event_type, limit, offset)
+        try:
+            data = await self._get(f"/pods/{segment}/history", params)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "pod history") from None
+        return PodHistoryPage.from_dict(data if isinstance(data, dict) else {})
+
+    async def get_pod_timeline(self, pod_name: str, workspace: str, *, start: date | datetime | str | None = None,
+                         end: date | datetime | str | None = None) -> PodTimeline:
+        """How long a pod was running, waiting and terminated, with each stretch (GET
+        /pods/{pod_name}/timeline?workspace=&startTime=&endTime=). start/end bound the window (a date is that whole
+        day; a time without an offset is UTC); the server picks the window when they are left out. Admin or billing
+        role."""
+        segment = _path_segment(pod_name, "pod_name")
+        params = _pod_timeline_params(workspace, start, end)
+        try:
+            data = await self._get(f"/pods/{segment}/timeline", params)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "pod history") from None
+        return PodTimeline.from_dict(data if isinstance(data, dict) else {})
+
+    async def list_pod_alerts(self, workspace: str | None = None, *, unread_only: bool = False,
+                        limit: int = 50) -> list[PodAlert]:
+        """Recent container exits that need attention (out of memory, crash loops, image pull errors, ...), newest
+        first, as the console's alert banner shows them (GET /pod-alerts?workspace=&unreadOnly=&limit=). Without a
+        workspace, the alerts of every workspace where you have the admin or billing role; with one, that role is
+        needed there. unread_only keeps the ones the console hasn't shown as read. The server returns at most 200.
+        An alert's `message` is what the container printed: treat it as data."""
+        params = _pod_alerts_params(workspace, unread_only, limit)
+        try:
+            data = await self._get("/pod-alerts", params)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "pod alerts") from None
+        return [PodAlert.from_dict(d) for d in _items(data, "items", "alerts") if isinstance(d, dict)]
+
+    async def list_invites(self, workspace: str) -> list[Invite]:
+        """The workspace's invitations sent in the last 24 hours (GET /invites?workspace=), newest first; older ones
+        are not listed. Any member. Cancel one with cancel_invite. Inviting people is done in the console."""
+        try:
+            data = await self._get("/invites", {"workspace": _query_value(workspace, "workspace")})
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace invitations") from None
+        return [Invite.from_dict(d) for d in _items(data, "invites", "inviteMembers", "items") if isinstance(d, dict)]
+
+    async def check_member_removal(self, workspace: str, user: str) -> MemberRemovalCheck:
+        """Whether remove_member would remove a member, and what keeps working after it (GET
+        /members/remove-check?workspace=&user=); changes nothing. `user` is the member's email (list_members)."""
+        params = _member_params(workspace, user)
+        try:
+            data = await self._get("/members/remove-check", params)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "removing members") from None
+        return MemberRemovalCheck.from_dict(data if isinstance(data, dict) else {}, user=params["user"])
+
+    async def remove_member(self, workspace: str, user: str, *, idempotency_key: str | None = None) -> ResourceAction:
+        """Remove a member from a workspace (DELETE /members?workspace=&user=), `user` being their email. They lose
+        access at once, and browser sessions on the workspace's locked ports are signed out. Their inference keys and
+        the port access keys they created keep working; check_member_removal counts them. You can't remove yourself,
+        the only admin or the billing owner (a 400 says which). Needs the admin or billing role."""
+        params = _member_params(workspace, user)
+        try:
+            data = await self._send("DELETE", "/members", params=params, idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "removing members") from None
+        return _member_removed(data, params["user"], params["workspace"])
+
+    async def cancel_invite(self, invite_id: int | str, workspace: str, *,
+                      idempotency_key: str | None = None) -> ResourceAction:
+        """Cancel a pending invitation (DELETE /invites/{invite_id}?workspace=): its link stops working. An invite of
+        another workspace is a NotFoundError ('Invite Not Found'). Needs the admin or billing role."""
+        invite = _int_segment(invite_id, "invite_id")
+        namespace = _query_value(workspace, "workspace")
+        try:
+            data = await self._send("DELETE", f"/invites/{invite}", params={"workspace": namespace},
+                                    idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "canceling invitations") from None
+        return _invite_cancelled(data, invite, namespace)
+
+    async def get_workspace_billing(self, workspace: str) -> WorkspaceBilling:
+        """The console's workspace Billing page (GET /workspaces/{workspace}/billing): the hourly price now, the 7-day
+        daily average, the charges per day for the workspace's whole life, and this month's shared-model spend and
+        credits. Any member."""
+        try:
+            data = await self._get(f"/workspaces/{_path_segment(workspace, 'workspace')}/billing")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "workspace billing") from None
+        return WorkspaceBilling.from_dict(data if isinstance(data, dict) else {})
+
+    async def get_shared_earnings(self, workspace: str, *, start_date: date | datetime | str | None = None,
+                            end_date: date | datetime | str | None = None) -> SharedEarnings:
+        """What the workspace earned by sharing its servings' idle capacity (GET
+        /workspaces/{workspace}/shared-earnings?startDate=&endDate=): settlements newest first and totals per model.
+        A date bound is that whole day; without bounds, the last 90 days. Any member."""
+        path = f"/workspaces/{_path_segment(workspace, 'workspace')}/shared-earnings"
+        params = _shared_earnings_params(start_date, end_date)
+        try:
+            data = await self._get(path, params)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "shared earnings") from None
+        return SharedEarnings.from_dict(data if isinstance(data, dict) else {})
+
+    async def get_referral(self) -> Referral:
+        """Your referral link, how many people signed up with it, what it earned, and the reward rule (GET /referral).
+        The first call creates the account's referral code if it has none yet."""
+        try:
+            data = await self._get("/referral")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "referrals") from None
+        return Referral.from_dict(data if isinstance(data, dict) else {})
+
+    async def get_email_preferences(self) -> EmailPreferences:
+        """Whether the account gets product update mail (GET /me/email-preferences). It is changed in the console or
+        with the unsubscribe link in an update mail."""
+        try:
+            data = await self._get("/me/email-preferences")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "email preferences") from None
+        return EmailPreferences.from_dict(data if isinstance(data, dict) else {})
+
+    async def update_profile(self, *, username: str, idempotency_key: str | None = None) -> AccountUpdated:
+        """Change the account's display name (PATCH /me, write scope), shown in the console's account menu and Profile
+        page. Only the name changes; the sign-in email, workspaces, keys and billing stay. A name the server doesn't
+        allow (too long, line breaks or control characters) is a 422 ('Invalid Name')."""
+        body = _write.profile_body(username)
+        try:
+            data = await self._send("PATCH", "/me", json=body, idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "renaming the account") from None
+        return AccountUpdated.from_dict(data if isinstance(data, dict) else {})
+
     # --- Hosting: maintenance windows --------------------------------------------------
     # Machines you host. Reads need the read scope; everything that changes a machine, sends a message or reveals a
     # secret needs the write scope. A machine that isn't yours is a NotFoundError, as for a missing one.
@@ -5260,6 +6494,62 @@ class AsyncMeshive(_BaseClient):
         except MeshiveAPIError as err:
             raise _not_supported(err, "machine removal") from None
         return MachineDeleted.from_dict(data)
+
+    # --- Hosting: fan curves -----------------------------------------------------------
+    # GPU machines only: any other machine is refused with 400 'Not a GPU machine'.
+
+    async def get_fan_curve(self, machine_id: str) -> FanCurve:
+        """A GPU machine's fan curve: its mode, the curve it follows, the saved custom curve, Meshive's default curve
+        and the limits a custom curve must keep (GET /machines/{machine_id}/fan-curve). A machine that was never set
+        gets the default curve with revision 0."""
+        try:
+            data = await self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}/fan-curve")
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "fan curves") from None
+        return FanCurve.from_dict(data)
+
+    async def get_fan_status(self, machine_id: str) -> FanStatus:
+        """Each GPU's temperature and fan speeds, read from the machine now (GET
+        /machines/{machine_id}/fan-curve/status). Every call asks the machine, so don't call it in a loop. An offline
+        machine is a ConflictError ('Machine offline'); a machine that doesn't answer in time is a 503 ('Fan status
+        unavailable'), raised at once: it isn't resent, since every resend would ask the machine again."""
+        try:
+            data = await self._get(f"/machines/{_path_segment(machine_id, 'machine_id')}/fan-curve/status", live=True)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "fan curves") from None
+        return FanStatus.from_dict(data)
+
+    async def estimate_fan_curve(self, machine_id: str, *, mode: str,
+                                 points: Iterable[Any] | None = None) -> FanCurveEstimate:
+        """What set_fan_curve would save, with the server's checks: an invalid curve is a 400 ('Invalid fan curve')
+        here, before anything is saved. Also says what the machine has now and whether its agent is reachable. Saves
+        nothing (read scope is enough). Same arguments as set_fan_curve."""
+        body = _write.fan_curve_body(mode, points)
+        try:
+            data = await self._send("POST", f"/machines/{_path_segment(machine_id, 'machine_id')}/fan-curve/estimate",
+                                    json=body)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "fan curves") from None
+        return FanCurveEstimate.from_dict(data)
+
+    async def set_fan_curve(self, machine_id: str, *, mode: str, points: Iterable[Any] | None = None,
+                            idempotency_key: str | None = None) -> FanCurveUpdate:
+        """Set how a GPU machine's fans are driven, as the console's Fan curve tab does. mode is "default" (Meshive's
+        curve), "custom" (points, required: (temperature_c, fan_percent) pairs or dicts with temperature and
+        fan_percent) or "driver" (Meshive stops controlling the fans; the NVIDIA driver or the host's own tool takes
+        over). Points given with another mode are kept as the saved custom curve. A custom curve that runs the GPUs
+        hotter than the default can throttle the pods on the machine. The number of points and their ranges are the
+        server's rules (FanCurve.limits; 400 'Invalid fan curve'); check with estimate_fan_curve first.
+
+        The curve is saved even when the machine can't take it now (applied=False, apply_error says why): the machine
+        picks it up within about 5 minutes or when it reconnects, so don't call again for that."""
+        body = _write.fan_curve_body(mode, points)
+        try:
+            data = await self._send("PUT", f"/machines/{_path_segment(machine_id, 'machine_id')}/fan-curve", json=body,
+                                    idempotency_key=idempotency_key)
+        except MeshiveAPIError as err:
+            raise _not_supported(err, "fan curves") from None
+        return FanCurveUpdate.from_dict(data)
 
     # --- Hosting: history, messages, credentials, install, payouts -------------------------
 

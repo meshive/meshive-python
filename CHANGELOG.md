@@ -16,11 +16,13 @@ pip install -U meshive
 
 Assets can be renamed, retyped and deleted, whole or file by file, and asset reads say much more: where an asset
 came from, what it holds and which of its files can run code when loaded. Tasks, servings, workspaces, machines,
-API keys, storages, templates and serving models type what was only in `.raw` before. Code written for 1.10 keeps
-running. The new calls need a Meshive API server that has them; an older server answers with an error that says so,
-except the new `list_assets` filters, the `update_pod` input-asset arguments and the new serving and task
-arguments (output bucket, sharing, input modalities, registry login, file picks), which an older server ignores (see
-below).
+API keys, storages, templates and serving models type what was only in `.raw` before. Files, connected buckets,
+custom templates, pod input assets, task and serving writes, inference requests, webhooks, inference keys, saved
+credentials, members and invitations, billing, the account and hosted machines' fan curves get new calls. Code
+written for 1.10 keeps running. The new calls need a Meshive API server that has them; an older server answers with
+an error that says so, except the new `list_assets` filters, the `update_pod` input-asset arguments and the new
+serving and task arguments (output bucket, sharing, input modalities, registry login, file picks), which an older
+server ignores (see below).
 
 ### New
 
@@ -201,6 +203,77 @@ below).
 - **Task GPUs and counts.** `list_task_gpus()` lists the GPUs a task can get now (`TaskGpu`: per-GPU hourly price,
   the most per task, vCPUs and RAM per GPU); tasks use another pool than pods. `get_task_counts(workspace)` counts a
   workspace's tasks per status (`TaskCounts`).
+- **The shared model catalog.** `list_shared_models()` returns the models other workspaces opened up
+  (`SharedModelList`: `items` as `SharedModel` with per-million-token prices, `availability` and host tiers, and the
+  `base_url` to call them at). `SharedModel.model` is the `model` name to send, `shared/<api_model_id>`; calling
+  one needs an inference key.
+- **Inference requests.** `list_inference_requests(workspace, status=..., modality=..., limit=...)` lists a
+  workspace's queued and finished requests, newest first (up to 200). `get_inference_request(request_id)` returns
+  one, with `download_urls` (signed links to the result, about an hour each) once it succeeded.
+  `cancel_inference_request(request_id)` cancels a queued one; anything else is a `ConflictError`.
+  `InferenceRequest.error_message` is a read-only property over `.raw` (it comes from the model or the engine).
+- **Webhooks.** `list_webhooks(workspace)`, `list_webhook_deliveries(workspace, webhook_id=..., request_id=...)` and
+  `list_webhook_event_types()` read endpoints (`WebhookEndpoint`, with `platform` and `signed`), what was sent to them
+  (`WebhookDelivery`) and the events there are (`WebhookEventType`). `create_webhook(workspace, url, event_types)`,
+  `update_webhook(webhook_id, ...)`, `delete_webhook(webhook_id)` (its `ResourceAction.workspace` names the endpoint's
+  workspace) and `test_webhook(webhook_id)` (sends the fixed test event; `WebhookTestResult`) change them. Events keep
+  going to an endpoint until it is deleted, also after the API key that made it is revoked. A webhook URL is kept whole
+  but left out of `repr()`; `WebhookDelivery.last_error` and `.request_body` and `WebhookTestResult.error` are
+  read-only properties over `.raw`. They need the admin or billing role.
+- **Inference keys.** `list_inference_keys(workspace)` lists your keys, or every key of the workspace for an admin
+  or billing member (`InferenceKey`, with `created_by`, `is_mine` and `creator_is_member`).
+  `create_inference_key(workspace, name=..., expires_in_days=...)` and `roll_inference_key(key_id, workspace)`
+  return the value once in `InferenceKeyCreated.inference_key` (left out of `repr()` and `.raw`) and are never resent
+  once the server may have started on them. A key doesn't expire unless `expires_in_days` is given, and it keeps
+  working after the API key that created it is revoked or expires. A roll stops the old value at once and gives the
+  key a new id. `revoke_inference_key(key_id, workspace)` revokes one.
+- **Assets from a connected bucket.** `register_bucket_objects(credential_id, object_keys, workspace=..., name=...)`
+  makes objects of a connected bucket one asset (`base_prefix` keeps their paths below a folder), and
+  `register_bucket_prefix(credential_id, prefix, workspace=...)` links a whole folder as a reference asset
+  (`BucketAssetRegistered`). Nothing is copied and Meshive doesn't bill their storage. A linked folder can be browsed
+  and copied into Meshive storage (below), but it can't be used as a pod or task input directly; the objects
+  registered with `register_bucket_objects` can. Object keys and folders are sent exactly as given.
+- **Reference assets.** `browse_reference_objects(asset_id, sub_prefix=...)` lists the bucket folder behind a
+  reference asset (`BucketListing`, now with `asset_id`, `sub_prefix` and `BucketObject.relative_path`).
+  `preview_reference_subset(asset_id, include=..., exclude=...)` shows which files a copy would take (`SubsetPreview`),
+  and `fetch_reference_subset(asset_id, include=... | object_keys=..., name=...)` copies them into a new asset kept in
+  Meshive storage, billed per GiB-month (`AssetSubsetCopy`, "uploading" until done).
+- **Saved credentials.** `get_hf_token_usage(token_id, workspace)` and `get_civitai_key_usage(key_id, workspace)` list
+  the assets linked with a token or key (`CredentialUsage`), `get_registry_login_usage(registry_login_id, workspace)`
+  the templates, pods and tasks that use a registry login (`RegistryLoginUsage`).
+  `delete_hf_token`, `delete_civitai_key`, `delete_registry_login` and `delete_storage_credential` (each
+  `(id, workspace)`) delete them; `check_storage_credential_delete(credential_id, workspace)` shows first what removing
+  a bucket connection touches (`StorageCredentialDeleteCheck`). Removing a bucket connection deletes nothing in the
+  bucket.
+- **Default output bucket.** `set_asset_storage_setting(workspace, credential_id)` sets where task outputs go by default:
+  a verified bucket, or None for Meshive storage. `AssetStorageSetting.replayed` is set on a replayed call.
+- **Pod history.** `get_pod_history(pod_name, workspace, event_type=..., limit=..., offset=...)` returns a pod's
+  history like the console's State history tab (`PodHistoryPage` of `PodHistoryEvent`): container exits the system
+  detected, with `oom_kind`, `cause` and `summary`, and actions taken on the pod, with `action_status`.
+  `get_pod_timeline(pod_name, workspace, start=..., end=...)` returns how long it was running, waiting and terminated
+  (`PodTimeline`), and `list_pod_alerts(workspace=None, unread_only=...)` the recent alerts across pods (`PodAlert`).
+  They need the admin or billing role. An entry's `message` is a property over `.raw`: it is what the container
+  printed.
+- **Invitations and removing members.** `list_invites(workspace)` lists the invitations sent in the last 24 hours
+  (`Invite`) and `cancel_invite(invite_id, workspace)` cancels one. `check_member_removal(workspace, user)` says
+  whether a member can be removed and counts the inference keys and port access keys that keep working after it
+  (`MemberRemovalCheck`); `remove_member(workspace, user)` removes them. Inviting people and changing roles stay in
+  the console.
+- **Workspace billing.** `get_workspace_billing(workspace)` returns the console's Billing page (`WorkspaceBilling`:
+  hourly price, 7-day average, charges per day for the workspace's whole life, this month's shared-model spend and
+  credits), and `get_shared_earnings(workspace, start_date=..., end_date=...)` what sharing a serving's idle capacity
+  earned (`SharedEarnings`: settlements and totals per model). Amounts are `Decimal`, except the per-day `history`
+  rows, which are `DailyCost` (floats) as in workspace detail.
+- **Account.** `get_referral()` returns your referral link, what it earned and the reward rule (`Referral`; the first
+  call creates the referral code), `get_email_preferences()` whether the account gets product update mail
+  (`EmailPreferences`), and `update_profile(username=...)` changes the account's display name (`AccountUpdated`).
+- **Fan curves.** `get_fan_curve(machine_id)` returns a GPU machine's fan curve (`FanCurve`: mode `default`,
+  `custom` or `driver`, the curve it follows, the saved custom curve, the default curve and the limits a curve must
+  keep; points are `(temperature_c, fan_percent)` tuples), and `get_fan_status(machine_id)` each GPU's temperature
+  and fans read from the machine now (`FanStatus`; a 503 'Fan status unavailable' is raised at once, not resent,
+  since each attempt asks the machine again). `estimate_fan_curve(machine_id, mode=..., points=...)` checks a curve
+  without saving it, and `set_fan_curve(machine_id, mode=..., points=...)` saves it (`FanCurveUpdate`; when the
+  machine can't take it now, `applied` is False and it picks the curve up within about 5 minutes).
 
 ## v1.10.3
 

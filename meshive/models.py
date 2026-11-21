@@ -1305,6 +1305,24 @@ def _failed_step(steps: list[dict]) -> dict:
 
 
 @dataclass
+class StorageTransaction(Transaction):
+    """One storage operation (list_storage_transactions / get_storage_transaction): a volume being created, grown or
+    deleted. `resource_name` is the volume's pv_name and `user_alias` its display name; `action` is create, update
+    or delete. `capacity` is the requested size in MiB and `storage_type` the volume's type; both are None when the
+    server doesn't send them. Read the fields Transaction documents the same way."""
+
+    capacity: int | None = None
+    storage_type: str | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "StorageTransaction":
+        txn = super().from_dict(d)
+        txn.capacity = _optional_int_or_none(d.get("capacity"))
+        txn.storage_type = _optional_str(d.get("storageType"))
+        return txn
+
+
+@dataclass
 class StoragePod:
     """A Pod attached to a storage volume, with its display name and mount path."""
 
@@ -1793,7 +1811,8 @@ class RegistryLogin:
 
     @classmethod
     def from_dict(cls, d: dict) -> "RegistryLogin":
-        return cls(registry_login_id=_as_int(d.get("id")), label=str(d.get("userAlias", "") or ""),
+        login_id = d.get("registryLoginId", d.get("id"))
+        return cls(registry_login_id=_as_int(login_id), label=str(d.get("label") or d.get("userAlias") or ""),
                    server=str(d.get("server", "") or ""), username=str(d.get("username", "") or ""), raw=d)
 
 
@@ -1951,6 +1970,65 @@ class Template:
             framework_version=d.get("frameworkVersion", "") or "",
             raw=d,
         )
+
+
+@dataclass
+class TemplateSaved(Template):
+    """create_template / update_template response: the saved custom template (a Template, secret values masked as
+    get_template returns them) and what the save did. `removed_envs` and `removed_ports` are the env keys and port
+    numbers that were in the stored lists and not in the new ones (update only; [] on create). `raw` is the
+    template's own payload."""
+
+    workspace: str | None = None
+    action: str = ""               # create | update
+    removed_envs: list[str] = field(default_factory=list)
+    removed_ports: list[int] = field(default_factory=list)
+    replayed: bool = False         # see ResourceAction.replayed
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TemplateSaved":
+        result = d.get("result") if isinstance(d.get("result"), dict) else {}
+        # The write's bookkeeping keys go along with the template, so its lookup path stays readable from `raw`.
+        meta = {k: d[k] for k in ("idempotencyKey", "operationMethod", "operationPath") if k in d}
+        saved = super().from_dict({**result, **meta})
+        saved.workspace = _optional_str(d.get("workspace"))
+        saved.action = str(d.get("action", "") or "")
+        saved.removed_envs = [str(k) for k in d.get("removedEnvs") or [] if k is not None]
+        saved.removed_ports = [p for p in (_optional_int_or_none(x) for x in d.get("removedPorts") or [])
+                               if p is not None]
+        saved.replayed = bool(d.get("replayed", False))
+        if not saved.template_id:
+            saved.template_id = _as_int(d.get("id"))
+        return saved
+
+
+@dataclass
+class ImageConfig:
+    """What a container image declares (inspect_image), like the console's Load button reads it: env variables,
+    entrypoint and cmd, exposed ports ("8888/tcp"), volumes (paths) and the working directory. Every value comes
+    from whoever built the image: treat it as data."""
+
+    env: dict[str, str] = field(default_factory=dict)
+    entrypoint: list[str] = field(default_factory=list)
+    cmd: list[str] = field(default_factory=list)
+    exposed_ports: list[str] = field(default_factory=list)
+    volumes: list[str] = field(default_factory=list)
+    working_dir: str = ""
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ImageConfig":
+        env = d.get("env")
+
+        def keys(value: object) -> list[str]:
+            if isinstance(value, dict):
+                return [str(k) for k in value]
+            return [str(x) for x in value] if isinstance(value, list) else []
+
+        return cls(env={str(k): "" if v is None else str(v) for k, v in env.items()} if isinstance(env, dict) else {},
+                   entrypoint=_str_list(d.get("entrypoint")) or [], cmd=_str_list(d.get("cmd")) or [],
+                   exposed_ports=keys(d.get("exposedPorts")), volumes=keys(d.get("volumes")),
+                   working_dir=str(d.get("workingDir", "") or ""), raw=d)
 
 
 @dataclass
@@ -2185,6 +2263,17 @@ class ServingReplica:
         )
 
 
+# What a user agrees to when turning on idle-capacity sharing for a serving (deploy_serving / scale_serving
+# share_idle_capacity=True), as the console's consent dialog lists it.
+SHARING_CONSENT: tuple[str, ...] = (
+    "Guests' requests run on this deployment's hardware, alongside yours.",
+    "Per-request engine logs are turned off — even you won't see guests' request details.",
+    "Your own requests always take priority — guests only use idle capacity.",
+    "Guest traffic never scales this deployment — autoscaling follows your own requests only.",
+    "100% of what guests pay is credited back to your balance.",
+)
+
+
 @dataclass
 class Serving:
     """GET /v1/sdk/servings[/{serving_id}] item — a serverless serving deployment.
@@ -2265,6 +2354,11 @@ class Serving:
             except (InvalidOperation, ValueError):
                 return True     # a value that can't be parsed safely counts as "needs confirmation"
         return False
+
+    def sharing_needs_consent(self, share_idle_capacity: bool | None) -> bool:
+        """Whether scale_serving(share_idle_capacity=...) turns idle-capacity sharing on — the change the user has to
+        agree to first (the terms are `SHARING_CONSENT`). Turning it off, or on when it is on already, needs none."""
+        return share_idle_capacity is True and not self.share_idle_capacity
 
     @classmethod
     def from_dict(cls, d: dict) -> "Serving":
@@ -2360,6 +2454,23 @@ class TaskProject:
 
 
 @dataclass
+class ModelFit:
+    """What a model's GPU memory need is computed from: `weight_gib` (the weights in GiB), `kv_bytes_per_token` (KV
+    cache per token on one GPU) and the model's own maximum `context_length` (None if unknown)."""
+
+    weight_gib: float
+    kv_bytes_per_token: int
+    context_length: int | None = None
+
+    @classmethod
+    def from_dict(cls, d: object) -> "ModelFit | None":
+        if not isinstance(d, dict):
+            return None
+        return cls(weight_gib=_as_float(d.get("weightGib")), kv_bytes_per_token=_as_int(d.get("kvBytesPerToken")),
+                   context_length=_optional_int_or_none(d.get("contextLength")))
+
+
+@dataclass
 class ModelDetection:
     """POST /v1/sdk/models/detect response — whether an HF repo can be served (the detection in the console's registration dialog)."""
 
@@ -2374,6 +2485,11 @@ class ModelDetection:
     context_length: int | None = None   # detected max context — None if unknown
     suggested_repo: str | None = None   # candidate original repo for an unsupported GGUF
     raw: dict = field(default_factory=dict, repr=False)
+    engine: str | None = None           # full | no (no = the serving engine can't run it)
+    # Weight file formats in the repo ("bin", "gguf", "safetensors"); [] = unknown.
+    weight_formats: list[str] | None = None
+    has_config: bool | None = None      # the repo has a config.json
+    fit: ModelFit | None = None         # inputs for the GPU memory estimate; None if unknown
 
     @property
     def ok(self) -> bool:
@@ -2384,7 +2500,9 @@ class ModelDetection:
         return cls(status=str(d.get("status", "") or ""), output=d.get("output"), takes_image=bool(d.get("takesImage")),
                    capability=d.get("cap"), framework=d.get("framework"), detail=d.get("detail"),
                    architecture=d.get("arch"), file_size_bytes=d.get("fileSizeBytes"),
-                   context_length=d.get("contextLength"), suggested_repo=d.get("suggestedRepo"), raw=d)
+                   context_length=d.get("contextLength"), suggested_repo=d.get("suggestedRepo"), raw=d,
+                   engine=_optional_str(d.get("engine")), weight_formats=_str_list(d.get("weightFormats")),
+                   has_config=_optional_bool(d.get("hasConfig")), fit=ModelFit.from_dict(d.get("fit")))
 
 
 @dataclass
@@ -3304,6 +3422,813 @@ class AssetFilesDeleted:
                    replayed=bool(d.get("replayed", False)), raw=d)
 
 
+# --- buckets, file views, exports, adding files, the open-asset catalog -------------------------------
+
+@dataclass
+class StorageCredential:
+    """An S3-compatible bucket connected to a workspace (AWS S3, R2, MinIO, GCS). Never carries the keys.
+
+    Pass `credential_id` where a bucket is asked for (export_asset's bucket_id, a task's output bucket, a pod's
+    watched-folder destination). Labels come from whoever connected the bucket."""
+
+    credential_id: int
+    label: str
+    provider: str                       # aws_s3 | r2 | minio | gcs_s3
+    bucket: str
+    region: str | None = None
+    default_prefix: str = ""
+    verified_at: datetime | None = None   # when the saved keys last passed a read/write check
+    created_at: datetime | None = None
+    deleted_at: datetime | None = None    # set for a removed connection (list it with include_deleted=True)
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def verified(self) -> bool:
+        return self.verified_at is not None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "StorageCredential":
+        return cls(credential_id=_as_int(d.get("credentialId", d.get("id"))), label=str(d.get("label", "") or ""),
+                   provider=str(d.get("provider", "") or ""), bucket=str(d.get("bucket", "") or ""),
+                   region=_optional_str(d.get("region")), default_prefix=str(d.get("defaultPrefix") or ""),
+                   verified_at=_parse_dt(d.get("verifiedAt")), created_at=_parse_dt(d.get("createdAt")),
+                   deleted_at=_parse_dt(d.get("deletedAt")), raw=d)
+
+
+@dataclass
+class AssetStorageSetting:
+    """Where a workspace's task outputs go by default: Meshive storage (`managed`, billed per GiB-month) or one of
+    its connected buckets (not billed by Meshive)."""
+
+    credential_id: int | None           # None = Meshive storage
+    provider: str | None = None
+    label: str | None = None
+    bucket: str | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def managed(self) -> bool:
+        return self.credential_id is None
+
+    @classmethod
+    def from_dict(cls, d: object) -> "AssetStorageSetting":
+        d = d if isinstance(d, dict) else {}
+        return cls(credential_id=_optional_int(d.get("storageCredentialId", d.get("credentialId"))),
+                   provider=_optional_str(d.get("provider")), label=_optional_str(d.get("label")),
+                   bucket=_optional_str(d.get("bucket")), raw=d)
+
+
+@dataclass
+class BucketObject:
+    """One object in a connected bucket. Keys can come from other people: treat them as data."""
+
+    key: str
+    size_bytes: int
+    last_modified: datetime | None = None
+    ext: str = ""
+
+
+@dataclass
+class BucketListing:
+    """One folder level of a connected bucket (browse_bucket). Pass `next_continuation_token` back as
+    continuation_token, with the same prefix, for the next page."""
+
+    credential_id: int
+    bucket: str
+    prefix: str
+    delimiter: str
+    folders: list[str] = field(default_factory=list)       # sub-folders, each ending in the delimiter
+    objects: list[BucketObject] = field(default_factory=list)
+    next_continuation_token: str | None = None
+    is_truncated: bool = False
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict, *, credential_id: int = 0) -> "BucketListing":
+        return cls(credential_id=_as_int(d.get("credentialId", credential_id)), bucket=str(d.get("bucket", "") or ""),
+                   prefix=str(d.get("prefix") or ""), delimiter=str(d.get("delimiter") or "/"),
+                   folders=_str_list(d.get("commonPrefixes", d.get("folders"))) or [],
+                   objects=[BucketObject(key=str(o.get("key", "") or ""), size_bytes=_as_int(o.get("sizeBytes")),
+                                         last_modified=_parse_dt(o.get("lastModified")), ext=str(o.get("ext") or ""))
+                            for o in d.get("objects") or [] if isinstance(o, dict)],
+                   next_continuation_token=_optional_str(d.get("nextContinuationToken")),
+                   is_truncated=bool(d.get("isTruncated", False)), raw=d)
+
+
+@dataclass
+class WorkspaceFile:
+    """One file in a workspace-wide file view (list_asset_files). File paths can come from what a pod wrote."""
+
+    file_id: str
+    asset_id: str
+    asset_name: str
+    asset_kind: str                     # file | collection
+    path: str                           # relative path inside the asset
+    size_bytes: int
+    file_type: str | None = None
+    media_kind: str | None = None
+    ingest_source: str = ""
+    source_pod: str | None = None       # display name of the pod the file was saved from
+    source_statefulset: str | None = None   # that pod's internal name without the "-0" (pod methods take "<it>-0")
+    source_task_id: str | None = None   # "task_..." of the task the file is an output of
+    source_available: bool = False      # the pod or task it came from still exists
+    created_at: datetime | None = None
+    detected_format: str | None = None  # from servers that send it
+    pickle_flag: str | None = None      # "detected" | "suspected" (can run code when loaded), from servers that send it
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "WorkspaceFile":
+        return cls(file_id=str(d.get("fileExternalId", "") or ""), asset_id=str(d.get("assetExternalId", "") or ""),
+                   asset_name=str(d.get("assetName", "") or ""), asset_kind=str(d.get("assetKind", "") or ""),
+                   path=str(d.get("relativePath", "") or ""), size_bytes=_as_int(d.get("sizeBytes")),
+                   file_type=_optional_str(d.get("fileType")), media_kind=_optional_str(d.get("mediaKind")),
+                   ingest_source=str(d.get("ingestSource", "") or ""),
+                   source_pod=_optional_str(d.get("sourceUserAlias")),
+                   source_statefulset=_optional_str(d.get("sourceStatefulsetName")),
+                   source_task_id=_optional_str(d.get("sourceTaskExternalId")),
+                   source_available=bool(d.get("sourceAvailable", False)), created_at=_parse_dt(d.get("createdAt")),
+                   detected_format=_optional_str(d.get("detectedFormat")), pickle_flag=_optional_str(d.get("pickleFlag")),
+                   raw=d)
+
+
+@dataclass
+class AssetFilePage:
+    """One page of a workspace file view (list_asset_files). Pass `next_cursor` back as cursor while has_more."""
+
+    items: list[WorkspaceFile]
+    total: int
+    has_more: bool = False
+    next_cursor: str | None = None
+    # Files of catalog-added assets the view left out (counted on the first page only): include_catalog=True lists them.
+    catalog_hidden: int = 0
+    raw: dict = field(default_factory=dict, repr=False)
+
+    def __iter__(self):
+        return iter(self.items)
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AssetFilePage":
+        rows = d.get("data", d.get("items")) or []
+        return cls(items=[WorkspaceFile.from_dict(r) for r in rows if isinstance(r, dict)], total=_as_int(d.get("total")),
+                   has_more=bool(d.get("hasMore", False)), next_cursor=_optional_str(d.get("nextCursor")),
+                   catalog_hidden=_as_int(d.get("catalogAddedTotal")), raw=d)
+
+
+@dataclass
+class AssetFileList:
+    """One slice of one asset's files (list_asset_detail_files), ordered by path. `total` counts every match."""
+
+    items: list[AssetFile]
+    total: int
+    raw: dict = field(default_factory=dict, repr=False)
+
+    def __iter__(self):
+        return iter(self.items)
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AssetFileList":
+        rows = d.get("items", d.get("files", d.get("data"))) or []
+        items = [AssetFile.from_dict(f) for f in rows if isinstance(f, dict)]
+        return cls(items=items, total=_as_int(d.get("total", len(items))), raw=d)
+
+
+@dataclass
+class FileDownloadItem(DownloadFile):
+    """One file of asset_file_download_urls: a short-lived link plus the asset it belongs to."""
+
+    file_id: str = ""
+    asset_id: str = ""
+    asset_name: str = ""
+    asset_kind: str = ""
+    storage_provider: str | None = None   # meshive_r2 | user_s3
+
+
+@dataclass
+class FileDownload:
+    """POST /v1/sdk/assets/files/download-urls response — links to files picked by id, across assets.
+    `skipped_file_count` files could not be linked (deleted meanwhile, linked from a source, being moved)."""
+
+    files: list[FileDownloadItem]
+    expires_in: int                    # link lifetime (seconds)
+    skipped_file_count: int = 0
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "FileDownload":
+        return cls(files=[FileDownloadItem(path=str(f.get("relativePath", "") or ""), url=str(f.get("url", "") or ""),
+                                           size_bytes=f.get("sizeBytes"), file_id=str(f.get("fileExternalId") or ""),
+                                           asset_id=str(f.get("assetExternalId") or ""),
+                                           asset_name=str(f.get("assetName") or ""),
+                                           asset_kind=str(f.get("assetKind") or ""),
+                                           storage_provider=_optional_str(f.get("storageProvider")))
+                          for f in d.get("files") or [] if isinstance(f, dict)],
+                   expires_in=_as_int(d.get("expiresIn")), skipped_file_count=_as_int(d.get("skippedFileCount")), raw=d)
+
+
+@dataclass
+class AssetExport:
+    """POST /v1/sdk/assets/{id}/export response — the copy to a bucket started in the background. Nothing reports
+    when it finishes: check the bucket."""
+
+    asset_id: str
+    name: str
+    status: str                        # exporting
+    target_bucket: str
+    target_prefix: str
+    message: str = ""
+    replayed: bool = False             # see ResourceAction.replayed
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AssetExport":
+        return cls(asset_id=str(d.get("assetExternalId", "") or ""), name=str(d.get("name", "") or ""),
+                   status=str(d.get("status", "") or ""), target_bucket=str(d.get("targetBucket", "") or ""),
+                   target_prefix=str(d.get("targetPrefix", "") or ""), message=str(d.get("message", "") or ""),
+                   replayed=bool(d.get("replayed", False)), raw=d)
+
+
+@dataclass
+class AssetHfUpload:
+    """POST /v1/sdk/assets/{id}/upload-hf response — the upload to a Hugging Face repo started in the background.
+    Nothing reports when it finishes: check `repo_url`. `license_notice`: re-uploading a model is the user's
+    responsibility under its license."""
+
+    asset_id: str
+    name: str
+    status: str                        # uploading
+    hf_repo: str
+    repo_url: str
+    path_in_repo: str = ""
+    license_notice: str = ""
+    message: str = ""
+    replayed: bool = False             # see ResourceAction.replayed
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AssetHfUpload":
+        return cls(asset_id=str(d.get("assetExternalId", "") or ""), name=str(d.get("name", "") or ""),
+                   status=str(d.get("status", "") or ""), hf_repo=str(d.get("hfRepo", "") or ""),
+                   repo_url=str(d.get("repoUrl", "") or ""), path_in_repo=str(d.get("pathInRepo", "") or ""),
+                   license_notice=str(d.get("licenseNotice", "") or ""), message=str(d.get("message", "") or ""),
+                   replayed=bool(d.get("replayed", False)), raw=d)
+
+
+@dataclass
+class BatchUploadTarget:
+    """One file of an add-files upload: "single" (PUT the bytes to `url`) or "multipart" (get part links with
+    asset_file_upload_part_urls). The link is a credential for this file only, so it is kept out of repr."""
+
+    file_id: str                       # "file_..."
+    relative_path: str
+    size_bytes: int
+    mode: str                          # single | multipart
+    url: str | None = field(default=None, repr=False)
+    part_size_bytes: int | None = None
+    part_count: int | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "BatchUploadTarget":
+        return cls(file_id=str(d.get("fileExternalId", "") or ""), relative_path=str(d.get("relativePath", "") or ""),
+                   size_bytes=_as_int(d.get("sizeBytes")), mode=str(d.get("mode", "") or ""),
+                   url=d.get("url") or None, part_size_bytes=_optional_int(d.get("partSizeBytes")),
+                   part_count=_optional_int(d.get("partCount")))
+
+
+def _without_upload_secrets(d: dict) -> dict:
+    """The payload without the upload token and the upload links, so printing or logging `.raw` leaks neither."""
+    clean = {k: v for k, v in d.items() if k != "uploadToken"}
+    if isinstance(clean.get("files"), list):
+        clean["files"] = [{k: v for k, v in f.items() if k not in ("url", "parts")} if isinstance(f, dict) else f
+                          for f in clean["files"]]
+    return clean
+
+
+@dataclass
+class FileUploadBatch:
+    """POST /v1/sdk/assets/{id}/uploads response — an upload that adds files to a collection.
+
+    `upload_token` and each file's `url` authorise only this upload, together with your API key. They are kept out
+    of repr and `.raw`; don't write them anywhere. Finish with complete_asset_file_upload, or abort."""
+
+    upload_batch_id: str
+    upload_token: str = field(repr=False)
+    asset_id: str = ""
+    expires_at: datetime | None = None   # the upload must be completed before this
+    presign_expires_in: int = 0          # lifetime of each link (seconds)
+    files: list[BatchUploadTarget] = field(default_factory=list)
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "FileUploadBatch":
+        return cls(upload_batch_id=str(d.get("uploadBatchId", "") or ""), upload_token=str(d.get("uploadToken") or ""),
+                   asset_id=str(d.get("assetExternalId", "") or ""), expires_at=_parse_dt(d.get("uploadExpiresAt")),
+                   presign_expires_in=_as_int(d.get("presignExpiresIn")),
+                   files=[BatchUploadTarget.from_dict(f) for f in d.get("files") or [] if isinstance(f, dict)],
+                   raw=_without_upload_secrets(d))
+
+
+@dataclass
+class AddedFile:
+    file_id: str
+    path: str
+
+
+@dataclass
+class FilesAdded:
+    """POST /v1/sdk/assets/{id}/uploads/{batch}/complete response — the files were added to the collection. Pods
+    already using the collection get them on their next start."""
+
+    asset_id: str
+    added_file_count: int
+    added_size_bytes: int
+    total_file_count: int              # the collection's files after the add
+    total_size_bytes: int
+    files: list[AddedFile] = field(default_factory=list)
+    upload_batch_id: str = ""
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "FilesAdded":
+        return cls(asset_id=str(d.get("assetExternalId", "") or ""), added_file_count=_as_int(d.get("addedFileCount")),
+                   added_size_bytes=_as_int(d.get("addedSizeBytes")), total_file_count=_as_int(d.get("totalFileCount")),
+                   total_size_bytes=_as_int(d.get("totalSizeBytes")),
+                   files=[AddedFile(file_id=str(f.get("fileExternalId", "") or ""),
+                                    path=str(f.get("relativePath", "") or ""))
+                          for f in d.get("files") or [] if isinstance(f, dict)],
+                   upload_batch_id=str(d.get("uploadBatchId", "") or ""), raw=d)
+
+
+@dataclass
+class OpenAssetEntry:
+    """One file of the open-asset catalog (a checkpoint, LoRA, VAE, ...). Import it with import_open_assets."""
+
+    slug: str
+    name: str
+    category: str
+    family: str | None = None
+    description: str | None = None
+    source: str = ""                   # hf | civitai
+    size_bytes: int = 0
+    file_count: int = 0
+    default_role: str | None = None    # the input role to pass when a pod uses it
+    license: str | None = None
+    license_url: str | None = None
+    hf_gated: str | None = None        # "auto" (accept the license) | "manual" (owner approval) | None
+    existing_asset_id: str | None = None   # the workspace already has it; an import reuses this asset
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "OpenAssetEntry":
+        return cls(slug=str(d.get("slug", "") or ""), name=str(d.get("name", "") or ""),
+                   category=str(d.get("category", "") or ""), family=_optional_str(d.get("family")),
+                   description=_optional_str(d.get("description")),
+                   source=str(d.get("source") or d.get("sourceMark") or ""), size_bytes=_as_int(d.get("sizeBytes")),
+                   file_count=_as_int(d.get("fileCount")), default_role=_optional_str(d.get("defaultRole")),
+                   license=_optional_str(d.get("license")), license_url=_optional_str(d.get("licenseUrl")),
+                   hf_gated=d.get("hfGated") or None,
+                   existing_asset_id=_optional_str(d.get("existingAssetId", d.get("existingAssetExternalId"))), raw=d)
+
+
+@dataclass
+class OpenAssetCatalog:
+    """GET /v1/sdk/open-assets response — the whole open-asset catalog: single files (`entries`) and every model set
+    (`model_sets`, not only the ones a given template takes)."""
+
+    categories: list[str] = field(default_factory=list)
+    entries: list[OpenAssetEntry] = field(default_factory=list)
+    model_sets: list["ModelSet"] = field(default_factory=list)
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "OpenAssetCatalog":
+        sets = d.get("modelSets", d.get("bundles")) or []
+        return cls(categories=_str_list(d.get("categories")) or [],
+                   entries=[OpenAssetEntry.from_dict(e) for e in d.get("entries") or [] if isinstance(e, dict)],
+                   model_sets=[ModelSet.from_dict(s) for s in sets if isinstance(s, dict)], raw=d)
+
+
+@dataclass
+class OpenAssetImportRow:
+    """One catalog entry of import_open_assets: status "created", "reused" (the workspace had it) or "failed"."""
+
+    slug: str
+    status: str
+    error: str | None = None
+    error_title: str | None = None     # set for a gated Hugging Face file the token can't read
+    default_role: str | None = None
+    asset_id: str | None = None
+    name: str | None = None
+    asset_type: str | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "OpenAssetImportRow":
+        return cls(slug=str(d.get("slug", "") or ""), status=str(d.get("status", "") or ""),
+                   error=_optional_str(d.get("error")), error_title=_optional_str(d.get("errorTitle")),
+                   default_role=_optional_str(d.get("defaultRole")), asset_id=_optional_str(d.get("assetExternalId")),
+                   name=_optional_str(d.get("name")), asset_type=_optional_str(d.get("assetType")))
+
+
+@dataclass
+class OpenAssetImport:
+    """POST /v1/sdk/open-assets/materialize response — one row per catalog entry. A partial failure is a normal
+    answer: the other entries stay imported, and calling again retries only the failed ones."""
+
+    results: list[OpenAssetImportRow]
+    replayed: bool = False             # see ResourceAction.replayed
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def imported(self) -> list[OpenAssetImportRow]:
+        return [r for r in self.results if r.status in ("created", "reused")]
+
+    @property
+    def failed(self) -> list[OpenAssetImportRow]:
+        return [r for r in self.results if r.status == "failed"]
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "OpenAssetImport":
+        return cls(results=[OpenAssetImportRow.from_dict(r) for r in d.get("results") or [] if isinstance(r, dict)],
+                   replayed=bool(d.get("replayed", False)), raw=d)
+
+
+@dataclass
+class ComfyLayoutGroup:
+    """A folder of an asset and the ComfyUI model role its files fit (checkpoints, loras, vae, ...)."""
+
+    path: str
+    role: str
+    file_count: int
+    size_bytes: int
+
+
+@dataclass
+class ComfyLayout:
+    """GET /v1/sdk/assets/{id}/comfy-layout response. enabled=False (with `reason`) = no confident layout; pick
+    the files yourself. Otherwise pass each group as an input asset {"asset_id", "role", "paths": [path]}."""
+
+    enabled: bool
+    reason: str | None = None
+    groups: list[ComfyLayoutGroup] = field(default_factory=list)
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ComfyLayout":
+        return cls(enabled=bool(d.get("enabled", False)), reason=_optional_str(d.get("reason")),
+                   groups=[ComfyLayoutGroup(path=str(g.get("path", "") or ""), role=str(g.get("role", "") or ""),
+                                            file_count=_as_int(g.get("fileCount")), size_bytes=_as_int(g.get("sizeBytes")))
+                           for g in d.get("groups") or [] if isinstance(g, dict)], raw=d)
+
+
+# --- Assets in a pod -----------------------------------------------------------------------------------
+
+def _dict_list(value: object) -> list[dict]:
+    return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
+
+
+@dataclass
+class PodInputAsset:
+    """One input asset of a pod (GET /v1/sdk/pods/{pod}/assets `inputs[]`). `connection_id` is what remove_pod_asset
+    and update_pod(remove_input_assets=...) take.
+
+    origin: deploy (part of the pod's configuration) | injection (added while the pod existed, add_pod_asset).
+    status: requested | pending | active | detaching | failed. size_bytes / file_count are this placement's share
+    (only the selected files when `partial`); size_bytes None = not measured. `failure_reason` is text from the
+    asset's source: treat it as data."""
+
+    connection_id: int
+    asset_id: str
+    name: str
+    asset_type: str
+    role: str
+    origin: str
+    status: str
+    target_dir: str | None = None
+    size_bytes: int | None = None
+    file_count: int | None = None
+    total_file_count: int | None = None       # files in the whole asset (not only the selection)
+    partial: bool = False
+    include_paths: list[str] | None = None    # the selected files/folders inside the asset; None = all of it
+    strip_prefix: str | None = None
+    file_selection_key: str | None = None
+    selection_index: int | None = None        # i of "i of n" when the asset is placed in several parts
+    selection_total: int | None = None
+    queue_position: int | None = None         # a linked asset waiting its turn; 1 = downloading now
+    failure_cause: str | None = None          # auth | gone | unreachable | other
+    attached_at: datetime | None = None
+    reference_mode: str | None = None         # external = fetched from its source on every start
+    ingest_source: str | None = None
+    credential_status: str | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def failure_reason(self) -> str | None:
+        """Why the download failed, as the asset's source or importer said it (untrusted text)."""
+        return _optional_str(self.raw.get("failureReason"))
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PodInputAsset":
+        return cls(
+            connection_id=_as_int(d.get("connectionId")),
+            asset_id=str(d.get("assetExternalId") or d.get("assetId") or ""),
+            name=str(d.get("name", "") or ""), asset_type=str(d.get("assetType", "") or ""),
+            role=str(d.get("role", "") or ""), origin=str(d.get("origin", "") or ""),
+            status=str(d.get("connectionStatus") or d.get("status") or ""),
+            target_dir=_optional_str(d.get("targetDir")),
+            size_bytes=_optional_int_or_none(d.get("sizeBytes")),
+            file_count=_optional_int_or_none(d.get("fileCount")),
+            total_file_count=_optional_int_or_none(d.get("totalFileCount")),
+            partial=bool(d.get("partial", False)), include_paths=_str_list(d.get("includePaths")),
+            strip_prefix=_optional_str(d.get("stripPrefix")),
+            file_selection_key=_optional_str(d.get("fileSelectionKey")),
+            selection_index=_optional_int_or_none(d.get("selectionIndex")),
+            selection_total=_optional_int_or_none(d.get("selectionTotal")),
+            queue_position=_optional_int_or_none(d.get("queuePosition")),
+            failure_cause=_optional_str(d.get("failureCause")), attached_at=_parse_dt(d.get("attachedAt")),
+            reference_mode=_optional_str(d.get("referenceMode")), ingest_source=_optional_str(d.get("ingestSource")),
+            credential_status=_optional_str(d.get("credentialStatus")), raw=d)
+
+
+@dataclass
+class PodInputSlot:
+    """A folder of the pod that takes assets by role (what add_pod_asset's `role` names). cardinality "one" holds one
+    asset; `occupied` = it holds one already."""
+
+    role: str
+    path: str
+    cardinality: str | None = None            # one | many
+    occupied: bool = False
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PodInputSlot":
+        return cls(role=str(d.get("role", "") or ""), path=str(d.get("path", "") or ""),
+                   cardinality=_optional_str(d.get("cardinality")), occupied=bool(d.get("occupied", False)))
+
+
+@dataclass
+class PodAssetFetchItem:
+    """Download progress of one asset (fetch_progress.per_asset[])."""
+
+    asset_id: str | None
+    downloaded_bytes: int
+    total_bytes: int
+    state: str | None = None                  # downloading | done | failed
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def failure_reason(self) -> str | None:
+        """Why it failed, as the source said it (untrusted text)."""
+        return _optional_str(self.raw.get("failureReason"))
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PodAssetFetchItem":
+        return cls(asset_id=_optional_str(d.get("assetExternalId") or d.get("assetId")),
+                   downloaded_bytes=_as_int(d.get("downloadedBytes")), total_bytes=_as_int(d.get("totalBytes")),
+                   state=_optional_str(d.get("state")), raw=d)
+
+
+@dataclass
+class PodAssetFetch:
+    """Download progress the pod reported for its input assets. Only assets that reported so far are counted."""
+
+    downloaded_bytes: int
+    total_bytes: int
+    bytes_per_second: float = 0.0
+    per_asset: list[PodAssetFetchItem] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, d: object) -> "PodAssetFetch | None":
+        """None when there is no report (never read that as 0%)."""
+        if not isinstance(d, dict):
+            return None
+        return cls(downloaded_bytes=_as_int(d.get("downloadedBytes")), total_bytes=_as_int(d.get("totalBytes")),
+                   bytes_per_second=_as_float(d.get("bytesPerSecond")),
+                   per_asset=[PodAssetFetchItem.from_dict(x) for x in _dict_list(d.get("perAsset"))])
+
+
+@dataclass
+class AssetVolumeUsage:
+    """One asset volume of a pod: allocated and used MiB and its hourly price (USD, string)."""
+
+    allocated_mib: int
+    used_mib: int
+    price_per_hour: str | None = None
+    measured_at: datetime | None = None
+    stale: bool = False                       # the used size is an old measurement
+
+    @classmethod
+    def from_dict(cls, d: object) -> "AssetVolumeUsage | None":
+        if not isinstance(d, dict):
+            return None
+        price = d.get("hourlyPrice", d.get("pricePerHour"))
+        return cls(allocated_mib=_as_int(d.get("allocatedMiB", d.get("allocatedMib"))),
+                   used_mib=_as_int(d.get("usedMiB", d.get("usedMib"))),
+                   price_per_hour=None if price is None else str(price), measured_at=_parse_dt(d.get("measuredAt")),
+                   stale=bool(d.get("stale", False)))
+
+
+@dataclass
+class PodAssetVolumes:
+    """A pod's asset volumes: `input` (where input assets are placed), `output`, and `unknown` (older volumes whose
+    role isn't known yet). They are billed by size; freed space isn't billed back."""
+
+    input: AssetVolumeUsage | None = None
+    output: AssetVolumeUsage | None = None
+    unknown: AssetVolumeUsage | None = None
+    total_price_per_hour: str | None = None
+
+    @classmethod
+    def from_dict(cls, d: object) -> "PodAssetVolumes":
+        if not isinstance(d, dict):
+            return cls()
+        total = d.get("totalHourlyPrice", d.get("totalPricePerHour"))
+        return cls(input=AssetVolumeUsage.from_dict(d.get("input")), output=AssetVolumeUsage.from_dict(d.get("output")),
+                   unknown=AssetVolumeUsage.from_dict(d.get("unknown")),
+                   total_price_per_hour=None if total is None else str(total))
+
+
+def _dir_key(path: str) -> str:
+    return path.rstrip("/") or "/"
+
+
+@dataclass
+class PodAssets:
+    """GET /v1/sdk/pods/{pod}/assets response — a pod's input assets, its input slots, download progress and asset
+    volumes, as the console's Assets tab shows them.
+
+    receives_assets_while_running: add_pod_asset can place assets while the pod runs (False: only update_pod, which
+    restarts it). receives_assets_on_start: a stopped pod places a saved request at its next start. None = unknown.
+    `config_version` is the pod's asset configuration version."""
+
+    inputs: list[PodInputAsset] = field(default_factory=list)
+    input_slots: list[PodInputSlot] = field(default_factory=list)
+    total_size_bytes: int | None = None       # None = no placement measured
+    total_file_count: int | None = None
+    distinct_asset_count: int = 0
+    fetch_progress: PodAssetFetch | None = None
+    receives_assets_while_running: bool | None = None
+    receives_assets_on_start: bool | None = None
+    harvests_outputs: bool | None = None
+    volumes: PodAssetVolumes = field(default_factory=PodAssetVolumes)
+    config_version: int | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    def slot_for(self, role: str | None = None, target_dir: str | None = None) -> PodInputSlot | None:
+        """The input slot add_pod_asset would use, chosen the way the server chooses it. With `role` only: the first
+        slot with that role (a template can declare a role at several paths). With `role` and `target_dir`: the first
+        slot with that role whose path is `target_dir` or contains it; None when `target_dir` is outside every slot
+        with that role (the server refuses that request). With `target_dir` only: the slot it is in (the deepest
+        one). Without either: the only slot. None when there is no such slot or the choice is ambiguous."""
+        if target_dir is not None and not target_dir.strip():
+            target_dir = None                     # the server ignores a blank target_dir
+        target = _dir_key(target_dir) if target_dir is not None else None
+
+        def contains(slot: PodInputSlot) -> bool:
+            path = _dir_key(slot.path)
+            return target == path or target.startswith(path.rstrip("/") + "/")
+
+        if role is not None:
+            with_role = [s for s in self.input_slots if s.role == role]
+            if target is None:
+                return with_role[0] if with_role else None
+            return next((s for s in with_role if contains(s)), None)
+        if target is not None:
+            matches = [s for s in self.input_slots if contains(s)]
+            return max(matches, key=lambda s: len(_dir_key(s.path))) if matches else None
+        return self.input_slots[0] if len(self.input_slots) == 1 else None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PodAssets":
+        return cls(inputs=[PodInputAsset.from_dict(x) for x in _dict_list(d.get("inputs"))],
+                   input_slots=[PodInputSlot.from_dict(x) for x in _dict_list(d.get("inputSlots"))],
+                   total_size_bytes=_optional_int_or_none(d.get("totalSizeBytes")),
+                   total_file_count=_optional_int_or_none(d.get("totalFileCount")),
+                   distinct_asset_count=_as_int(d.get("distinctAssetCount")),
+                   fetch_progress=PodAssetFetch.from_dict(d.get("fetchProgress")),
+                   receives_assets_while_running=_optional_bool(d.get("receivesAssetsWhileRunning")),
+                   receives_assets_on_start=_optional_bool(d.get("receivesAssetsOnStart")),
+                   harvests_outputs=_optional_bool(d.get("harvestsOutputs")),
+                   volumes=PodAssetVolumes.from_dict(d.get("volumes")),
+                   config_version=_optional_int_or_none(d.get("configVersion")), raw=d)
+
+
+@dataclass
+class AssetInjection:
+    """POST /v1/sdk/pods/{pod}/assets response (202) — the asset was accepted for the pod. A running pod gets it
+    within moments: poll get_pod_assets until this connection_id is active or failed. scheduled=True: the pod was
+    stopped and gets it at its next start. replaced=True: an asset already placed for that role had its file
+    selection replaced."""
+
+    connection_id: int
+    status: str
+    asset_id: str
+    role: str
+    target_path: str
+    file_selection_key: str | None = None
+    selected_file_count: int | None = None    # None = the whole asset
+    selected_size_bytes: int | None = None
+    replaced: bool = False
+    scheduled: bool = False
+    replayed: bool = False                    # see ResourceAction.replayed
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AssetInjection":
+        return cls(connection_id=_as_int(d.get("connectionId")), status=str(d.get("status", "") or ""),
+                   asset_id=str(d.get("assetExternalId") or d.get("assetId") or ""), role=str(d.get("role", "") or ""),
+                   target_path=str(d.get("targetPath", "") or ""),
+                   file_selection_key=_optional_str(d.get("fileSelectionKey")),
+                   selected_file_count=_optional_int_or_none(d.get("selectedFileCount")),
+                   selected_size_bytes=_optional_int_or_none(d.get("selectedSizeBytes")),
+                   replaced=bool(d.get("replaced", False)), scheduled=bool(d.get("scheduled", False)),
+                   replayed=bool(d.get("replayed", False)), raw=d)
+
+
+@dataclass
+class PodAssetRemoval:
+    """DELETE /v1/sdk/pods/{pod}/assets/{connection_id} response (202). status "detaching": the files are being
+    removed from the running pod; "released": a failed row was cleared (nothing in the pod changed)."""
+
+    connection_id: int
+    status: str
+    replayed: bool = False                    # see ResourceAction.replayed
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PodAssetRemoval":
+        return cls(connection_id=_as_int(d.get("connectionId")), status=str(d.get("status", "") or ""),
+                   replayed=bool(d.get("replayed", False)), raw=d)
+
+
+@dataclass
+class AttachPlanGroup:
+    """What one file selection of an asset would place. whole_asset=True: the selection is the whole asset (the
+    counts are then None — use AttachPlan's totals)."""
+
+    whole_asset: bool
+    paths: list[str] | None = None
+    strip_prefix: str | None = None
+    file_count: int | None = None
+    size_bytes: int | None = None
+    file_selection_key: str | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AttachPlanGroup":
+        return cls(whole_asset=bool(d.get("wholeAsset", False)),
+                   paths=_str_list(d.get("includePaths", d.get("paths"))),
+                   strip_prefix=_optional_str(d.get("stripPrefix")),
+                   file_count=_optional_int_or_none(d.get("fileCount")),
+                   size_bytes=_optional_int_or_none(d.get("sizeBytes")),
+                   file_selection_key=_optional_str(d.get("fileSelectionKey")))
+
+
+@dataclass
+class AttachPlan:
+    """POST /v1/sdk/assets/{id}/attach-plan response — one result per selection, in the order given, and the whole
+    asset's file count and size."""
+
+    selections: list[AttachPlanGroup] = field(default_factory=list)
+    total_file_count: int = 0
+    total_bytes: int = 0
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AttachPlan":
+        return cls(selections=[AttachPlanGroup.from_dict(x) for x in _dict_list(d.get("selections"))],
+                   total_file_count=_as_int(d.get("totalFileCount")), total_bytes=_as_int(d.get("totalBytes")), raw=d)
+
+
+@dataclass
+class AssetServeFacts:
+    """GET /v1/sdk/assets/{id}/serve-facts response — whether a model kept in Asset Hub can be served, with the same
+    names and meaning as ModelDetection. ready=False: the asset is still uploading and the rest is None. None = unknown."""
+
+    ready: bool
+    architecture: str | None = None
+    file_size_bytes: int | None = None
+    weight_formats: list[str] | None = None
+    has_config: bool | None = None
+    status: str | None = None
+    engine: str | None = None
+    output: str | None = None
+    fit: ModelFit | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AssetServeFacts":
+        return cls(ready=bool(d.get("ready", False)), architecture=_optional_str(d.get("arch")),
+                   file_size_bytes=_optional_int_or_none(d.get("fileSizeBytes")),
+                   weight_formats=_str_list(d.get("weightFormats")), has_config=_optional_bool(d.get("hasConfig")),
+                   status=_optional_str(d.get("status")), engine=_optional_str(d.get("engine")),
+                   output=_optional_str(d.get("output")), fit=ModelFit.from_dict(d.get("fit")), raw=d)
+
+
 # =============================================================================
 # Write surface — estimates, accepted responses, logs
 # =============================================================================
@@ -3748,6 +4673,176 @@ class TaskSubmitted:
 
 
 @dataclass
+class TaskGpu:
+    """GET /v1/sdk/tasks/gpu-availability item — a GPU a task can get right now (list_task_gpus). Tasks use another
+    pool than pods, so this list differs from list_gpus. Pass `gpu_model` (and `vram_gb` as gpu_vram_gb when a model
+    comes in several sizes) to estimate_task / submit_task; submitting checks again."""
+
+    gpu_model: str
+    vram_gb: int | None = None
+    price_per_gpu_hour: str | None = None   # USD per GPU per hour
+    max_gpus_per_task: int | None = None
+    vcpu_per_gpu: int | None = None         # the vCPUs a task gets per GPU
+    ram_gb_per_gpu: int | None = None       # the RAM a task gets per GPU
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TaskGpu":
+        price = d.get("gpuPrice")
+        return cls(gpu_model=str(d.get("gpuModel") or ""), vram_gb=_optional_int(d.get("vram")),
+                   price_per_gpu_hour=None if price is None else str(price),
+                   max_gpus_per_task=_optional_int(d.get("maxGpuCount")), vcpu_per_gpu=_optional_int(d.get("cpuCores")),
+                   ram_gb_per_gpu=_optional_int(d.get("ramGb")), raw=d)
+
+
+@dataclass
+class TaskCounts:
+    """GET /v1/sdk/tasks/counts response — a workspace's tasks per status (deleted tasks aren't counted). A status
+    with no task has no key in `by_status`."""
+
+    by_status: dict = field(default_factory=dict)   # {status: count}
+    total: int = 0
+    latest_updated_at: datetime | None = None       # when a task of the workspace last changed
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TaskCounts":
+        by_status = d.get("byStatus") if isinstance(d.get("byStatus"), dict) else {}
+        counts = {str(k): _as_int(v) for k, v in by_status.items()}
+        total = d.get("total")
+        return cls(by_status=counts, total=sum(counts.values()) if total is None else _as_int(total),
+                   latest_updated_at=_parse_dt(d.get("latestUpdatedAt")), raw=d)
+
+
+@dataclass
+class TaskDeleteSkip:
+    """A task delete_tasks left alone. `reason`: not_found (no such task in this workspace), active (still running:
+    stop it first), finalizing (just ended; try again in a minute) or uploading (its outputs are still being saved:
+    wait, or discard_task_outputs)."""
+
+    task_id: str
+    reason: str
+    message: str = ""
+
+
+@dataclass
+class TasksDeleted:
+    """POST /v1/sdk/tasks/delete response. A task already deleted is in `deleted` too, so a retry is harmless."""
+
+    deleted: list[str] = field(default_factory=list)
+    skipped: list[TaskDeleteSkip] = field(default_factory=list)
+    replayed: bool = False         # see ResourceAction.replayed
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TasksDeleted":
+        skipped = [TaskDeleteSkip(task_id=str(s.get("taskId") or s.get("externalId") or ""),
+                                  reason=str(s.get("reason") or ""), message=str(s.get("message") or ""))
+                   for s in d.get("skipped") or [] if isinstance(s, dict)]
+        return cls(deleted=[str(t) for t in d.get("deleted") or [] if t], skipped=skipped,
+                   replayed=bool(d.get("replayed", False)), raw=d)
+
+
+@dataclass
+class TaskOutputsDiscarded:
+    """POST /v1/sdk/tasks/{task_id}/outputs/discard response. The upload stops within about 30 seconds; the task's
+    outputs `phase` then reads discarded. `output_upload_state` is the state when it was asked."""
+
+    task_id: str
+    output_upload_state: str | None = None
+    deadline_at: datetime | None = None
+    message: str = ""
+    replayed: bool = False         # see ResourceAction.replayed
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TaskOutputsDiscarded":
+        return cls(task_id=str(d.get("taskId") or d.get("externalId") or ""),
+                   output_upload_state=_optional_str(d.get("outputUploadState")),
+                   deadline_at=_parse_dt(d.get("deadlineAt")), message=str(d.get("message") or ""),
+                   replayed=bool(d.get("replayed", False)), raw=d)
+
+
+@dataclass
+class GpuCandidate:
+    """A GPU that meets a model's needs (ModelAvailability.gpu_candidates), cheapest first. `gpu_label` is the card
+    name, "2× RTX 5090" when a replica takes several. `price_per_hour` is per replica (USD/h). A card the model's
+    quantization doesn't run on is `compatible=False` (with `incompatible_reason`) and never `available`."""
+
+    gpu_label: str
+    vram_gb: int | None = None      # per GPU
+    price_per_hour: str | None = None
+    available: bool = False
+    compatible: bool = True
+    incompatible_reason: str | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "GpuCandidate":
+        price = d.get("pricePerHour")
+        return cls(gpu_label=str(d.get("gpuLabel") or ""), vram_gb=_optional_int(d.get("vramGb")),
+                   price_per_hour=None if price is None else str(price), available=bool(d.get("available", False)),
+                   compatible=bool(d.get("compatible", True)),
+                   incompatible_reason=_optional_str(d.get("incompatibleReason")), raw=d)
+
+
+@dataclass
+class ModelAvailability:
+    """GET /v1/sdk/models/{registration_id}/availability response — which GPUs can serve a model now and what a
+    replica costs (get_model_availability). `status` is "available", "unavailable" or "error" (the check failed —
+    not the same as nothing being free). Prices are USD per replica-hour; `price_low`/`price_high` span the available
+    candidates and `cheapest_gpu` is the cheapest of them. `suggested_cap_per_hour` is a price_cap_per_hour to start
+    from. `required_vram_gb` is the GPU memory the model needs at the asked context, `required_host_ram_gb` the
+    host memory an image or video model needs."""
+
+    status: str
+    deployable: bool = False
+    cheapest_gpu: str | None = None
+    vram_gb: int | None = None
+    price_per_hour: str | None = None
+    price_low: str | None = None
+    price_high: str | None = None
+    suggested_cap_per_hour: str | None = None
+    required_vram_gb: int | None = None
+    required_host_ram_gb: int | None = None
+    gpu_candidates: list[GpuCandidate] = field(default_factory=list)
+    raw: dict = field(default_factory=dict, repr=False)
+
+    def within_cap(self, price_cap_per_hour: object) -> list[GpuCandidate]:
+        """The available candidates priced at or under a per-replica cap (USD/h), cheapest first."""
+        try:
+            cap = Decimal(str(price_cap_per_hour))
+        except (InvalidOperation, ValueError):
+            raise ValueError("price_cap_per_hour must be a number") from None
+        out = []
+        for candidate in self.gpu_candidates:
+            if not (candidate.available and candidate.compatible) or candidate.price_per_hour is None:
+                continue
+            try:
+                if Decimal(candidate.price_per_hour) <= cap:
+                    out.append(candidate)
+            except (InvalidOperation, ValueError):
+                continue
+        return sorted(out, key=lambda c: Decimal(c.price_per_hour or "0"))
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ModelAvailability":
+        def money(key: str) -> str | None:
+            value = d.get(key)
+            return None if value is None else str(value)
+        deployable = bool(d.get("overall", False))
+        status = "error" if d.get("reason") == "error" else "available" if deployable else "unavailable"
+        return cls(status=status, deployable=deployable, cheapest_gpu=_optional_str(d.get("gpuLabel")),
+                   vram_gb=_optional_int(d.get("vramGb")), price_per_hour=money("pricePerHour"),
+                   price_low=money("priceLow"), price_high=money("priceHigh"),
+                   suggested_cap_per_hour=money("suggestedCapPerHour"),
+                   required_vram_gb=_optional_int(d.get("requiredMinVramGb")),
+                   required_host_ram_gb=_optional_int(d.get("requiredHostRamGb")),
+                   gpu_candidates=[GpuCandidate.from_dict(c) for c in d.get("gpuCandidates") or []
+                                   if isinstance(c, dict)], raw=d)
+
+
+@dataclass
 class WorkspaceEstimate:
     """POST /v1/sdk/workspaces/estimate response — what creating a workspace would do. A workspace costs nothing by
     itself; pods, storage and tasks in it are billed as usual."""
@@ -4005,6 +5100,166 @@ class MachineClients:
 
 
 @dataclass
+class DiskHealthDisk:
+    """One disk of a machine as disk monitoring last saw it. `state` is normal, slow, not_responding, recovering or
+    unknown; `idle_write_ms` is how long a write took while the disk was lightly loaded (None when not measured)."""
+
+    device: str
+    state: str
+    idle_write_ms: float | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "DiskHealthDisk":
+        return cls(device=str(d.get("device", "") or ""), state=str(d.get("state", "") or "unknown"),
+                   idle_write_ms=_as_optional_float(d.get("idleWriteMs")))
+
+
+@dataclass
+class DiskHealthIssue:
+    """A disk problem (`DiskHealth.issues`): kind "stall", "slow" or "full", as in MachineDetail.disk_warnings.
+    `gone` marks a stalled disk that vanished from the system. `resolved_at` is None while the issue is active; a
+    stall that cleared moments ago is listed with it set while the disk recovers."""
+
+    kind: str
+    device: str
+    since: datetime | None = None
+    value: float | None = None
+    threshold: float | None = None
+    gone: bool = False
+    resolved_at: datetime | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.resolved_at is None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "DiskHealthIssue":
+        return cls(kind=str(d.get("kind", "") or ""), device=str(d.get("device", "") or ""),
+                   since=_parse_dt(d.get("since")), value=_as_optional_float(d.get("value")),
+                   threshold=_as_optional_float(d.get("threshold")), gone=bool(d.get("gone", False)),
+                   resolved_at=_parse_dt(d.get("resolvedAt")))
+
+
+@dataclass
+class DiskHealth:
+    """A machine's disk monitoring snapshot (`MachineDetail.disk_health`): when it was checked, how full the system
+    disk is (`root_usage_percent`), the alert thresholds (`slow_threshold_ms`, `full_threshold_percent`), each disk's
+    state and the issues, recovering stalls included."""
+
+    checked_at: datetime | None = None
+    root_usage_percent: float | None = None
+    slow_threshold_ms: float | None = None
+    full_threshold_percent: float | None = None
+    disks: list[DiskHealthDisk] = field(default_factory=list)
+    issues: list[DiskHealthIssue] = field(default_factory=list)
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "DiskHealth":
+        return cls(checked_at=_parse_dt(d.get("checkedAt")),
+                   root_usage_percent=_as_optional_float(d.get("rootUsagePercent")),
+                   slow_threshold_ms=_as_optional_float(d.get("slowThresholdMs")),
+                   full_threshold_percent=_as_optional_float(d.get("fullThresholdPercent")),
+                   disks=[DiskHealthDisk.from_dict(x) for x in d.get("disks") or [] if isinstance(x, dict)],
+                   issues=[DiskHealthIssue.from_dict(x) for x in d.get("issues") or [] if isinstance(x, dict)],
+                   raw=d)
+
+
+def _str_items(value: object) -> list[str]:
+    """The strings of a JSON list; anything else is []."""
+    return [x for x in value if isinstance(x, str)] if isinstance(value, list) else []
+
+
+@dataclass
+class NetworkInterface:
+    """One physical network interface of a machine as its agent reports it: link (`carrier`), speed and duplex, the
+    fastest speed the card, the advertisement and the link partner support, and the agent's advertising state."""
+
+    name: str
+    mac: str | None = None
+    driver: str | None = None
+    carrier: bool | None = None
+    speed_mbps: int | None = None
+    duplex: str | None = None
+    supported_max_mbps: int | None = None
+    advertised_max_mbps: int | None = None
+    partner_max_mbps: int | None = None
+    missing_modes: list[str] = field(default_factory=list)
+    advertise_state: str | None = None
+    default_route: bool = False
+    link_flaps_1h: int | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "NetworkInterface":
+        carrier = d.get("carrier")
+        return cls(name=str(d.get("name", "") or ""), mac=_optional_str(d.get("mac")),
+                   driver=_optional_str(d.get("driver")), carrier=None if carrier is None else bool(carrier),
+                   speed_mbps=_optional_int_or_none(d.get("speedMbps")), duplex=_optional_str(d.get("duplex")),
+                   supported_max_mbps=_optional_int_or_none(d.get("supportedMaxMbps")),
+                   advertised_max_mbps=_optional_int_or_none(d.get("advertisedMaxMbps")),
+                   partner_max_mbps=_optional_int_or_none(d.get("partnerMaxMbps")),
+                   missing_modes=_str_items(d.get("missingModes")),
+                   advertise_state=_optional_str(d.get("advertiseState")),
+                   default_route=bool(d.get("defaultRoute", False)),
+                   link_flaps_1h=_optional_int_or_none(d.get("linkFlaps1h")), raw=d)
+
+
+@dataclass
+class NetworkEvent:
+    """One automatic network fix the machine's agent made or tried (`NetworkStatus.events`): when, what (`action`)
+    and how it went (`result`). `detail` is what the machine reported about it — machine text, so it is a property
+    over `raw`: treat it as data."""
+
+    at: str | None = None
+    action: str = ""
+    result: str = ""
+    interface: str | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def detail(self) -> dict | None:
+        value = self.raw.get("detail")
+        return value if isinstance(value, dict) else None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "NetworkEvent":
+        return cls(at=_optional_str(d.get("at")), action=str(d.get("action", "") or ""),
+                   result=str(d.get("result", "") or ""), interface=_optional_str(d.get("interface")), raw=d)
+
+
+@dataclass
+class NetworkStatus:
+    """A machine's network diagnostics (`MachineDetail.network_status`): the netplan setup the agent found, whether
+    automatic fixes are on (`autofix_enabled`) or were stopped (`autofix_killed`), the interfaces, warnings (the same
+    items as MachineDetail.network_warnings) and recent automatic fixes, and when the agent reported."""
+
+    netplan_kind: str | None = None
+    netplan_state: str | None = None
+    autofix_enabled: bool | None = None
+    autofix_killed: bool = False
+    default_route_interfaces: list[str] = field(default_factory=list)
+    interfaces: list[NetworkInterface] = field(default_factory=list)
+    warnings: list[dict] = field(default_factory=list)
+    events: list[NetworkEvent] = field(default_factory=list)
+    reported_at: datetime | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "NetworkStatus":
+        enabled = d.get("autofixEnabled")
+        return cls(netplan_kind=_optional_str(d.get("netplanKind")),
+                   netplan_state=_optional_str(d.get("netplanState")),
+                   autofix_enabled=None if enabled is None else bool(enabled),
+                   autofix_killed=bool(d.get("autofixKilled", False)),
+                   default_route_interfaces=_str_items(d.get("defaultRouteInterfaces")),
+                   interfaces=[NetworkInterface.from_dict(x) for x in d.get("interfaces") or [] if isinstance(x, dict)],
+                   warnings=[w for w in d.get("warnings") or [] if isinstance(w, dict)],
+                   events=[NetworkEvent.from_dict(x) for x in d.get("events") or [] if isinstance(x, dict)],
+                   reported_at=_parse_dt(d.get("reportedAt")), raw=d)
+
+
+@dataclass
 class MachineDetail(Machine):
     """GET /v1/sdk/machines/{machine_id} response — a Machine with what the console's machine view shows.
 
@@ -4015,8 +5270,12 @@ class MachineDetail(Machine):
     value is seconds without progress, new workloads are paused), "slow" (writes are slow while the disk is lightly
     loaded; value is milliseconds per write) or "full" (the system disk, device "/", is almost full; value is the
     percent used). threshold is the alert level for that kind. platform_fee is the
-    current platform fee as a fraction (0.2 = 20%) and promotional_fee_until is when a promotional fee ends. Fields
-    an older server doesn't send stay empty (platform_fee None), so the detail of an older server still parses.
+    current platform fee as a fraction (0.2 = 20%) and promotional_fee_until is when a promotional fee ends.
+    network_status is the machine's network diagnostics (each interface's link, speed and duplex, recent automatic
+    fixes) and disk_health its disk monitoring snapshot (each disk's state, the system disk's usage, the thresholds,
+    and stalls that are recovering, which disk_warnings leaves out); disk_health is None when disk monitoring isn't
+    on for the machine. Fields an older server doesn't send stay empty (platform_fee, network_status and disk_health
+    None), so the detail of an older server still parses.
     """
 
     clients: MachineClients = field(default_factory=MachineClients)
@@ -4026,6 +5285,8 @@ class MachineDetail(Machine):
     platform_fee: float | None = None
     promotional_fee_until: datetime | None = None
     disk_warnings: list[dict] = field(default_factory=list)
+    network_status: NetworkStatus | None = None
+    disk_health: DiskHealth | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "MachineDetail":
@@ -4039,6 +5300,9 @@ class MachineDetail(Machine):
         detail.disk_warnings = [w for w in disk if isinstance(w, dict)] if isinstance(disk, list) else []
         detail.platform_fee = _as_optional_float(d.get("platformFee"))
         detail.promotional_fee_until = _parse_dt(d.get("promotionalFeeUntil"))
+        network, health = d.get("networkStatus"), d.get("diskHealth")
+        detail.network_status = NetworkStatus.from_dict(network) if isinstance(network, dict) else None
+        detail.disk_health = DiskHealth.from_dict(health) if isinstance(health, dict) else None
         return detail
 
 
@@ -4375,6 +5639,86 @@ class MessagesRead:
     def from_dict(cls, d: dict) -> "MessagesRead":
         return cls(machine_id=str(d.get("machineId", "") or ""), marked=_as_int(d.get("marked")), raw=d,
                    replayed=bool(d.get("replayed", False)))
+
+
+@dataclass
+class MessageToHostSent:
+    """POST /v1/sdk/workspaces/{workspace}/host-messages response (201) — a message from the workspace to the host of
+    a machine it uses. `pod_name` is the pod it was addressed by (None when sent by machine id)."""
+
+    workspace: str
+    pod_name: str | None = None
+    message_ids: list[int] = field(default_factory=list)
+    replayed: bool = False         # see ResourceAction.replayed
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MessageToHostSent":
+        return cls(workspace=str(d.get("workspace", "") or ""), pod_name=_optional_str(d.get("podName")),
+                   message_ids=[_as_int(i) for i in d.get("messageIds") or []],
+                   replayed=bool(d.get("replayed", False)), raw=d)
+
+
+@dataclass
+class WorkspaceMessagesRead:
+    """POST /v1/sdk/workspaces/{workspace}/host-messages/read response — how many messages from hosts were marked
+    read."""
+
+    workspace: str
+    marked: int
+    replayed: bool = False         # see ResourceAction.replayed
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "WorkspaceMessagesRead":
+        return cls(workspace=str(d.get("workspace", "") or ""), marked=_as_int(d.get("marked")),
+                   replayed=bool(d.get("replayed", False)), raw=d)
+
+
+@dataclass
+class NoticeImpact:
+    """A service a platform notice affects and how (`PlatformNotice.affected_services`). `service` is console,
+    management_api, inference_api, storage or gpu_workloads."""
+
+    service: str
+    description: str = ""
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "NoticeImpact":
+        return cls(service=str(d.get("service", "") or ""), description=str(d.get("description", "") or ""))
+
+
+@dataclass
+class PlatformNotice:
+    """An incident or maintenance the Meshive team announced, as the console's banner shows it (list_platform_notices).
+    `status` is scheduled, in_progress, overdue (past its expected end, not resolved yet) or resolved (shown for a
+    day after). `user_guidance` is the team's advice to users."""
+
+    notice_id: int
+    title: str
+    summary: str
+    status: str
+    starts_at: datetime | None = None
+    expected_ends_at: datetime | None = None
+    resolved_at: datetime | None = None
+    affected_services: list[NoticeImpact] = field(default_factory=list)
+    user_guidance: str = ""
+    publish_at: datetime | None = None
+    updated_at: datetime | None = None
+    revision: int | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PlatformNotice":
+        return cls(notice_id=_as_int(d.get("id")), title=str(d.get("title", "") or ""),
+                   summary=str(d.get("summary", "") or ""), status=str(d.get("status", "") or ""),
+                   starts_at=_parse_dt(d.get("startsAt")), expected_ends_at=_parse_dt(d.get("expectedEndsAt")),
+                   resolved_at=_parse_dt(d.get("resolvedAt")),
+                   affected_services=[NoticeImpact.from_dict(x) for x in d.get("affectedServices") or []
+                                      if isinstance(x, dict)],
+                   user_guidance=str(d.get("userGuidance", "") or ""), publish_at=_parse_dt(d.get("publishAt")),
+                   updated_at=_parse_dt(d.get("updatedAt")), revision=_optional_int_or_none(d.get("revision")),
+                   raw=d)
 
 
 @dataclass

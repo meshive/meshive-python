@@ -18,7 +18,9 @@ Assets can be renamed, retyped and deleted, whole or file by file, and asset rea
 came from, what it holds and which of its files can run code when loaded. Tasks, servings, workspaces, machines,
 API keys, storages, templates and serving models type what was only in `.raw` before. Code written for 1.10 keeps
 running. The new calls need a Meshive API server that has them; an older server answers with an error that says so,
-except the new `list_assets` filters, which an older server ignores (see below).
+except the new `list_assets` filters, the `update_pod` input-asset arguments and the new serving and task
+arguments (output bucket, sharing, input modalities, registry login, file picks), which an older server ignores (see
+below).
 
 ### New
 
@@ -84,6 +86,121 @@ except the new `list_assets` filters, which an older server ignores (see below).
 - **Serving model details.** `ServingModel` gains `modality`, `input_modalities`, `is_official`, `workspace`,
   `endpoint_type`, `recommended_context_length`, `display_vram_gb`, the image and video model limits, and the
   properties `takes_image` and `can_share_idle_capacity`.
+- **Connected buckets.** `list_storage_credentials(workspace)` lists the S3-compatible buckets connected to a
+  workspace (`StorageCredential`: id, label, provider, bucket, default prefix, `verified`; never the keys;
+  `include_deleted=True` adds removed connections). `browse_bucket(credential_id, workspace, prefix=...)` lists one
+  folder level (`BucketListing` with `folders` and `objects`; pass `next_continuation_token` back for more).
+  `get_asset_storage_setting(workspace)` says where task outputs go by default (`AssetStorageSetting.managed` is
+  Meshive storage).
+- **Registry logins.** `list_registry_logins(workspace)` lists the container registry logins saved in a workspace
+  (`RegistryLogin`: id, label, server, user name; never the password).
+- **File views.** `list_asset_files(workspace, view=...)` lists files across the workspace's assets like the
+  console's file views (model, adapter, checkpoint, config, file, output), with `search`, `pod`, `task_id` and
+  `include_catalog`, paged by cursor (`AssetFilePage` of `WorkspaceFile`). Each `WorkspaceFile` carries
+  `pickle_flag` ("detected" or "suspected": a pickle file, which can run code when loaded) and `detected_format`, both
+  `None` when the server doesn't send them. `list_asset_detail_files(asset_id, ...)`
+  pages one asset's files, narrowed by `paths` globs, `media_kind` and `file_type` (`AssetFileList`).
+- **Download links by file id.** `asset_file_download_urls(workspace, file_ids)` signs up to 500 files from any
+  assets of the workspace (`FileDownload`; each `FileDownloadItem` is a `DownloadFile` with its asset).
+  `skipped_file_count` counts files that couldn't be linked.
+- **Export an asset.** `export_asset(asset_id, workspace=..., bucket_id=...)` copies an asset kept in Meshive storage
+  to a connected bucket, and `upload_asset_to_hf(asset_id, workspace=..., hf_repo=..., hf_token_id=...)` to a
+  Hugging Face repo (created private unless `private=False`). Both run in the background and nothing reports when
+  they finish (`AssetExport`, `AssetHfUpload` with `repo_url` and `license_notice`).
+- **Add files to a collection.** `add_asset_files(asset_id, path)` adds a local file or a folder's files to a
+  collection kept in Meshive storage, big files in parts, and cancels the upload if anything fails. Adding never
+  replaces: a path the collection has already is a `ConflictError` ('File Path Already Exists'). The steps are
+  public too: `start_asset_file_upload`, `asset_file_upload_part_urls`, `complete_asset_file_upload`,
+  `abort_asset_file_upload`. The upload's token and links (`FileUploadBatch.upload_token`,
+  `BatchUploadTarget.url`) are kept out of `repr()` and `.raw`. `add_asset_files` is on `Meshive` only, like
+  `upload_asset`.
+- **The whole open-asset catalog.** `list_open_assets(workspace)` returns every catalog file (`OpenAssetEntry`, with
+  its `default_role` and `existing_asset_id`) and every model set, not only the ones a template takes.
+  `import_open_assets(workspace, entries=[...])` or `import_open_assets(workspace, model_set=...)` makes them linked
+  assets (nothing copied, no storage charge). Some entries can fail while the rest are imported
+  (`OpenAssetImport.failed`); calling again retries those. Gated Hugging Face files need `hf_token_id`.
+- **Assets a pod uploaded, and ComfyUI layouts.** `list_assets(..., pod=...)` keeps the assets a pod uploaded from its
+  watched folders (an older server ignores it and returns the whole list). `get_comfy_layout(asset_id)` says how an
+  asset's folders map to ComfyUI model roles (`ComfyLayout`; `enabled=False` with a `reason` when there is no
+  confident layout).
+- **A pod's input assets.** `get_pod_assets(pod_name, workspace)` returns what the console's Assets tab shows
+  (`PodAssets`): each input asset (`PodInputAsset` with its `connection_id`, `origin` deploy or injection, `status`,
+  the selected files, download `failure_cause`, and `failure_reason` as a read-only property over `.raw`), the pod's
+  `input_slots` (`PodInputSlot`; `PodAssets.slot_for(role=..., target_dir=...)` picks one), download progress
+  (`fetch_progress`, None when nothing was reported), whether it `receives_assets_while_running`, its asset volumes
+  with their hourly price (`PodAssetVolumes`, `AssetVolumeUsage`) and `config_version`.
+- **Add or remove an asset without a restart.** `add_pod_asset(pod_name, workspace, asset, role=...)` adds an asset,
+  or some of its files (`paths`, `strip_prefix`), to an existing pod like the console's Inject: a running pod gets it
+  within moments, a stopped pod at its next start (`AssetInjection.scheduled`). `remove_pod_asset(pod_name,
+  workspace, connection_id)` removes one added that way, stops a download or clears a failed row
+  (`PodAssetRemoval`). `plan_asset_attach(asset_id, selections)` counts the files and bytes file selections would
+  place (`AttachPlan`).
+- **Change a pod's input assets with a restart.** `update_pod` and `estimate_pod_update` take `add_input_assets`
+  (create_pod's `input_assets` items) and `remove_input_assets` (connection ids). An older server ignores them; a
+  change made only of them is refused there as having nothing to change.
+- **Serve-check an asset.** `asset_serve_facts(asset_id)` says whether a model kept in Asset Hub can be served
+  (`AssetServeFacts`, with the same names as `detect_model`; `ready=False` while it is still uploading).
+  `ModelDetection` gains `engine`, `weight_formats`, `has_config` and `fit` (`ModelFit`: weights in GiB, KV cache
+  bytes per token, maximum context).
+- **Write to a host as a renter.** `message_host(workspace, title=..., pod=...)` (or `machine_id=...`) sends a
+  message from a workspace to the host of a machine it uses; the host is notified by email
+  (`MessageToHostSent`). `mark_workspace_messages_read(workspace, message_ids)` marks messages from hosts read
+  (`WorkspaceMessagesRead`). Read the conversation in `get_workspace(...).host_messages`.
+- **Platform notices.** `list_platform_notices()` returns the incidents and maintenance the Meshive team announced,
+  as the console's banner shows them (`PlatformNotice` with `status`, times, `affected_services` and
+  `user_guidance`).
+- **Storage operations.** `list_storage_transactions(workspace)` lists volumes being created, grown or deleted, and
+  `get_storage_transaction(transaction_id, workspace)` reads one, such as `create_storage`'s `transaction_id`
+  (`StorageTransaction`: a `Transaction` with `capacity` in MiB and `storage_type`).
+- **Read an image's settings.** `inspect_image(image, workspace=...)` returns what an image declares, like the
+  console's Load button (`ImageConfig`: env, entrypoint, cmd, exposed ports, volumes, working directory); a private
+  image takes `registry_login_id`.
+- **Custom templates.** `create_template(name, image, workspace=..., ...)` and `update_template(template_id,
+  workspace, ...)` save a custom pod template (`TemplateSaved`, a `Template` with `removed_envs` and
+  `removed_ports`); each list argument replaces the stored one, and a secret env sent without a value keeps the
+  stored value. Public ports without their own `locked` are saved locked unless `lock_public_ports=False`.
+  `update_template(..., registry_login_id=None)` detaches the registry login. `delete_template(template_id,
+  workspace)` deletes one; pods created from it keep their settings.
+- **Machine disk and network diagnostics.** `MachineDetail` gains `network_status` (`NetworkStatus`: interfaces with
+  link, speed and duplex, warnings, and recent automatic fixes as `NetworkEvent`s, whose `detail` is a read-only
+  property over `.raw`) and `disk_health` (`DiskHealth`: each disk's state, the system disk's usage, the alert
+  thresholds and the issues, recovering stalls included; None when disk monitoring isn't on). `disk_warnings` still
+  lists active issues only.
+- **Where a serving's outputs go, and idle-capacity sharing.** `deploy_serving(..., output_bucket_id=...)` sends an
+  image or video serving's outputs to a connected bucket (None = Meshive storage). `scale_serving` takes
+  `output_bucket_id`, `managed_output=True` (back to Meshive storage; the two can't be combined) and
+  `share_idle_capacity` (True lets other workspaces use the serving's idle capacity and credits you what guests pay;
+  official text models on vLLM only; False turns it off). `meshive.SHARING_CONSENT` lists what the user agrees to
+  when turning sharing on, as the console's dialog does, and `Serving.sharing_needs_consent(share_idle_capacity)` says
+  whether a change turns it on. An older server ignores these arguments.
+- **Register a model that takes images.** `register_model(..., input_modalities=["text", "image"])` says what a
+  model takes when its Hugging Face repo doesn't. When neither `framework` nor `input_modalities` is passed, the
+  server now works both out from the repo, as the console does: a repo that doesn't say what it takes is a 422
+  ('Modality Required'), and an image or video repo is refused with a 400 that says why.
+- **Logs of every serving replica.** `get_serving_replica_logs(serving_id, replica_id)` reads a replica whose log is
+  collected outside a pod, by its `ServingReplica.log_replica_id` (a replica with a `pod_name` is read with
+  `get_pod_logs`). It returns `Logs`, with the run before in `previous` when there is one.
+- **The official model catalog and GPU availability.** `list_official_models()` lists the models anyone can deploy.
+  `get_model_availability(registration_id, workspace=..., max_context_tokens=...)` says which GPUs can serve a model
+  now and what a replica costs (`ModelAvailability`: `status` available, unavailable or error, the price range,
+  `suggested_cap_per_hour`, the memory it needs and `gpu_candidates` as `GpuCandidate`s; `within_cap(cap)` keeps
+  the available ones under a price cap). It needs the admin or billing role and can take a few seconds.
+- **More ways to submit a task.** `submit_task` and `estimate_task` take `project` (`{"asset", "entrypoint",
+  "requirements_path"}`: run an uploaded folder from its entry file) instead of `script`, which is now optional
+  (pass exactly one), `registry_login_id` for a private `image`, and `output_bucket` (None = the workspace's default,
+  `"managed"` = Meshive storage, or a bucket id). `input_assets` items take `paths` and `strip_prefix` as in
+  `create_pod`; an unknown key in an item now raises `ValueError` instead of being dropped. An older server
+  ignores `registry_login_id`, `output_bucket` and the file picks, and refuses a task without a script.
+- **Delete finished tasks.** `delete_tasks(workspace, task_ids)` deletes up to 100 finished tasks (`TasksDeleted`):
+  they disappear from lists, details and logs and their script, requirements, env and args are erased; output
+  assets and billing history stay. Tasks that can't go yet are in `skipped` (`TaskDeleteSkip` with `reason`
+  not_found, active, finalizing or uploading).
+- **Stop saving a task's outputs.** `discard_task_outputs(task_id)` stops an upload of /outputs that is still running
+  (`TaskOutputsDiscarded`); files already uploaded stay. When nothing is uploading any more it is a `ConflictError`
+  with `raw["detail"]["code"] == "upload_not_active"`.
+- **Task GPUs and counts.** `list_task_gpus()` lists the GPUs a task can get now (`TaskGpu`: per-GPU hourly price,
+  the most per task, vCPUs and RAM per GPU); tasks use another pool than pods. `get_task_counts(workspace)` counts a
+  workspace's tasks per status (`TaskCounts`).
 
 ## v1.10.3
 

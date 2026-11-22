@@ -49,6 +49,11 @@ server ignores (see below).
   `AssetFile` gains `ext`, `file_type`, `media_kind`, `detected_format`, `pickle_flag` and `format_unverified`.
   `pickle_flag` ("detected" or "suspected") marks pickle files, which can run code when they are loaded. Against an
   older server the new fields keep their defaults.
+- **Which bucket an asset reads through.** An asset in a connected bucket (a file registered from it or a linked
+  folder) now says which bucket connection it uses: `Asset.bucket_id` (the `credential_id` that
+  `list_storage_credentials` gives), `bucket_label` and `bucket_status` (`"ok"`, or `"removed"` once that connection
+  was removed). For a linked folder, `reference.credential_label` and `reference.credential_status` carry the same
+  connection. They are None for an asset in Meshive storage and against an older server.
 - **How a task was submitted.** `get_task` now types what was in `.raw`: `script`, `requirements`, `args`, `env`
   (secret values come as `"***"`) and `secret_env_keys`, `project` (`TaskProject`), `output_bucket_id` (None =
   Meshive storage), the split of the hourly price (`compute_rate_per_hour`, `storage_rate_per_hour`,

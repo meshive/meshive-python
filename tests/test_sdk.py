@@ -1383,11 +1383,12 @@ def test_asset_source_url_pod_and_subset_lineage():
     assert (harvested.pod_name, harvested.pod_label, harvested.pod_path) == (
         "sts-abc-0", "trainer", "/workspace/outputs")
 
-    assert source(ingestSource="s3_subset_fetch", importSourceRef="s3subset:asset_src@v1").from_asset_id == "asset_src"
+    assert source(ingestSource="s3_subset_fetch",
+                  importSourceRef="s3subset:asset_src@v1:b/p").from_asset_id == "asset_src"
     for garbage in ("s3subset:@v1", "s3subset:asset_src", "other:asset_src@v1", None, 7):
         assert source(ingestSource="s3_subset_fetch", importSourceRef=garbage).from_asset_id is None
     # the subset ref only counts for a subset fetch
-    assert source(ingestSource="web_upload", importSourceRef="s3subset:asset_src@v1").from_asset_id is None
+    assert source(ingestSource="web_upload", importSourceRef="s3subset:asset_src@v1:b/p").from_asset_id is None
 
 
 def test_asset_reference_and_missing_keys_default():

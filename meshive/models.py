@@ -6,6 +6,7 @@ the original dict is kept in `.raw` → the SDK doesn't break when the backend a
 """
 from __future__ import annotations
 
+import re
 import warnings
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -2912,7 +2913,6 @@ class AssetFile:
 
 # Ingest sources whose importSourceRef is a URL the user gave (other sources keep internal references there).
 _URL_INGEST_SOURCES = ("civitai_import", "url_import")
-_SUBSET_PREFIX = "s3subset:"
 
 
 def _source_url(ingest_source: str, ref: object) -> str | None:
@@ -2925,13 +2925,18 @@ def _source_url(ingest_source: str, ref: object) -> str | None:
     return parts._replace(netloc=host, query="", fragment="").geturl()
 
 
+# importSourceRef of a subset copy: "s3subset:<asset_id>:<bucket>/<prefix>[?include=...&exclude=...]". Copies made
+# by older servers carry a version after the id ("s3subset:<asset_id>@v<n>:<bucket>/<prefix>..."). The id is a single
+# token (letters, digits, "_" and "-").
+_SUBSET_REF = re.compile(r"s3subset:([A-Za-z0-9_-]+)(?:@v[0-9]+)?:[^/]+/")
+
+
 def _subset_source_asset_id(ingest_source: str, ref: object) -> str | None:
-    """The asset a reference subset was copied from: importSourceRef is "s3subset:<asset_id>@v<n>". Anything else → None."""
-    if ingest_source != "s3_subset_fetch" or not isinstance(ref, str) or not ref.startswith(_SUBSET_PREFIX):
+    """The asset a reference subset was copied from, read from importSourceRef (see _SUBSET_REF). Anything else → None."""
+    if ingest_source != "s3_subset_fetch" or not isinstance(ref, str):
         return None
-    rest = ref[len(_SUBSET_PREFIX):]
-    at = rest.find("@v")
-    return rest[:at] if at > 0 else None
+    m = _SUBSET_REF.match(ref)
+    return m.group(1) if m else None
 
 
 @dataclass
@@ -2968,7 +2973,10 @@ class AssetReference:
     # CivitAI source whose file list was recorded when it was linked
     mode: str
     prefix: str | None = None
-    credential_label: str | None = None  # the bucket connection or token it reads through
+    # The bucket connection (mode prefix, same as Asset.bucket_label / bucket_status) or the Hugging Face / CivitAI
+    # token (mode external) it reads through. Status of a bucket connection: "ok", or "removed" once it was removed;
+    # of a token: "ok", "missing" or "not_required".
+    credential_label: str | None = None
     credential_status: str | None = None
     size_notice: str | None = None      # why the size is not exact, when it isn't
 
@@ -2977,8 +2985,23 @@ class AssetReference:
         mode = d.get("referenceMode")
         if not mode:
             return None
-        return cls(mode=str(mode), prefix=d.get("referencePrefix"), credential_label=d.get("credentialLabel"),
-                   credential_status=d.get("credentialStatus"), size_notice=d.get("sizeNotice"))
+        label, status = d.get("credentialLabel"), d.get("credentialStatus")
+        if label is None and status is None and mode == "prefix":   # a bucket folder: its bucket connection
+            label, status = _bucket_label(d), _bucket_status(d)
+        return cls(mode=str(mode), prefix=d.get("referencePrefix"), credential_label=label,
+                   credential_status=status, size_notice=d.get("sizeNotice"))
+
+
+def _bucket_id(d: dict) -> int | None:
+    return _optional_int_or_none(d.get("storageCredentialId", d.get("storage_credential_id")))
+
+
+def _bucket_label(d: dict) -> str | None:
+    return _optional_str(d.get("storageCredentialLabel", d.get("storage_credential_label")))
+
+
+def _bucket_status(d: dict) -> str | None:
+    return _optional_str(d.get("storageCredentialStatus", d.get("storage_credential_status")))
 
 
 @dataclass
@@ -3062,6 +3085,13 @@ class Asset:
     source: AssetSource | None = None
     reference: AssetReference | None = None        # None for an asset that holds its own files
     active_upload: AssetActiveUpload | None = None
+    # The connected bucket an asset in a user bucket (storage_provider "user_s3": a registered file or a linked folder)
+    # reads through. bucket_id is the credential_id list_storage_credentials gives (the bucket_id other calls take).
+    # bucket_status is "ok", or "removed" when that connection was removed (bucket_id and bucket_label are then None
+    # when the server no longer has it). All None for an asset in Meshive storage, and against an older server.
+    bucket_id: int | None = None
+    bucket_label: str | None = None
+    bucket_status: str | None = None
 
     @classmethod
     def from_dict(cls, d: dict, *, namespace_name: str = "") -> "Asset":
@@ -3103,6 +3133,9 @@ class Asset:
             source=AssetSource.from_dict(d) if has_source else None,
             reference=AssetReference.from_dict(d),
             active_upload=AssetActiveUpload.from_dict(d.get("activeBatch")),
+            bucket_id=_bucket_id(d),
+            bucket_label=_bucket_label(d),
+            bucket_status=_bucket_status(d),
         )
 
     # --- deprecated: version fields the server echoes back for older SDKs (removed in 2.0) -----------------

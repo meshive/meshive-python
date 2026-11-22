@@ -551,11 +551,11 @@ def port_preflight_body(allow: Any) -> dict[str, Any]:
 
 
 def access_key_body(name: Any, expires_in_days: Any) -> dict[str, Any]:
-    """POST …/ports/{port}/keys body. Which lifetimes exist is the server's rule (30, 90 or 365 days, or 0 for a key
-    that never expires), so only the type is checked. None is refused rather than read as "never expires"."""
+    """POST …/ports/{port}/keys body. Which lifetimes exist is the server's rule (30, 90 or 365 days for an API key
+    caller; a key that never expires is made only in the web console), so only the type is checked. None is refused
+    rather than read as "never expires"."""
     if isinstance(expires_in_days, bool) or not isinstance(expires_in_days, int) or expires_in_days < 0:
-        raise ValueError("expires_in_days must be a whole number of days (30, 90 or 365), or 0 for a key that never "
-                         "expires")
+        raise ValueError("expires_in_days must be a whole number of days: 30, 90 or 365")
     return {"name": _require_str(name, "name"), "expiresInDays": expires_in_days}
 
 

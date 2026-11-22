@@ -194,7 +194,7 @@ Every command has `--help`. The [CLI reference](https://docs.meshive.ai/sdk-cli/
   a summary first and ask you to confirm. Add `--estimate` to see the price only, or `--yes` to skip the
   question in scripts.
 - **Two kinds of keys.** A **Read only** key can see everything. A **Read & write** key is needed to create,
-  change or delete, and it expires (after 30 days by default).
+  change or delete. Both expire: a Read & write key within 90 days (30 by default), a Read only key within 365.
 - **Public ports are created locked.** A port that is newly exposed over HTTPS, on a new pod or by `pod-update`,
   lets in only workspace members signed in to the console, and programs that send one of the port's access keys
   (`meshive port-key-create`). Pass `--no-lock` (`lock_public_ports=False`) to create them open to anyone with the

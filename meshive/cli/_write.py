@@ -1334,12 +1334,12 @@ def _key_outcome_unknown(args: argparse.Namespace, what: str, exc: httpx.Request
 
 
 def _expiry_days(value: str) -> int:
-    """--expires DAYS|never → expires_in_days (0 = never). Which lifetimes exist is the server's rule."""
+    """--expires DAYS → expires_in_days. Which lifetimes exist is the server's rule; a key that never expires is made
+    only in the web console, so none is offered here."""
     text = value.strip().lower()
-    if text == "never":
-        return 0
     if not text.isdigit() or int(text) == 0:
-        raise ValueError(f"--expires expects a number of days (30, 90 or 365) or 'never', got {value!r}")
+        hint = " A key that never expires can only be made in the web console." if text in ("never", "0") else ""
+        raise ValueError(f"--expires expects a number of days (30, 90 or 365), got {value!r}.{hint}")
     return int(text)
 
 
@@ -2285,11 +2285,12 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
                             "With -o name only the value is printed.")
     p.add_argument("workspace"); p.add_argument("pod_name"); p.add_argument("port", type=int)
     p.add_argument("--name", required=True, help="A label for the key, such as the program that will use it.")
-    p.add_argument("--expires", default="90", metavar="DAYS|never",
-                   help="Lifetime in days: 30, 90 (default) or 365, or never.")
+    p.add_argument("--expires", default="90", metavar="DAYS",
+                   help="Lifetime in days: 30, 90 (default) or 365.")
     p = sub.add_parser("port-key-roll", parents=[common],
                        help="Replace an access key's value and print the new one once; the old value keeps working "
-                            "for a while so clients can be moved.")
+                            "for a while so clients can be moved. A key that never expires (made in the console) "
+                            "is rolled in the console.")
     p.add_argument("workspace"); p.add_argument("pod_name"); p.add_argument("port", type=int)
     p.add_argument("key_id", type=int, help="Key ID, as `meshive port-keys` lists it.")
     p.add_argument("--overlap", default="1h", metavar="now|1h|24h|7d",
@@ -2353,7 +2354,9 @@ def add_parsers(sub: argparse._SubParsersAction, common: argparse.ArgumentParser
     p.add_argument("workspace"); p.add_argument("model_id", type=int, help="Model registration ID (see `meshive models`).")
     p.add_argument("--price-cap", required=True, metavar="USD", help="Per-replica hourly price cap.")
     p.add_argument("--min-replicas", type=int, default=1); p.add_argument("--max-replicas", type=int, default=3)
-    p.add_argument("--no-autoscale", action="store_true")
+    p.add_argument("--no-autoscale", action="store_true",
+                   help="Run a fixed number of replicas. A new serving starts at most 10; raise the count with "
+                        "serving-scale once it is running.")
     p.add_argument("--max-context", type=int, default=None, metavar="TOKENS")
     p.add_argument("--share-idle", action="store_true", help="Share idle capacity (official text models only).")
     _yes(p)

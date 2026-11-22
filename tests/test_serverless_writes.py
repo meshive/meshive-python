@@ -54,6 +54,14 @@ def test_deploy_serving_output_bucket():
         sync_client(rec).deploy_serving(7, workspace="ws", price_cap_per_hour=1.5, output_bucket_id=0)
 
 
+def test_deploy_serving_docs_name_the_first_start_replica_limit():
+    # With autoscale off a new serving starts at most 10 replicas (400 'Too Many Replicas'); more come by scaling.
+    import meshive
+    for cls in (meshive.Meshive, meshive.AsyncMeshive):
+        doc = cls.deploy_serving.__doc__
+        assert "at most 10 replicas" in doc and "scale_serving" in doc, cls
+
+
 def test_scale_serving_bucket_managed_and_sharing():
     rec = Recorder((200, ACTION))
     client = sync_client(rec)

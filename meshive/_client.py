@@ -2401,8 +2401,9 @@ class Meshive(_BaseClient):
         """Create an access key for a locked port (write scope). Programs send its value as
         `Authorization: Bearer <key>`, or as `X-Meshive-Key: <key>` when the app uses Authorization itself.
         `access_key` on the result is the value: it is returned this once and can't be read again. expires_in_days is
-        30, 90 (the default) or 365, or 0 for a key that never expires. The port must be locked (400 'Endpoint Not
-        Locked'), and a port holds a limited number of keys (400 'Too Many Keys').
+        30, 90 (the default) or 365; a key that never expires can only be made in the web console (400 with an API
+        key). The port must be locked (400 'Endpoint Not Locked'), and a port holds a limited number of keys (400 'Too
+        Many Keys').
         Not idempotent: every call creates another key, so a failed call is resent only when the server surely never
         started on it. After a timeout, check list_access_keys before calling again, and revoke a key you can't use."""
         path = f"/pods/{_path_segment(pod_name, 'pod_name')}/ports/{_write.port_segment(port)}/keys"
@@ -2418,8 +2419,8 @@ class Meshive(_BaseClient):
         """Replace an access key's value (write scope): same name and port, a new value in `access_key` (returned
         this once), and a new id. The old value keeps working for overlap_seconds — 3600 (the default), 86400 or
         604800, or 0 to stop it at once — so clients can be moved to the new value; `previous_value_valid_until`
-        says until when. The new value expires after the same lifetime the key was created with, counted from now.
-        An expired key can be rolled too: its old value stopped working already, so overlap_seconds is ignored and
+        says until when. The new value expires after the same lifetime the key was created with, counted from now. A
+        key made in the console without an expiry must be rolled there (400 with an API key). An expired key can be rolled too: its old value stopped working already, so overlap_seconds is ignored and
         `previous_value_valid_until` is None.
         Not idempotent: every call issues another value, so it is resent only when the server surely never started
         on it. After a timeout, check list_access_keys before calling again."""
@@ -2560,7 +2561,9 @@ class Meshive(_BaseClient):
                        output_bucket_id: int | None = None,
                        idempotency_key: str | None = None) -> ResourceAction:
         """Deploy a registered model (registration id — list_models / register_model) as a serving (201).
-        Cost cap = price_cap_per_hour × max_replicas. `output_bucket_id` (a connected bucket,
+        Cost cap = price_cap_per_hour × max_replicas. With autoscale off a new serving starts at most 10 replicas
+        (400 'Too Many Replicas'); raise the count with scale_serving once it is running. With autoscale on it starts
+        from one replica. `output_bucket_id` (a connected bucket,
         list_storage_credentials) is where an image or video serving stores its outputs; None = Meshive storage.
         share_idle_capacity=True turns idle-capacity sharing on: get the user's agreement to `SHARING_CONSENT` first."""
         body = _write.serving_deploy_body(model_registration_id, price_cap_per_hour=price_cap_per_hour,
@@ -5312,7 +5315,9 @@ class AsyncMeshive(_BaseClient):
                        output_bucket_id: int | None = None,
                        idempotency_key: str | None = None) -> ResourceAction:
         """Deploy a registered model (registration id — list_models / register_model) as a serving (201).
-        Cost cap = price_cap_per_hour × max_replicas. `output_bucket_id` (a connected bucket,
+        Cost cap = price_cap_per_hour × max_replicas. With autoscale off a new serving starts at most 10 replicas
+        (400 'Too Many Replicas'); raise the count with scale_serving once it is running. With autoscale on it starts
+        from one replica. `output_bucket_id` (a connected bucket,
         list_storage_credentials) is where an image or video serving stores its outputs; None = Meshive storage.
         share_idle_capacity=True turns idle-capacity sharing on: get the user's agreement to `SHARING_CONSENT` first."""
         body = _write.serving_deploy_body(model_registration_id, price_cap_per_hour=price_cap_per_hour,

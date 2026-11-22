@@ -275,6 +275,13 @@ server ignores (see below).
   without saving it, and `set_fan_curve(machine_id, mode=..., points=...)` saves it (`FanCurveUpdate`; when the
   machine can't take it now, `applied` is False and it picks the curve up within about 5 minutes).
 
+### Changed
+
+- **Port access keys from an API key always expire.** The API refuses a key that never expires (`expires_in_days=0`)
+  from an API key, and a roll of one: such keys are made and rolled in the web console. `create_access_key` documents
+  30, 90 (default) or 365 days, `meshive port-key-create --expires` no longer takes `never`, and `deploy_serving`
+  says that with autoscale off a new serving starts at most 10 replicas.
+
 ## v1.10.3
 
 One fix: `meshive port-forward` now tells an HTTP/1.0 client when an answer sent in chunks broke off. Code

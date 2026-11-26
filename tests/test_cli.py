@@ -1,6 +1,7 @@
+import shutil
 import subprocess
 import sys
-from pathlib import Path
+import sysconfig
 
 import pytest
 
@@ -53,11 +54,14 @@ def test_unknown_argument_exits_with_error(capsys):
 
 def test_console_script_runs():
     """End-to-end: the installed `meshive` console script works."""
-    script = Path(sys.executable).parent / "meshive"
-    if not script.exists():
-        pytest.skip(f"console script not found at {script}")
+    # Looked up where this interpreter's scripts are installed (not always the interpreter's own folder),
+    # under the name the platform gives it (meshive.exe on Windows).
+    scripts = sysconfig.get_path("scripts")
+    script = shutil.which("meshive", path=scripts)
+    if script is None:
+        pytest.skip(f"console script not found in {scripts}")
     result = subprocess.run(
-        [str(script), "--version"],
+        [script, "--version"],
         capture_output=True,
         text=True,
         check=True,

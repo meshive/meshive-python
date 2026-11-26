@@ -2296,3 +2296,185 @@ def test_async_wait_for_workspace(slept):
     ws, error = asyncio.run(run())
     assert ws.status == "running" and calls["n"] == 4 and slept == [1.5, 1.5, 1.5, 3.0]
     assert not isinstance(error, WaitTimeoutError) and failing_calls["n"] == 2
+
+
+# --- Asset changes and deletion ------------------------------------------------
+
+ASSET_UPDATED = {"resource": "asset", "id": "asset_abc", "workspace": None, "action": "update", "accepted": True,
+                 "result": {"assetExternalId": "asset_abc", "name": "imagenet", "assetType": "model"}}
+ASSET_DELETED = {"resource": "asset", "id": "asset_abc", "workspace": "team-ns", "action": "delete",
+                 "accepted": True, "result": {"status": "deleted"}}
+FILE_DELETE_PLAN = {"action": "deleteFiles", "requestedFileCount": 3, "resolvedFileCount": 3, "activeFileCount": 3,
+                    "deletableFileCount": 2, "blockedFileCount": 1, "staleFileCount": 0,
+                    "activeTotalSizeBytes": 3 * 2**30, "assetExternalId": None, "assetName": "renders",
+                    "assetDeletePath": None, "requiresAssetDelete": [],
+                    "samplePaths": ["renders/a.png", "renders/b.png"]}
+FILES_DELETED = {"results": [
+    {"fileExternalId": "file_a", "relativePath": "renders/a.png", "status": "deleted", "reason": None},
+    {"fileExternalId": "file_b", "relativePath": "renders/b.png", "status": "alreadyDeleted", "reason": None},
+    {"fileExternalId": "file_c", "relativePath": "renders/c.png", "status": "blocked", "reason": "in_use"},
+    {"fileExternalId": "file_d", "relativePath": "renders/d.png", "status": "failed", "reason": "storage error"}],
+    "retiredAssetExternalIds": ["asset_single"]}
+
+
+def test_asset_update_body_shape_and_local_checks():
+    assert _write.asset_update_body(name="  imagenet ") == {"name": "imagenet"}
+    assert _write.asset_update_body(asset_type=" Model") == {"assetType": "model"}
+    assert _write.asset_update_body(name="x", asset_type="dataset") == {"name": "x", "assetType": "dataset"}
+    with pytest.raises(ValueError, match="name or asset_type"):
+        _write.asset_update_body()
+    with pytest.raises(ValueError, match="output"):
+        _write.asset_update_body(asset_type="Output")
+    for bad in ("", "   ", 3):
+        with pytest.raises(ValueError, match="name"):
+            _write.asset_update_body(name=bad)
+    with pytest.raises(ValueError, match="asset_type"):
+        _write.asset_update_body(asset_type="")
+
+
+def test_update_asset_builds_request_and_parses():
+    rec = Recorder((200, ASSET_UPDATED))
+    updated = sync_client(rec).update_asset("asset_abc", name="imagenet", asset_type="model",
+                                            idempotency_key="asset-key-0001")
+    assert rec.last.method == "PATCH" and rec.last.url.path == "/v1/sdk/assets/asset_abc" and not rec.last.url.params
+    assert rec.last.headers["Idempotency-Key"] == "asset-key-0001"
+    assert rec.body() == {"name": "imagenet", "assetType": "model"}
+    assert (updated.asset_id, updated.name, updated.asset_type, updated.replayed) == (
+        "asset_abc", "imagenet", "model", False)
+    with pytest.raises(TypeError):                         # changes are keyword-only
+        sync_client(rec).update_asset("asset_abc", "imagenet")
+    assert sync_client(_answer(200, ASSET_UPDATED, "true")).update_asset("asset_abc", name="x").replayed is True
+    with pytest.raises(NotFoundError, match="does not support asset editing"):     # GET-only path on older servers
+        sync_client(Recorder((405, {"detail": "Method Not Allowed"}))).update_asset("asset_abc", name="x")
+    with pytest.raises(ConflictError) as err:                                      # titled errors pass through
+        sync_client(Recorder((409, {"detail": {"title": "Asset Name Conflict", "message": "taken"}}))).update_asset(
+            "asset_abc", name="x")
+    assert err.value.title == "Asset Name Conflict"
+
+
+def test_delete_asset_builds_request_and_parses():
+    rec = Recorder((200, ASSET_DELETED))
+    action = sync_client(rec).delete_asset("asset_abc", idempotency_key="asset-key-0002")
+    assert isinstance(action, ResourceAction)
+    assert (action.resource, action.id, action.workspace, action.action, action.result) == (
+        "asset", "asset_abc", "team-ns", "delete", {"status": "deleted"})
+    assert rec.last.method == "DELETE" and rec.last.url.path == "/v1/sdk/assets/asset_abc"
+    assert not rec.last.url.params and rec.last.content == b""          # never a force flag
+    assert rec.last.headers["Idempotency-Key"] == "asset-key-0002"
+    with pytest.raises(NotFoundError, match="does not support asset deletion"):
+        sync_client(Recorder((405, {"detail": "Method Not Allowed"}))).delete_asset("asset_abc")
+    with pytest.raises(NotFoundError) as err:                            # a missing asset is not "unsupported"
+        sync_client(Recorder((404, {"detail": {"title": "Asset Not Found", "message": "no such asset"}}))).delete_asset(
+            "asset_x")
+    assert "does not support" not in str(err.value)
+    with pytest.raises(PermissionDeniedError):
+        sync_client(Recorder((403, {"detail": {"title": "Asset Frozen", "message": "frozen"}}))).delete_asset("asset_abc")
+    with pytest.raises(ValueError):
+        sync_client(rec).delete_asset("..")
+
+
+def test_asset_file_delete_body_selection_rules():
+    assert _write.asset_file_delete_body(file_ids=["file_a", "file_b"]) == {"fileIds": ["file_a", "file_b"]}
+    assert _write.asset_file_delete_body(file_ids="file_a") == {"fileIds": ["file_a"]}
+    assert _write.asset_file_delete_body(asset_id="asset_abc", paths="renders/*", expected_file_count=0) == {
+        "assetId": "asset_abc", "paths": ["renders/*"], "expectedFileCount": 0}
+    for bad in ({}, {"asset_id": "asset_abc"}, {"paths": ["*.png"]}, {"file_ids": []},
+                {"file_ids": ["file_a"], "asset_id": "asset_abc"}, {"file_ids": ["file_a"], "paths": ["*"]},
+                {"file_ids": ["file_a", ""]}, {"asset_id": " ", "paths": ["*"]},
+                {"file_ids": ["file_a"], "expected_file_count": -1},
+                {"file_ids": ["file_a"], "expected_file_count": True}):
+        with pytest.raises(ValueError):
+            _write.asset_file_delete_body(**bad)
+    assert len(_write.asset_file_delete_body(file_ids=[f"file_{i}" for i in range(1000)])["fileIds"]) == 1000
+    with pytest.raises(ValueError, match="1000"):
+        _write.asset_file_delete_body(file_ids=[f"file_{i}" for i in range(1001)])
+
+
+def test_preview_asset_file_delete_is_a_read_and_parses():
+    from meshive import AssetFileDeletePlan
+
+    rec = Recorder((200, FILE_DELETE_PLAN))
+    plan = sync_client(rec).preview_asset_file_delete("team-ns", asset_id="asset_abc", paths=["renders/*"])
+    assert rec.last.method == "POST" and rec.last.url.path == "/v1/sdk/assets/files/delete/preflight"
+    assert dict(rec.last.url.params) == {"workspace": "team-ns"}
+    assert rec.body() == {"assetId": "asset_abc", "paths": ["renders/*"]}   # never an expected count
+    assert (plan.action, plan.requested_file_count, plan.active_file_count, plan.deletable_file_count,
+            plan.blocked_file_count, plan.stale_file_count, plan.active_total_size_bytes) == (
+        "delete_files", 3, 3, 2, 1, 0, 3 * 2**30)
+    assert plan.asset_id is None and plan.asset_name == "renders"
+    assert plan.sample_paths == ["renders/a.png", "renders/b.png"] and plan.requires_asset_delete == []
+    whole = AssetFileDeletePlan.from_dict({**FILE_DELETE_PLAN, "action": "deleteAsset", "assetExternalId": "asset_abc",
+                                           "requiresAssetDelete": ["asset_abc"]})
+    assert (whole.action, whole.asset_id, whole.requires_asset_delete) == ("delete_asset", "asset_abc", ["asset_abc"])
+    assert AssetFileDeletePlan.from_dict({"action": "blocked"}).sample_paths == []
+    # the size a delete really removes is separate from the selected size; an older server doesn't send it
+    assert plan.deletable_total_size_bytes is None
+    sized = AssetFileDeletePlan.from_dict({**FILE_DELETE_PLAN, "deletableTotalSizeBytes": 2 * 2**30})
+    assert (sized.deletable_total_size_bytes, sized.active_total_size_bytes) == (2 * 2**30, 3 * 2**30)
+    assert AssetFileDeletePlan.from_dict({**FILE_DELETE_PLAN, "deletableTotalSizeBytes": 0}).deletable_total_size_bytes == 0
+    with pytest.raises(TypeError):                         # a preview records nothing, so it takes no key
+        sync_client(rec).preview_asset_file_delete("team-ns", file_ids=["file_a"], idempotency_key="k")
+    with pytest.raises(NotFoundError, match="does not support asset file deletion"):
+        sync_client(Recorder((404, {"detail": "Not Found"}))).preview_asset_file_delete("team-ns", file_ids=["file_a"])
+    with pytest.raises(ValueError):
+        sync_client(rec).preview_asset_file_delete(" ", file_ids=["file_a"])
+
+
+def test_delete_asset_files_builds_request_and_parses():
+    from meshive import AssetFilesDeleted
+
+    rec = Recorder((200, FILES_DELETED))
+    done = sync_client(rec).delete_asset_files("team-ns", file_ids=["file_a", "file_b", "file_c", "file_d"],
+                                               expected_file_count=3, idempotency_key="asset-key-0003")
+    assert rec.last.method == "POST" and rec.last.url.path == "/v1/sdk/assets/files/delete"
+    assert dict(rec.last.url.params) == {"workspace": "team-ns"}
+    assert rec.last.headers["Idempotency-Key"] == "asset-key-0003"
+    assert rec.body() == {"fileIds": ["file_a", "file_b", "file_c", "file_d"], "expectedFileCount": 3}
+    assert [(r.file_id, r.path, r.status) for r in done.results] == [
+        ("file_a", "renders/a.png", "deleted"), ("file_b", "renders/b.png", "already_deleted"),
+        ("file_c", "renders/c.png", "blocked"), ("file_d", "renders/d.png", "failed")]
+    assert done.deleted_count == 1 and done.already_deleted_count == 1
+    assert [r.reason for r in done.blocked] == ["in_use"] and [r.file_id for r in done.failed] == ["file_d"]
+    assert done.retired_asset_ids == ["asset_single"] and done.replayed is False
+    bare = AssetFilesDeleted.from_dict({"results": [{"fileExternalId": "file_a", "status": "deleted"}]})
+    assert bare.results[0].path is None and bare.retired_asset_ids == []          # server without relativePath
+    with pytest.raises(NotFoundError, match="does not support asset file deletion"):
+        sync_client(Recorder((404, {"detail": "Not Found"}))).delete_asset_files("team-ns", file_ids=["file_a"])
+    with pytest.raises(ConflictError) as err:
+        sync_client(Recorder((409, {"detail": {"title": "Selection Changed", "message": "preview again"}}))
+                    ).delete_asset_files("team-ns", asset_id="asset_abc", paths="*", expected_file_count=2)
+    assert err.value.title == "Selection Changed"
+
+
+def test_async_asset_writes_mirror_sync():
+    import inspect
+
+    import meshive
+
+    for name in ("update_asset", "delete_asset", "preview_asset_file_delete", "delete_asset_files", "list_assets"):
+        assert inspect.signature(getattr(meshive.Meshive, name)) == \
+            inspect.signature(getattr(meshive.AsyncMeshive, name)), name
+        assert inspect.iscoroutinefunction(getattr(meshive.AsyncMeshive, name)), name
+    for name in ("AssetUpdated", "AssetFileDeletePlan", "AssetFileDeleteResult", "AssetFilesDeleted", "AssetSource",
+                 "AssetReference", "AssetActiveUpload"):
+        assert name in meshive.__all__ and getattr(meshive, name).__name__ == name
+
+    rec = Recorder((200, ASSET_UPDATED), (200, ASSET_DELETED), (200, FILE_DELETE_PLAN), (200, FILES_DELETED))
+
+    async def run():
+        async with async_client(rec) as client:
+            return (await client.update_asset("asset_abc", name="imagenet", idempotency_key="k1"),
+                    await client.delete_asset("asset_abc", idempotency_key="k2"),
+                    await client.preview_asset_file_delete("team-ns", file_ids=["file_a"]),
+                    await client.delete_asset_files("team-ns", file_ids=["file_a"], expected_file_count=1,
+                                                    idempotency_key="k3"))
+
+    updated, deleted, plan, done = asyncio.run(run())
+    assert [(r.method, r.url.path) for r in rec.requests] == [
+        ("PATCH", "/v1/sdk/assets/asset_abc"), ("DELETE", "/v1/sdk/assets/asset_abc"),
+        ("POST", "/v1/sdk/assets/files/delete/preflight"), ("POST", "/v1/sdk/assets/files/delete")]
+    keys = [r.headers["Idempotency-Key"] for r in rec.requests]
+    assert (keys[0], keys[1], keys[3]) == ("k1", "k2", "k3")
+    assert rec.body(-1) == {"fileIds": ["file_a"], "expectedFileCount": 1}
+    assert updated.name == "imagenet" and deleted.action == "delete" and plan.action == "delete_files"
+    assert done.deleted_count == 1

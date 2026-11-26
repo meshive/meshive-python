@@ -669,7 +669,8 @@ def test_the_key_value_is_only_in_access_key():
 
 @pytest.mark.parametrize("days, sent", [(30, 30), (365, 365), (0, 0), (7, 7)])
 def test_access_key_lifetimes_are_the_servers_rule(days, sent):
-    # 0 is a key that never expires. Which other values exist is the server's call (7 comes back as a 422).
+    # Which values exist is the server's call: 7 comes back as a 422, and 0 (a key that never expires) as a 400 for
+    # an API key caller, since only the web console makes such keys. The SDK sends what it is given.
     api = Api({("POST", KEYS_PATH): (201, {**KEY_ITEM, "accessKey": KEY})})
     sync_client(api).create_access_key("p-0", "ws", 3000, "ci", expires_in_days=days)
     assert api.body("POST", KEYS_PATH)["expiresInDays"] == sent
@@ -685,6 +686,22 @@ def test_create_access_key_checks_arguments_before_sending(kwargs):
     with pytest.raises(ValueError):
         sync_client(api).create_access_key("p-0", "ws", 3000, name, **kwargs)
     assert not api.requests
+
+
+def test_access_key_lifetimes_offered_are_the_ones_an_api_key_can_create():
+    # A caller signed in with an API key gets a 400 for a key that never expires; only the console can make one.
+    # So neither the docs nor the argument check offer it, and a roll of such a key is pointed at the console.
+    import meshive
+    for cls in (meshive.Meshive, meshive.AsyncMeshive):
+        doc = cls.create_access_key.__doc__ or ""
+        assert "0 for" not in doc and "or 0" not in doc, cls
+    doc = meshive.Meshive.create_access_key.__doc__
+    assert "30, 90 (the default) or 365;" in doc and "only be made in the web console" in doc
+    assert "console" in meshive.Meshive.roll_access_key.__doc__
+    with pytest.raises(ValueError) as caught:
+        sync_client(Api()).create_access_key("p-0", "ws", 3000, "ci", expires_in_days=-1)
+    assert "never" not in str(caught.value) and "0 for" not in str(caught.value)
+    assert "30, 90 or 365" in str(caught.value)
 
 
 def test_roll_access_key_request_and_result():
@@ -884,7 +901,7 @@ def test_async_port_lock_and_access_keys(slept):
         async with async_client(api) as c:
             lock = await c.set_port_lock("p-0", "ws", 3000, True)
             keys = await c.list_access_keys("p-0", "ws", 3000)
-            key = await c.create_access_key("p-0", "ws", 3000, "ci", expires_in_days=0)
+            key = await c.create_access_key("p-0", "ws", 3000, "ci", expires_in_days=365)
             with pytest.raises(httpx.ReadTimeout):
                 await c.roll_access_key("p-0", "ws", 3000, 12, overlap_seconds=86400)
             action = await c.revoke_access_key("p-0", "ws", 3000, 12)
@@ -896,7 +913,7 @@ def test_async_port_lock_and_access_keys(slept):
     lock, keys, key, action, pod = asyncio.run(run())
     assert lock.locked is True and [k.id for k in keys] == [12] and pod.pod_name == "p-0"
     assert key.access_key == KEY and KEY not in repr(key) and "accessKey" not in key.raw
-    assert api.body("POST", KEYS_PATH) == {"name": "ci", "expiresInDays": 0}
+    assert api.body("POST", KEYS_PATH) == {"name": "ci", "expiresInDays": 365}
     assert api.body("POST", f"{KEYS_PATH}/12/roll") == {"overlapSeconds": 86400}
     assert len(api.sent("POST", f"{KEYS_PATH}/12/roll")) == 1 and slept == []     # the roll was not sent again
     assert action.id == "12" and action.resource == "access_key"
@@ -1150,17 +1167,29 @@ def test_cli_port_key_create_prints_the_value_once(api, capsys, non_tty):
     # -o name: only the value, for KEY=$(…). -o json: the server's answer, value included, as other secrets are.
     assert cli.main(["port-key-create", "ws", "p-0", "3000", "--name", "ci", "-o", "name"]) == 0
     assert capsys.readouterr().out == KEY + "\n"
-    assert cli.main(["port-key-create", "ws", "p-0", "3000", "--name", "ci", "--expires", "never", "-o", "json"]) == 0
+    assert cli.main(["port-key-create", "ws", "p-0", "3000", "--name", "ci", "--expires", "30", "-o", "json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["accessKey"] == KEY and payload["id"] == 12
-    assert api.body("POST", KEYS_PATH)["expiresInDays"] == 0
+    assert api.body("POST", KEYS_PATH)["expiresInDays"] == 30
     assert cli.main(["port-key-create", "ws", "p-0", "3000", "--name", "ci", "--expires", "365"]) == 0
     assert api.body("POST", KEYS_PATH)["expiresInDays"] == 365
     capsys.readouterr()
-    for bad in ("soon", "0", "-5"):
+    for bad in ("soon", "0", "-5", "never"):
         before = len(api.sent("POST", KEYS_PATH))
         assert cli.main(["port-key-create", "ws", "p-0", "3000", "--name", "ci", "--expires", bad]) == 2
         assert "--expires expects" in capsys.readouterr().err and len(api.sent("POST", KEYS_PATH)) == before
+
+
+def test_cli_port_key_create_offers_no_key_that_never_expires(api, capsys, non_tty):
+    # The CLI signs in with an API key, and the server refuses such a key from one: only the console makes them.
+    assert cli.main(["port-key-create", "ws", "p-0", "3000", "--name", "ci", "--expires", "never"]) == 2
+    err = capsys.readouterr().err
+    assert "--expires expects" in err and "30, 90 or 365" in err and "console" in err
+    assert not api.sent("POST", KEYS_PATH)
+    with pytest.raises(SystemExit):
+        cli.main(["port-key-create", "--help"])
+    help_text = capsys.readouterr().out
+    assert "never" not in help_text and "30, 90 (default) or 365" in help_text
 
 
 def test_cli_port_key_create_is_not_repeated_after_a_timeout(api, capsys, slept):

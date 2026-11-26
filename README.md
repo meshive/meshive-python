@@ -13,12 +13,30 @@ tasks, serve models and manage your files: the same things you can do in the con
 
 ## Install
 
+Install the `meshive` command with [uv](https://docs.astral.sh/uv/getting-started/installation/):
+
 ```bash
-pip install meshive
+uv tool install meshive
 ```
 
-Requires Python 3.10 or newer (tested on 3.10 to 3.13). This installs the `meshive` command and the `meshive`
-Python package. Check it with `meshive --version`.
+or with [pipx](https://pipx.pypa.io/):
+
+```bash
+pipx install meshive
+```
+
+Either one keeps the CLI in its own environment, and uv downloads a suitable Python if you don't have 3.10 or
+newer. Check it with `meshive --version`. If the command isn't found, run `uv tool update-shell` (or `pipx ensurepath`) and open a new terminal. Upgrade with
+`uv tool upgrade meshive` (or `pipx upgrade meshive`).
+
+To use the Python SDK, install the package in your project's virtual environment:
+
+```bash
+pip install "meshive>=1,<2"
+```
+
+Requires Python 3.10 or newer (tested on 3.10 to 3.13). A `pip install` outside a virtual environment fails with
+`externally-managed-environment` on Homebrew Python and on recent Debian and Ubuntu releases; use the commands above.
 
 In a requirements file, pin the major version so you get fixes but nothing that breaks your code:
 
@@ -176,7 +194,7 @@ Every command has `--help`. The [CLI reference](https://docs.meshive.ai/sdk-cli/
   a summary first and ask you to confirm. Add `--estimate` to see the price only, or `--yes` to skip the
   question in scripts.
 - **Two kinds of keys.** A **Read only** key can see everything. A **Read & write** key is needed to create,
-  change or delete, and it expires (after 30 days by default).
+  change or delete. Both expire: a Read & write key within 90 days (30 by default), a Read only key within 365.
 - **Public ports are created locked.** A port that is newly exposed over HTTPS, on a new pod or by `pod-update`,
   lets in only workspace members signed in to the console, and programs that send one of the port's access keys
   (`meshive port-key-create`). Pass `--no-lock` (`lock_public_ports=False`) to create them open to anyone with the
